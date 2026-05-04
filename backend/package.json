@@ -1,0 +1,17 @@
+{
+  "name": "ask-support-wise-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.mjs",
+    "start": "node index.mjs",
+    "migrate": "node scripts/run-migration.mjs",
+    "import:learners": "node scripts/import-learners.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pg": "^8.20.0"
+  }
+}
