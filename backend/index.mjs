@@ -10,7 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const distPath = path.resolve(__dirname, "../frontend/dist");
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const sharedSupportPassword = process.env.SUPPORT_PORTAL_PASSWORD?.trim() || "admin123";
+const sharedSupportPassword = process.env.SUPPORT_PORTAL_PASSWORD?.trim() || "";
 const allowedStatuses = new Set(["Open", "Pending", "In Progress", "Resolved", "Closed"]);
 const allowedCategories = new Set(["Learning", "Technical", "Others"]);
 const allowedTechnicalSubcategories = new Set(["Aptem", "LMS", "Teams"]);
@@ -79,6 +79,12 @@ app.post("/api/admin/login", async (req, res) => {
 
   if (!username || !password) {
     return res.status(400).json({ message: "Username and password are required." });
+  }
+
+  if (!sharedSupportPassword) {
+    return res.status(503).json({
+      message: "Admin login is not configured. Set SUPPORT_PORTAL_PASSWORD on the server.",
+    });
   }
 
   try {
@@ -907,6 +913,10 @@ app.listen(port, () => {
 
   if (!databaseUrl) {
     console.warn("DATABASE_URL is missing. Add it to backend/.env.local before starting the server.");
+  }
+
+  if (!sharedSupportPassword) {
+    console.warn("SUPPORT_PORTAL_PASSWORD is missing. Set it in backend/.env.local before enabling admin login.");
   }
 });
 

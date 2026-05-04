@@ -136,7 +136,7 @@ const AdminLogin = () => {
             </Button>
 
             <div className="text-xs text-center text-muted-foreground pt-2">
-              Use an active support username. The local default password is <span className="font-mono">admin123</span>.
+              Use an active support username and the password configured on the server.
             </div>
           </form>
         </div>
