@@ -28,6 +28,97 @@ import { ChatMessage, useSupport } from "@/context/SupportContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
+const egyptSupportTimeZone = "Africa/Cairo";
+const ukSupportTimeZone = "Europe/London";
+const egyptSupportSessionStartMinutes = 10 * 60;
+const egyptSupportSessionEndMinutes = 18 * 60;
+const ukSupportSessionStartMinutes = 8 * 60;
+const ukSupportSessionEndMinutes = 18 * 60;
+const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
+
+function formatDateInputValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function parseLocalDateTime(dateValue: string, timeValue: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || !/^\d{2}:\d{2}$/.test(timeValue)) {
+    return null;
+  }
+
+  const [year, month, day] = dateValue.split("-").map(Number);
+  const [hours, minutes] = timeValue.split(":").map(Number);
+  const parsed = new Date(year, month - 1, day, hours, minutes, 0, 0);
+
+  if (
+    Number.isNaN(parsed.getTime())
+    || parsed.getFullYear() !== year
+    || parsed.getMonth() !== month - 1
+    || parsed.getDate() !== day
+    || parsed.getHours() !== hours
+    || parsed.getMinutes() !== minutes
+  ) {
+    return null;
+  }
+
+  return parsed;
+}
+
+function getTimeInTimeZoneMinutes(date: Date, timeZone: string) {
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const hours = Number(parts.find((part) => part.type === "hour")?.value ?? Number.NaN);
+  const minutes = Number(parts.find((part) => part.type === "minute")?.value ?? Number.NaN);
+
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) {
+    return Number.NaN;
+  }
+
+  return (hours * 60) + minutes;
+}
+
+function isMinutesWithinRange(minutes: number, startMinutes: number, endMinutes: number) {
+  return minutes >= startMinutes && minutes <= endMinutes;
+}
+
+function isWithinSupportSessionWindow(requestedDateTime: Date) {
+  const egyptMinutes = getTimeInTimeZoneMinutes(requestedDateTime, egyptSupportTimeZone);
+  const ukMinutes = getTimeInTimeZoneMinutes(requestedDateTime, ukSupportTimeZone);
+
+  return (
+    isMinutesWithinRange(egyptMinutes, egyptSupportSessionStartMinutes, egyptSupportSessionEndMinutes)
+    || isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes)
+  );
+}
+
+function getSupportSessionValidationMessage(dateValue: string, timeValue: string, now = new Date()) {
+  if (!dateValue || !timeValue) {
+    return "";
+  }
+
+  const requestedDateTime = parseLocalDateTime(dateValue, timeValue);
+  if (!requestedDateTime) {
+    return "Please choose a valid session date and time.";
+  }
+
+  if ((requestedDateTime.getTime() - now.getTime()) <= supportSessionLeadTimeMs) {
+    return "Support sessions must be booked more than 24 hours in advance.";
+  }
+
+  if (!isWithinSupportSessionWindow(requestedDateTime)) {
+    return "Support sessions must be between 10:00 AM and 6:00 PM Egypt time or between 8:00 AM and 6:00 PM UK time.";
+  }
+
+  return "";
+}
+
 const ChatSupport = () => {
   const navigate = useNavigate();
   const { ticket, updateTicket } = useSupport();
@@ -38,6 +129,7 @@ const ChatSupport = () => {
   const [bookingTime, setBookingTime] = useState("");
   const [isClosing, setIsClosing] = useState(false);
   const [isBooking, setIsBooking] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -84,14 +176,74 @@ const ChatSupport = () => {
     setMessages((prev) => [...prev, { ...message, id: crypto.randomUUID(), timestamp: now }]);
   };
 
-  const handleSend = () => {
-    if (!input.trim()) return;
+  const handleSend = async () => {
+    const trimmedInput = input.trim();
+    if (!trimmedInput || isSendingMessage) return;
 
-    pushMsg({ sender: "user", text: input });
+    if (!ticket.id) {
+      toast.error("This ticket is not ready for chatbot messaging yet.");
+      return;
+    }
+
+    const userMessage: Omit<ChatMessage, "id" | "timestamp"> = {
+      sender: "user",
+      text: trimmedInput,
+    };
+    const nextMessages = [...messages, {
+      ...userMessage,
+      id: crypto.randomUUID(),
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    }];
+
+    setMessages(nextMessages);
     setInput("");
-    setTimeout(() => {
-      pushMsg({ sender: "bot", text: "Got it - I've shared this with the support team." });
-    }, 700);
+    setIsSendingMessage(true);
+
+    try {
+      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chatbot-message`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message: trimmedInput,
+          clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+          messages: nextMessages.map((message) => ({
+            sender: message.sender,
+            text: message.text,
+            timestamp: message.timestamp,
+          })),
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as {
+        message?: string;
+        reply?: string | null;
+        webhookConfigured?: boolean;
+        webhookDelivered?: boolean;
+      } | null;
+
+      if (!response.ok) {
+        toast.error(payload?.message || "We could not send your message to the chatbot right now.");
+        return;
+      }
+
+      if (payload?.reply) {
+        pushMsg({ sender: "bot", text: payload.reply });
+      } else if (payload?.webhookConfigured === false) {
+        pushMsg({ sender: "bot", text: "I received your message, but the chatbot is not connected yet." });
+        toast.error("Chatbot webhook is not configured on the server.");
+      } else if (payload?.webhookDelivered === false) {
+        pushMsg({ sender: "bot", text: "I received your message, but I could not reach the chatbot right now." });
+        toast.error("Your message was saved, but the chatbot webhook could not be reached.");
+      } else {
+        pushMsg({ sender: "bot", text: "Your message was sent, but the chatbot did not return a reply." });
+      }
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsSendingMessage(false);
+    }
   };
 
   const onLiveAgent = () => {
@@ -103,6 +255,8 @@ const ChatSupport = () => {
 
   const userMessageCount = messages.filter((message) => message.sender === "user").length;
   const canShowSupportActions = userMessageCount >= 5;
+  const minBookingDate = formatDateInputValue(new Date());
+  const bookingValidationMessage = getSupportSessionValidationMessage(bookingDate, bookingTime);
 
   const handleClose = async () => {
     if (!ticket.id) {
@@ -125,7 +279,11 @@ const ChatSupport = () => {
         }),
       });
 
-      const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+      const payload = (await response.json().catch(() => null)) as {
+        message?: string;
+        webhookConfigured?: boolean;
+        webhookDelivered?: boolean;
+      } | null;
 
       if (!response.ok) {
         toast.error(payload?.message || "We could not save the chat history right now.");
@@ -143,6 +301,17 @@ const ChatSupport = () => {
 
   const handleBooking = async () => {
     if (!ticket.id || !bookingDate || !bookingTime) return;
+    const requestedDateTime = parseLocalDateTime(bookingDate, bookingTime);
+
+    if (bookingValidationMessage) {
+      toast.error(bookingValidationMessage);
+      return;
+    }
+
+    if (!requestedDateTime) {
+      toast.error("Please choose a valid session date and time.");
+      return;
+    }
 
     setIsBooking(true);
 
@@ -155,10 +324,16 @@ const ChatSupport = () => {
         body: JSON.stringify({
           date: bookingDate,
           time: bookingTime,
+          scheduledAt: requestedDateTime.toISOString(),
+          clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
         }),
       });
 
-      const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+      const payload = (await response.json().catch(() => null)) as {
+        message?: string;
+        webhookConfigured?: boolean;
+        webhookDelivered?: boolean;
+      } | null;
 
       if (!response.ok) {
         toast.error(payload?.message || "We could not save the support session request.");
@@ -170,6 +345,13 @@ const ChatSupport = () => {
         sender: "bot",
         text: `Your support session request has been sent for ${bookingDate} at ${bookingTime}.`,
       });
+      if (payload?.webhookConfigured === false) {
+        toast.error("Booking saved, but the booking webhook is not configured on the server.");
+      } else if (payload?.webhookDelivered === false) {
+        toast.error("Booking saved, but the webhook notification could not be delivered.");
+      } else {
+        toast.success("Support session request saved and sent to the booking webhook.");
+      }
       setBookingDate("");
       setBookingTime("");
     } catch {
@@ -226,11 +408,12 @@ const ChatSupport = () => {
               <Input
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
-                onKeyDown={(event) => event.key === "Enter" && handleSend()}
+                onKeyDown={(event) => event.key === "Enter" && void handleSend()}
                 placeholder="Type your message..."
                 className="h-11"
+                disabled={isSendingMessage}
               />
-              <Button onClick={handleSend} className="h-11 border-0 shrink-0 gradient-primary">
+              <Button onClick={() => void handleSend()} className="h-11 border-0 shrink-0 gradient-primary" disabled={isSendingMessage}>
                 <Send className="w-4 h-4" />
               </Button>
             </div>
@@ -242,22 +425,37 @@ const ChatSupport = () => {
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>Book a Support Session</DialogTitle>
-            <DialogDescription>Choose a date and time that works for you.</DialogDescription>
+            <DialogDescription>
+              Choose a date and time that works for you. Sessions are available from 10:00 AM to 6:00 PM Egypt time or from 8:00 AM to 6:00 PM UK time, and they must be more than 24 hours away.
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div>
               <label className="block mb-1.5 text-sm font-medium">Date</label>
-              <Input type="date" value={bookingDate} onChange={(event) => setBookingDate(event.target.value)} />
+              <Input
+                type="date"
+                min={minBookingDate}
+                value={bookingDate}
+                onChange={(event) => setBookingDate(event.target.value)}
+              />
             </div>
             <div>
               <label className="block mb-1.5 text-sm font-medium">Time</label>
-              <Input type="time" value={bookingTime} onChange={(event) => setBookingTime(event.target.value)} />
+              <Input
+                type="time"
+                step="60"
+                value={bookingTime}
+                onChange={(event) => setBookingTime(event.target.value)}
+              />
             </div>
+            <p className={cn("text-xs", bookingValidationMessage ? "text-destructive" : "text-muted-foreground")}>
+              {bookingValidationMessage || "Allowed meeting hours are 10:00 AM to 6:00 PM Egypt time or 8:00 AM to 6:00 PM UK time, with more than 24 hours notice required."}
+            </p>
           </div>
           <DialogFooter>
             <Button
               className="w-full border-0 gradient-primary"
-              disabled={!bookingDate || !bookingTime || isBooking}
+              disabled={!bookingDate || !bookingTime || Boolean(bookingValidationMessage) || isBooking}
               onClick={() => void handleBooking()}
             >
               <Check className="w-4 h-4 mr-2" /> {isBooking ? "Saving..." : "Confirm Booking"}
