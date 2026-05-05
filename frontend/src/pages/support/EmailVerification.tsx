@@ -18,6 +18,30 @@ import { useSupport } from "@/context/SupportContext";
 
 const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 
+const getVerificationErrorState = (
+  status: number,
+  payload: { exists?: boolean; message?: string } | null,
+) => {
+  if (status === 400) {
+    return {
+      title: "Invalid Email",
+      message: payload?.message || "Please enter a valid email address.",
+    };
+  }
+
+  if (status === 404) {
+    return {
+      title: "Email Not Found",
+      message: payload?.message || "This email is not registered in our records.",
+    };
+  }
+
+  return {
+    title: "Verification Unavailable",
+    message: payload?.message || "The verification service is unavailable right now. Please try again in a moment.",
+  };
+};
+
 const EmailVerification = () => {
   const navigate = useNavigate();
   const { ticket, setTicket, updateTicket } = useSupport();
@@ -75,8 +99,9 @@ const EmailVerification = () => {
         return;
       }
 
-      setErrorTitle(response.status === 400 ? "Invalid Email" : "Email Not Found");
-      setErrorMessage(payload?.message || "This email is not registered in our records.");
+      const errorState = getVerificationErrorState(response.status, payload);
+      setErrorTitle(errorState.title);
+      setErrorMessage(errorState.message);
       setErrorOpen(true);
     } catch {
       setErrorTitle("Verification Unavailable");

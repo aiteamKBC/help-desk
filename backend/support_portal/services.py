@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -11,6 +11,7 @@ from urllib import request as urllib_request
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import psycopg
 from django.conf import settings
 from django.db import connection, transaction
 
@@ -19,13 +20,11 @@ ALLOWED_STATUSES = {"Open", "Pending", "In Progress", "Resolved", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
 ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "LMS", "Teams"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
-EGYPT_SUPPORT_TIMEZONE = "Africa/Cairo"
 UK_SUPPORT_TIMEZONE = "Europe/London"
-EGYPT_SUPPORT_SESSION_START_MINUTES = 10 * 60
-EGYPT_SUPPORT_SESSION_END_MINUTES = 18 * 60
 UK_SUPPORT_SESSION_START_MINUTES = 8 * 60
-UK_SUPPORT_SESSION_END_MINUTES = 18 * 60
+UK_SUPPORT_SESSION_END_MINUTES = 16 * 60
 SUPPORT_SESSION_LEAD_TIME_SECONDS = 24 * 60 * 60
+WEBHOOK_RESPONSE_WRAPPER_KEYS = ("data", "body", "result", "payload", "json", "content", "booking", "meeting", "event")
 
 
 @dataclass
@@ -81,6 +80,105 @@ def run_query(sql: str, params: list[Any] | tuple[Any, ...] | None = None) -> li
 def run_query_one(sql: str, params: list[Any] | tuple[Any, ...] | None = None) -> dict[str, Any] | None:
     rows = run_query(sql, params)
     return rows[0] if rows else None
+
+
+def fetch_local_learner_by_email(email: str) -> dict[str, Any] | None:
+    return run_query_one(
+        """
+        SELECT id, external_learner_id, full_name, email, phone
+        FROM learners
+        WHERE LOWER(TRIM(email)) = %s
+        LIMIT 1
+        """,
+        [email],
+    )
+
+
+def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
+    if not settings.LEGACY_DATABASE_URL:
+        return None
+
+    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT
+                  NULLIF(TRIM("ID"::text), '') AS external_learner_id,
+                  NULLIF(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName"))), '') AS full_name,
+                  LOWER(TRIM("Email")) AS email,
+                  NULLIF(TRIM(COALESCE("Learner_Phone", "learner-phone")), '') AS phone
+                FROM kbc_users_data
+                WHERE LOWER(TRIM("Email")) = %s
+                LIMIT 1
+                """,
+                [email],
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    external_learner_id, full_name, normalized_email, phone = row
+    return {
+        "external_learner_id": external_learner_id,
+        "full_name": full_name,
+        "email": normalized_email,
+        "phone": phone,
+    }
+
+
+def upsert_learner_record(learner: dict[str, Any], source: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO learners (
+              external_learner_id,
+              full_name,
+              email,
+              phone,
+              source,
+              metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (email) DO UPDATE
+            SET
+              external_learner_id = COALESCE(EXCLUDED.external_learner_id, learners.external_learner_id),
+              full_name = COALESCE(EXCLUDED.full_name, learners.full_name),
+              phone = COALESCE(EXCLUDED.phone, learners.phone),
+              source = EXCLUDED.source,
+              metadata = learners.metadata || EXCLUDED.metadata,
+              updated_at = NOW()
+            RETURNING id, external_learner_id, full_name, email, phone
+            """,
+            [
+                learner.get("external_learner_id"),
+                learner.get("full_name"),
+                learner["email"],
+                learner.get("phone"),
+                source,
+                json.dumps(metadata),
+            ],
+        )
+        return dictfetchone(cursor)
+
+
+def find_learner_by_email(email: str) -> dict[str, Any] | None:
+    learner = fetch_local_learner_by_email(email)
+    if learner:
+        return learner
+
+    legacy_learner = fetch_legacy_learner_by_email(email)
+    if not legacy_learner:
+        return None
+
+    return upsert_learner_record(
+        legacy_learner,
+        source="legacy_kbc_users_data",
+        metadata={
+            "legacy_source": "kbc_users_data",
+            "synced_on_demand": True,
+        },
+    )
 
 
 def serialize_agent(row: dict[str, Any]) -> dict[str, Any]:
@@ -201,20 +299,12 @@ def is_minutes_within_range(minutes: int, start_minutes: int, end_minutes: int) 
 
 
 def is_within_support_session_window(requested_datetime: datetime) -> bool:
-    egypt_minutes = get_time_in_timezone_minutes(requested_datetime, EGYPT_SUPPORT_TIMEZONE)
     uk_minutes = get_time_in_timezone_minutes(requested_datetime, UK_SUPPORT_TIMEZONE)
 
-    return (
-        is_minutes_within_range(
-            egypt_minutes,
-            EGYPT_SUPPORT_SESSION_START_MINUTES,
-            EGYPT_SUPPORT_SESSION_END_MINUTES,
-        )
-        or is_minutes_within_range(
-            uk_minutes,
-            UK_SUPPORT_SESSION_START_MINUTES,
-            UK_SUPPORT_SESSION_END_MINUTES,
-        )
+    return is_minutes_within_range(
+        uk_minutes,
+        UK_SUPPORT_SESSION_START_MINUTES,
+        UK_SUPPORT_SESSION_END_MINUTES,
     )
 
 
@@ -225,21 +315,215 @@ def validate_support_session_request(
     now: datetime | None = None,
 ) -> str:
     current_time = now or datetime.now(tz=ZoneInfo(settings.TIME_ZONE))
-    requested_datetime = parse_scheduled_at(scheduled_at_value) if scheduled_at_value else parse_local_datetime(date_value, time_value)
+    requested_datetime = resolve_support_session_datetime(date_value, time_value, scheduled_at_value)
 
     if not requested_datetime:
         return "Please choose a valid session date and time."
-
-    if requested_datetime.tzinfo is None:
-        requested_datetime = requested_datetime.replace(tzinfo=ZoneInfo(settings.TIME_ZONE))
 
     if (requested_datetime - current_time).total_seconds() <= SUPPORT_SESSION_LEAD_TIME_SECONDS:
         return "Support sessions must be booked more than 24 hours in advance."
 
     if not is_within_support_session_window(requested_datetime):
-        return "Support sessions must be between 10:00 AM and 6:00 PM Egypt time or between 8:00 AM and 6:00 PM UK time."
+        return "Support sessions must be between 8:00 AM and 4:00 PM UK time."
 
     return ""
+
+
+def resolve_support_session_datetime(date_value: str, time_value: str, scheduled_at_value: str = "") -> datetime | None:
+    requested_datetime = parse_scheduled_at(scheduled_at_value) if scheduled_at_value else parse_local_datetime(date_value, time_value)
+
+    if not requested_datetime:
+        return None
+
+    if requested_datetime.tzinfo is None:
+        return requested_datetime.replace(tzinfo=ZoneInfo(settings.TIME_ZONE))
+
+    return requested_datetime
+
+
+def extract_webhook_value(response_payload: Any, keys: tuple[str, ...]) -> Any | None:
+    if isinstance(response_payload, list):
+        for item in response_payload:
+            value = extract_webhook_value(item, keys)
+            if value is not None and (not isinstance(value, str) or value.strip()):
+                return value
+        return None
+
+    if isinstance(response_payload, dict):
+        for key in keys:
+            if key in response_payload:
+                value = response_payload[key]
+                if value is not None and (not isinstance(value, str) or value.strip()):
+                    return value
+
+        for wrapper_key in WEBHOOK_RESPONSE_WRAPPER_KEYS:
+            if wrapper_key in response_payload:
+                nested_value = extract_webhook_value(response_payload[wrapper_key], keys)
+                if nested_value is not None and (not isinstance(nested_value, str) or nested_value.strip()):
+                    return nested_value
+
+    return None
+
+
+def extract_webhook_string(response_payload: Any, keys: tuple[str, ...]) -> str:
+    value = extract_webhook_value(response_payload, keys)
+    return sanitize_text(value) if isinstance(value, str) else ""
+
+
+def extract_webhook_bool(response_payload: Any, keys: tuple[str, ...]) -> bool | None:
+    value = extract_webhook_value(response_payload, keys)
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized_value = value.strip().lower()
+        if normalized_value in {"true", "1", "yes", "ok", "success"}:
+            return True
+        if normalized_value in {"false", "0", "no", "failed"}:
+            return False
+
+    return None
+
+
+def build_support_session_webhook_payload(
+    ticket: dict[str, Any],
+    session_request_id: int,
+    requested_date: str,
+    requested_time: str,
+    requested_datetime: datetime,
+    client_time_zone: str,
+    created_at: Any,
+) -> dict[str, Any]:
+    request_end = requested_datetime + timedelta(minutes=settings.SUPPORT_SESSION_DURATION_MINUTES)
+    request_start_utc = requested_datetime.astimezone(ZoneInfo("UTC"))
+    request_end_utc = request_end.astimezone(ZoneInfo("UTC"))
+
+    return {
+        "event": "support_session_requested",
+        "source": "support_portal",
+        "bookingProvider": "microsoft_teams",
+        "reserveSlot": True,
+        "durationMinutes": settings.SUPPORT_SESSION_DURATION_MINUTES,
+        "ticketId": ticket["public_id"],
+        "learnerId": int(ticket["learner_id"]),
+        "learnerName": ticket.get("learner_full_name"),
+        "learnerEmail": ticket["learner_email"],
+        "learnerPhone": ticket.get("learner_phone"),
+        "category": ticket["category"],
+        "technicalSubcategory": ticket.get("technical_subcategory"),
+        "inquiry": ticket["inquiry"],
+        "ticketStatus": ticket["status"],
+        "ticketPriority": ticket["priority"],
+        "assignedTeam": ticket["assigned_team"],
+        "requestedDate": requested_date,
+        "requestedTime": requested_time,
+        "requestedStartAt": requested_datetime.isoformat(),
+        "requestedEndAt": request_end.isoformat(),
+        "requestedStartAtUtc": request_start_utc.isoformat().replace("+00:00", "Z"),
+        "requestedEndAtUtc": request_end_utc.isoformat().replace("+00:00", "Z"),
+        "requestedTimeZone": client_time_zone or settings.TIME_ZONE,
+        "sessionRequestId": session_request_id,
+        "createdAt": created_at,
+        "learner": {
+            "id": int(ticket["learner_id"]),
+            "fullName": ticket.get("learner_full_name"),
+            "email": ticket["learner_email"],
+            "phone": ticket.get("learner_phone"),
+        },
+        "ticket": {
+            "id": ticket["public_id"],
+            "category": ticket["category"],
+            "technicalSubcategory": ticket.get("technical_subcategory"),
+            "inquiry": ticket["inquiry"],
+            "status": ticket["status"],
+            "priority": ticket["priority"],
+            "assignedTeam": ticket["assigned_team"],
+        },
+    }
+
+
+def extract_booking_webhook_result(response_payload: Any, delivered: bool, status: int | None) -> dict[str, Any]:
+    meeting_join_url = extract_webhook_string(
+        response_payload,
+        ("joinUrl", "meetingJoinUrl", "teamsJoinUrl", "meeting_url", "teams_meeting_url", "webUrl"),
+    )
+    event_id = extract_webhook_string(
+        response_payload,
+        ("eventId", "calendarEventId", "bookingId", "reservationId", "id"),
+    )
+    calendar_event_url = extract_webhook_string(
+        response_payload,
+        ("calendarEventUrl", "eventUrl", "calendarUrl", "outlookEventUrl"),
+    )
+    organizer_email = extract_webhook_string(
+        response_payload,
+        ("organizerEmail", "hostEmail", "ownerEmail", "calendarOwnerEmail"),
+    )
+    booking_reference = extract_webhook_string(
+        response_payload,
+        ("bookingReference", "reference", "bookingCode", "reservationCode"),
+    )
+
+    reserved_flag = extract_webhook_bool(
+        response_payload,
+        ("reservationConfirmed", "bookingConfirmed", "reserved", "booked", "scheduled", "created"),
+    )
+    conflict_flag = extract_webhook_bool(
+        response_payload,
+        ("slotUnavailable", "conflict", "alreadyBooked", "busy", "unavailable"),
+    )
+    available_flag = extract_webhook_bool(response_payload, ("available", "slotAvailable"))
+    message = extract_webhook_string(
+        response_payload,
+        ("message", "detail", "error", "reason"),
+    ) or extract_chatbot_reply(response_payload)
+
+    slot_unavailable = conflict_flag is True or available_flag is False or status == 409
+    reservation_confirmed = False
+
+    if not slot_unavailable:
+        if reserved_flag is not None:
+            reservation_confirmed = reserved_flag
+        elif delivered and status is not None and 200 <= status < 300 and (event_id or meeting_join_url or calendar_event_url):
+            reservation_confirmed = True
+
+    return {
+        "reservationConfirmed": reservation_confirmed,
+        "slotUnavailable": slot_unavailable,
+        "meetingJoinUrl": meeting_join_url or None,
+        "calendarEventId": event_id or None,
+        "calendarEventUrl": calendar_event_url or None,
+        "organizerEmail": organizer_email or None,
+        "bookingReference": booking_reference or None,
+        "message": message or "",
+    }
+
+
+def update_support_session_request_record(
+    session_request_id: int,
+    *,
+    status: str,
+    notes: str | None = None,
+    metadata_patch: dict[str, Any] | None = None,
+) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE support_session_requests
+            SET status = %s,
+                notes = COALESCE(%s, notes),
+                metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+            WHERE id = %s
+            """,
+            [
+                status,
+                sanitize_text(notes) or None,
+                json.dumps(metadata_patch or {}),
+                session_request_id,
+            ],
+        )
 
 
 def normalize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -480,15 +764,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_valid_email(email):
         raise ApiError(400, "Please enter a valid email address.")
 
-    learner = run_query_one(
-        """
-        SELECT id, full_name, email
-        FROM learners
-        WHERE email = %s
-        LIMIT 1
-        """,
-        [email],
-    )
+    learner = find_learner_by_email(email)
 
     if not learner:
         raise ApiError(404, "This email is not registered in our records.")
@@ -775,15 +1051,7 @@ def create_ticket(payload: dict[str, Any]) -> dict[str, Any]:
         raise ApiError(400, "Inquiry details are required.")
 
     with transaction.atomic():
-        learner = run_query_one(
-            """
-            SELECT id, full_name, email, phone
-            FROM learners
-            WHERE email = %s
-            LIMIT 1
-            """,
-            [email],
-        )
+        learner = find_learner_by_email(email)
 
         if not learner:
             raise ApiError(404, "This email is not registered in our records.")
@@ -1128,9 +1396,9 @@ def extract_chatbot_reply(response_payload: Any) -> str:
     return ""
 
 
-def post_json_webhook(url: str, payload: dict[str, Any]) -> tuple[bool, bool, int | None, str]:
+def post_json_webhook(url: str, payload: dict[str, Any]) -> tuple[bool, bool, int | None, Any]:
     if not url:
-        return False, False, None, ""
+        return False, False, None, None
 
     request = urllib_request.Request(
         url,
@@ -1148,34 +1416,36 @@ def post_json_webhook(url: str, payload: dict[str, Any]) -> tuple[bool, bool, in
             except json.JSONDecodeError:
                 parsed = body
 
-            return True, 200 <= status < 300, status, extract_chatbot_reply(parsed)
+            return True, 200 <= status < 300, status, parsed
     except urllib_error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
         try:
             parsed = json.loads(body) if body else None
         except json.JSONDecodeError:
             parsed = body
-        return True, False, error.code, extract_chatbot_reply(parsed) or sanitize_text(body)
+        return True, False, error.code, parsed or sanitize_text(body)
     except Exception:
-        return True, False, None, ""
+        return True, False, None, None
 
 
 def send_booking_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, _reply = post_json_webhook(settings.BOOKING_WEBHOOK_URL, payload)
+    configured, delivered, status, response_payload = post_json_webhook(settings.BOOKING_WEBHOOK_URL, payload)
+    booking_result = extract_booking_webhook_result(response_payload, delivered, status)
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
+        **booking_result,
     }
 
 
 def send_chatbot_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, reply = post_json_webhook(settings.CHATBOT_WEBHOOK_URL, payload)
+    configured, delivered, status, response_payload = post_json_webhook(settings.CHATBOT_WEBHOOK_URL, payload)
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
-        "reply": reply,
+        "reply": extract_chatbot_reply(response_payload),
     }
 
 
@@ -1291,6 +1561,10 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
     if support_session_validation_message:
         raise ApiError(400, support_session_validation_message)
 
+    requested_datetime = resolve_support_session_datetime(requested_date, requested_time, scheduled_at)
+    if not requested_datetime:
+        raise ApiError(400, "Please choose a valid session date and time.")
+
     with transaction.atomic():
         ticket = run_query_one(
             """
@@ -1354,49 +1628,88 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
         )
 
     webhook_result = send_booking_webhook(
-        {
-            "event": "support_session_requested",
-            "source": "support_portal",
-            "ticketId": public_id,
-            "learnerId": int(ticket["learner_id"]),
-            "learnerName": ticket.get("learner_full_name"),
-            "learnerEmail": ticket["learner_email"],
-            "learnerPhone": ticket.get("learner_phone"),
-            "category": ticket["category"],
-            "technicalSubcategory": ticket.get("technical_subcategory"),
-            "inquiry": ticket["inquiry"],
-            "ticketStatus": ticket["status"],
-            "ticketPriority": ticket["priority"],
-            "assignedTeam": ticket["assigned_team"],
-            "requestedDate": requested_date,
-            "requestedTime": requested_time,
-            "scheduledAt": scheduled_at or None,
-            "clientTimeZone": client_time_zone or None,
-            "sessionRequestId": int(created_session_request["id"]),
-            "createdAt": created_session_request["created_at"],
-            "learner": {
-                "id": int(ticket["learner_id"]),
-                "fullName": ticket.get("learner_full_name"),
-                "email": ticket["learner_email"],
-                "phone": ticket.get("learner_phone"),
-            },
-            "ticket": {
-                "id": ticket["public_id"],
-                "category": ticket["category"],
-                "technicalSubcategory": ticket.get("technical_subcategory"),
-                "inquiry": ticket["inquiry"],
-                "status": ticket["status"],
-                "priority": ticket["priority"],
-                "assignedTeam": ticket["assigned_team"],
-            },
-        }
+        build_support_session_webhook_payload(
+            ticket,
+            int(created_session_request["id"]),
+            requested_date,
+            requested_time,
+            requested_datetime,
+            client_time_zone,
+            created_session_request["created_at"],
+        )
     )
+
+    session_request_metadata = {
+        "booking_provider": "microsoft_teams",
+        "webhook_configured": webhook_result["configured"],
+        "webhook_delivered": webhook_result["delivered"],
+        "webhook_status": webhook_result["status"],
+        "requested_start_at": requested_datetime.isoformat(),
+        "requested_end_at": (requested_datetime + timedelta(minutes=settings.SUPPORT_SESSION_DURATION_MINUTES)).isoformat(),
+        "duration_minutes": settings.SUPPORT_SESSION_DURATION_MINUTES,
+        "reservation_confirmed": webhook_result["reservationConfirmed"],
+        "slot_unavailable": webhook_result["slotUnavailable"],
+        "calendar_event_id": webhook_result["calendarEventId"],
+        "calendar_event_url": webhook_result["calendarEventUrl"],
+        "meeting_join_url": webhook_result["meetingJoinUrl"],
+        "organizer_email": webhook_result["organizerEmail"],
+        "booking_reference": webhook_result["bookingReference"],
+    }
+
+    if webhook_result["reservationConfirmed"]:
+        update_support_session_request_record(
+            int(created_session_request["id"]),
+            status="scheduled",
+            notes="Microsoft Teams booking confirmed.",
+            metadata_patch=session_request_metadata,
+        )
+        insert_history_event(
+            int(ticket["id"]),
+            "support_session_scheduled",
+            {"role": "system", "label": "booking_webhook"},
+            {
+                "sessionRequestId": int(created_session_request["id"]),
+                "meetingJoinUrl": webhook_result["meetingJoinUrl"],
+                "calendarEventId": webhook_result["calendarEventId"],
+            },
+        )
+    elif webhook_result["slotUnavailable"]:
+        update_support_session_request_record(
+            int(created_session_request["id"]),
+            status="cancelled",
+            notes=webhook_result["message"] or "The selected Teams slot is no longer available.",
+            metadata_patch=session_request_metadata,
+        )
+        insert_history_event(
+            int(ticket["id"]),
+            "support_session_unavailable",
+            {"role": "system", "label": "booking_webhook"},
+            {
+                "sessionRequestId": int(created_session_request["id"]),
+                "message": webhook_result["message"] or "The selected Teams slot is no longer available.",
+            },
+        )
+        raise ApiError(409, webhook_result["message"] or "This Teams slot is no longer available. Please choose a different time.")
+    else:
+        update_support_session_request_record(
+            int(created_session_request["id"]),
+            status="requested",
+            notes=webhook_result["message"] or None,
+            metadata_patch=session_request_metadata,
+        )
 
     return {
         "ok": True,
         "webhookConfigured": webhook_result["configured"],
         "webhookDelivered": webhook_result["delivered"],
         "webhookStatus": webhook_result["status"],
+        "reservationConfirmed": webhook_result["reservationConfirmed"],
+        "meetingJoinUrl": webhook_result["meetingJoinUrl"],
+        "calendarEventId": webhook_result["calendarEventId"],
+        "calendarEventUrl": webhook_result["calendarEventUrl"],
+        "organizerEmail": webhook_result["organizerEmail"],
+        "bookingReference": webhook_result["bookingReference"],
+        "message": webhook_result["message"] or "",
     }
 
 

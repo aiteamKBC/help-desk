@@ -5,6 +5,7 @@ import {
   Bot,
   CalendarClock,
   Check,
+  CheckCircle2,
   Headphones,
   Paperclip,
   Send,
@@ -28,13 +29,11 @@ import { ChatMessage, useSupport } from "@/context/SupportContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
-const egyptSupportTimeZone = "Africa/Cairo";
 const ukSupportTimeZone = "Europe/London";
-const egyptSupportSessionStartMinutes = 10 * 60;
-const egyptSupportSessionEndMinutes = 18 * 60;
 const ukSupportSessionStartMinutes = 8 * 60;
-const ukSupportSessionEndMinutes = 18 * 60;
+const ukSupportSessionEndMinutes = 16 * 60;
 const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
+const OUTLOOK_BOOKINGS_URL = "https://outlook.office.com/book/StudentSupport1@kentbusinesscollege.com/s/Z4Zc9rZxw0mEOB417C5bVQ2";
 
 function formatDateInputValue(date: Date) {
   const year = date.getFullYear();
@@ -89,13 +88,9 @@ function isMinutesWithinRange(minutes: number, startMinutes: number, endMinutes:
 }
 
 function isWithinSupportSessionWindow(requestedDateTime: Date) {
-  const egyptMinutes = getTimeInTimeZoneMinutes(requestedDateTime, egyptSupportTimeZone);
   const ukMinutes = getTimeInTimeZoneMinutes(requestedDateTime, ukSupportTimeZone);
 
-  return (
-    isMinutesWithinRange(egyptMinutes, egyptSupportSessionStartMinutes, egyptSupportSessionEndMinutes)
-    || isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes)
-  );
+  return isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes);
 }
 
 function getSupportSessionValidationMessage(dateValue: string, timeValue: string, now = new Date()) {
@@ -113,10 +108,35 @@ function getSupportSessionValidationMessage(dateValue: string, timeValue: string
   }
 
   if (!isWithinSupportSessionWindow(requestedDateTime)) {
-    return "Support sessions must be between 10:00 AM and 6:00 PM Egypt time or between 8:00 AM and 6:00 PM UK time.";
+    return "Support sessions must be between 8:00 AM and 4:00 PM UK time.";
   }
 
   return "";
+}
+
+function formatSupportSessionDetails(dateValue: string, timeValue: string) {
+  const requestedDateTime = parseLocalDateTime(dateValue, timeValue);
+
+  if (!requestedDateTime) {
+    return {
+      dateLabel: dateValue,
+      timeLabel: timeValue,
+    };
+  }
+
+  return {
+    dateLabel: new Intl.DateTimeFormat("en-US", {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    }).format(requestedDateTime),
+    timeLabel: new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).format(requestedDateTime),
+  };
 }
 
 const ChatSupport = () => {
@@ -127,6 +147,12 @@ const ChatSupport = () => {
   const [bookingOpen, setBookingOpen] = useState(false);
   const [bookingDate, setBookingDate] = useState("");
   const [bookingTime, setBookingTime] = useState("");
+  const [bookingSuccess, setBookingSuccess] = useState<{
+    dateLabel: string;
+    timeLabel: string;
+    reservationConfirmed: boolean;
+    meetingJoinUrl: string | null;
+  } | null>(null);
   const [isClosing, setIsClosing] = useState(false);
   const [isBooking, setIsBooking] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
@@ -230,6 +256,14 @@ const ChatSupport = () => {
     }, 1200);
   };
 
+  const openOutlookBookings = () => {
+    pushMsg({
+      sender: "bot",
+      text: "Opening the official Kent Business College booking page for you. Please complete your support session booking there.",
+    });
+    window.open(OUTLOOK_BOOKINGS_URL, "_blank", "noopener,noreferrer");
+  };
+
   const userMessageCount = messages.filter((message) => message.sender === "user").length;
   const canShowSupportActions = userMessageCount >= 5;
   const minBookingDate = formatDateInputValue(new Date());
@@ -310,6 +344,8 @@ const ChatSupport = () => {
         message?: string;
         webhookConfigured?: boolean;
         webhookDelivered?: boolean;
+        reservationConfirmed?: boolean;
+        meetingJoinUrl?: string | null;
       } | null;
 
       if (!response.ok) {
@@ -317,17 +353,27 @@ const ChatSupport = () => {
         return;
       }
 
+      const bookingDetails = formatSupportSessionDetails(bookingDate, bookingTime);
       setBookingOpen(false);
+      setBookingSuccess({
+        ...bookingDetails,
+        reservationConfirmed: Boolean(payload?.reservationConfirmed),
+        meetingJoinUrl: payload?.meetingJoinUrl || null,
+      });
       pushMsg({
         sender: "bot",
-        text: `Your support session request has been sent for ${bookingDate} at ${bookingTime}.`,
+        text: payload?.reservationConfirmed
+          ? `Your support session has been booked for ${bookingDetails.dateLabel} at ${bookingDetails.timeLabel}. The Teams slot is now reserved for you.`
+          : `Thank you. Your support session request has been submitted for ${bookingDetails.dateLabel} at ${bookingDetails.timeLabel}. Our team will review it and confirm the next steps with you shortly.`,
       });
-      if (payload?.webhookConfigured === false) {
-        toast.error("Booking saved, but the booking webhook is not configured on the server.");
+      if (payload?.reservationConfirmed) {
+        toast.success("Your Teams support session has been reserved successfully.");
+      } else if (payload?.webhookConfigured === false) {
+        toast.success("Your request has been submitted successfully. Our team will review it shortly.");
       } else if (payload?.webhookDelivered === false) {
-        toast.error("Booking saved, but the webhook notification could not be delivered.");
+        toast.success("Your request has been submitted successfully. Confirmation may take a little longer than usual.");
       } else {
-        toast.success("Support session request saved and sent to the booking webhook.");
+        toast.success("Your support session request has been submitted successfully.");
       }
       setBookingDate("");
       setBookingTime("");
@@ -371,7 +417,7 @@ const ChatSupport = () => {
 
             {canShowSupportActions && (
               <div className="grid gap-3 pt-2 sm:grid-cols-2">
-                <QuickCard icon={CalendarClock} title="Book a Support Session" desc="Schedule a call" onClick={() => setBookingOpen(true)} />
+                <QuickCard icon={CalendarClock} title="Book a Support Session" desc="Open Outlook Bookings" onClick={openOutlookBookings} />
                 <QuickCard icon={Headphones} title="Speak to Live Agent" desc="Talk to a human" onClick={onLiveAgent} />
               </div>
             )}
@@ -403,7 +449,7 @@ const ChatSupport = () => {
           <DialogHeader>
             <DialogTitle>Book a Support Session</DialogTitle>
             <DialogDescription>
-              Choose a date and time that works for you. Sessions are available from 10:00 AM to 6:00 PM Egypt time or from 8:00 AM to 6:00 PM UK time, and they must be more than 24 hours away.
+              Choose a date and time that works for you. Sessions are available from 8:00 AM to 4:00 PM UK time, and they must be more than 24 hours away.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -426,7 +472,7 @@ const ChatSupport = () => {
               />
             </div>
             <p className={cn("text-xs", bookingValidationMessage ? "text-destructive" : "text-muted-foreground")}>
-              {bookingValidationMessage || "Allowed meeting hours are 10:00 AM to 6:00 PM Egypt time or 8:00 AM to 6:00 PM UK time, with more than 24 hours notice required."}
+              {bookingValidationMessage || "Allowed meeting hours are 8:00 AM to 4:00 PM UK time, with more than 24 hours notice required."}
             </p>
           </div>
           <DialogFooter>
@@ -436,6 +482,45 @@ const ChatSupport = () => {
               onClick={() => void handleBooking()}
             >
               <Check className="w-4 h-4 mr-2" /> {isBooking ? "Saving..." : "Confirm Booking"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(bookingSuccess)} onOpenChange={(open) => !open && setBookingSuccess(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <div className="mx-auto mb-2 flex h-14 w-14 items-center justify-center rounded-full bg-success/10">
+              <CheckCircle2 className="h-7 w-7 text-success" />
+            </div>
+            <DialogTitle className="text-center">
+              {bookingSuccess?.reservationConfirmed ? "Teams Session Reserved" : "Support Session Request Submitted"}
+            </DialogTitle>
+            <DialogDescription className="text-center">
+              {bookingSuccess?.reservationConfirmed
+                ? "Your selected time has been reserved successfully in Microsoft Teams. Please keep this slot available, and use the link below if you would like to open the meeting details now."
+                : "Thank you for booking a support session. Your request has been received successfully, and our team will review it and contact you using your registered details to confirm the session."}
+            </DialogDescription>
+          </DialogHeader>
+          {bookingSuccess && (
+            <div className="rounded-2xl border bg-muted/30 px-4 py-3">
+              <div className="text-sm font-semibold text-foreground">Requested session</div>
+              <div className="mt-1 text-sm text-muted-foreground">{bookingSuccess.dateLabel}</div>
+              <div className="text-sm text-muted-foreground">{bookingSuccess.timeLabel}</div>
+            </div>
+          )}
+          <DialogFooter>
+            {bookingSuccess?.meetingJoinUrl && (
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => window.open(bookingSuccess.meetingJoinUrl || "", "_blank", "noopener,noreferrer")}
+              >
+                Open Teams Meeting
+              </Button>
+            )}
+            <Button className="w-full border-0 gradient-primary" onClick={() => setBookingSuccess(null)}>
+              Return to Chat
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -477,6 +477,16 @@ const AgentDashboard = () => {
                           <div className="text-muted-foreground text-xs mt-1">
                             Status: {request.status} - Requested by: {request.createdBy} - {formatDateTime(request.createdAt)}
                           </div>
+                          {typeof request.metadata?.meeting_join_url === "string" && request.metadata.meeting_join_url ? (
+                            <a
+                              href={request.metadata.meeting_join_url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="mt-2 inline-block text-xs font-medium text-primary hover:underline"
+                            >
+                              Open Teams meeting
+                            </a>
+                          ) : null}
                         </div>
                       ))
                     )}
