@@ -1233,6 +1233,9 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
             "source": "support_portal",
             "message": message,
             "clientTimeZone": client_time_zone or None,
+            "category": ticket["category"],
+            "technicalSubcategory": ticket.get("technical_subcategory"),
+            "inquiry": ticket["inquiry"],
             "learner": {
                 "id": int(ticket["learner_id"]),
                 "fullName": ticket.get("learner_full_name"),

@@ -138,31 +138,8 @@ const ChatSupport = () => {
       return;
     }
 
-    if (messages.length === 0) {
-      const now = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      setMessages([
-        {
-          id: "m1",
-          sender: "bot",
-          text: ticket.category === "Technical" && ticket.technicalSubcategory
-            ? `Hi! I'm your Help Desk assistant. I see you've raised a technical inquiry related to ${ticket.technicalSubcategory}.`
-            : `Hi! I'm your Help Desk assistant. I see you've raised a ${ticket.category.toLowerCase()} inquiry.`,
-          timestamp: now,
-        },
-        { id: "m2", sender: "user", text: ticket.inquiry, timestamp: now },
-        {
-          id: "m3",
-          sender: "bot",
-          text: "Thank you. Your support request has been created. A support agent will review your inquiry shortly.",
-          timestamp: now,
-        },
-        {
-          id: "m4",
-          sender: "bot",
-          text: "In the meantime, here are a few ways I can help you right now:",
-          timestamp: now,
-        },
-      ]);
+    if (ticket.chatHistory.length > 0) {
+      setMessages(ticket.chatHistory);
     }
     // eslint-disable-next-line
   }, []);
