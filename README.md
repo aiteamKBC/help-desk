@@ -1,0 +1,3 @@
+->Modified attachments to accept only PDF, videos, and images, shows error message otherwise
+->Modified chat textbox to allow input at all times and not grey out after send
+->Finished Meeting a Booking wordflow as a front-end
