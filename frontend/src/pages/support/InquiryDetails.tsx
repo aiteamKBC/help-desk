@@ -44,10 +44,15 @@ const textMimeTypes = new Set([
 ]);
 
 const technicalSubcategories: TechnicalSubcategory[] = ["Aptem", "LMS", "Teams"];
+const acceptedEvidenceExtensions = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".mp4", ".mov", ".avi", ".mkv", ".webm"]);
 
 const getExtension = (name: string) => {
   const dotIndex = name.lastIndexOf(".");
   return dotIndex === -1 ? "" : name.slice(dotIndex).toLowerCase();
+};
+
+const isAcceptedEvidenceFile = (file: File) => {
+  return file.type.startsWith("image/") || file.type.startsWith("video/") || file.type === "application/pdf" || acceptedEvidenceExtensions.has(getExtension(file.name));
 };
 
 const isTextPreviewable = (file: { name: string; mimeType?: string; type?: string }) => {
@@ -104,6 +109,7 @@ const InquiryDetails = () => {
   const [technicalSubcategory, setTechnicalSubcategory] = useState<TechnicalSubcategory>(ticket.technicalSubcategory);
   const [inquiry, setInquiry] = useState(ticket.inquiry);
   const [evidence, setEvidence] = useState(ticket.evidence);
+  const [attachmentError, setAttachmentError] = useState("");
   const [previewFile, setPreviewFile] = useState<EvidenceFile | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -117,8 +123,20 @@ const InquiryDetails = () => {
   const onFiles = async (files: FileList | null) => {
     if (!files) return;
 
-    const nextFiles = await Promise.all(Array.from(files).map(toEvidenceFile));
-    setEvidence((prev) => [...prev, ...nextFiles]);
+    const selectedFiles = Array.from(files);
+    const acceptedFiles = selectedFiles.filter(isAcceptedEvidenceFile);
+    const rejectedFiles = selectedFiles.filter((file) => !isAcceptedEvidenceFile(file));
+
+    if (rejectedFiles.length > 0) {
+      setAttachmentError("Unsupported file type. Please upload an image, PDF, or video file.");
+    } else {
+      setAttachmentError("");
+    }
+
+    if (acceptedFiles.length > 0) {
+      const nextFiles = await Promise.all(acceptedFiles.map(toEvidenceFile));
+      setEvidence((prev) => [...prev, ...nextFiles]);
+    }
 
     if (fileRef.current) {
       fileRef.current.value = "";
@@ -276,7 +294,7 @@ const InquiryDetails = () => {
 
             <div className="space-y-2">
               <Label className="flex items-center gap-2">
-                <Paperclip className="w-4 h-4" /> Please upload any available evidence
+                <Paperclip className="w-4 h-4" /> Upload supporting evidence
               </Label>
               <div
                 onClick={() => fileRef.current?.click()}
@@ -285,16 +303,22 @@ const InquiryDetails = () => {
                 <Paperclip className="w-6 h-6 mx-auto mb-2 text-muted-foreground" />
                 <p className="text-sm font-medium">Click to upload files</p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Images, PDF, video, audio, documents and more (multiple allowed)
+                  Accepted file types: images, PDFs, and videos. You can upload multiple files.
                 </p>
                 <input
                   ref={fileRef}
                   type="file"
+                  accept="image/*,application/pdf,video/*"
                   multiple
                   className="hidden"
                   onChange={(event) => void onFiles(event.target.files)}
                 />
               </div>
+              {attachmentError && (
+                <p className="text-xs text-destructive">
+                  {attachmentError}
+                </p>
+              )}
               {evidence.length > 0 && (
                 <ul className="mt-3 space-y-2">
                   {evidence.map((file, index) => (

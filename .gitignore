@@ -22,6 +22,11 @@ venv/
 db.sqlite3
 backend/staticfiles/
 
+# Local toolchains and downloaded installers
+.tools/
+node-v*-win-x64.zip
+python-*-amd64.exe
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

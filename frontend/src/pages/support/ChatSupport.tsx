@@ -28,12 +28,9 @@ import { ChatMessage, useSupport } from "@/context/SupportContext";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
-const egyptSupportTimeZone = "Africa/Cairo";
 const ukSupportTimeZone = "Europe/London";
-const egyptSupportSessionStartMinutes = 10 * 60;
-const egyptSupportSessionEndMinutes = 18 * 60;
 const ukSupportSessionStartMinutes = 8 * 60;
-const ukSupportSessionEndMinutes = 18 * 60;
+const ukSupportSessionEndMinutes = 16 * 60;
 const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
 
 function formatDateInputValue(date: Date) {
@@ -89,13 +86,9 @@ function isMinutesWithinRange(minutes: number, startMinutes: number, endMinutes:
 }
 
 function isWithinSupportSessionWindow(requestedDateTime: Date) {
-  const egyptMinutes = getTimeInTimeZoneMinutes(requestedDateTime, egyptSupportTimeZone);
   const ukMinutes = getTimeInTimeZoneMinutes(requestedDateTime, ukSupportTimeZone);
 
-  return (
-    isMinutesWithinRange(egyptMinutes, egyptSupportSessionStartMinutes, egyptSupportSessionEndMinutes)
-    || isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes)
-  );
+  return isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes);
 }
 
 function getSupportSessionValidationMessage(dateValue: string, timeValue: string, now = new Date()) {
@@ -113,7 +106,7 @@ function getSupportSessionValidationMessage(dateValue: string, timeValue: string
   }
 
   if (!isWithinSupportSessionWindow(requestedDateTime)) {
-    return "Support sessions must be between 10:00 AM and 6:00 PM Egypt time or between 8:00 AM and 6:00 PM UK time.";
+    return "Please choose a time between 8:00 AM and 4:00 PM UK time.";
   }
 
   return "";
@@ -131,6 +124,7 @@ const ChatSupport = () => {
   const [isBooking, setIsBooking] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!ticket.email) {
@@ -155,7 +149,10 @@ const ChatSupport = () => {
 
   const handleSend = async () => {
     const trimmedInput = input.trim();
-    if (!trimmedInput || isSendingMessage) return;
+    if (!trimmedInput || isSendingMessage) {
+      inputRef.current?.focus();
+      return;
+    }
 
     if (!ticket.id) {
       toast.error("This ticket is not ready for chatbot messaging yet.");
@@ -220,6 +217,7 @@ const ChatSupport = () => {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setIsSendingMessage(false);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
     }
   };
 
@@ -318,10 +316,6 @@ const ChatSupport = () => {
       }
 
       setBookingOpen(false);
-      pushMsg({
-        sender: "bot",
-        text: `Your support session request has been sent for ${bookingDate} at ${bookingTime}.`,
-      });
       if (payload?.webhookConfigured === false) {
         toast.error("Booking saved, but the booking webhook is not configured on the server.");
       } else if (payload?.webhookDelivered === false) {
@@ -331,6 +325,7 @@ const ChatSupport = () => {
       }
       setBookingDate("");
       setBookingTime("");
+      navigate("/support/booking-confirmed");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
@@ -383,12 +378,12 @@ const ChatSupport = () => {
                 <Paperclip className="w-5 h-5" />
               </Button>
               <Input
+                ref={inputRef}
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={(event) => event.key === "Enter" && void handleSend()}
                 placeholder="Type your message..."
                 className="h-11"
-                disabled={isSendingMessage}
               />
               <Button onClick={() => void handleSend()} className="h-11 border-0 shrink-0 gradient-primary" disabled={isSendingMessage}>
                 <Send className="w-4 h-4" />
@@ -403,7 +398,7 @@ const ChatSupport = () => {
           <DialogHeader>
             <DialogTitle>Book a Support Session</DialogTitle>
             <DialogDescription>
-              Choose a date and time that works for you. Sessions are available from 10:00 AM to 6:00 PM Egypt time or from 8:00 AM to 6:00 PM UK time, and they must be more than 24 hours away.
+              Choose a date and time that works for you. Support sessions are available from 8:00 AM to 4:00 PM UK time. Please book more than 24 hours in advance.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -426,7 +421,7 @@ const ChatSupport = () => {
               />
             </div>
             <p className={cn("text-xs", bookingValidationMessage ? "text-destructive" : "text-muted-foreground")}>
-              {bookingValidationMessage || "Allowed meeting hours are 10:00 AM to 6:00 PM Egypt time or 8:00 AM to 6:00 PM UK time, with more than 24 hours notice required."}
+              {bookingValidationMessage || "Available times are 8:00 AM to 4:00 PM UK time. Bookings require more than 24 hours notice."}
             </p>
           </div>
           <DialogFooter>

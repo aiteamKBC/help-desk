@@ -19,12 +19,9 @@ ALLOWED_STATUSES = {"Open", "Pending", "In Progress", "Resolved", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
 ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "LMS", "Teams"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
-EGYPT_SUPPORT_TIMEZONE = "Africa/Cairo"
 UK_SUPPORT_TIMEZONE = "Europe/London"
-EGYPT_SUPPORT_SESSION_START_MINUTES = 10 * 60
-EGYPT_SUPPORT_SESSION_END_MINUTES = 18 * 60
 UK_SUPPORT_SESSION_START_MINUTES = 8 * 60
-UK_SUPPORT_SESSION_END_MINUTES = 18 * 60
+UK_SUPPORT_SESSION_END_MINUTES = 16 * 60
 SUPPORT_SESSION_LEAD_TIME_SECONDS = 24 * 60 * 60
 
 
@@ -201,20 +198,12 @@ def is_minutes_within_range(minutes: int, start_minutes: int, end_minutes: int) 
 
 
 def is_within_support_session_window(requested_datetime: datetime) -> bool:
-    egypt_minutes = get_time_in_timezone_minutes(requested_datetime, EGYPT_SUPPORT_TIMEZONE)
     uk_minutes = get_time_in_timezone_minutes(requested_datetime, UK_SUPPORT_TIMEZONE)
 
-    return (
-        is_minutes_within_range(
-            egypt_minutes,
-            EGYPT_SUPPORT_SESSION_START_MINUTES,
-            EGYPT_SUPPORT_SESSION_END_MINUTES,
-        )
-        or is_minutes_within_range(
-            uk_minutes,
-            UK_SUPPORT_SESSION_START_MINUTES,
-            UK_SUPPORT_SESSION_END_MINUTES,
-        )
+    return is_minutes_within_range(
+        uk_minutes,
+        UK_SUPPORT_SESSION_START_MINUTES,
+        UK_SUPPORT_SESSION_END_MINUTES,
     )
 
 
@@ -237,7 +226,7 @@ def validate_support_session_request(
         return "Support sessions must be booked more than 24 hours in advance."
 
     if not is_within_support_session_window(requested_datetime):
-        return "Support sessions must be between 10:00 AM and 6:00 PM Egypt time or between 8:00 AM and 6:00 PM UK time."
+        return "Please choose a time between 8:00 AM and 4:00 PM UK time."
 
     return ""
 
