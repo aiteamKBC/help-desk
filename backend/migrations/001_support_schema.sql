@@ -10,6 +10,31 @@ CREATE TABLE IF NOT EXISTS learners (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS conversations (
+  id BIGSERIAL PRIMARY KEY,
+  channel TEXT NOT NULL DEFAULT 'support',
+  customer_id TEXT,
+  customer_name TEXT,
+  customer_email TEXT,
+  customer_phone TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  intent TEXT,
+  language TEXT NOT NULL DEFAULT 'en',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_message_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id BIGSERIAL PRIMARY KEY,
+  conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT 'support',
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS agents (
   id BIGSERIAL PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
@@ -27,7 +52,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   id BIGSERIAL PRIMARY KEY,
   public_id TEXT NOT NULL UNIQUE,
   learner_id BIGINT NOT NULL REFERENCES learners(id) ON DELETE RESTRICT,
-  conversation_id INTEGER UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
+  conversation_id BIGINT UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
   category TEXT NOT NULL,
   technical_subcategory TEXT,
   inquiry TEXT NOT NULL,

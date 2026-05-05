@@ -157,6 +157,7 @@ const ChatSupport = () => {
   const [isBooking, setIsBooking] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!ticket.email) {
@@ -181,7 +182,10 @@ const ChatSupport = () => {
 
   const handleSend = async () => {
     const trimmedInput = input.trim();
-    if (!trimmedInput || isSendingMessage) return;
+    if (!trimmedInput || isSendingMessage) {
+      inputRef.current?.focus();
+      return;
+    }
 
     if (!ticket.id) {
       toast.error("This ticket is not ready for chatbot messaging yet.");
@@ -246,6 +250,7 @@ const ChatSupport = () => {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setIsSendingMessage(false);
+      window.setTimeout(() => inputRef.current?.focus(), 0);
     }
   };
 
@@ -429,12 +434,12 @@ const ChatSupport = () => {
                 <Paperclip className="w-5 h-5" />
               </Button>
               <Input
+                ref={inputRef}
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={(event) => event.key === "Enter" && void handleSend()}
                 placeholder="Type your message..."
                 className="h-11"
-                disabled={isSendingMessage}
               />
               <Button onClick={() => void handleSend()} className="h-11 border-0 shrink-0 gradient-primary" disabled={isSendingMessage}>
                 <Send className="w-4 h-4" />

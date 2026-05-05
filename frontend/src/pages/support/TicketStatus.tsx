@@ -43,7 +43,8 @@ const TicketStatus = () => {
           </div>
           <h1 className="text-2xl font-bold mb-2">Resolution Confirmed</h1>
           <p className="text-sm leading-6 text-muted-foreground max-w-xl mx-auto">
-Thank you for contacting Kent Help Desk. It has been a pleasure assisting you today. We appreciate your time and look forward to supporting you again in the future          </p>
+            Thank you for contacting Kent College Support. It was a pleasure assisting you today. We appreciate your time and look forward to supporting you again in the future.
+          </p>
         </div>
 
         <div className="flex flex-wrap gap-3 justify-center mt-6">
