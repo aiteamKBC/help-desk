@@ -189,14 +189,17 @@ const InquiryDetails = () => {
             message?: string;
             ticket?: {
               id: string;
+              learnerName?: string;
               email: string;
               category: Category;
               technicalSubcategory: TechnicalSubcategory;
               inquiry: string;
-              status: "Open" | "Pending" | "In Progress" | "Resolved" | "Closed";
+              status: "Open" | "Pending" | "Closed";
+              statusReason?: string;
               assignedTeam: string;
               slaStatus: string;
               createdAt: string;
+              liveChatRequested?: boolean;
             };
           }
         | null;
@@ -208,17 +211,20 @@ const InquiryDetails = () => {
 
         updateTicket({
           id: payload.ticket.id,
+          learnerName: payload.ticket.learnerName || ticket.learnerName,
           email: payload.ticket.email,
           category: payload.ticket.category,
           technicalSubcategory: payload.ticket.technicalSubcategory,
           inquiry: payload.ticket.inquiry,
           evidence,
-        createdAt: payload.ticket.createdAt,
-        status: payload.ticket.status,
-        assignedTeam: payload.ticket.assignedTeam,
-        slaStatus: payload.ticket.slaStatus,
-        chatHistory: hasExistingTicket ? ticket.chatHistory : [],
-      });
+          statusReason: payload.ticket.statusReason || ticket.statusReason,
+          createdAt: payload.ticket.createdAt,
+          status: payload.ticket.status,
+          assignedTeam: payload.ticket.assignedTeam,
+          slaStatus: payload.ticket.slaStatus,
+          liveChatRequested: payload.ticket.liveChatRequested ?? (hasExistingTicket ? ticket.liveChatRequested : false),
+          chatHistory: hasExistingTicket ? ticket.chatHistory : [],
+        });
       navigate("/support/chat");
     } catch {
       toast.error("We could not connect to the server. Please try again.");

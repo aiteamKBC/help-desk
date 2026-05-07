@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Mail, AlertTriangle, ArrowRight, LifeBuoy } from "lucide-react";
+import { Mail, AlertTriangle, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,6 +13,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { SupportLayout } from "@/components/support/SupportLayout";
+import { KentCrestMark } from "@/components/support/KentCrestMark";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { useSupport } from "@/context/SupportContext";
 
@@ -41,6 +42,11 @@ const getVerificationErrorState = (
     message: payload?.message || "The verification service is unavailable right now. Please try again in a moment.",
   };
 };
+
+const getVerificationRequestFailureMessage = () =>
+  import.meta.env.DEV
+    ? "We could not reach the support API. Make sure the Django backend is running on 127.0.0.1:3001, then try again."
+    : "We could not verify your email right now. Please try again.";
 
 const EmailVerification = () => {
   const navigate = useNavigate();
@@ -74,26 +80,29 @@ const EmailVerification = () => {
       });
 
       const payload = (await response.json().catch(() => null)) as
-        | { exists?: boolean; message?: string }
+        | { exists?: boolean; message?: string; learner?: { fullName?: string; email?: string } }
         | null;
 
       if (response.ok && payload?.exists) {
         if (ticket.email && ticket.email !== trimmedEmail) {
           setTicket({
             id: "",
+            learnerName: payload?.learner?.fullName || "",
             email: trimmedEmail,
             category: "",
             technicalSubcategory: "",
             inquiry: "",
             evidence: [],
             status: "Open",
+            statusReason: "",
             assignedTeam: "Unassigned",
             slaStatus: "Pending Review",
             createdAt: "",
+            liveChatRequested: false,
             chatHistory: [],
           });
         } else {
-          updateTicket({ email: trimmedEmail });
+          updateTicket({ learnerName: payload?.learner?.fullName || "", email: trimmedEmail });
         }
         navigate("/support/inquiry");
         return;
@@ -103,9 +112,10 @@ const EmailVerification = () => {
       setErrorTitle(errorState.title);
       setErrorMessage(errorState.message);
       setErrorOpen(true);
-    } catch {
+    } catch (error) {
+      console.error("Email verification request failed.", error);
       setErrorTitle("Verification Unavailable");
-      setErrorMessage("We could not verify your email right now. Please try again.");
+      setErrorMessage(getVerificationRequestFailureMessage());
       setErrorOpen(true);
     } finally {
       setIsSubmitting(false);
@@ -118,9 +128,7 @@ const EmailVerification = () => {
       <div className="max-w-md mx-auto">
         <div className="bg-card rounded-2xl border shadow-card p-8">
           <div className="flex justify-center mb-5">
-            <div className="h-14 w-14 rounded-2xl gradient-primary flex items-center justify-center shadow-card">
-              <LifeBuoy className="h-7 w-7 text-primary-foreground" />
-            </div>
+            <KentCrestMark className="h-24 w-[264px] rounded-3xl" imageClassName="p-3" />
           </div>
           <h1 className="text-2xl font-bold text-center mb-2">Support Request</h1>
           <p className="text-sm text-muted-foreground text-center mb-7">

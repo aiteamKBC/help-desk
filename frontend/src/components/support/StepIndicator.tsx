@@ -13,29 +13,24 @@ const steps = [
 export const StepIndicator = ({ current }: { current: number }) => {
   const navigate = useNavigate();
   const { ticket } = useSupport();
+  const furthestStepReached = (() => {
+    if (ticket.id && ticket.status === "Closed") {
+      return 4;
+    }
+
+    if (ticket.id) {
+      return 3;
+    }
+
+    if (ticket.email) {
+      return 2;
+    }
+
+    return 1;
+  })();
 
   const isStepAvailable = (stepIndex: number) => {
-    if (stepIndex > current) {
-      return false;
-    }
-
-    if (stepIndex === 1) {
-      return true;
-    }
-
-    if (stepIndex === 2) {
-      return Boolean(ticket.email);
-    }
-
-    if (stepIndex === 3) {
-      return Boolean(ticket.id);
-    }
-
-    if (stepIndex === 4) {
-      return Boolean(ticket.id);
-    }
-
-    return false;
+    return stepIndex <= furthestStepReached;
   };
 
   return (
@@ -43,8 +38,9 @@ export const StepIndicator = ({ current }: { current: number }) => {
       <div className="flex items-center justify-between">
         {steps.map((step, i) => {
           const idx = i + 1;
-          const isDone = idx < current;
+          const isCompleted = idx < furthestStepReached && idx !== current;
           const isActive = idx === current;
+          const isReached = idx <= furthestStepReached;
           const isClickable = isStepAvailable(idx) && !isActive;
           return (
             <div key={step.label} className="flex items-center flex-1 last:flex-none">
@@ -59,19 +55,20 @@ export const StepIndicator = ({ current }: { current: number }) => {
                   disabled={!isClickable}
                   className={cn(
                     "h-9 w-9 rounded-full flex items-center justify-center text-sm font-semibold border transition-all",
-                    isDone && "bg-success border-success text-success-foreground",
+                    isCompleted && "bg-success border-success text-success-foreground",
                     isActive && "gradient-primary border-transparent text-primary-foreground shadow-card",
-                    !isDone && !isActive && "bg-card border-border text-muted-foreground",
-                    isClickable && "cursor-pointer hover:scale-105",
+                    !isCompleted && !isActive && !isReached && "bg-card border-border text-muted-foreground",
+                    !isCompleted && !isActive && isReached && "border-primary/30 bg-primary/5 text-primary",
+                    isClickable && "cursor-pointer hover:scale-105 hover:border-primary hover:bg-primary/10",
                     !isClickable && "cursor-default"
                   )}
                 >
-                  {isDone ? <Check className="h-4 w-4" /> : idx}
+                  {isCompleted ? <Check className="h-4 w-4" /> : idx}
                 </button>
                 <span
                   className={cn(
                     "text-xs font-medium hidden sm:block",
-                    isActive ? "text-foreground" : "text-muted-foreground",
+                    isActive ? "text-foreground" : isReached ? "text-foreground/80" : "text-muted-foreground",
                     isClickable && "cursor-pointer"
                   )}
                 >
@@ -79,7 +76,12 @@ export const StepIndicator = ({ current }: { current: number }) => {
                 </span>
               </div>
               {i < steps.length - 1 && (
-                <div className={cn("h-0.5 flex-1 mx-2 sm:mx-3 mb-6 rounded-full", idx < current ? "bg-success" : "bg-border")} />
+                <div
+                  className={cn(
+                    "h-0.5 flex-1 mx-2 sm:mx-3 mb-6 rounded-full",
+                    idx < furthestStepReached ? "bg-success" : "bg-border",
+                  )}
+                />
               )}
             </div>
           );

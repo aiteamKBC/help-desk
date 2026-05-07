@@ -1,15 +1,22 @@
-import { LifeBuoy } from "lucide-react";
 import { Link } from "react-router-dom";
 import { ReactNode } from "react";
+import { KentCrestMark } from "@/components/support/KentCrestMark";
+import { cn } from "@/lib/utils";
 
-export const SupportLayout = ({ children, right }: { children: ReactNode; right?: ReactNode }) => (
+export const SupportLayout = ({
+  children,
+  right,
+  fullWidth = false,
+}: {
+  children: ReactNode;
+  right?: ReactNode;
+  fullWidth?: boolean;
+}) => (
   <div className="min-h-screen gradient-soft">
     <header className="border-b bg-card/70 backdrop-blur-sm sticky top-0 z-30">
-      <div className="container flex h-16 items-center justify-between">
+      <div className={cn("flex h-16 items-center justify-between", fullWidth ? "w-full px-4 md:px-6" : "container")}>
         <Link to="/" className="flex items-center gap-2.5">
-          <div className="h-9 w-9 rounded-xl gradient-primary flex items-center justify-center shadow-card">
-            <LifeBuoy className="h-5 w-5 text-primary-foreground" />
-          </div>
+          <KentCrestMark className="h-14 w-[172px] shrink-0 rounded-2xl" imageClassName="p-2.5" />
           <div>
             <div className="font-semibold leading-tight">Help Desk</div>
             <div className="text-xs text-muted-foreground leading-tight">Learner Support</div>
@@ -21,6 +28,6 @@ export const SupportLayout = ({ children, right }: { children: ReactNode; right?
         </nav>
       </div>
     </header>
-    <main className="container py-8 md:py-10">{children}</main>
+    <main className={cn(fullWidth ? "w-full px-4 py-6 md:px-6 md:py-8" : "container py-8 md:py-10")}>{children}</main>
   </div>
 );

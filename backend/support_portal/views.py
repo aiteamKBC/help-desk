@@ -4,21 +4,28 @@ import json
 from pathlib import Path
 
 from django.conf import settings
-from django.http import FileResponse, Http404, JsonResponse
+from django.http import FileResponse, Http404, HttpResponseRedirect, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
 
 from .contracts import LEGACY_ENDPOINTS
 from .services import (
     ApiError,
+    create_follow_up_ticket,
     create_support_session_request,
     create_ticket,
     get_admin_login_response,
     get_admin_ticket_detail_response,
+    get_support_booking_url,
+    get_ticket_booking_context_response,
+    get_ticket_chat_history_response,
+    get_ticket_chat_context_response,
     get_verify_email_response,
     list_admin_tickets,
     list_agents,
+    request_live_chat,
     save_chat_history,
+    send_admin_ai_agent_message,
     send_chatbot_message,
     serve_frontend_asset,
     update_admin_ticket,
@@ -116,6 +123,24 @@ def admin_ticket_detail(request, public_id: str):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def admin_ticket_ai_message(request, public_id: str):
+    try:
+        return JsonResponse(send_admin_ai_agent_message(public_id, parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def admin_ticket_follow_up(request, public_id: str):
+    try:
+        return JsonResponse(create_follow_up_ticket(public_id, parse_json_body(request)), status=201)
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def tickets_create(request):
     try:
         return JsonResponse(create_ticket(parse_json_body(request)), status=201)
@@ -133,9 +158,11 @@ def tickets_update(request, public_id: str):
 
 
 @csrf_exempt
-@require_http_methods(["POST"])
+@require_http_methods(["GET", "POST"])
 def ticket_chat_history(request, public_id: str):
     try:
+        if request.method == "GET":
+            return JsonResponse(get_ticket_chat_history_response(public_id))
         return JsonResponse(save_chat_history(public_id, parse_json_body(request)))
     except Exception as error:
         return handle_api_error(error)
@@ -146,6 +173,39 @@ def ticket_chat_history(request, public_id: str):
 def ticket_chatbot_message(request, public_id: str):
     try:
         return JsonResponse(send_chatbot_message(public_id, parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def ticket_live_chat_request(request, public_id: str):
+    try:
+        return JsonResponse(request_live_chat(public_id))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def ticket_booking_context(request, public_id: str):
+    try:
+        return JsonResponse(get_ticket_booking_context_response(public_id))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def ticket_chat_context(request, public_id: str):
+    try:
+        return JsonResponse(get_ticket_chat_context_response(public_id))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def booking_link(_request):
+    try:
+        return HttpResponseRedirect(get_support_booking_url())
     except Exception as error:
         return handle_api_error(error)
 

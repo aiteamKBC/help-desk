@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -16,10 +16,32 @@ from django.conf import settings
 from django.db import connection, transaction
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-ALLOWED_STATUSES = {"Open", "Pending", "In Progress", "Resolved", "Closed"}
+ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
 ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "LMS", "Teams"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
+STATUS_REASON_CLOSED_DUE_TO_INACTIVITY = "Closed due to inactivity"
+STATUS_REASON_CLOSING_BY_CHATBOT = "Closed via Chatbot"
+STATUS_REASON_CLOSED_BY_AGENT = "Closed via Agent"
+STATUS_REASON_AWAITING_MEETING = "Awaiting support meeting"
+STATUS_REASON_ESCALATION = "Escalation"
+STATUS_REASON_AWAITING_RESOLUTION = "Awaiting Resolution"
+ALLOWED_CHAT_STATES = {"open", "closed"}
+ALLOWED_STATUS_REASONS_BY_STATUS = {
+    "Closed": {
+        STATUS_REASON_CLOSED_DUE_TO_INACTIVITY,
+        STATUS_REASON_CLOSING_BY_CHATBOT,
+        STATUS_REASON_CLOSED_BY_AGENT,
+    },
+    "Pending": {
+        STATUS_REASON_AWAITING_MEETING,
+        STATUS_REASON_ESCALATION,
+        STATUS_REASON_AWAITING_RESOLUTION,
+    },
+}
+AUTO_MANAGED_SLA_STATUSES = {"Open", "Pending", "Closed"}
+PENDING_SLA_BREACH_AFTER = timedelta(days=3)
+SLA_ATTENTION_REASON_PENDING_OVERDUE = "pending_over_3_days"
 UK_SUPPORT_TIMEZONE = "Europe/London"
 UK_SUPPORT_SESSION_START_MINUTES = 8 * 60
 UK_SUPPORT_SESSION_END_MINUTES = 16 * 60
@@ -35,6 +57,243 @@ class ApiError(Exception):
 
 def sanitize_text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def normalize_json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    return {}
+
+
+def normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
+def is_active_conversation(value: Any) -> bool:
+    metadata = normalize_json_object(value)
+    return normalize_bool(metadata.get("is_active_conversation"))
+
+
+def is_live_chat_requested(ticket_metadata: Any, conversation_metadata: Any = None) -> bool:
+    normalized_ticket_metadata = normalize_json_object(ticket_metadata)
+    normalized_conversation_metadata = normalize_json_object(conversation_metadata)
+    return (
+        normalize_bool(normalized_conversation_metadata.get("live_chat_requested"))
+        or normalize_bool(normalized_ticket_metadata.get("live_chat_requested"))
+    )
+
+
+def normalize_admin_documentation(
+    value: Any,
+    *,
+    fallback_inquiry: str = "",
+    fallback_chat_id: str = "",
+    fallback_ticket_id: str = "",
+) -> dict[str, Any]:
+    source = normalize_json_object(value)
+    raw_images = source.get("errorImages") if isinstance(source.get("errorImages"), list) else []
+    error_images = []
+
+    for item in raw_images:
+        if not isinstance(item, dict):
+            continue
+
+        data_url = sanitize_text(item.get("dataUrl"))
+        mime_type = sanitize_text(item.get("mimeType")) or "image/png"
+        if not data_url.startswith("data:image/"):
+            continue
+
+        error_images.append(
+            {
+                "name": sanitize_text(item.get("name")) or "image",
+                "mimeType": mime_type,
+                "size": int(item.get("size") or 0),
+                "dataUrl": data_url,
+            }
+        )
+
+    return {
+        "inquiry": sanitize_text(source.get("inquiry")) or fallback_inquiry,
+        "symptoms": sanitize_text(source.get("symptoms")),
+        "errors": sanitize_text(source.get("errors")),
+        "steps": sanitize_text(source.get("steps")),
+        "resources": sanitize_text(source.get("resources")),
+        "chatId": sanitize_text(source.get("chatId")) or fallback_chat_id,
+        "ticketId": sanitize_text(source.get("ticketId")) or fallback_ticket_id,
+        "ticketStatus": sanitize_text(source.get("ticketStatus")),
+        "statusReason": sanitize_text(source.get("statusReason")),
+        "issuesAddressed": sanitize_text(source.get("issuesAddressed")),
+        "errorImages": error_images,
+    }
+
+
+def derive_sla_state(status: Any, created_at: Any, current_sla_status: Any) -> tuple[str, bool, str | None]:
+    normalized_status = sanitize_text(status)
+    fallback_sla_status = sanitize_text(current_sla_status)
+
+    if fallback_sla_status not in ALLOWED_SLA_STATUSES:
+        fallback_sla_status = "Pending Review"
+
+    if normalized_status == "Open":
+        return "Pending Review", False, None
+
+    if normalized_status == "Closed":
+        return "On Track", False, None
+
+    if normalized_status == "Pending":
+        created_datetime = created_at if isinstance(created_at, datetime) else None
+        if created_datetime:
+            comparison_now = datetime.now(created_datetime.tzinfo or timezone.utc)
+            if (comparison_now - created_datetime) > PENDING_SLA_BREACH_AFTER:
+                return "Breached", True, SLA_ATTENTION_REASON_PENDING_OVERDUE
+
+        return "On Track", False, None
+
+    return fallback_sla_status, False, None
+
+
+def resolve_next_sla_state(
+    status: Any,
+    created_at: Any,
+    current_sla_status: Any,
+    requested_sla_status: Any = None,
+) -> tuple[str, bool, str | None]:
+    normalized_status = sanitize_text(status)
+    normalized_requested_sla_status = sanitize_text(requested_sla_status)
+
+    if normalized_status in AUTO_MANAGED_SLA_STATUSES:
+        return derive_sla_state(normalized_status, created_at, current_sla_status)
+
+    if normalized_requested_sla_status in ALLOWED_SLA_STATUSES:
+        return normalized_requested_sla_status, False, None
+
+    return derive_sla_state(normalized_status, created_at, current_sla_status)
+
+
+def build_sla_metadata_patch(attention_required: bool, attention_reason: str | None) -> dict[str, Any]:
+    return {
+        "sla_attention_required": attention_required,
+        "sla_attention_reason": attention_reason,
+        "sla_attention_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def validate_status_reason_for_status(status: str, status_reason: str) -> None:
+    normalized_status = sanitize_text(status)
+    normalized_status_reason = sanitize_text(status_reason)
+
+    if not normalized_status_reason:
+        return
+
+    allowed_reasons = ALLOWED_STATUS_REASONS_BY_STATUS.get(normalized_status)
+    if allowed_reasons is None:
+        return
+
+    if normalized_status_reason not in allowed_reasons:
+        raise ApiError(400, f"Invalid status reason for {normalized_status.lower()} tickets.")
+
+
+def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[str, Any]:
+    metadata = normalize_json_object(row.get("metadata"))
+    current_sla_status = sanitize_text(row.get("sla_status")) or "Pending Review"
+    current_attention_required = normalize_bool(metadata.get("sla_attention_required"))
+    current_attention_reason = sanitize_text(metadata.get("sla_attention_reason")) or None
+
+    next_sla_status, attention_required, attention_reason = derive_sla_state(
+        row.get("status"),
+        row.get("created_at"),
+        current_sla_status,
+    )
+    metadata_patch = build_sla_metadata_patch(attention_required, attention_reason)
+
+    row["sla_status"] = next_sla_status
+    row["sla_attention_required"] = attention_required
+    row["metadata"] = {**metadata, **metadata_patch}
+
+    if (
+        persist
+        and row.get("id")
+        and (
+            next_sla_status != current_sla_status
+            or attention_required != current_attention_required
+            or attention_reason != current_attention_reason
+        )
+    ):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET sla_status = %s,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [next_sla_status, json.dumps(metadata_patch), row["id"]],
+            )
+
+    return row
+
+
+def sync_auto_managed_ticket_sla_statuses() -> dict[str, int]:
+    tickets = run_query(
+        """
+        SELECT id, status, sla_status, metadata, created_at
+        FROM tickets
+        WHERE status = ANY(%s)
+        ORDER BY id ASC
+        """,
+        [list(AUTO_MANAGED_SLA_STATUSES)],
+    )
+
+    scanned_count = 0
+    updated_count = 0
+    breached_count = 0
+    attention_required_count = 0
+
+    for ticket in tickets:
+        scanned_count += 1
+        previous_sla_status = sanitize_text(ticket.get("sla_status")) or "Pending Review"
+        previous_metadata = normalize_json_object(ticket.get("metadata"))
+        previous_attention_required = normalize_bool(previous_metadata.get("sla_attention_required"))
+        previous_attention_reason = sanitize_text(previous_metadata.get("sla_attention_reason")) or None
+
+        synced_ticket = apply_ticket_sla_policy(ticket, persist=True)
+        current_sla_status = sanitize_text(synced_ticket.get("sla_status")) or "Pending Review"
+        current_metadata = normalize_json_object(synced_ticket.get("metadata"))
+        current_attention_required = normalize_bool(current_metadata.get("sla_attention_required"))
+        current_attention_reason = sanitize_text(current_metadata.get("sla_attention_reason")) or None
+
+        if (
+            current_sla_status != previous_sla_status
+            or current_attention_required != previous_attention_required
+            or current_attention_reason != previous_attention_reason
+        ):
+            updated_count += 1
+
+        if current_sla_status == "Breached":
+            breached_count += 1
+
+        if current_attention_required:
+            attention_required_count += 1
+
+    return {
+        "scanned": scanned_count,
+        "updated": updated_count,
+        "breached": breached_count,
+        "attentionRequired": attention_required_count,
+    }
 
 
 def normalize_email(value: Any) -> str:
@@ -59,6 +318,24 @@ def normalize_technical_subcategory(value: Any) -> str:
 
 def build_public_ticket_id(ticket_id: int) -> str:
     return f"KBC-{ticket_id:06d}"
+
+
+def build_public_chat_id(ticket_public_id: Any = "", conversation_id: Any = None, conversation_metadata: Any = None) -> str:
+    normalized_conversation_metadata = normalize_json_object(conversation_metadata)
+    configured_chat_public_id = sanitize_text(normalized_conversation_metadata.get("chat_public_id"))
+    if configured_chat_public_id:
+        return configured_chat_public_id
+
+    normalized_ticket_public_id = sanitize_text(ticket_public_id)
+    if normalized_ticket_public_id:
+        return normalized_ticket_public_id
+
+    try:
+        normalized_conversation_id = int(conversation_id)
+    except (TypeError, ValueError):
+        return ""
+
+    return f"CHAT-{normalized_conversation_id:06d}"
 
 
 def dictfetchall(cursor) -> list[dict[str, Any]]:
@@ -192,18 +469,31 @@ def serialize_agent(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
+    chat_state = sanitize_text(row.get("conversation_status")).lower()
+    if not chat_state:
+        chat_state = "closed" if sanitize_text(row.get("status")) == "Closed" else "open"
+
     return {
         "id": row["public_id"],
         "learnerName": row.get("learner_name") or "",
         "email": row.get("learner_email") or "",
+        "learnerPhone": row.get("learner_phone") or "",
         "category": row["category"],
         "technicalSubcategory": row.get("technical_subcategory") or "",
+        "inquiryPreview": sanitize_text(row.get("inquiry")),
         "status": row["status"],
+        "statusReason": row.get("status_reason") or "",
         "assignedAgentId": int(row["assigned_agent_id"]) if row.get("assigned_agent_id") else None,
         "assignedAgentName": row.get("assigned_agent_name") or "Unassigned",
         "assignedAgentUsername": row.get("assigned_agent_username") or "",
         "assignedTeam": row.get("assigned_team") or "Unassigned",
+        "chatId": build_public_chat_id(row.get("public_id"), row.get("conversation_id"), row.get("conversation_metadata")),
+        "chatIsActive": is_active_conversation(row.get("conversation_metadata")),
+        "liveChatRequested": is_live_chat_requested(row.get("metadata"), row.get("conversation_metadata")),
+        "chatState": chat_state,
+        "lastMessageAt": row.get("last_message_at"),
         "slaStatus": row["sla_status"],
+        "slaAttentionRequired": bool(row.get("sla_attention_required")),
         "evidenceCount": int(row.get("evidence_count") or 0),
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
@@ -212,18 +502,87 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 def serialize_ticket_detail(row: dict[str, Any]) -> dict[str, Any]:
     detail = serialize_ticket_summary(row)
+    metadata = normalize_json_object(row.get("metadata"))
     detail.update(
         {
             "inquiry": row["inquiry"],
             "priority": row["priority"],
             "closedAt": row.get("closed_at"),
+            "documentation": normalize_admin_documentation(
+                metadata.get("admin_documentation"),
+                fallback_inquiry=sanitize_text(row.get("inquiry")),
+                fallback_chat_id=build_public_chat_id(row.get("public_id"), row.get("conversation_id"), row.get("conversation_metadata")),
+                fallback_ticket_id=row.get("public_id") or "",
+            ),
         }
     )
     return detail
 
 
-def to_sender_label(role: str, metadata: dict[str, Any] | None) -> str:
-    original_sender = sanitize_text((metadata or {}).get("original_sender"))
+def get_ticket_issue_label(category: str, technical_subcategory: str) -> str:
+    normalized_subcategory = sanitize_text(technical_subcategory)
+    normalized_category = sanitize_text(category)
+
+    if normalized_subcategory:
+        return normalized_subcategory
+    if normalized_category:
+        return normalized_category
+    return "your request"
+
+
+def build_chat_intro_message(learner_name: Any, category: Any, technical_subcategory: Any) -> str:
+    greeting_name = sanitize_text(learner_name) or "there"
+    issue_label = get_ticket_issue_label(
+        sanitize_text(category),
+        sanitize_text(technical_subcategory),
+    )
+    return (
+        f"Hello {greeting_name}, Thank you for reaching Kent College Support, "
+        f"I understand you are reaching us for an issue related to {issue_label}, am I correct?"
+    )
+
+
+def format_chat_message_timestamp(value: Any) -> str:
+    if isinstance(value, datetime):
+        parsed_value = value
+    else:
+        try:
+            parsed_value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return ""
+
+    return parsed_value.strftime("%I:%M %p").lstrip("0")
+
+
+def ensure_intro_message_row(
+    rows: list[dict[str, Any]],
+    *,
+    intro_message: str,
+    created_at: Any,
+    intro_id: str,
+) -> list[dict[str, Any]]:
+    normalized_intro_message = sanitize_text(intro_message)
+    if not normalized_intro_message:
+        return rows
+
+    if any(sanitize_text(row.get("content")) == normalized_intro_message for row in rows):
+        return rows
+
+    return [
+        {
+            "id": intro_id,
+            "role": "assistant",
+            "content": normalized_intro_message,
+            "metadata": {"original_sender": "bot"},
+            "created_at": created_at,
+        },
+        *rows,
+    ]
+
+
+def to_sender_label(role: str, metadata: Any) -> str:
+    metadata_object = normalize_json_object(metadata)
+    original_sender = sanitize_text(metadata_object.get("original_sender"))
 
     if role == "user":
         return "Learner"
@@ -257,8 +616,6 @@ def derive_assigned_team(agent: dict[str, Any] | None) -> str:
 
 
 def map_conversation_status(status: str) -> str:
-    if status == "In Progress":
-        return "in_progress"
     return status.lower()
 
 
@@ -415,6 +772,7 @@ def build_support_session_webhook_payload(
         "technicalSubcategory": ticket.get("technical_subcategory"),
         "inquiry": ticket["inquiry"],
         "ticketStatus": ticket["status"],
+        "ticketStatusReason": ticket.get("status_reason"),
         "ticketPriority": ticket["priority"],
         "assignedTeam": ticket["assigned_team"],
         "requestedDate": requested_date,
@@ -438,6 +796,7 @@ def build_support_session_webhook_payload(
             "technicalSubcategory": ticket.get("technical_subcategory"),
             "inquiry": ticket["inquiry"],
             "status": ticket["status"],
+            "statusReason": ticket.get("status_reason"),
             "priority": ticket["priority"],
             "assignedTeam": ticket["assigned_team"],
         },
@@ -639,22 +998,30 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           t.technical_subcategory,
           t.inquiry,
           t.status,
+          t.status_reason,
           t.assigned_team,
           t.sla_status,
           t.priority,
           t.evidence_count,
+          t.metadata,
           t.created_at,
           t.updated_at,
           t.closed_at,
           t.conversation_id,
+          c.status AS conversation_status,
+          c.metadata AS conversation_metadata,
+          c.last_message_at,
           l.full_name AS learner_name,
           l.email AS learner_email,
+          l.phone AS learner_phone,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
         LEFT JOIN agents a
           ON a.id = t.assigned_agent_id
         WHERE t.public_id = %s
@@ -666,8 +1033,10 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
     if not ticket:
         return None
 
+    apply_ticket_sla_policy(ticket, persist=True)
+
     if ticket.get("conversation_id"):
-        messages = run_query(
+        raw_messages = run_query(
             """
             SELECT id, role, content, metadata, created_at
             FROM messages
@@ -677,7 +1046,18 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
             [ticket["conversation_id"]],
         )
     else:
-        messages = []
+        raw_messages = []
+
+    messages = ensure_intro_message_row(
+        raw_messages,
+        intro_message=build_chat_intro_message(
+            ticket.get("learner_name"),
+            ticket.get("category"),
+            ticket.get("technical_subcategory"),
+        ),
+        created_at=ticket.get("created_at"),
+        intro_id=f"intro-{ticket['public_id']}",
+    )
 
     attachments = run_query(
         """
@@ -711,7 +1091,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
         "ticket": serialize_ticket_detail(ticket),
         "chatHistory": [
             {
-                "id": int(row["id"]),
+                "id": int(row["id"]) if isinstance(row.get("id"), int) else str(row.get("id")),
                 "role": row["role"],
                 "senderLabel": to_sender_label(row["role"], row.get("metadata")),
                 "text": row["content"],
@@ -726,7 +1106,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
                 "mimeType": row.get("mime_type"),
                 "size": int(row["file_size"]) if row.get("file_size") else 0,
                 "storageUrl": row.get("storage_url"),
-                "metadata": row.get("metadata") or {},
+                "metadata": normalize_json_object(row.get("metadata")),
                 "createdAt": row["created_at"],
             }
             for row in attachments
@@ -737,7 +1117,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
                 "eventType": row["event_type"],
                 "actorType": row["actor_type"],
                 "actorLabel": row.get("actor_label"),
-                "payload": row.get("payload") or {},
+                "payload": normalize_json_object(row.get("payload")),
                 "createdAt": row["created_at"],
             }
             for row in history
@@ -750,7 +1130,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
                 "status": row["status"],
                 "createdBy": row["created_by"],
                 "notes": row.get("notes"),
-                "metadata": row.get("metadata") or {},
+                "metadata": normalize_json_object(row.get("metadata")),
                 "createdAt": row["created_at"],
             }
             for row in session_requests
@@ -830,27 +1210,38 @@ def list_admin_tickets() -> dict[str, Any]:
           t.id,
           t.public_id,
           t.category,
+          t.inquiry,
           t.technical_subcategory,
           t.status,
+          t.status_reason,
           t.assigned_team,
           t.sla_status,
+          t.metadata,
           t.evidence_count,
           t.created_at,
           t.updated_at,
+          t.conversation_id,
+          c.status AS conversation_status,
+          c.metadata AS conversation_metadata,
+          c.last_message_at,
           l.full_name AS learner_name,
           l.email AS learner_email,
+          l.phone AS learner_phone,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
         LEFT JOIN agents a
           ON a.id = t.assigned_agent_id
         ORDER BY t.created_at DESC, t.id DESC
         """
     )
 
+    tickets = [apply_ticket_sla_policy(ticket, persist=True) for ticket in tickets]
     return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
 
 
@@ -865,10 +1256,627 @@ def get_admin_ticket_detail_response(public_id: str) -> dict[str, Any]:
     return detail
 
 
+def create_follow_up_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    requested_inquiry = sanitize_text(payload.get("inquiry"))
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.learner_id,
+              t.conversation_id,
+              t.category,
+              t.technical_subcategory,
+              t.inquiry,
+              t.assigned_agent_id,
+              t.assigned_team,
+              c.metadata AS conversation_metadata
+            FROM tickets t
+            LEFT JOIN conversations c
+              ON c.id = t.conversation_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not ticket.get("conversation_id"):
+            raise ApiError(400, "This ticket is not linked to a chat conversation.")
+
+        actor_row = fetch_actor_by_username(actor_username) if actor_username else None
+        actor = (
+            {
+                "id": actor_row["id"],
+                "role": actor_row["role"],
+                "label": actor_row.get("full_name") or actor_row["username"],
+            }
+            if actor_row
+            else {"role": "system", "label": "support_portal"}
+        )
+
+        next_inquiry = requested_inquiry or sanitize_text(ticket.get("inquiry"))
+        if not next_inquiry:
+            raise ApiError(400, "Inquiry details are required.")
+
+        chat_public_id = build_public_chat_id(
+            ticket.get("public_id"),
+            ticket.get("conversation_id"),
+            ticket.get("conversation_metadata"),
+        )
+        draft_public_id = f"TMP-{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:8]}"
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO tickets (
+                  public_id,
+                  learner_id,
+                  conversation_id,
+                  category,
+                  technical_subcategory,
+                  inquiry,
+                  status,
+                  status_reason,
+                  assigned_agent_id,
+                  assigned_team,
+                  evidence_count,
+                  metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                RETURNING id
+                """,
+                [
+                    draft_public_id,
+                    ticket["learner_id"],
+                    ticket["conversation_id"],
+                    ticket["category"],
+                    ticket.get("technical_subcategory") or None,
+                    next_inquiry,
+                    "Open",
+                    "",
+                    ticket.get("assigned_agent_id"),
+                    ticket.get("assigned_team") or "Unassigned",
+                    0,
+                    json.dumps(
+                        {
+                            "source": "support_portal_follow_up",
+                            "parent_ticket_public_id": ticket["public_id"],
+                            "chat_public_id": chat_public_id,
+                            "technical_subcategory": ticket.get("technical_subcategory") or None,
+                        }
+                    ),
+                ],
+            )
+            new_ticket_row = dictfetchone(cursor)
+            if not new_ticket_row:
+                raise ApiError(500, "We could not create the follow-up ticket right now.")
+
+            new_public_id = build_public_ticket_id(int(new_ticket_row["id"]))
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET public_id = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                [new_public_id, new_ticket_row["id"]],
+            )
+
+            cursor.execute(
+                """
+                UPDATE conversations
+                SET status = 'open',
+                    last_message_at = NOW(),
+                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                WHERE id = %s
+                """,
+                [
+                    json.dumps(
+                        {
+                            "chat_public_id": chat_public_id or new_public_id,
+                            "latest_ticket_public_id": new_public_id,
+                            "parent_ticket_public_id": ticket["public_id"],
+                        }
+                    ),
+                    ticket["conversation_id"],
+                ],
+            )
+
+        insert_history_event(
+            int(new_ticket_row["id"]),
+            "ticket_created",
+            actor,
+            {
+                "category": ticket["category"],
+                "technical_subcategory": ticket.get("technical_subcategory") or None,
+                "followUpFrom": ticket["public_id"],
+                "chatId": chat_public_id or new_public_id,
+            },
+        )
+        insert_history_event(
+            int(ticket["id"]),
+            "follow_up_ticket_created",
+            actor,
+            {
+                "newTicketId": new_public_id,
+                "chatId": chat_public_id or new_public_id,
+            },
+        )
+
+    detail = fetch_admin_ticket_detail(new_public_id)
+    if not detail:
+        raise ApiError(500, "We could not load the follow-up ticket.")
+
+    return detail
+
+
+def send_admin_ai_agent_message(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    message = sanitize_text(payload.get("message"))
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not message:
+        raise ApiError(400, "Message text is required.")
+
+    ticket = run_query_one(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          t.conversation_id,
+          t.category,
+          t.technical_subcategory,
+          t.inquiry,
+          t.status,
+          t.status_reason,
+          t.priority,
+          t.assigned_team,
+          t.metadata,
+          c.metadata AS conversation_metadata,
+          l.id AS learner_id,
+          l.full_name AS learner_full_name,
+          l.email AS learner_email,
+          l.phone AS learner_phone
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        WHERE t.public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    admin_actor = fetch_actor_by_username(actor_username) if actor_username else None
+    documentation = normalize_admin_documentation(
+        normalize_json_object(ticket.get("metadata")).get("admin_documentation"),
+        fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+        fallback_chat_id=build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
+        fallback_ticket_id=ticket["public_id"],
+    )
+    conversation_history = get_ticket_conversation_history(ticket.get("conversation_id"))
+    recent_messages = [
+        {
+            "role": sanitize_text(entry.get("role")) or "user",
+            "text": sanitize_text(entry.get("text")),
+            "timestamp": sanitize_text(entry.get("timestamp")),
+        }
+        for entry in messages[-12:]
+        if sanitize_text(entry.get("text"))
+    ]
+
+    webhook_result = send_chatbot_webhook(
+        {
+            "event": "admin_console_ai_message",
+            "source": "support_portal_admin_console",
+            "message": message,
+            "admin": {
+                "username": actor_username or None,
+                "fullName": admin_actor.get("full_name") if admin_actor else None,
+                "role": admin_actor.get("role") if admin_actor else None,
+            },
+            "learner": {
+                "id": int(ticket["learner_id"]),
+                "fullName": ticket.get("learner_full_name"),
+                "email": ticket["learner_email"],
+                "phone": ticket.get("learner_phone"),
+            },
+            "ticket": {
+                "id": ticket["public_id"],
+                "chatId": build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
+                "category": ticket["category"],
+                "technicalSubcategory": ticket.get("technical_subcategory"),
+                "inquiry": ticket["inquiry"],
+                "status": ticket["status"],
+                "statusReason": ticket.get("status_reason"),
+                "priority": ticket["priority"],
+                "assignedTeam": ticket["assigned_team"],
+                "documentation": documentation,
+            },
+            "conversationHistory": conversation_history[-20:],
+            "messages": recent_messages,
+        }
+    )
+
+    return {
+        "ok": True,
+        "reply": webhook_result["reply"],
+        "webhookConfigured": webhook_result["configured"],
+        "webhookDelivered": webhook_result["delivered"],
+        "webhookStatus": webhook_result["status"],
+    }
+
+
+def get_support_booking_url() -> str:
+    booking_url = sanitize_text(settings.SUPPORT_BOOKING_URL)
+    if not booking_url:
+        raise ApiError(503, "Support booking is not configured on the server.")
+
+    return booking_url
+
+
+def get_ticket_booking_context_response(public_id: str) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    ticket = run_query_one(
+        """
+        SELECT
+          t.public_id,
+          t.category,
+          t.technical_subcategory,
+          t.inquiry,
+          t.status,
+          l.id AS learner_id,
+          l.full_name AS learner_full_name,
+          l.email AS learner_email,
+          l.phone AS learner_phone
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        WHERE t.public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    return {
+        "bookingUrl": get_support_booking_url(),
+        "externalAutofillSupported": False,
+        "handoffMethod": "postMessage",
+        "message": (
+            "Booking details were prepared from the support portal and will be sent to the embedded page. "
+            "Autofill depends on the external booking provider supporting this handoff."
+        ),
+        "learner": {
+            "id": int(ticket["learner_id"]),
+            "fullName": ticket.get("learner_full_name") or "",
+            "email": ticket["learner_email"],
+            "phone": ticket.get("learner_phone") or "",
+        },
+        "ticket": {
+            "id": ticket["public_id"],
+            "category": ticket["category"],
+            "technicalSubcategory": ticket.get("technical_subcategory") or "",
+            "inquiry": ticket["inquiry"],
+            "status": ticket["status"],
+        },
+        "prefill": {
+            "fullName": ticket.get("learner_full_name") or "",
+            "email": ticket["learner_email"],
+            "phone": ticket.get("learner_phone") or "",
+            "specialRequests": ticket["inquiry"],
+        },
+    }
+
+
+def get_ticket_conversation_history(conversation_id: Any) -> list[dict[str, Any]]:
+    try:
+        normalized_conversation_id = int(conversation_id)
+    except (TypeError, ValueError):
+        return []
+
+    rows = run_query(
+        """
+        SELECT role, content, metadata, created_at
+        FROM messages
+        WHERE conversation_id = %s
+        ORDER BY created_at ASC, id ASC
+        """,
+        [normalized_conversation_id],
+    )
+
+    return [
+        {
+            "role": row["role"],
+            "senderLabel": to_sender_label(row["role"], row.get("metadata")),
+            "text": row["content"],
+            "createdAt": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def map_role_to_sender(role: Any, metadata: Any) -> str:
+    normalized_metadata = normalize_json_object(metadata)
+    original_sender = sanitize_text(normalized_metadata.get("original_sender"))
+    if original_sender in {"user", "bot", "agent"}:
+        return original_sender
+
+    normalized_role = sanitize_text(role).lower()
+    if normalized_role == "user":
+        return "user"
+    if normalized_role == "agent":
+        return "agent"
+    return "bot"
+
+
+def get_ticket_chat_history_response(public_id: str) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    ticket = run_query_one(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          t.category,
+          t.technical_subcategory,
+          t.status,
+          t.status_reason,
+          t.assigned_team,
+          t.sla_status,
+          t.created_at,
+          t.metadata,
+          t.conversation_id,
+          c.metadata AS conversation_metadata,
+          l.full_name AS learner_name
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        WHERE t.public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    raw_message_rows = run_query(
+        """
+        SELECT id, role, content, metadata, created_at
+        FROM messages
+        WHERE conversation_id = %s
+        ORDER BY created_at ASC, id ASC
+        """,
+        [ticket["conversation_id"]],
+    ) if ticket.get("conversation_id") else []
+
+    messages = ensure_intro_message_row(
+        raw_message_rows,
+        intro_message=build_chat_intro_message(
+            ticket.get("learner_name"),
+            ticket.get("category"),
+            ticket.get("technical_subcategory"),
+        ),
+        created_at=ticket.get("created_at"),
+        intro_id=f"intro-{ticket['public_id']}",
+    )
+
+    return {
+        "ticket": {
+            "id": ticket["public_id"],
+            "status": ticket["status"],
+            "statusReason": ticket.get("status_reason") or "",
+            "assignedTeam": ticket.get("assigned_team") or "Unassigned",
+            "slaStatus": ticket["sla_status"],
+            "createdAt": ticket["created_at"],
+            "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
+        },
+        "chatHistory": [
+            {
+                "id": str(row["id"]),
+                "sender": map_role_to_sender(row["role"], row.get("metadata")),
+                "text": row["content"],
+                "timestamp": sanitize_text(normalize_json_object(row.get("metadata")).get("client_timestamp"))
+                or format_chat_message_timestamp(row.get("created_at")),
+            }
+            for row in messages
+        ],
+        "historyCount": len(messages),
+    }
+
+
+def mark_conversation_as_active(ticket_public_id: str, conversation_id: Any) -> None:
+    try:
+        normalized_conversation_id = int(conversation_id)
+    except (TypeError, ValueError):
+        return
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE conversations
+            SET
+              last_message_at = COALESCE(last_message_at, NOW()),
+              metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+            WHERE id = %s
+            """,
+            [
+                json.dumps(
+                    {
+                        "is_active_conversation": True,
+                        "chat_public_id": sanitize_text(ticket_public_id) or None,
+                    }
+                ),
+                normalized_conversation_id,
+            ],
+        )
+
+
+def request_live_chat(public_id: str) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.metadata,
+              t.conversation_id,
+              l.email AS learner_email
+            FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not ticket.get("conversation_id"):
+            raise ApiError(400, "This ticket is not linked to a conversation.")
+
+        mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET
+                  metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                  updated_at = NOW()
+                WHERE id = %s
+                """,
+                [
+                    json.dumps(
+                        {
+                            "live_chat_requested": True,
+                            "live_chat_requested_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ),
+                    ticket["id"],
+                ],
+            )
+            cursor.execute(
+                """
+                UPDATE conversations
+                SET
+                  last_message_at = NOW(),
+                  metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                WHERE id = %s
+                """,
+                [
+                    json.dumps(
+                        {
+                            "chat_public_id": ticket["public_id"],
+                            "is_active_conversation": True,
+                            "live_chat_requested": True,
+                            "live_chat_requested_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ),
+                    ticket["conversation_id"],
+                ],
+            )
+
+        insert_history_event(
+            int(ticket["id"]),
+            "live_chat_requested",
+            {"role": "learner", "label": ticket.get("learner_email") or "learner"},
+            {"requested": True},
+        )
+
+    return {
+        "ok": True,
+        "ticket": {
+            "id": ticket["public_id"],
+            "liveChatRequested": True,
+        },
+    }
+
+
+def get_ticket_chat_context_response(public_id: str) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    ticket = run_query_one(
+        """
+        SELECT
+          t.public_id,
+          t.metadata,
+          t.conversation_id,
+          t.category,
+          t.technical_subcategory,
+          c.metadata AS conversation_metadata,
+          l.id AS learner_id,
+          l.full_name AS learner_full_name,
+          l.email AS learner_email
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        WHERE t.public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
+
+    return {
+        "introMessage": build_chat_intro_message(
+            ticket.get("learner_full_name"),
+            ticket["category"],
+            ticket.get("technical_subcategory"),
+        ),
+        "learner": {
+            "id": int(ticket["learner_id"]),
+            "fullName": ticket.get("learner_full_name") or "",
+            "email": ticket["learner_email"],
+        },
+        "ticket": {
+            "id": ticket["public_id"],
+            "category": ticket["category"],
+            "technicalSubcategory": ticket.get("technical_subcategory") or "",
+            "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
+        },
+    }
+
+
 def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     requested_status = sanitize_text(payload.get("status")) if "status" in payload else None
+    requested_status_reason = sanitize_text(payload.get("statusReason")) if "statusReason" in payload else None
+    requested_chat_state = sanitize_text(payload.get("chatState")).lower() if "chatState" in payload else None
     requested_sla_status = sanitize_text(payload.get("slaStatus")) if "slaStatus" in payload else None
     requested_assigned_team = sanitize_text(payload.get("assignedTeam")) if "assignedTeam" in payload else None
+    requested_documentation = payload.get("documentation") if isinstance(payload.get("documentation"), dict) else None
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     note = sanitize_text(payload.get("note"))
     has_assigned_agent_input = "assignedAgentId" in payload
@@ -878,6 +1886,9 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
     if requested_status is not None and requested_status not in ALLOWED_STATUSES:
         raise ApiError(400, "Invalid ticket status.")
+
+    if requested_chat_state is not None and requested_chat_state not in ALLOWED_CHAT_STATES:
+        raise ApiError(400, "Invalid chat state.")
 
     if requested_sla_status is not None and requested_sla_status not in ALLOWED_SLA_STATUSES:
         raise ApiError(400, "Invalid SLA status.")
@@ -890,17 +1901,24 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             SELECT
               t.id,
               t.public_id,
+              t.inquiry,
               t.status,
+              t.status_reason,
               t.assigned_agent_id,
               t.assigned_team,
               t.sla_status,
+              t.metadata,
+              t.created_at,
               t.closed_at,
               t.conversation_id,
+              c.metadata AS conversation_metadata,
               a.username AS assigned_agent_username,
               a.full_name AS assigned_agent_name
             FROM tickets t
             LEFT JOIN agents a
               ON a.id = t.assigned_agent_id
+            LEFT JOIN conversations c
+              ON c.id = t.conversation_id
             WHERE t.public_id = %s
             LIMIT 1
             """,
@@ -909,6 +1927,11 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
         if not ticket:
             raise ApiError(404, "Ticket not found.")
+
+        apply_ticket_sla_policy(ticket)
+
+        if requested_status is not None and requested_status != ticket["status"] and not note:
+            raise ApiError(400, "Add an internal note before changing the ticket status.")
 
         actor_row = fetch_actor_by_username(actor_username) if actor_username else None
         actor = (
@@ -944,7 +1967,26 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             }
 
         next_status = requested_status or ticket["status"]
-        next_sla_status = requested_sla_status or ticket["sla_status"]
+        next_status_reason = requested_status_reason if requested_status_reason is not None else (ticket.get("status_reason") or "")
+        validate_status_reason_for_status(next_status, next_status_reason)
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            next_status,
+            ticket.get("created_at"),
+            ticket["sla_status"],
+            requested_sla_status,
+        )
+        next_chat_state = requested_chat_state or map_conversation_status(next_status)
+        sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
+        if requested_documentation is not None:
+            documentation_payload = normalize_admin_documentation(
+                requested_documentation,
+                fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+                fallback_chat_id=build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
+                fallback_ticket_id=ticket["public_id"],
+            )
+            metadata_patch = {**sla_metadata_patch, "admin_documentation": documentation_payload}
+        else:
+            metadata_patch = sla_metadata_patch
         next_assigned_agent_id = parsed_assigned_agent_id if has_assigned_agent_input else ticket.get("assigned_agent_id")
         if requested_assigned_team is not None:
             next_assigned_team = requested_assigned_team or derive_assigned_team(assigned_agent)
@@ -959,9 +2001,11 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                 UPDATE tickets
                 SET
                   status = %s,
+                  status_reason = %s,
                   assigned_agent_id = %s,
                   assigned_team = %s,
                   sla_status = %s,
+                  metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
                   updated_at = NOW(),
                   closed_at = CASE
                     WHEN %s = 'Closed' THEN NOW()
@@ -972,9 +2016,11 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                 """,
                 [
                     next_status,
+                    next_status_reason,
                     next_assigned_agent_id,
                     next_assigned_team,
                     next_sla_status,
+                    json.dumps(metadata_patch),
                     next_status,
                     next_status,
                     ticket["id"],
@@ -992,10 +2038,12 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                     WHERE id = %s
                     """,
                     [
-                        map_conversation_status(next_status),
+                        next_chat_state,
                         json.dumps(
                             {
                                 "ticket_status": next_status,
+                                "status_reason": next_status_reason,
+                                "chat_state": next_chat_state,
                                 "assigned_agent_id": next_assigned_agent_id,
                                 "assigned_team": next_assigned_team,
                             }
@@ -1006,6 +2054,14 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
         if ticket["status"] != next_status:
             insert_history_event(ticket["id"], "status_changed", actor, {"from": ticket["status"], "to": next_status})
+
+        if (ticket.get("status_reason") or "") != next_status_reason:
+            insert_history_event(
+                ticket["id"],
+                "status_reason_changed",
+                actor,
+                {"from": ticket.get("status_reason") or "", "to": next_status_reason},
+            )
 
         if (ticket.get("assigned_agent_id") or None) != (next_assigned_agent_id or None):
             insert_history_event(
@@ -1123,6 +2179,7 @@ def create_ticket(payload: dict[str, Any]) -> dict[str, Any]:
                     json.dumps(
                         {
                             "ticket_public_id": public_id,
+                            "chat_public_id": public_id,
                             "learner_id": learner["id"],
                             "technical_subcategory": technical_subcategory or None,
                         }
@@ -1178,14 +2235,17 @@ def create_ticket(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "ticket": {
             "id": public_id,
+            "learnerName": learner.get("full_name") or "",
             "email": learner["email"],
             "category": category,
             "technicalSubcategory": technical_subcategory,
             "inquiry": inquiry,
             "status": ticket_row["status"],
+            "statusReason": "",
             "assignedTeam": ticket_row["assigned_team"],
             "slaStatus": ticket_row["sla_status"],
             "createdAt": ticket_row["created_at"],
+            "liveChatRequested": False,
         }
     }
 
@@ -1214,11 +2274,14 @@ def update_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
               t.id,
               t.public_id,
               t.status,
+              t.status_reason,
               t.assigned_team,
               t.sla_status,
+              t.metadata,
               t.created_at,
               t.conversation_id,
               t.technical_subcategory,
+              l.full_name AS learner_name,
               l.email
             FROM tickets t
             JOIN learners l
@@ -1231,6 +2294,8 @@ def update_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
         if not existing_ticket:
             raise ApiError(404, "Ticket not found.")
+
+        apply_ticket_sla_policy(existing_ticket, persist=True)
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -1261,6 +2326,7 @@ def update_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                         category,
                         json.dumps(
                             {
+                                "chat_public_id": existing_ticket["public_id"],
                                 "ticket_category": category,
                                 "technical_subcategory": technical_subcategory or None,
                                 "latest_inquiry": inquiry,
@@ -1310,20 +2376,24 @@ def update_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "ticket": {
             "id": existing_ticket["public_id"],
+            "learnerName": existing_ticket.get("learner_name") or "",
             "email": existing_ticket["email"],
             "category": category,
             "technicalSubcategory": technical_subcategory,
             "inquiry": inquiry,
             "status": existing_ticket["status"],
+            "statusReason": existing_ticket.get("status_reason") or "",
             "assignedTeam": existing_ticket["assigned_team"],
             "slaStatus": existing_ticket["sla_status"],
             "createdAt": existing_ticket["created_at"],
+            "liveChatRequested": is_live_chat_requested(existing_ticket.get("metadata")),
         }
     }
 
 
 def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     status = sanitize_text(payload.get("status")) or "Open"
+    status_reason = sanitize_text(payload.get("statusReason")) if "statusReason" in payload else None
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
 
     if not public_id:
@@ -1334,7 +2404,7 @@ def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]
     with transaction.atomic():
         ticket = run_query_one(
             """
-            SELECT id, conversation_id
+            SELECT id, public_id, conversation_id, status, status_reason, assigned_team, sla_status, metadata, created_at
             FROM tickets
             WHERE public_id = %s
             LIMIT 1
@@ -1347,28 +2417,61 @@ def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]
         if not ticket.get("conversation_id"):
             raise ApiError(400, "This ticket is not linked to a conversation.")
 
+        mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
+        apply_ticket_sla_policy(ticket)
         filtered_messages = sync_conversation_messages(int(ticket["conversation_id"]), status, messages)
+        next_status_reason = status_reason if status_reason is not None else (ticket.get("status_reason") or "")
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            status,
+            ticket.get("created_at"),
+            ticket["sla_status"],
+        )
+        sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
 
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE tickets
                 SET status = %s,
+                    status_reason = %s,
+                    sla_status = %s,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
                     updated_at = NOW(),
-                    closed_at = CASE WHEN %s = 'Closed' THEN NOW() ELSE closed_at END
+                    closed_at = CASE
+                      WHEN %s = 'Closed' THEN NOW()
+                      WHEN status = 'Closed' AND %s <> 'Closed' THEN NULL
+                      ELSE closed_at
+                    END
                 WHERE id = %s
                 """,
-                [status, status, ticket["id"]],
+                [status, next_status_reason, next_sla_status, json.dumps(sla_metadata_patch), status, status, ticket["id"]],
             )
 
         insert_history_event(
             int(ticket["id"]),
             "chat_history_synced",
             {"role": "system", "label": "support_portal"},
-            {"message_count": len(filtered_messages), "status": status},
+            {
+                "message_count": len(filtered_messages),
+                "status": status,
+                "statusReason": next_status_reason,
+                "slaStatus": next_sla_status,
+                "slaAttentionRequired": next_sla_attention_required,
+            },
         )
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "ticket": {
+            "id": ticket["public_id"],
+            "status": status,
+            "statusReason": next_status_reason,
+            "assignedTeam": ticket["assigned_team"],
+            "slaStatus": next_sla_status,
+            "slaAttentionRequired": next_sla_attention_required,
+            "createdAt": ticket["created_at"],
+        },
+    }
 
 
 def extract_chatbot_reply(response_payload: Any) -> str:
@@ -1469,6 +2572,7 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
           t.technical_subcategory,
           t.inquiry,
           t.status,
+          t.status_reason,
           t.priority,
           t.assigned_team,
           l.id AS learner_id,
@@ -1486,6 +2590,8 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
 
     if not ticket:
         raise ApiError(404, "Ticket not found.")
+
+    mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
 
     recent_messages = [
         {
@@ -1516,10 +2622,11 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
                 "id": ticket["public_id"],
                 "category": ticket["category"],
                 "technicalSubcategory": ticket.get("technical_subcategory"),
-                "inquiry": ticket["inquiry"],
-                "status": ticket["status"],
-                "priority": ticket["priority"],
-                "assignedTeam": ticket["assigned_team"],
+            "inquiry": ticket["inquiry"],
+            "status": ticket["status"],
+            "statusReason": ticket.get("status_reason"),
+            "priority": ticket["priority"],
+            "assignedTeam": ticket["assigned_team"],
             },
             "messages": recent_messages,
         }
@@ -1571,12 +2678,16 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             SELECT
               t.id,
               t.public_id,
+              t.conversation_id,
               t.category,
               t.technical_subcategory,
               t.inquiry,
               t.status,
+              t.sla_status,
               t.priority,
               t.assigned_team,
+              t.metadata,
+              t.created_at,
               l.id AS learner_id,
               l.full_name AS learner_full_name,
               l.email AS learner_email,
@@ -1626,6 +2737,58 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             {"role": "learner", "label": public_id},
             {"requestedDate": requested_date, "requestedTime": requested_time},
         )
+
+        apply_ticket_sla_policy(ticket)
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            "Pending",
+            ticket.get("created_at"),
+            ticket["sla_status"],
+        )
+        sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET status = %s,
+                    status_reason = %s,
+                    sla_status = %s,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    updated_at = NOW(),
+                    closed_at = CASE
+                      WHEN status = 'Closed' THEN NULL
+                      ELSE closed_at
+                    END
+                WHERE id = %s
+                """,
+                ["Pending", STATUS_REASON_AWAITING_MEETING, next_sla_status, json.dumps(sla_metadata_patch), ticket["id"]],
+            )
+
+            if ticket.get("conversation_id"):
+                cursor.execute(
+                    """
+                    UPDATE conversations
+                    SET status = %s,
+                        last_message_at = NOW(),
+                        metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                    WHERE id = %s
+                    """,
+                    [
+                        map_conversation_status("Pending"),
+                        json.dumps(
+                            {
+                                "ticket_status": "Pending",
+                                "status_reason": STATUS_REASON_AWAITING_MEETING,
+                                "sla_status": next_sla_status,
+                            }
+                        ),
+                        ticket["conversation_id"],
+                    ],
+                )
+
+        ticket["status"] = "Pending"
+        ticket["status_reason"] = STATUS_REASON_AWAITING_MEETING
+        ticket["sla_status"] = next_sla_status
 
     webhook_result = send_booking_webhook(
         build_support_session_webhook_payload(
@@ -1710,6 +2873,15 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
         "organizerEmail": webhook_result["organizerEmail"],
         "bookingReference": webhook_result["bookingReference"],
         "message": webhook_result["message"] or "",
+        "ticket": {
+            "id": ticket["public_id"],
+            "status": ticket["status"],
+            "statusReason": ticket.get("status_reason") or "",
+            "slaStatus": ticket["sla_status"],
+            "slaAttentionRequired": next_sla_attention_required,
+            "assignedTeam": ticket["assigned_team"],
+            "createdAt": ticket["created_at"],
+        },
     }
 
 

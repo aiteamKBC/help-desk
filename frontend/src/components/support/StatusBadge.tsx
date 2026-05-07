@@ -3,8 +3,6 @@ import { cn } from "@/lib/utils";
 const map: Record<string, string> = {
   Open: "bg-info/10 text-info border-info/20",
   Pending: "bg-warning/10 text-warning border-warning/20",
-  "In Progress": "bg-primary/10 text-primary border-primary/20",
-  Resolved: "bg-success/10 text-success border-success/20",
   Closed: "bg-muted text-muted-foreground border-border",
   Draft: "bg-muted text-muted-foreground border-border",
 };

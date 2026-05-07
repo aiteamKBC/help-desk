@@ -66,3 +66,7 @@ CHATBOT_WEBHOOK_URL = get_env("N8N_CHATBOT_WEBHOOK_URL")
 LEGACY_DATABASE_URL = get_env("LEGACY_DATABASE_URL")
 LEGACY_EXPRESS_ENTRYPOINT = BASE_DIR / "index.mjs"
 SUPPORT_SESSION_DURATION_MINUTES = max(int(get_env("SUPPORT_SESSION_DURATION_MINUTES", "60") or "60"), 15)
+SUPPORT_BOOKING_URL = get_env(
+    "SUPPORT_BOOKING_URL",
+    "https://outlook.office.com/book/StudentSupport1@kentbusinesscollege.com/s/Z4Zc9rZxw0mEOB417C5bVQ2",
+)

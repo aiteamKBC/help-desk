@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, ReactNode } from "react";
 
-export type TicketStatus = "Open" | "Pending" | "In Progress" | "Resolved" | "Closed";
+export type TicketStatus = "Open" | "Pending" | "Closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
 export type TechnicalSubcategory = "Aptem" | "LMS" | "Teams" | "";
 
@@ -21,29 +21,35 @@ export interface EvidenceFile {
 
 export interface Ticket {
   id: string;
+  learnerName: string;
   email: string;
   category: Category;
   technicalSubcategory: TechnicalSubcategory;
   inquiry: string;
   evidence: EvidenceFile[];
   status: TicketStatus;
+  statusReason: string;
   assignedTeam: string;
   slaStatus: string;
   createdAt: string;
+  liveChatRequested: boolean;
   chatHistory: ChatMessage[];
 }
 
 const defaultTicket: Ticket = {
   id: "",
+  learnerName: "",
   email: "",
   category: "",
   technicalSubcategory: "",
   inquiry: "",
   evidence: [],
   status: "Open",
+  statusReason: "",
   assignedTeam: "Unassigned",
   slaStatus: "Pending Review",
   createdAt: "",
+  liveChatRequested: false,
   chatHistory: [],
 };
 

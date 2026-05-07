@@ -52,11 +52,12 @@ CREATE TABLE IF NOT EXISTS tickets (
   id BIGSERIAL PRIMARY KEY,
   public_id TEXT NOT NULL UNIQUE,
   learner_id BIGINT NOT NULL REFERENCES learners(id) ON DELETE RESTRICT,
-  conversation_id BIGINT UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
+  conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
   category TEXT NOT NULL,
   technical_subcategory TEXT,
   inquiry TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'Open',
+  status_reason TEXT NOT NULL DEFAULT '',
   assigned_agent_id BIGINT REFERENCES agents(id) ON DELETE SET NULL,
   assigned_team TEXT NOT NULL DEFAULT 'Unassigned',
   sla_status TEXT NOT NULL DEFAULT 'Pending Review',
@@ -66,12 +67,40 @@ CREATE TABLE IF NOT EXISTS tickets (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   closed_at TIMESTAMPTZ,
-  CONSTRAINT tickets_status_check CHECK (status IN ('Open', 'Pending', 'In Progress', 'Resolved', 'Closed')),
+  CONSTRAINT tickets_status_check CHECK (status IN ('Open', 'Pending', 'Closed')),
   CONSTRAINT tickets_priority_check CHECK (priority IN ('Low', 'Normal', 'High', 'Urgent'))
 );
 
 ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS technical_subcategory TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS status_reason TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE tickets
+DROP CONSTRAINT IF EXISTS tickets_conversation_id_key;
+
+UPDATE tickets
+SET status = 'Closed',
+    closed_at = COALESCE(closed_at, NOW()),
+    updated_at = NOW()
+WHERE status = 'Resolved';
+
+UPDATE tickets
+SET status = 'Open',
+    closed_at = NULL,
+    updated_at = NOW()
+WHERE status = 'In Progress';
+
+UPDATE conversations
+SET status = 'open'
+WHERE status = 'in_progress';
+
+ALTER TABLE tickets
+DROP CONSTRAINT IF EXISTS tickets_status_check;
+
+ALTER TABLE tickets
+ADD CONSTRAINT tickets_status_check CHECK (status IN ('Open', 'Pending', 'Closed'));
 
 CREATE TABLE IF NOT EXISTS ticket_attachments (
   id BIGSERIAL PRIMARY KEY,
@@ -121,8 +150,5 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_created_at ON messages(c
 
 INSERT INTO agents (username, full_name, email, role)
 VALUES
-  ('admin', 'System Admin', NULL, 'admin'),
-  ('sarah.chen', 'Sarah Chen', 'sarah.chen@support.local', 'agent'),
-  ('james.patel', 'James Patel', 'james.patel@support.local', 'agent'),
-  ('maria.lopez', 'Maria Lopez', 'maria.lopez@support.local', 'agent')
+  ('ahmedhamamo', 'Ahmed Hamamo', NULL, 'admin')
 ON CONFLICT (username) DO NOTHING;

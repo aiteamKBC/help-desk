@@ -1,0 +1,56 @@
+<svg width="520" height="180" viewBox="0 0 520 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="laurelGradient" x1="24" y1="32" x2="232" y2="224" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6D28D9"/>
+      <stop offset="1" stop-color="#4F46E5"/>
+    </linearGradient>
+    <clipPath id="shieldClip">
+      <path d="M128 42C153 42 179 45 198 52V112C198 154 171 192 128 214C85 192 58 154 58 112V52C77 45 103 42 128 42Z"/>
+    </clipPath>
+  </defs>
+
+  <g transform="translate(4 10) scale(0.62)">
+    <path d="M42 178C27 164 18 145 18 123C18 113 20 104 24 95" stroke="url(#laurelGradient)" stroke-width="6" stroke-linecap="round"/>
+    <path d="M214 178C229 164 238 145 238 123C238 113 236 104 232 95" stroke="url(#laurelGradient)" stroke-width="6" stroke-linecap="round"/>
+
+    <g fill="url(#laurelGradient)">
+      <ellipse cx="28" cy="84" rx="8" ry="14" transform="rotate(-28 28 84)"/>
+      <ellipse cx="22" cy="107" rx="8" ry="14" transform="rotate(-18 22 107)"/>
+      <ellipse cx="21" cy="131" rx="8" ry="14" transform="rotate(-9 21 131)"/>
+      <ellipse cx="25" cy="154" rx="8" ry="14" transform="rotate(2 25 154)"/>
+      <ellipse cx="35" cy="175" rx="8" ry="14" transform="rotate(14 35 175)"/>
+
+      <ellipse cx="228" cy="84" rx="8" ry="14" transform="rotate(28 228 84)"/>
+      <ellipse cx="234" cy="107" rx="8" ry="14" transform="rotate(18 234 107)"/>
+      <ellipse cx="235" cy="131" rx="8" ry="14" transform="rotate(9 235 131)"/>
+      <ellipse cx="231" cy="154" rx="8" ry="14" transform="rotate(-2 231 154)"/>
+      <ellipse cx="221" cy="175" rx="8" ry="14" transform="rotate(-14 221 175)"/>
+    </g>
+
+    <path d="M54 194L94 224" stroke="url(#laurelGradient)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M202 194L162 224" stroke="url(#laurelGradient)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M95 224H161" stroke="url(#laurelGradient)" stroke-width="7" stroke-linecap="round"/>
+
+    <path d="M128 42C153 42 179 45 198 52V112C198 154 171 192 128 214C85 192 58 154 58 112V52C77 45 103 42 128 42Z" fill="white" stroke="#B7791F" stroke-width="7"/>
+
+    <g clip-path="url(#shieldClip)">
+      <rect x="128" y="52" width="70" height="60" fill="url(#laurelGradient)"/>
+      <rect x="58" y="112" width="70" height="72" fill="url(#laurelGradient)"/>
+      <path d="M128 52V186" stroke="#B7791F" stroke-width="6"/>
+      <path d="M58 112H198" stroke="#B7791F" stroke-width="6"/>
+
+      <path d="M148 88C153 74 165 67 179 69C174 75 173 82 176 89C180 98 187 103 191 111C184 112 179 110 176 107L171 112L174 118C168 121 163 118 161 114L156 117C151 113 148 109 147 104L141 103L144 95L139 89L148 88Z" fill="white"/>
+
+      <path d="M96 165C97 154 101 144 108 139C110 146 112 150 116 153C120 157 124 161 126 169C122 168 119 166 117 164L116 178C113 178 110 177 109 175L105 182L101 180L103 171L96 165Z" fill="#F4F4F5"/>
+      <path d="M110 143C113 140 116 139 119 139" stroke="#7C4A15" stroke-width="2.5" stroke-linecap="round"/>
+    </g>
+  </g>
+
+  <path d="M174 28V152" stroke="#5B21B6" stroke-width="4" stroke-linecap="round"/>
+
+  <g fill="#5919DD" stroke="white" stroke-width="5" paint-order="stroke fill" font-family="Arial Black, Arial, sans-serif" font-weight="900">
+    <text x="196" y="76" font-size="78" letter-spacing="-2">Kent</text>
+    <text x="198" y="119" font-size="46" letter-spacing="-1">Business</text>
+    <text x="198" y="159" font-size="46" letter-spacing="-1">College</text>
+  </g>
+</svg>

@@ -8,6 +8,7 @@ import NotFound from "./pages/NotFound.tsx";
 import EmailVerification from "./pages/support/EmailVerification.tsx";
 import InquiryDetails from "./pages/support/InquiryDetails.tsx";
 import ChatSupport from "./pages/support/ChatSupport.tsx";
+import EmbeddedBooking from "./pages/support/EmbeddedBooking.tsx";
 import BookingConfirmed from "./pages/support/BookingConfirmed.tsx";
 import TicketStatus from "./pages/support/TicketStatus.tsx";
 import Documentation from "./pages/support/Documentation.tsx";
@@ -29,6 +30,7 @@ const App = () => (
             <Route path="/support" element={<Navigate to="/" replace />} />
             <Route path="/support/inquiry" element={<InquiryDetails />} />
             <Route path="/support/chat" element={<ChatSupport />} />
+            <Route path="/support/booking" element={<EmbeddedBooking />} />
             <Route path="/support/booking-confirmed" element={<BookingConfirmed />} />
             <Route path="/support/status" element={<TicketStatus />} />
             <Route path="/support/docs" element={<Documentation />} />
