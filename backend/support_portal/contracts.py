@@ -1,7 +1,13 @@
 LEGACY_ENDPOINTS = [
     {"method": "GET", "path": "/api/booking-link"},
+    {"method": "GET", "path": "/api/teams-call-context"},
     {"method": "POST", "path": "/api/verify-email"},
     {"method": "POST", "path": "/api/admin/login"},
+    {"method": "POST", "path": "/api/admin/logout"},
+    {"method": "POST", "path": "/api/admin/session-heartbeat"},
+    {"method": "GET", "path": "/api/admin/accounts"},
+    {"method": "POST", "path": "/api/admin/accounts"},
+    {"method": "PATCH", "path": "/api/admin/accounts/:accountId"},
     {"method": "GET", "path": "/api/admin/agents"},
     {"method": "GET", "path": "/api/admin/tickets"},
     {"method": "GET", "path": "/api/admin/tickets/:publicId"},
@@ -13,7 +19,9 @@ LEGACY_ENDPOINTS = [
     {"method": "POST", "path": "/api/tickets/:publicId/chat-history"},
     {"method": "POST", "path": "/api/tickets/:publicId/chatbot-message"},
     {"method": "POST", "path": "/api/tickets/:publicId/live-chat-request"},
+    {"method": "POST", "path": "/api/tickets/:publicId/teams-call-request"},
     {"method": "GET", "path": "/api/tickets/:publicId/chat-context"},
     {"method": "GET", "path": "/api/tickets/:publicId/booking-context"},
     {"method": "POST", "path": "/api/tickets/:publicId/session-requests"},
+    {"method": "POST", "path": "/api/tickets/:publicId/session-requests/cancel"},
 ]

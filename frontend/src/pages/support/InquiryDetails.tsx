@@ -20,7 +20,8 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { Category, EvidenceFile, TechnicalSubcategory, useSupport } from "@/context/SupportContext";
+import { type Category, type EvidenceFile, type TechnicalSubcategory, useSupport } from "@/context/SupportContext";
+import { isQuickTicketOnlyRequesterRole } from "@/lib/supportFlow";
 import { toast } from "sonner";
 
 const textExtensions = new Set([
@@ -43,7 +44,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const technicalSubcategories: TechnicalSubcategory[] = ["Aptem", "LMS", "Teams"];
+const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams"];
 const acceptedEvidenceExtensions = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".mp4", ".mov", ".avi", ".mkv", ".webm"]);
 
 const getExtension = (name: string) => {
@@ -105,7 +106,6 @@ const formatFileTypeLabel = (file: EvidenceFile) => {
 const InquiryDetails = () => {
   const navigate = useNavigate();
   const { ticket, updateTicket } = useSupport();
-  const [category, setCategory] = useState<Category>(ticket.category);
   const [technicalSubcategory, setTechnicalSubcategory] = useState<TechnicalSubcategory>(ticket.technicalSubcategory);
   const [inquiry, setInquiry] = useState(ticket.inquiry);
   const [evidence, setEvidence] = useState(ticket.evidence);
@@ -114,11 +114,7 @@ const InquiryDetails = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const canSubmit = Boolean(
-    category &&
-    inquiry.trim().length > 0 &&
-    (category !== "Technical" || technicalSubcategory)
-  );
+  const canSubmit = Boolean(technicalSubcategory && inquiry.trim().length > 0);
 
   const onFiles = async (files: FileList | null) => {
     if (!files) return;
@@ -173,8 +169,9 @@ const InquiryDetails = () => {
         },
         body: JSON.stringify({
           email: ticket.email,
-          category,
-          technicalSubcategory: category === "Technical" ? technicalSubcategory : "",
+          requesterRole: ticket.requesterRole,
+          category: "Technical",
+          technicalSubcategory,
           inquiry,
           evidence: evidence.map((file) => ({
             name: file.name,
@@ -191,6 +188,7 @@ const InquiryDetails = () => {
               id: string;
               learnerName?: string;
               email: string;
+              requesterRole?: "user" | "coach" | "employer";
               category: Category;
               technicalSubcategory: TechnicalSubcategory;
               inquiry: string;
@@ -199,6 +197,7 @@ const InquiryDetails = () => {
               assignedTeam: string;
               slaStatus: string;
               createdAt: string;
+              chatState?: "open" | "closed";
               liveChatRequested?: boolean;
             };
           }
@@ -209,23 +208,29 @@ const InquiryDetails = () => {
         return;
       }
 
-        updateTicket({
-          id: payload.ticket.id,
-          learnerName: payload.ticket.learnerName || ticket.learnerName,
-          email: payload.ticket.email,
-          category: payload.ticket.category,
-          technicalSubcategory: payload.ticket.technicalSubcategory,
-          inquiry: payload.ticket.inquiry,
-          evidence,
-          statusReason: payload.ticket.statusReason || ticket.statusReason,
-          createdAt: payload.ticket.createdAt,
-          status: payload.ticket.status,
-          assignedTeam: payload.ticket.assignedTeam,
-          slaStatus: payload.ticket.slaStatus,
-          liveChatRequested: payload.ticket.liveChatRequested ?? (hasExistingTicket ? ticket.liveChatRequested : false),
-          chatHistory: hasExistingTicket ? ticket.chatHistory : [],
-        });
-      navigate("/support/chat");
+      const nextRequesterRole = payload.ticket.requesterRole || ticket.requesterRole;
+      const nextTicketState = {
+        id: payload.ticket.id,
+        learnerName: payload.ticket.learnerName || ticket.learnerName,
+        email: payload.ticket.email,
+        requesterRole: nextRequesterRole,
+        category: payload.ticket.category,
+        technicalSubcategory: payload.ticket.technicalSubcategory,
+        inquiry: payload.ticket.inquiry,
+        evidence,
+        statusReason: payload.ticket.statusReason || ticket.statusReason,
+        createdAt: payload.ticket.createdAt,
+        status: payload.ticket.status,
+        assignedTeam: payload.ticket.assignedTeam,
+        slaStatus: payload.ticket.slaStatus,
+        liveChatRequested: payload.ticket.liveChatRequested ?? (hasExistingTicket ? ticket.liveChatRequested : false),
+        chatState: payload.ticket.chatState ?? (hasExistingTicket ? ticket.chatState : "open"),
+        chatHistory: hasExistingTicket ? ticket.chatHistory : [],
+      } as const;
+
+      updateTicket(nextTicketState);
+
+      navigate("/support/options");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
@@ -238,55 +243,30 @@ const InquiryDetails = () => {
   return (
     <SupportLayout>
       <StepIndicator current={2} />
-      <div className="grid max-w-5xl gap-6 mx-auto lg:grid-cols-3">
-        <div className="p-6 border lg:col-span-2 bg-card rounded-2xl shadow-card md:p-8">
-          <h1 className="mb-1 text-2xl font-bold">Create Support Inquiry</h1>
+      <div className="mx-auto grid max-w-5xl gap-4 sm:gap-6 lg:grid-cols-3 lg:items-stretch">
+        <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8 lg:col-span-2">
+          <h1 className="mb-1 text-2xl font-bold text-primary">Create Support Inquiry</h1>
           <p className="mb-6 text-sm text-muted-foreground">
-            Choose the category and describe your issue.
+            Choose the platform and describe your issue.
           </p>
 
           <div className="space-y-5">
             <div className="space-y-2">
               <Label>Inquiry Category</Label>
               <Select
-                value={category}
-                onValueChange={(value) => {
-                  const nextCategory = value as Category;
-                  setCategory(nextCategory);
-                  if (nextCategory !== "Technical") {
-                    setTechnicalSubcategory("");
-                  }
-                }}
+                value={technicalSubcategory}
+                onValueChange={(value) => setTechnicalSubcategory(value as TechnicalSubcategory)}
               >
                 <SelectTrigger className="h-11">
-                  <SelectValue placeholder="Select a category" />
+                  <SelectValue placeholder="Select a platform" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="Learning">Learning</SelectItem>
-                  <SelectItem value="Technical">Technical</SelectItem>
-                  <SelectItem value="Others">Others</SelectItem>
+                  {inquiryPlatforms.map((item) => (
+                    <SelectItem key={item} value={item}>{item}</SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
-
-            {category === "Technical" && (
-              <div className="space-y-2">
-                <Label>Technical Sub Category</Label>
-                <Select
-                  value={technicalSubcategory}
-                  onValueChange={(value) => setTechnicalSubcategory(value as TechnicalSubcategory)}
-                >
-                  <SelectTrigger className="h-11">
-                    <SelectValue placeholder="Select a technical sub category" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {technicalSubcategories.map((item) => (
-                      <SelectItem key={item} value={item}>{item}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
 
             <div className="space-y-2">
               <Label>Inquiry</Label>
@@ -295,6 +275,7 @@ const InquiryDetails = () => {
                 placeholder="Please describe your issue in detail..."
                 value={inquiry}
                 onChange={(event) => setInquiry(event.target.value)}
+                className="resize-none"
               />
             </div>
 
@@ -355,14 +336,14 @@ const InquiryDetails = () => {
               )}
             </div>
 
-            <div className="flex justify-between pt-2">
-              <Button variant="ghost" onClick={() => navigate("/support")}>
+            <div className="flex flex-col-reverse gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
+              <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/support")}>
                 <ArrowLeft className="w-4 h-4 mr-2" /> Back
               </Button>
               <Button
                 disabled={!canSubmit || isSubmitting}
                 onClick={() => void handleNext()}
-                className="border-0 gradient-primary"
+                className="w-full border-0 gradient-primary sm:w-auto"
               >
                 {isSubmitting ? (ticket.id ? "Saving..." : "Creating...") : "Next"}
                 {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
@@ -371,28 +352,26 @@ const InquiryDetails = () => {
           </div>
         </div>
 
-        <aside className="p-6 border h-fit bg-card rounded-2xl shadow-card lg:sticky lg:top-24">
-          <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        <aside className="rounded-[28px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.04] p-5 shadow-elevated sm:p-6 lg:sticky lg:top-24 lg:self-stretch lg:min-h-full">
+          <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-primary/75">
             Summary
           </div>
-          <dl className="space-y-3 text-sm">
-            <div>
-              <dt className="text-muted-foreground">Email</dt>
-              <dd className="font-medium truncate">{ticket.email || "-"}</dd>
+          <dl className="text-sm">
+            <div className="border-b border-primary/10 pb-4">
+              <dt className="text-[15px] font-bold text-foreground">Requester Type</dt>
+              <dd className="mt-1 text-[15px] font-medium capitalize">{ticket.requesterRole || "-"}</dd>
             </div>
-            <div>
-              <dt className="text-muted-foreground">Category</dt>
-              <dd className="font-medium">{category || "-"}</dd>
+            <div className="border-b border-primary/10 py-4">
+              <dt className="text-[15px] font-bold text-foreground">Email</dt>
+              <dd className="mt-1 text-[15px] font-medium truncate">{ticket.email || "-"}</dd>
             </div>
-            {category === "Technical" && technicalSubcategory && (
-              <div>
-                <dt className="text-muted-foreground">Sub Category</dt>
-                <dd className="font-medium">{technicalSubcategory}</dd>
-              </div>
-            )}
-            <div>
-              <dt className="text-muted-foreground">Evidence</dt>
-              <dd className="font-medium">{evidence.length} file(s)</dd>
+            <div className="border-b border-primary/10 py-4">
+              <dt className="text-[15px] font-bold text-foreground">Category</dt>
+              <dd className="mt-1 text-[15px] font-medium">{technicalSubcategory || "-"}</dd>
+            </div>
+            <div className="py-4">
+              <dt className="text-[15px] font-bold text-foreground">Evidence</dt>
+              <dd className="mt-1 text-[15px] font-medium">{evidence.length} file(s)</dd>
             </div>
           </dl>
         </aside>

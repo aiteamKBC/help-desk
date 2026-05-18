@@ -1,10 +1,10 @@
 import { cn } from "@/lib/utils";
 
 const map: Record<string, string> = {
-  Open: "bg-info/10 text-info border-info/20",
-  Pending: "bg-warning/10 text-warning border-warning/20",
-  Closed: "bg-muted text-muted-foreground border-border",
-  Draft: "bg-muted text-muted-foreground border-border",
+  Open: "bg-sky-600 text-white border-sky-600",
+  Pending: "bg-amber-500 text-white border-amber-500",
+  Closed: "bg-emerald-600 text-white border-emerald-600",
+  Draft: "bg-slate-600 text-white border-slate-600",
 };
 
 export const StatusBadge = ({ status }: { status: string }) => (

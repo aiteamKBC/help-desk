@@ -1,0 +1,10 @@
+Please test code for this cases and tell me what state is its ticket as an output:
+->User choose quick ticket
+->User open chatbot, when he is still speaking with chat
+-> User open chatbot, when he goes inactive
+->User open chatbot, when he closes chat from his side
+->User choose live agent, 
+->User choose live agent and admin transfered chat
+->User choose live agnet and agent chose pending escalation
+->User choose live agnet and agent chose closed
+->

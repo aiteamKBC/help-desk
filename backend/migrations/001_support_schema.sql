@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   language TEXT NOT NULL DEFAULT 'en',
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_message_at TIMESTAMPTZ
+  last_message_at TIMESTAMPTZ,
+  chat_duration_minutes BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -35,18 +36,83 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS agents (
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = current_schema()
+      AND table_name = 'agents'
+  ) AND NOT EXISTS (
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = current_schema()
+      AND table_name = 'support_accounts'
+  ) THEN
+    EXECUTE 'ALTER TABLE agents RENAME TO support_accounts';
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS support_accounts (
   id BIGSERIAL PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   full_name TEXT,
   email TEXT UNIQUE,
+  account_scope TEXT NOT NULL DEFAULT 'staff',
   role TEXT NOT NULL DEFAULT 'agent',
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT agents_role_check CHECK (role IN ('agent', 'admin'))
+  CONSTRAINT support_accounts_role_check CHECK (role IN ('agent', 'user', 'coach', 'employer', 'admin', 'superadmin')),
+  CONSTRAINT support_accounts_account_scope_check CHECK (account_scope IN ('staff', 'requester'))
 );
+
+ALTER TABLE support_accounts
+ADD COLUMN IF NOT EXISTS account_scope TEXT NOT NULL DEFAULT 'staff';
+
+UPDATE support_accounts
+SET account_scope = CASE
+  WHEN role IN ('user', 'coach', 'employer') THEN 'requester'
+  ELSE 'staff'
+END;
+
+ALTER TABLE support_accounts
+DROP CONSTRAINT IF EXISTS agents_role_check;
+
+ALTER TABLE support_accounts
+DROP CONSTRAINT IF EXISTS support_accounts_role_check;
+
+ALTER TABLE support_accounts
+ADD CONSTRAINT support_accounts_role_check
+CHECK (role IN ('agent', 'user', 'coach', 'employer', 'admin', 'superadmin'));
+
+ALTER TABLE support_accounts
+DROP CONSTRAINT IF EXISTS agents_account_scope_check;
+
+ALTER TABLE support_accounts
+DROP CONSTRAINT IF EXISTS support_accounts_account_scope_check;
+
+ALTER TABLE support_accounts
+ADD CONSTRAINT support_accounts_account_scope_check
+CHECK (account_scope IN ('staff', 'requester'));
+
+ALTER TABLE learners
+ADD COLUMN IF NOT EXISTS support_account_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE learners
+DROP CONSTRAINT IF EXISTS learners_support_account_id_key;
+
+ALTER TABLE learners
+ADD CONSTRAINT learners_support_account_id_key UNIQUE (support_account_id);
+
+UPDATE learners AS l
+SET support_account_id = sa.id,
+    updated_at = NOW()
+FROM support_accounts AS sa
+WHERE LOWER(TRIM(l.email)) = LOWER(TRIM(sa.email))
+  AND sa.account_scope = 'requester'
+  AND (l.support_account_id IS NULL OR l.support_account_id <> sa.id);
 
 CREATE TABLE IF NOT EXISTS tickets (
   id BIGSERIAL PRIMARY KEY,
@@ -58,7 +124,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   inquiry TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'Open',
   status_reason TEXT NOT NULL DEFAULT '',
-  assigned_agent_id BIGINT REFERENCES agents(id) ON DELETE SET NULL,
+  assigned_agent_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL,
   assigned_team TEXT NOT NULL DEFAULT 'Unassigned',
   sla_status TEXT NOT NULL DEFAULT 'Pending Review',
   priority TEXT NOT NULL DEFAULT 'Normal',
@@ -95,6 +161,29 @@ WHERE status = 'In Progress';
 UPDATE conversations
 SET status = 'open'
 WHERE status = 'in_progress';
+
+ALTER TABLE conversations
+ADD COLUMN IF NOT EXISTS chat_duration_minutes BIGINT NOT NULL DEFAULT 0;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'conversations'
+      AND column_name = 'chat_duration_seconds'
+  ) THEN
+    EXECUTE '
+      UPDATE conversations
+      SET chat_duration_minutes = CASE
+        WHEN chat_duration_minutes = 0 AND chat_duration_seconds > 0
+          THEN FLOOR(chat_duration_seconds / 60.0)::bigint
+        ELSE chat_duration_minutes
+      END
+    ';
+  END IF;
+END $$;
 
 ALTER TABLE tickets
 DROP CONSTRAINT IF EXISTS tickets_status_check;
@@ -139,6 +228,7 @@ CREATE TABLE IF NOT EXISTS support_session_requests (
 );
 
 CREATE INDEX IF NOT EXISTS idx_learners_source ON learners(source);
+CREATE INDEX IF NOT EXISTS idx_learners_support_account_id ON learners(support_account_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_learner_id ON tickets(learner_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_agent_id ON tickets(assigned_agent_id);
@@ -148,7 +238,7 @@ CREATE INDEX IF NOT EXISTS idx_ticket_history_ticket_id ON ticket_history(ticket
 CREATE INDEX IF NOT EXISTS idx_support_session_requests_ticket_id ON support_session_requests(ticket_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_created_at ON messages(conversation_id, created_at);
 
-INSERT INTO agents (username, full_name, email, role)
+INSERT INTO support_accounts (username, full_name, email, role)
 VALUES
   ('ahmedhamamo', 'Ahmed Hamamo', NULL, 'admin')
 ON CONFLICT (username) DO NOTHING;

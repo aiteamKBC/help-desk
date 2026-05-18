@@ -1,0 +1,59 @@
+ROLE_USER = "user"
+ROLE_COACH = "coach"
+ROLE_EMPLOYER = "employer"
+ROLE_ADMIN = "admin"
+ROLE_SUPERADMIN = "superadmin"
+ROLE_AGENT = "agent"
+ACCOUNT_SCOPE_STAFF = "staff"
+ACCOUNT_SCOPE_REQUESTER = "requester"
+
+ACCOUNT_ROLES = (
+    ROLE_USER,
+    ROLE_COACH,
+    ROLE_EMPLOYER,
+    ROLE_ADMIN,
+    ROLE_SUPERADMIN,
+    ROLE_AGENT,
+)
+
+PUBLIC_SUPPORT_ACCOUNT_ROLES = (
+    ROLE_USER,
+    ROLE_COACH,
+    ROLE_EMPLOYER,
+)
+
+STAFF_ACCOUNT_ROLES = (
+    ROLE_ADMIN,
+    ROLE_SUPERADMIN,
+    ROLE_AGENT,
+)
+
+PUBLIC_SUPPORT_ACCOUNT_ROLE_SET = set(PUBLIC_SUPPORT_ACCOUNT_ROLES)
+ADMIN_ACCESS_ROLES = {ROLE_ADMIN, ROLE_SUPERADMIN}
+ACCOUNT_SCOPES = (
+    ACCOUNT_SCOPE_STAFF,
+    ACCOUNT_SCOPE_REQUESTER,
+)
+
+DEFAULT_ACCOUNT_ROLE = ROLE_AGENT
+
+ACCOUNT_ROLE_LABELS = {
+    ROLE_USER: "User",
+    ROLE_COACH: "Coach",
+    ROLE_EMPLOYER: "Employer",
+    ROLE_ADMIN: "Admin",
+    ROLE_SUPERADMIN: "Super Admin",
+    ROLE_AGENT: "Agent",
+}
+
+ACCOUNT_SCOPE_LABELS = {
+    ACCOUNT_SCOPE_STAFF: "Staff",
+    ACCOUNT_SCOPE_REQUESTER: "Requester",
+}
+
+
+def derive_account_scope_from_role(role: str | None) -> str:
+    normalized_role = (role or "").strip().lower()
+    if normalized_role in PUBLIC_SUPPORT_ACCOUNT_ROLE_SET:
+        return ACCOUNT_SCOPE_REQUESTER
+    return ACCOUNT_SCOPE_STAFF

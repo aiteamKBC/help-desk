@@ -203,7 +203,7 @@ function getCanvasContext(canvas: HTMLCanvasElement) {
 
 function getSenderLabel(sender: ChatMessage["sender"]) {
   if (sender === "user") return "You";
-  if (sender === "agent") return "Live Agent";
+  if (sender === "agent") return "Live Chat";
   return "Help Bot";
 }
 

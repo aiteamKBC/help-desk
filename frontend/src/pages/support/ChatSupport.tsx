@@ -5,7 +5,6 @@ import {
   Bot,
   CalendarClock,
   Check,
-  CheckCircle2,
   Download,
   Headphones,
   Paperclip,
@@ -23,27 +22,28 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { StatusBadge } from "@/components/support/StatusBadge";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { type Category, type ChatMessage, type TechnicalSubcategory, type TicketStatus, useSupport } from "@/context/SupportContext";
+import { type Category, type ChatMessage, type TechnicalSubcategory, type Ticket, useSupport } from "@/context/SupportContext";
 import { downloadChatPdf } from "@/lib/chatPdf";
+import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
+import { getSupportResumePath, isAwaitingMeetingTicket, isAwaitingSupportReviewTicket, isQuickTicketOnlyRequesterRole } from "@/lib/supportFlow";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
 const ukSupportTimeZone = "Europe/London";
 const ukSupportSessionStartMinutes = 8 * 60;
 const ukSupportSessionEndMinutes = 16 * 60;
+const supportSessionSlotIntervalMinutes = 30;
 const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
-const inactivityReminderDelayMs = 2 * 60 * 1000;
-const inactivityAutoCloseDelayMs = 3 * 60 * 1000;
 const learnerChatPollIntervalMs = 2500;
 const chatbotClosingReason = "Closed via Chatbot";
 const awaitingMeetingReason = "Awaiting support meeting";
 const inactivityClosingReason = "Closed due to inactivity";
-const inactivityClosedText = "This chat has been closed due to inactivity.";
 const closedChatDescription = "If you still need help, you can start a new chat and continue with a fresh support request.";
-const liveAgentRequestedMessage = "A live support agent has been requested. Please stay connected while we connect you.";
+const liveAgentRequestedMessage = "Live chat has been requested. Please stay connected while we connect you.";
 
 function getIssueLabel(category: string, technicalSubcategory: string) {
   return technicalSubcategory.trim() || category.trim() || "your request";
@@ -53,11 +53,6 @@ function buildSupportIntroMessage(learnerName: string, category: string, technic
   const greetingName = learnerName.trim() || "there";
   const issueLabel = getIssueLabel(category, technicalSubcategory);
   return `Hello ${greetingName}, Thank you for reaching Kent College Support, I understand you are reaching us for an issue related to ${issueLabel}, am I correct?`;
-}
-
-function buildInactivityReminderText(learnerName: string) {
-  const greetingName = learnerName.trim() || "there";
-  return `Hi ${greetingName}, are you still connected? Please note that this chat will be automatically closed if we do not receive a reply within 3 minutes.`;
 }
 
 function buildTimestamp() {
@@ -87,6 +82,39 @@ function ensureIntroMessage(messages: ChatMessage[], introText: string) {
   );
 
   return [buildBotMessage(introText), ...messagesWithoutIntro];
+}
+
+function isSameChatMessage(left: Pick<ChatMessage, "sender" | "text">, right: Pick<ChatMessage, "sender" | "text">) {
+  return left.sender === right.sender && left.text === right.text;
+}
+
+function areMessageListsEquivalent(left: ChatMessage[], right: ChatMessage[]) {
+  return left.length === right.length && left.every((message, index) => isSameChatMessage(message, right[index]));
+}
+
+function isMessageListPrefix(prefix: ChatMessage[], full: ChatMessage[]) {
+  return prefix.length <= full.length && prefix.every((message, index) => isSameChatMessage(message, full[index]));
+}
+
+function reconcileChatHistory(
+  localMessages: ChatMessage[],
+  incomingMessages: ChatMessage[],
+  preferLocalMessages = false,
+) {
+  if (areMessageListsEquivalent(localMessages, incomingMessages)) {
+    return { messages: localMessages, backendCaughtUp: true };
+  }
+
+  // Keep optimistic learner messages visible until the backend history catches up.
+  if (preferLocalMessages && localMessages.length > incomingMessages.length && isMessageListPrefix(incomingMessages, localMessages)) {
+    return { messages: localMessages, backendCaughtUp: false };
+  }
+
+  return { messages: incomingMessages, backendCaughtUp: true };
+}
+
+function isLearnerChatClosed(ticket: Pick<Ticket, "status" | "chatState">) {
+  return ticket.status === "Closed" || ticket.chatState === "closed";
 }
 
 function formatDateInputValue(date: Date) {
@@ -147,6 +175,11 @@ function isWithinSupportSessionWindow(requestedDateTime: Date) {
   return isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes);
 }
 
+function isSupportSessionTimeAligned(requestedDateTime: Date) {
+  const localMinutes = (requestedDateTime.getHours() * 60) + requestedDateTime.getMinutes();
+  return localMinutes % supportSessionSlotIntervalMinutes === 0;
+}
+
 function getSupportSessionValidationMessage(dateValue: string, timeValue: string, now = new Date()) {
   if (!dateValue || !timeValue) {
     return "";
@@ -161,11 +194,53 @@ function getSupportSessionValidationMessage(dateValue: string, timeValue: string
     return "Support sessions must be booked more than 24 hours in advance.";
   }
 
+  if (!isSupportSessionTimeAligned(requestedDateTime)) {
+    return "Support sessions must start on 30-minute intervals.";
+  }
+
   if (!isWithinSupportSessionWindow(requestedDateTime)) {
     return "Support sessions must be between 8:00 AM and 4:00 PM UK time.";
   }
 
   return "";
+}
+
+function buildSupportSessionTimeOptions(dateValue: string, now = new Date()) {
+  if (!dateValue) {
+    return [];
+  }
+
+  const options: Array<{ value: string; label: string }> = [];
+
+  for (let minutes = 0; minutes < 24 * 60; minutes += supportSessionSlotIntervalMinutes) {
+    const hours = String(Math.floor(minutes / 60)).padStart(2, "0");
+    const mins = String(minutes % 60).padStart(2, "0");
+    const value = `${hours}:${mins}`;
+    const requestedDateTime = parseLocalDateTime(dateValue, value);
+
+    if (!requestedDateTime) {
+      continue;
+    }
+
+    if ((requestedDateTime.getTime() - now.getTime()) <= supportSessionLeadTimeMs) {
+      continue;
+    }
+
+    if (!isWithinSupportSessionWindow(requestedDateTime)) {
+      continue;
+    }
+
+    options.push({
+      value,
+      label: new Intl.DateTimeFormat("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      }).format(requestedDateTime),
+    });
+  }
+
+  return options;
 }
 
 function formatSupportSessionDetails(dateValue: string, timeValue: string) {
@@ -195,18 +270,12 @@ function formatSupportSessionDetails(dateValue: string, timeValue: string) {
 
 const ChatSupport = () => {
   const navigate = useNavigate();
-  const { ticket, setTicket, updateTicket } = useSupport();
+  const { ticket, bookingSummary, setTicket, updateTicket, setBookingSummary, clearBookingSummary } = useSupport();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [bookingOpen, setBookingOpen] = useState(false);
   const [bookingDate, setBookingDate] = useState("");
   const [bookingTime, setBookingTime] = useState("");
-  const [bookingSuccess, setBookingSuccess] = useState<{
-    dateLabel: string;
-    timeLabel: string;
-    reservationConfirmed: boolean;
-    meetingJoinUrl: string | null;
-  } | null>(null);
   const [isClosing, setIsClosing] = useState(false);
   const [isBooking, setIsBooking] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
@@ -214,24 +283,12 @@ const ChatSupport = () => {
   const [isDownloadingTranscript, setIsDownloadingTranscript] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const reminderTimerRef = useRef<number | null>(null);
-  const autoCloseTimerRef = useRef<number | null>(null);
-  const reminderSentRef = useRef(false);
-  const isAutoClosingRef = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
+  const hasPendingOptimisticHistoryRef = useRef(false);
   const ticketRef = useRef(ticket);
-
-  const clearInactivityTimers = () => {
-    if (reminderTimerRef.current !== null) {
-      window.clearTimeout(reminderTimerRef.current);
-      reminderTimerRef.current = null;
-    }
-
-    if (autoCloseTimerRef.current !== null) {
-      window.clearTimeout(autoCloseTimerRef.current);
-      autoCloseTimerRef.current = null;
-    }
-  };
+  const isSupportReviewChatLocked = isAwaitingSupportReviewTicket(ticket);
+  const isQuickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
+  const isMeetingChatReadOnly = Boolean(bookingSummary) || isAwaitingMeetingTicket(ticket);
 
   const replaceMessages = (nextMessages: ChatMessage[], persistToTicket = false) => {
     messagesRef.current = nextMessages;
@@ -242,58 +299,6 @@ const ChatSupport = () => {
     }
   };
 
-  const appendBotMessage = (text: string, persistToTicket = false) => {
-    const nextMessages = [...messagesRef.current, buildBotMessage(text)];
-    replaceMessages(nextMessages, persistToTicket);
-    return nextMessages;
-  };
-
-  const syncChatHistoryToServer = async (
-    nextMessages: ChatMessage[],
-    options?: {
-      status?: TicketStatus;
-      statusReason?: string;
-    },
-  ) => {
-    const latestTicket = ticketRef.current;
-    if (!latestTicket.id) {
-      return null;
-    }
-
-    const response = await fetch(`/api/tickets/${encodeURIComponent(latestTicket.id)}/chat-history`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        status: options?.status || latestTicket.status,
-        statusReason: options?.statusReason ?? latestTicket.statusReason,
-        messages: nextMessages.map((message) => ({
-          sender: message.sender,
-          text: message.text,
-          timestamp: message.timestamp,
-        })),
-      }),
-    });
-
-    const payload = (await response.json().catch(() => null)) as {
-      message?: string;
-      ticket?: {
-        status?: TicketStatus;
-        statusReason?: string;
-        assignedTeam?: string;
-        slaStatus?: string;
-        createdAt?: string;
-      };
-    } | null;
-
-    if (!response.ok) {
-      throw new Error(payload?.message || "We could not sync the chat history right now.");
-    }
-
-    return payload;
-  };
-
   useEffect(() => {
     ticketRef.current = ticket;
   }, [ticket]);
@@ -301,6 +306,20 @@ const ChatSupport = () => {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    if (isQuickTicketOnlyFlow) {
+      navigate(getSupportResumePath(ticket, bookingSummary));
+      return;
+    }
+  }, [bookingSummary, isQuickTicketOnlyFlow, navigate, ticket]);
+
+  useEffect(() => {
+    if (isSupportReviewChatLocked) {
+      navigate("/support/status");
+      return;
+    }
+  }, [navigate, isSupportReviewChatLocked]);
 
   useEffect(() => {
     if (!ticket.email) {
@@ -322,6 +341,9 @@ const ChatSupport = () => {
           learnerName?: string;
           category?: Category;
           technicalSubcategory?: TechnicalSubcategory;
+          status?: "Open" | "Pending" | "Closed";
+          statusReason?: string;
+          chatState?: "open" | "closed";
           liveChatRequested?: boolean;
         },
       ) => {
@@ -352,6 +374,9 @@ const ChatSupport = () => {
               ticket?: {
                 category?: Category;
                 technicalSubcategory?: TechnicalSubcategory;
+                status?: "Open" | "Pending" | "Closed";
+                statusReason?: string;
+                chatState?: "open" | "closed";
                 liveChatRequested?: boolean;
               };
             }
@@ -366,6 +391,9 @@ const ChatSupport = () => {
           learnerName: payload.learner?.fullName || "",
           category: payload.ticket?.category || ticket.category,
           technicalSubcategory: payload.ticket?.technicalSubcategory || "",
+          status: payload.ticket?.status || ticket.status,
+          statusReason: payload.ticket?.statusReason || ticket.statusReason,
+          chatState: payload.ticket?.chatState ?? ticket.chatState,
           ...(typeof payload.ticket?.liveChatRequested === "boolean" ? { liveChatRequested: payload.ticket.liveChatRequested } : {}),
         });
       } catch {
@@ -386,7 +414,7 @@ const ChatSupport = () => {
   }, [isSendingMessage, messages]);
 
   useEffect(() => {
-    if (!ticket.id || ticket.status === "Closed") {
+    if (!ticket.id || isLearnerChatClosed(ticket)) {
       return;
     }
 
@@ -407,8 +435,10 @@ const ChatSupport = () => {
                   assignedTeam?: string;
                   slaStatus?: string;
                   createdAt?: string;
+                  chatState?: "open" | "closed";
                   liveChatRequested?: boolean;
                 };
+                bookingSummary?: ApiBookingSummary | null;
                 chatHistory?: Array<{
                   id: string;
                   sender: "bot" | "user" | "agent";
@@ -422,11 +452,15 @@ const ChatSupport = () => {
             return;
           }
 
-          const nextMessages = payload.chatHistory || [];
-          const currentMessagesJson = JSON.stringify(messagesRef.current);
-          const nextMessagesJson = JSON.stringify(nextMessages);
+          const currentMessages = messagesRef.current;
+          const { messages: nextMessages, backendCaughtUp } = reconcileChatHistory(
+            currentMessages,
+            payload.chatHistory || [],
+            hasPendingOptimisticHistoryRef.current,
+          );
+          hasPendingOptimisticHistoryRef.current = !backendCaughtUp;
 
-          if (currentMessagesJson !== nextMessagesJson) {
+          if (!areMessageListsEquivalent(currentMessages, nextMessages)) {
             replaceMessages(nextMessages);
           }
 
@@ -437,8 +471,12 @@ const ChatSupport = () => {
             assignedTeam: payload.ticket.assignedTeam || ticketRef.current.assignedTeam,
             slaStatus: payload.ticket.slaStatus || ticketRef.current.slaStatus,
             createdAt: payload.ticket.createdAt || ticketRef.current.createdAt,
+            chatState: payload.ticket.chatState ?? ticketRef.current.chatState,
             liveChatRequested: Boolean(payload.ticket.liveChatRequested),
           });
+          if ("bookingSummary" in payload) {
+            setBookingSummary(toBookingSummary(payload.bookingSummary));
+          }
         } catch {
           // Keep the learner chat stable; the next successful poll will sync new messages.
         }
@@ -446,122 +484,15 @@ const ChatSupport = () => {
     }, learnerChatPollIntervalMs);
 
     return () => window.clearInterval(intervalId);
-  }, [ticket.id, ticket.status, isSendingMessage, isRequestingLiveAgent]);
+  }, [ticket.id, ticket.status, ticket.chatState, isSendingMessage, isRequestingLiveAgent]);
 
   const pushMsg = (message: Omit<ChatMessage, "id" | "timestamp">) => {
     const nextMessages = [
       ...messagesRef.current,
       { ...message, id: crypto.randomUUID(), timestamp: buildTimestamp() },
     ];
-    replaceMessages(nextMessages);
+    replaceMessages(nextMessages, true);
   };
-
-  useEffect(() => {
-    clearInactivityTimers();
-
-    if (ticket.status !== "Open" || isAutoClosingRef.current) {
-      return () => clearInactivityTimers();
-    }
-
-    const lastMessage = messages[messages.length - 1];
-    if (!lastMessage || lastMessage.sender === "user") {
-      return () => clearInactivityTimers();
-    }
-
-    if (reminderSentRef.current) {
-      autoCloseTimerRef.current = window.setTimeout(() => {
-        const latestTicket = ticketRef.current;
-        const latestMessages = messagesRef.current;
-        const latestLastMessage = latestMessages[latestMessages.length - 1];
-
-        if (
-          latestTicket.status !== "Open"
-          || !latestLastMessage
-          || latestLastMessage.sender === "user"
-          || isAutoClosingRef.current
-        ) {
-          reminderSentRef.current = false;
-          return;
-        }
-
-        isAutoClosingRef.current = true;
-        clearInactivityTimers();
-
-        const nextMessages = appendBotMessage(inactivityClosedText, true);
-        updateTicket({
-          chatHistory: nextMessages,
-          status: "Closed",
-          statusReason: inactivityClosingReason,
-        });
-        setInput("");
-        setBookingOpen(false);
-        toast.error("This chat was closed due to inactivity.");
-
-        if (!latestTicket.id) {
-          return;
-        }
-
-        void (async () => {
-          try {
-            const payload = await syncChatHistoryToServer(nextMessages, {
-              status: "Closed",
-              statusReason: inactivityClosingReason,
-            });
-
-            updateTicket({
-              chatHistory: nextMessages,
-              status: "Closed",
-              statusReason: payload?.ticket?.statusReason || inactivityClosingReason,
-              assignedTeam: payload?.ticket?.assignedTeam || latestTicket.assignedTeam,
-              slaStatus: payload?.ticket?.slaStatus || latestTicket.slaStatus,
-              createdAt: payload?.ticket?.createdAt || latestTicket.createdAt,
-            });
-          } catch {
-            toast.error("We could not connect to the server to sync the automatic chat closure.");
-          }
-        })();
-      }, inactivityAutoCloseDelayMs);
-
-      return () => clearInactivityTimers();
-    }
-
-    reminderTimerRef.current = window.setTimeout(() => {
-      const latestTicket = ticketRef.current;
-      const latestMessages = messagesRef.current;
-      const latestLastMessage = latestMessages[latestMessages.length - 1];
-
-      if (
-        latestTicket.status !== "Open"
-        || !latestLastMessage
-        || latestLastMessage.sender === "user"
-        || reminderSentRef.current
-      ) {
-        return;
-      }
-
-      reminderSentRef.current = true;
-      const nextMessages = appendBotMessage(buildInactivityReminderText(latestTicket.learnerName), true);
-
-      // Persist timed system messages immediately so polling cannot wipe them out.
-      void syncChatHistoryToServer(nextMessages, {
-        status: latestTicket.status,
-        statusReason: latestTicket.statusReason,
-      }).then((payload) => {
-        updateTicket({
-          chatHistory: nextMessages,
-          status: payload?.ticket?.status || latestTicket.status,
-          statusReason: payload?.ticket?.statusReason || latestTicket.statusReason,
-          assignedTeam: payload?.ticket?.assignedTeam || latestTicket.assignedTeam,
-          slaStatus: payload?.ticket?.slaStatus || latestTicket.slaStatus,
-          createdAt: payload?.ticket?.createdAt || latestTicket.createdAt,
-        });
-      }).catch(() => {
-        // Keep the reminder visible locally; the auto-close fallback still runs on the learner side.
-      });
-    }, inactivityReminderDelayMs);
-
-    return () => clearInactivityTimers();
-  }, [messages, ticket.status]);
 
   const handleSend = async () => {
     const trimmedInput = input.trim();
@@ -570,8 +501,13 @@ const ChatSupport = () => {
       return;
     }
 
-    if (ticket.status === "Closed") {
+    if (isLearnerChatClosed(ticket)) {
       toast.error("This chat is already closed.");
+      return;
+    }
+
+    if (isMeetingChatReadOnly) {
+      toast.error("Chat replies are disabled while your support meeting is active.");
       return;
     }
 
@@ -580,20 +516,19 @@ const ChatSupport = () => {
       return;
     }
 
-    clearInactivityTimers();
-    reminderSentRef.current = false;
-
     const userMessage: Omit<ChatMessage, "id" | "timestamp"> = {
       sender: "user",
       text: trimmedInput,
     };
-    const nextMessages = [...messages, {
+    const previousMessages = messagesRef.current;
+    const nextMessages = [...previousMessages, {
       ...userMessage,
       id: crypto.randomUUID(),
       timestamp: buildTimestamp(),
     }];
 
-    replaceMessages(nextMessages);
+    hasPendingOptimisticHistoryRef.current = true;
+    replaceMessages(nextMessages, true);
     setInput("");
     setIsSendingMessage(true);
 
@@ -623,10 +558,14 @@ const ChatSupport = () => {
             assignedTeam?: string;
             slaStatus?: string;
             createdAt?: string;
+            chatState?: "open" | "closed";
           };
         } | null;
 
         if (!response.ok) {
+          hasPendingOptimisticHistoryRef.current = false;
+          replaceMessages(previousMessages, true);
+          setInput(trimmedInput);
           toast.error(payload?.message || "We could not send your message to the live support queue right now.");
           return;
         }
@@ -638,6 +577,7 @@ const ChatSupport = () => {
           assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
           slaStatus: payload?.ticket?.slaStatus || ticket.slaStatus,
           createdAt: payload?.ticket?.createdAt || ticket.createdAt,
+          chatState: payload?.ticket?.chatState ?? ticket.chatState,
           liveChatRequested: true,
         });
         return;
@@ -667,6 +607,9 @@ const ChatSupport = () => {
       } | null;
 
       if (!response.ok) {
+        hasPendingOptimisticHistoryRef.current = false;
+        replaceMessages(previousMessages, true);
+        setInput(trimmedInput);
         toast.error(payload?.message || "We could not send your message to the chatbot right now.");
         return;
       }
@@ -683,6 +626,9 @@ const ChatSupport = () => {
         pushMsg({ sender: "bot", text: "Your message was sent, but the chatbot did not return a reply." });
       }
     } catch {
+      hasPendingOptimisticHistoryRef.current = false;
+      replaceMessages(previousMessages, true);
+      setInput(trimmedInput);
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setIsSendingMessage(false);
@@ -691,12 +637,15 @@ const ChatSupport = () => {
   };
 
   const handleRequestLiveAgent = async () => {
-    if (!ticket.id || ticket.status === "Closed" || ticket.liveChatRequested || isRequestingLiveAgent) {
+    if (!ticket.id || isLearnerChatClosed(ticket) || ticket.liveChatRequested || isRequestingLiveAgent) {
       return;
     }
 
-    clearInactivityTimers();
-    reminderSentRef.current = false;
+    if (isMeetingChatReadOnly) {
+      toast.error("Live chat requests are unavailable while your support meeting is active.");
+      return;
+    }
+
     setIsRequestingLiveAgent(true);
 
     try {
@@ -707,6 +656,7 @@ const ChatSupport = () => {
       const payload = (await response.json().catch(() => null)) as {
         message?: string;
         ticket?: {
+          chatState?: "open" | "closed";
           liveChatRequested?: boolean;
         };
       } | null;
@@ -738,6 +688,7 @@ const ChatSupport = () => {
 
       updateTicket({
         chatHistory: nextMessages,
+        chatState: payload?.ticket?.chatState ?? ticket.chatState,
         liveChatRequested: payload?.ticket?.liveChatRequested ?? true,
       });
       toast.success("Live support has been requested. Please stay connected.");
@@ -748,80 +699,30 @@ const ChatSupport = () => {
     }
   };
 
-  const openOutlookBookings = async () => {
-    if (ticket.status === "Closed") {
+  const openBookingDialog = () => {
+    if (isLearnerChatClosed(ticket)) {
       toast.error("This chat is already closed.");
       return;
     }
 
-    clearInactivityTimers();
-    reminderSentRef.current = false;
-
-    const bookingLink = "/api/booking-link";
-    const bookingMessage = buildBotMessage("Opening the Kent Business College booking page for you now.");
-    const nextMessages = [...messages, bookingMessage];
-
-    if (!ticket.id) {
-      replaceMessages(nextMessages);
-      updateTicket({
-        chatHistory: nextMessages,
-        status: "Pending",
-        statusReason: awaitingMeetingReason,
-      });
-      window.open(bookingLink, "_blank", "noopener,noreferrer");
+    if (isMeetingChatReadOnly) {
+      toast.error("This chat is in read-only mode while your support meeting is active.");
       return;
     }
 
-    try {
-      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          status: "Pending",
-          statusReason: awaitingMeetingReason,
-          messages: nextMessages,
-        }),
-      });
-
-      const payload = (await response.json().catch(() => null)) as {
-        message?: string;
-        ticket?: {
-          status?: string;
-          statusReason?: string;
-          assignedTeam?: string;
-          slaStatus?: string;
-          createdAt?: string;
-        };
-      } | null;
-
-      if (!response.ok) {
-        toast.error(payload?.message || "We could not update the ticket status for booking right now.");
-        return;
-      }
-
-      replaceMessages(nextMessages);
-      updateTicket({
-        chatHistory: nextMessages,
-        status: "Pending",
-        statusReason: payload?.ticket?.statusReason || awaitingMeetingReason,
-        assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
-        slaStatus: payload?.ticket?.slaStatus || ticket.slaStatus,
-        createdAt: payload?.ticket?.createdAt || ticket.createdAt,
-      });
-      window.open(bookingLink, "_blank", "noopener,noreferrer");
-    } catch {
-      toast.error("We could not connect to the server. Please try again.");
+    if (!ticket.id || !ticket.email) {
+      toast.error("We could not prepare your booking details right now.");
+      return;
     }
+
+    setBookingOpen(true);
   };
 
   const minBookingDate = formatDateInputValue(new Date());
   const bookingValidationMessage = getSupportSessionValidationMessage(bookingDate, bookingTime);
+  const bookingTimeOptions = buildSupportSessionTimeOptions(bookingDate);
 
   const handleClose = async () => {
-    clearInactivityTimers();
-    reminderSentRef.current = false;
     const nextMessages = messagesRef.current;
 
     if (!ticket.id) {
@@ -859,6 +760,7 @@ const ChatSupport = () => {
           assignedTeam?: string;
           slaStatus?: string;
           createdAt?: string;
+          chatState?: "open" | "closed";
         };
       } | null;
 
@@ -875,6 +777,7 @@ const ChatSupport = () => {
         assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
         slaStatus: payload?.ticket?.slaStatus || ticket.slaStatus,
         createdAt: payload?.ticket?.createdAt || ticket.createdAt,
+        chatState: payload?.ticket?.chatState || "closed",
       });
       navigate("/support/status");
     } catch {
@@ -898,8 +801,6 @@ const ChatSupport = () => {
       return;
     }
 
-    clearInactivityTimers();
-    reminderSentRef.current = false;
     setIsBooking(true);
 
     try {
@@ -936,7 +837,15 @@ const ChatSupport = () => {
 
       const bookingDetails = formatSupportSessionDetails(bookingDate, bookingTime);
       setBookingOpen(false);
-      setBookingSuccess({
+      updateTicket({
+        status: (payload?.ticket?.status as typeof ticket.status | undefined) || "Pending",
+        statusReason: payload?.ticket?.statusReason || awaitingMeetingReason,
+        assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
+      });
+      setBookingDate("");
+      setBookingTime("");
+
+      setBookingSummary({
         ...bookingDetails,
         reservationConfirmed: Boolean(payload?.reservationConfirmed),
         meetingJoinUrl: payload?.meetingJoinUrl || null,
@@ -956,13 +865,7 @@ const ChatSupport = () => {
       } else {
         toast.success("Your support session request has been submitted successfully.");
       }
-      updateTicket({
-        status: (payload?.ticket?.status as typeof ticket.status | undefined) || "Pending",
-        statusReason: payload?.ticket?.statusReason || awaitingMeetingReason,
-        assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
-      });
-      setBookingDate("");
-      setBookingTime("");
+      navigate("/support/status");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
@@ -971,10 +874,6 @@ const ChatSupport = () => {
   };
 
   const handleStartNewChat = () => {
-    clearInactivityTimers();
-    reminderSentRef.current = false;
-    isAutoClosingRef.current = false;
-
     setTicket({
       id: "",
       learnerName: ticket.learnerName,
@@ -988,9 +887,11 @@ const ChatSupport = () => {
       assignedTeam: "Unassigned",
       slaStatus: "Pending Review",
       createdAt: "",
+      chatState: "open",
       liveChatRequested: false,
       chatHistory: [],
     });
+    clearBookingSummary();
     navigate("/support/inquiry");
   };
 
@@ -1016,30 +917,36 @@ const ChatSupport = () => {
     }
   };
 
-  const isChatClosed = ticket.status === "Closed";
+  const isChatClosed = isLearnerChatClosed(ticket);
   const isInactivityClosed = ticket.statusReason === inactivityClosingReason;
   const closedPanelTitle = isInactivityClosed ? "Chat closed due to inactivity" : "Chat closed";
+  const showReadOnlyPanel = !isChatClosed && isMeetingChatReadOnly;
 
   return (
     <SupportLayout>
       <StepIndicator current={3} />
       <div className="max-w-5xl mx-auto">
-        <div className="relative flex flex-col overflow-hidden border bg-card rounded-2xl shadow-card h-[calc(100vh-220px)] min-h-[560px]">
-          <div className="flex items-center justify-between px-4 py-3.5 border-b md:px-6 bg-card">
+        <div className="relative flex h-[calc(100dvh-185px)] min-h-[480px] flex-col overflow-hidden rounded-2xl border border-primary/10 bg-card shadow-[0_12px_30px_-18px_hsl(var(--primary)/0.35),0_6px_16px_-10px_hsl(var(--primary)/0.18)] sm:h-[calc(100vh-220px)] sm:min-h-[560px]">
+          <div className="relative z-10 flex flex-col gap-3 border-b border-primary/10 bg-gradient-to-r from-primary/[0.05] via-card to-card px-4 py-3.5 shadow-[0_10px_22px_-18px_hsl(var(--primary)/0.4)] sm:flex-row sm:items-center sm:justify-between md:px-6">
             <div className="flex items-center gap-2">
               <div className="flex items-center justify-center w-8 h-8 rounded-lg gradient-primary">
                 <Headphones className="w-4 h-4 text-primary-foreground" />
               </div>
               <div className="text-left">
-                <div className="text-sm font-semibold">Kent Live Chat</div>
+                <div className="text-sm font-semibold">Kent Chatbot</div>
                 {ticket.liveChatRequested ? (
-                  <div className="text-xs font-medium text-success">Live agent requested</div>
+                  <div className="text-xs font-medium text-success">Live chat requested</div>
                 ) : null}
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <StatusBadge status={ticket.status} />
-              <Button variant="outline" size="sm" onClick={() => void handleClose()} disabled={isClosing || isChatClosed}>
+            <div className="flex w-full items-center justify-between gap-2 sm:w-auto sm:justify-end">
+              <StatusBadge status={isChatClosed ? "Closed" : ticket.status} />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleClose()}
+                disabled={isClosing || isChatClosed || isMeetingChatReadOnly}
+              >
                 <X className="w-4 h-4 mr-1.5" /> Close
               </Button>
             </div>
@@ -1048,7 +955,7 @@ const ChatSupport = () => {
           <div className="relative flex-1 min-h-0">
             <div
               ref={scrollRef}
-              className="h-full px-4 py-5 pr-20 space-y-4 overflow-y-auto sm:pr-24 md:px-6 md:pr-28 bg-gradient-to-b from-background to-card"
+              className="h-full space-y-4 overflow-y-auto bg-gradient-to-b from-background to-card px-3 py-4 pr-16 sm:px-4 sm:py-5 sm:pr-24 md:px-6 md:pr-28"
             >
               {messages.map((message) => (
                 <MessageBubble key={message.id} m={message} />
@@ -1058,47 +965,61 @@ const ChatSupport = () => {
             </div>
 
             <SupportActionRail
-              onBookingClick={openOutlookBookings}
+              onBookingClick={openBookingDialog}
               onLiveAgentClick={handleRequestLiveAgent}
-              bookingDisabled={isChatClosed}
-              liveAgentDisabled={isChatClosed || isRequestingLiveAgent || ticket.liveChatRequested}
+              bookingDisabled={isChatClosed || isMeetingChatReadOnly || !ticket.id || !ticket.email}
+              liveAgentDisabled={isChatClosed || isMeetingChatReadOnly || isRequestingLiveAgent || ticket.liveChatRequested}
               liveAgentRequested={ticket.liveChatRequested}
             />
           </div>
 
           <div className="p-3 border-t md:p-4 bg-card">
             {isChatClosed ? (
-              <div className="rounded-2xl border bg-muted/30 px-4 py-4">
+              <div className="rounded-2xl border border-primary/10 bg-muted/30 px-4 py-4 shadow-[0_10px_24px_-18px_hsl(var(--primary)/0.35)]">
                 <div className="text-sm font-semibold text-foreground">{closedPanelTitle}</div>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {closedChatDescription}
                 </p>
-                <div className="mt-4 flex flex-wrap justify-end gap-3">
-                  <Button variant="outline" onClick={() => void handleDownloadTranscript()} disabled={isDownloadingTranscript}>
+                <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:justify-end">
+                  <Button variant="outline" className="w-full sm:w-auto" onClick={() => void handleDownloadTranscript()} disabled={isDownloadingTranscript}>
                     <Download className="h-4 w-4 mr-2" />
                     {isDownloadingTranscript ? "Preparing Transcript..." : "Download Transcript"}
                   </Button>
-                  <Button onClick={handleStartNewChat} className="border-0 gradient-primary">
+                  <Button onClick={handleStartNewChat} className="w-full border-0 gradient-primary sm:w-auto">
                     Start New Chat
                   </Button>
                 </div>
               </div>
+            ) : showReadOnlyPanel ? (
+              <div className="rounded-2xl border border-primary/15 bg-primary/5 px-4 py-4 shadow-[0_10px_24px_-18px_hsl(var(--primary)/0.35)]">
+                <div className="text-sm font-semibold text-foreground">Chat is read-only during your booked session</div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  You can still review the conversation here, but new messages are disabled until the support meeting is cancelled or completed.
+                </p>
+                <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:justify-end">
+                  <Button variant="outline" className="w-full sm:w-auto" onClick={() => navigate("/support/status")}>
+                    View Meeting Status
+                  </Button>
+                </div>
+              </div>
             ) : (
-              <div className="flex items-end gap-2">
-                <Button variant="ghost" size="icon" className="shrink-0" aria-label="Attach">
-                  <Paperclip className="w-5 h-5" />
-                </Button>
-                <Input
-                  ref={inputRef}
-                  value={input}
-                  onChange={(event) => setInput(event.target.value)}
-                  onKeyDown={(event) => event.key === "Enter" && void handleSend()}
-                  placeholder="Type your message..."
-                  className="h-11"
-                />
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <div className="flex flex-1 items-end gap-2">
+                  <Button variant="ghost" size="icon" className="shrink-0" aria-label="Attach">
+                    <Paperclip className="w-5 h-5" />
+                  </Button>
+                  <Input
+                    ref={inputRef}
+                    value={input}
+                    onChange={(event) => setInput(event.target.value)}
+                    onKeyDown={(event) => event.key === "Enter" && void handleSend()}
+                    placeholder="Type your message..."
+                    className="h-11 flex-1"
+                  />
+                </div>
                 <Button
                   onClick={() => void handleSend()}
-                  className="h-11 border-0 shrink-0 gradient-primary"
+                  className="h-11 w-full border-0 shrink-0 gradient-primary sm:w-auto"
                   disabled={isSendingMessage}
                 >
                   <Send className="w-4 h-4" />
@@ -1111,33 +1032,54 @@ const ChatSupport = () => {
 
       <Dialog open={bookingOpen} onOpenChange={setBookingOpen}>
         <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>Book a Support Session</DialogTitle>
-            <DialogDescription>
-              Choose a date and time that works for you. Sessions are available from 8:00 AM to 4:00 PM UK time, and they must be more than 24 hours away.
-            </DialogDescription>
-          </DialogHeader>
+            <DialogHeader>
+              <DialogTitle>Book a Support Session</DialogTitle>
+              <DialogDescription>
+                Choose a date and time that works for you. We will use your verified Aptem email for the booking, and sessions must be more than 24 hours away between 8:00 AM and 4:00 PM UK time using 30-minute start times.
+              </DialogDescription>
+            </DialogHeader>
           <div className="space-y-3">
+            <div className="rounded-2xl border border-primary/20 bg-primary/5 px-4 py-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-primary">Aptem Email</div>
+              <div className="mt-1 text-sm font-medium text-foreground break-all">{ticket.email || "-"}</div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                This is the email address that will be used for your booking and follow-up.
+              </p>
+            </div>
             <div>
               <label className="block mb-1.5 text-sm font-medium">Date</label>
               <Input
                 type="date"
                 min={minBookingDate}
                 value={bookingDate}
-                onChange={(event) => setBookingDate(event.target.value)}
+                onChange={(event) => {
+                  setBookingDate(event.target.value);
+                  setBookingTime("");
+                }}
               />
             </div>
             <div>
               <label className="block mb-1.5 text-sm font-medium">Time</label>
-              <Input
-                type="time"
-                step="60"
-                value={bookingTime}
-                onChange={(event) => setBookingTime(event.target.value)}
-              />
+              <Select value={bookingTime} onValueChange={setBookingTime} disabled={!bookingDate || bookingTimeOptions.length === 0}>
+                <SelectTrigger className="h-11">
+                  <SelectValue placeholder={bookingDate ? "Select a time slot" : "Choose a date first"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {bookingTimeOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {bookingDate && bookingTimeOptions.length === 0 ? (
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  No valid support session slots are available for the selected date.
+                </p>
+              ) : null}
             </div>
             <p className={cn("text-xs", bookingValidationMessage ? "text-destructive" : "text-muted-foreground")}>
-              {bookingValidationMessage || "Allowed meeting hours are 8:00 AM to 4:00 PM UK time, with more than 24 hours notice required."}
+              {bookingValidationMessage || "Allowed meeting hours are 8:00 AM to 4:00 PM UK time, with more than 24 hours notice required, and sessions start on 30-minute intervals."}
             </p>
           </div>
           <DialogFooter>
@@ -1152,44 +1094,6 @@ const ChatSupport = () => {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={Boolean(bookingSuccess)} onOpenChange={(open) => !open && setBookingSuccess(null)}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <div className="mx-auto mb-2 flex h-14 w-14 items-center justify-center rounded-full bg-success/10">
-              <CheckCircle2 className="h-7 w-7 text-success" />
-            </div>
-            <DialogTitle className="text-center">
-              {bookingSuccess?.reservationConfirmed ? "Teams Session Reserved" : "Support Session Request Submitted"}
-            </DialogTitle>
-            <DialogDescription className="text-center">
-              {bookingSuccess?.reservationConfirmed
-                ? "Your selected time has been reserved successfully in Microsoft Teams. Please keep this slot available, and use the link below if you would like to open the meeting details now."
-                : "Thank you for booking a support session. Your request has been received successfully, and our team will review it and contact you using your registered details to confirm the session."}
-            </DialogDescription>
-          </DialogHeader>
-          {bookingSuccess && (
-            <div className="rounded-2xl border bg-muted/30 px-4 py-3">
-              <div className="text-sm font-semibold text-foreground">Requested session</div>
-              <div className="mt-1 text-sm text-muted-foreground">{bookingSuccess.dateLabel}</div>
-              <div className="text-sm text-muted-foreground">{bookingSuccess.timeLabel}</div>
-            </div>
-          )}
-          <DialogFooter>
-            {bookingSuccess?.meetingJoinUrl && (
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={() => window.open(bookingSuccess.meetingJoinUrl || "", "_blank", "noopener,noreferrer")}
-              >
-                Open Teams Meeting
-              </Button>
-            )}
-            <Button className="w-full border-0 gradient-primary" onClick={() => setBookingSuccess(null)}>
-              Return to Chat
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </SupportLayout>
   );
 };
@@ -1220,7 +1124,7 @@ const MessageBubble = ({ m }: { m: ChatMessage }) => {
       </div>
       <div className={cn("max-w-[80%]", isUser && "text-right")}>
         <div className="mb-1 text-xs text-muted-foreground">
-          {isUser ? "You" : isAgent ? "Live Agent" : "Help Bot"} - {m.timestamp}
+          {isUser ? "You" : isAgent ? "Live Chat" : "Help Bot"} - {m.timestamp}
         </div>
         <div
           className={cn(
@@ -1268,18 +1172,18 @@ const SupportActionRail = ({
   liveAgentDisabled?: boolean;
   liveAgentRequested?: boolean;
 }) => (
-  <div className="pointer-events-none absolute right-3 top-1/2 z-10 flex -translate-y-1/2 flex-col gap-2.5 sm:right-4">
+  <div className="group/rail pointer-events-none absolute bottom-20 right-3 z-10 flex flex-col items-end gap-2.5 sm:bottom-auto sm:right-4 sm:top-1/2 sm:-translate-y-1/2">
     <SupportActionButton
       icon={CalendarClock}
       title="Book Session"
-      desc="Open booking page"
+      desc="Use your Aptem email"
       onClick={onBookingClick}
       disabled={bookingDisabled}
     />
     <SupportActionButton
       icon={Headphones}
-      title={liveAgentRequested ? "Live Agent Requested" : "Live Agent"}
-      desc={liveAgentRequested ? "Please stay connected" : "Request human support"}
+      title={liveAgentRequested ? "Live Chat Requested" : "Live Chat"}
+      desc={liveAgentRequested ? "Please stay connected" : "Request live support"}
       onClick={onLiveAgentClick}
       disabled={liveAgentDisabled}
       active={liveAgentRequested}
@@ -1308,17 +1212,17 @@ const SupportActionButton = ({
     aria-label={`${title}. ${desc}`}
     aria-disabled={disabled}
     className={cn(
-      "group pointer-events-auto flex h-12 w-12 items-center gap-3 overflow-hidden rounded-full border border-border/80 bg-card/95 px-3 text-left shadow-lg backdrop-blur-sm transition-all duration-200 focus:w-60 focus:outline-none focus:ring-2 focus:ring-primary/20",
+      "group/button pointer-events-auto flex h-11 min-w-[152px] items-center gap-2.5 rounded-2xl border border-border/80 bg-card/95 px-3.5 text-left shadow-lg backdrop-blur-sm transition-all duration-300 ease-out focus:outline-none focus:ring-2 focus:ring-primary/20 sm:h-12 sm:w-12 sm:min-w-0 sm:gap-3 sm:overflow-hidden sm:rounded-full sm:px-3 sm:transition-[width,transform,box-shadow,border-color,background-color] sm:duration-[1000ms]",
       active
-        ? "w-60 border-success/30 bg-success/10 shadow-card"
+        ? "border-success/30 bg-success/10 shadow-card sm:w-60"
         : disabled
           ? "cursor-default border-border/60 bg-muted/80"
-          : "hover:w-60 hover:border-primary hover:bg-background hover:shadow-card focus:border-primary focus:bg-background",
+          : "hover:-translate-y-0.5 hover:border-primary/70 hover:bg-background hover:shadow-card sm:group-hover/rail:w-60 sm:group-focus-within/rail:w-60 sm:focus:w-60 sm:focus:border-primary sm:focus:bg-background",
     )}
   >
     <span
       className={cn(
-        "flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+        "flex h-7 w-7 shrink-0 items-center justify-center rounded-full sm:h-6 sm:w-6",
         active
           ? "bg-success text-success-foreground"
           : disabled
@@ -1328,21 +1232,23 @@ const SupportActionButton = ({
     >
       <Icon className="h-3.5 w-3.5" />
     </span>
-    <span className={cn(
-      "min-w-0 max-w-0 overflow-hidden opacity-0 transition-all duration-200 group-hover:max-w-[11rem] group-hover:opacity-100 group-focus:max-w-[11rem] group-focus:opacity-100",
-      active && "max-w-[11rem] opacity-100",
-    )}>
+    <span
+      className={cn(
+        "min-w-0 flex-1 sm:max-w-0 sm:flex-none sm:overflow-hidden sm:opacity-0 sm:transition-[max-width,opacity] sm:duration-[1000ms] sm:ease-out sm:group-hover/rail:max-w-[11rem] sm:group-hover/rail:opacity-100 sm:group-focus-within/rail:max-w-[11rem] sm:group-focus-within/rail:opacity-100",
+        active && "sm:max-w-[11rem] sm:opacity-100",
+      )}
+    >
       <span
         className={cn(
-          "block text-sm font-semibold leading-tight whitespace-nowrap",
+          "block text-[13px] font-semibold leading-tight whitespace-nowrap sm:text-sm",
           active ? "text-success" : disabled ? "text-muted-foreground" : "text-foreground",
         )}
       >
         {title}
       </span>
-      <span className={cn("mt-0.5 inline-flex items-center gap-1 text-xs whitespace-nowrap", active ? "text-success/80" : "text-muted-foreground")}>
+      <span className={cn("mt-0.5 inline-flex items-center gap-1 text-[11px] whitespace-nowrap sm:text-xs", active ? "text-success/80" : "text-muted-foreground")}>
         {desc}
-        {!disabled && !active && <ArrowRight className="h-3 w-3 shrink-0 text-primary" />}
+        {!disabled && !active && <ArrowRight className="hidden h-3 w-3 shrink-0 text-primary sm:block" />}
       </span>
     </span>
   </button>

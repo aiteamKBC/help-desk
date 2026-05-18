@@ -1,9 +1,8 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Mail, AlertTriangle, ArrowRight } from "lucide-react";
+import { Mail, AlertTriangle, ArrowRight, CalendarClock, MessageSquarePlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Dialog,
   DialogContent,
@@ -15,7 +14,9 @@ import {
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { KentCrestMark } from "@/components/support/KentCrestMark";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { useSupport } from "@/context/SupportContext";
+import { type BookingSummary, type RequesterRole, type Ticket, useSupport } from "@/context/SupportContext";
+import { getSupportResumePath, isAwaitingSupportReviewTicket } from "@/lib/supportFlow";
+import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 
 const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 
@@ -37,6 +38,26 @@ const getVerificationErrorState = (
     };
   }
 
+  if (status === 502 && import.meta.env.DEV) {
+    return {
+      title: "Support API Offline",
+      message:
+        payload?.message ||
+        "The frontend is running, but the Django backend on 127.0.0.1:3001 is unavailable. Start or restart the backend and try again.",
+    };
+  }
+
+  if (status === 503) {
+    return {
+      title: "Verification Unavailable",
+      message:
+        payload?.message ||
+        (import.meta.env.DEV
+          ? "The support API is running, but it cannot reach the support data service right now. Check the database connection and try again."
+          : "The verification service is unavailable right now. Please try again in a moment."),
+    };
+  }
+
   return {
     title: "Verification Unavailable",
     message: payload?.message || "The verification service is unavailable right now. Please try again in a moment.",
@@ -48,14 +69,89 @@ const getVerificationRequestFailureMessage = () =>
     ? "We could not reach the support API. Make sure the Django backend is running on 127.0.0.1:3001, then try again."
     : "We could not verify your email right now. Please try again.";
 
+interface RestoredTicketPayload {
+  id: string;
+  learnerName?: string;
+  email: string;
+  requesterRole?: RequesterRole;
+  category: "" | "Learning" | "Technical" | "Others";
+  technicalSubcategory: "" | "Aptem" | "LMS" | "Teams";
+  inquiry: string;
+  status: "Open" | "Pending" | "Closed";
+  statusReason?: string;
+  assignedTeam: string;
+  slaStatus: string;
+  createdAt: string;
+  chatState?: "open" | "closed";
+  liveChatRequested?: boolean;
+}
+
+function buildRestoredTicket(
+  restoredTicket: RestoredTicketPayload,
+  learnerNameFallback: string,
+): Ticket {
+  return {
+    id: restoredTicket.id,
+    learnerName: restoredTicket.learnerName || learnerNameFallback,
+    email: restoredTicket.email,
+    requesterRole: restoredTicket.requesterRole || "user",
+    category: restoredTicket.category,
+    technicalSubcategory: restoredTicket.technicalSubcategory,
+    inquiry: restoredTicket.inquiry,
+    evidence: [],
+    status: restoredTicket.status,
+    statusReason: restoredTicket.statusReason || "",
+    assignedTeam: restoredTicket.assignedTeam,
+    slaStatus: restoredTicket.slaStatus,
+    createdAt: restoredTicket.createdAt,
+    chatState: restoredTicket.chatState || "open",
+    liveChatRequested: restoredTicket.liveChatRequested ?? false,
+    chatHistory: [],
+  };
+}
+
 const EmailVerification = () => {
   const navigate = useNavigate();
-  const { ticket, setTicket, updateTicket } = useSupport();
+  const { ticket, setTicket, setBookingSummary, clearBookingSummary } = useSupport();
   const [email, setEmail] = useState(ticket.email);
   const [errorTitle, setErrorTitle] = useState("Invalid Email");
   const [errorMessage, setErrorMessage] = useState("Please enter a valid email address.");
   const [errorOpen, setErrorOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [existingRequestOpen, setExistingRequestOpen] = useState(false);
+  const [existingRequestTicket, setExistingRequestTicket] = useState<Ticket | null>(null);
+  const [existingRequestBookingSummary, setExistingRequestBookingSummary] = useState<BookingSummary | null>(null);
+
+  const restoreExistingRequest = (restoredTicket: Ticket, restoredBookingSummary: BookingSummary | null) => {
+    setTicket(restoredTicket);
+    setBookingSummary(restoredBookingSummary);
+    setExistingRequestOpen(false);
+    navigate(getSupportResumePath(restoredTicket, restoredBookingSummary));
+  };
+
+  const startNewTicket = (trimmedEmail: string, learnerName: string, requesterRole: RequesterRole) => {
+    setTicket({
+      id: "",
+      learnerName,
+      email: trimmedEmail,
+      requesterRole,
+      category: "",
+      technicalSubcategory: "",
+      inquiry: "",
+      evidence: [],
+      status: "Open",
+      statusReason: "",
+      assignedTeam: "Unassigned",
+      slaStatus: "Pending Review",
+      createdAt: "",
+      chatState: "open",
+      liveChatRequested: false,
+      chatHistory: [],
+    });
+    clearBookingSummary();
+    setExistingRequestOpen(false);
+    navigate("/support/inquiry");
+  };
 
   const handleNext = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -80,31 +176,45 @@ const EmailVerification = () => {
       });
 
       const payload = (await response.json().catch(() => null)) as
-        | { exists?: boolean; message?: string; learner?: { fullName?: string; email?: string } }
+        | {
+            exists?: boolean;
+            message?: string;
+            requesterRole?: RequesterRole;
+            learner?: { fullName?: string; email?: string };
+            ticket?: {
+              id: string;
+              learnerName?: string;
+              email: string;
+              requesterRole?: RequesterRole;
+              category: "" | "Learning" | "Technical" | "Others";
+              technicalSubcategory: "" | "Aptem" | "LMS" | "Teams";
+              inquiry: string;
+              status: "Open" | "Pending" | "Closed";
+              statusReason?: string;
+              assignedTeam: string;
+              slaStatus: string;
+              createdAt: string;
+              chatState?: "open" | "closed";
+              liveChatRequested?: boolean;
+            };
+          bookingSummary?: ApiBookingSummary | null;
+          }
         | null;
 
       if (response.ok && payload?.exists) {
-        if (ticket.email && ticket.email !== trimmedEmail) {
-          setTicket({
-            id: "",
-            learnerName: payload?.learner?.fullName || "",
-            email: trimmedEmail,
-            category: "",
-            technicalSubcategory: "",
-            inquiry: "",
-            evidence: [],
-            status: "Open",
-            statusReason: "",
-            assignedTeam: "Unassigned",
-            slaStatus: "Pending Review",
-            createdAt: "",
-            liveChatRequested: false,
-            chatHistory: [],
-          });
-        } else {
-          updateTicket({ learnerName: payload?.learner?.fullName || "", email: trimmedEmail });
+        const restoredBookingSummary = toBookingSummary(payload.bookingSummary);
+        const restoredTicket = payload.ticket;
+        const learnerName = payload?.learner?.fullName || "";
+        const requesterRole = payload?.requesterRole || restoredTicket?.requesterRole || "user";
+
+        if (restoredTicket?.id) {
+          setExistingRequestTicket(buildRestoredTicket(restoredTicket, learnerName));
+          setExistingRequestBookingSummary(restoredBookingSummary);
+          setExistingRequestOpen(true);
+          return;
         }
-        navigate("/support/inquiry");
+
+        startNewTicket(trimmedEmail, learnerName, requesterRole);
         return;
       }
 
@@ -125,18 +235,30 @@ const EmailVerification = () => {
   return (
     <SupportLayout>
       <StepIndicator current={1} />
-      <div className="max-w-md mx-auto">
-        <div className="bg-card rounded-2xl border shadow-card p-8">
-          <div className="flex justify-center mb-5">
-            <KentCrestMark className="h-24 w-[264px] rounded-3xl" imageClassName="p-3" />
+      <div className="mx-auto max-w-[22rem] sm:max-w-md">
+        <div className="rounded-2xl border bg-card p-6 shadow-card sm:p-8">
+          <div className="mb-6 flex flex-col items-center sm:mb-7">
+            <KentCrestMark
+              variant="full"
+              frame="plain"
+              className="h-[56px] w-full max-w-[220px] sm:h-[60px] sm:max-w-[248px]"
+              imageClassName="object-contain"
+            />
+            <div className="mt-3 inline-flex items-center gap-2 rounded-full border border-primary/10 bg-primary/[0.04] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-primary/80 sm:text-[11px] sm:tracking-[0.18em]">
+              <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
+              Support Portal
+            </div>
           </div>
-          <h1 className="text-2xl font-bold text-center mb-2">Support Request</h1>
-          <p className="text-sm text-muted-foreground text-center mb-7">
-            Please enter the email address registered in our database to continue.
+          <div className="mb-5 text-center sm:mb-6">
+            <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.03em] text-foreground sm:text-[2rem]">
+              Support Request
+            </h1>
+          </div>
+          <p className="mx-auto mb-6 max-w-[320px] text-center text-sm leading-6 text-muted-foreground sm:mb-7 sm:text-[15px] sm:leading-7">
+            Enter the email address your KBC admin registered for you to continue.
           </p>
-          <form onSubmit={handleNext} className="space-y-5">
-            <div className="space-y-2">
-              <Label htmlFor="email">Registered Email</Label>
+          <form onSubmit={handleNext} className="space-y-4 sm:space-y-5">
+            <div>
               <div className="relative">
                 <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                 <Input
@@ -145,7 +267,7 @@ const EmailVerification = () => {
                   placeholder="Enter your registered email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  className="pl-9 h-11"
+                  className="h-12 pl-9 text-[15px]"
                   autoFocus
                   required
                 />
@@ -153,15 +275,15 @@ const EmailVerification = () => {
             </div>
             <Button
               type="submit"
-              className="w-full h-11 gradient-primary border-0"
+              className="h-11 w-full border-0 text-sm font-semibold gradient-primary"
               disabled={isSubmitting}
             >
               {isSubmitting ? "Checking..." : "Next"}
               {!isSubmitting && <ArrowRight className="ml-2 h-4 w-4" />}
             </Button>
           </form>
-          <p className="text-xs text-muted-foreground text-center mt-6">
-            Use the same email address stored for you in KBC records.
+          <p className="mt-5 text-center text-[11px] leading-5 text-muted-foreground sm:mt-6 sm:text-xs">
+            Your role will be identified automatically from your registered account.
           </p>
         </div>
       </div>
@@ -180,6 +302,65 @@ const EmailVerification = () => {
           <DialogFooter>
             <Button className="w-full" onClick={() => setErrorOpen(false)}>
               Try Again
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={existingRequestOpen} onOpenChange={setExistingRequestOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-center">Existing Support Request Found</DialogTitle>
+            <DialogDescription className="text-center">
+              We found an active support request for this email. You can continue to the existing request to access your meeting or updates, or start a new ticket.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            {existingRequestTicket ? (
+              <div className="rounded-2xl border border-primary/15 bg-primary/5 px-4 py-4 text-center">
+                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-primary/80">Current Request</div>
+                <div className="mt-2 text-sm text-muted-foreground">
+                  {existingRequestTicket.category}
+                  {existingRequestTicket.technicalSubcategory ? ` - ${existingRequestTicket.technicalSubcategory}` : ""}
+                </div>
+                <div className="mt-1 text-sm text-muted-foreground">
+                  {existingRequestBookingSummary?.reservationConfirmed
+                    ? "Meeting reserved and ready to open."
+                    : isAwaitingSupportReviewTicket(existingRequestTicket)
+                      ? "Quick ticket submitted and waiting for team review."
+                      : existingRequestTicket.status === "Pending"
+                        ? "Request is saved and waiting for the next support update."
+                        : "Progress saved and available to continue."}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <DialogFooter className="flex-col gap-2 sm:flex-col">
+            <Button
+              className="w-full border-0 gradient-primary"
+              onClick={() => {
+                if (!existingRequestTicket) {
+                  return;
+                }
+                restoreExistingRequest(existingRequestTicket, existingRequestBookingSummary);
+              }}
+            >
+              <CalendarClock className="mr-2 h-4 w-4" />
+              Review Existing Request
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => startNewTicket(
+                email.trim().toLowerCase(),
+                existingRequestTicket?.learnerName || "",
+                existingRequestTicket?.requesterRole || "user",
+              )}
+            >
+              <MessageSquarePlus className="mr-2 h-4 w-4" />
+              Start New Ticket
             </Button>
           </DialogFooter>
         </DialogContent>

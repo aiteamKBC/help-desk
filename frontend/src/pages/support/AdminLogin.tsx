@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
-import { Lock, ShieldCheck, ArrowLeft, Eye, EyeOff } from "lucide-react";
+import { Lock, ShieldCheck, Eye, EyeOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { setAdminSession } from "@/lib/adminSession";
+import { createAdminSessionInstanceId, setAdminSession } from "@/lib/adminSession";
 import { toast } from "sonner";
 
 interface LoginResponse {
@@ -16,6 +16,7 @@ interface LoginResponse {
     fullName: string;
     email: string | null;
     role: string;
+    consoleStatus?: string;
   };
 }
 
@@ -38,6 +39,7 @@ const AdminLogin = () => {
     setIsSubmitting(true);
 
     try {
+      const instanceId = createAdminSessionInstanceId();
       const response = await fetch("/api/admin/login", {
         method: "POST",
         headers: {
@@ -46,6 +48,8 @@ const AdminLogin = () => {
         body: JSON.stringify({
           username,
           password,
+          instanceId,
+          consoleStatus: "Off",
         }),
       });
 
@@ -56,7 +60,11 @@ const AdminLogin = () => {
         return;
       }
 
-      setAdminSession(payload.admin);
+      setAdminSession({
+        ...payload.admin,
+        instanceId,
+        consoleStatus: "Off",
+      });
       toast.success(`Welcome back, ${payload.admin.fullName}`);
       navigate("/admin");
     } catch {
@@ -69,9 +77,6 @@ const AdminLogin = () => {
   return (
     <SupportLayout>
       <div className="max-w-md mx-auto">
-        <Button variant="ghost" size="sm" onClick={() => navigate("/")} className="mb-4">
-          <ArrowLeft className="h-4 w-4 mr-2" /> Back
-        </Button>
         <div className="bg-card rounded-2xl border shadow-card p-8">
           <div className="text-center mb-6">
             <div className="mx-auto h-12 w-12 rounded-2xl gradient-primary flex items-center justify-center shadow-card mb-3">
@@ -142,7 +147,7 @@ const AdminLogin = () => {
         </div>
 
         <p className="text-center text-xs text-muted-foreground mt-4">
-          Need a learner account?{" "}
+          Need support access?{" "}
           <Link to="/support" className="text-primary hover:underline">Go to Support</Link>
         </p>
       </div>
