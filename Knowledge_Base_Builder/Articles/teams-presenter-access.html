@@ -1,0 +1,106 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Teams Presenter/Admin Access</title><style>:root { --bg: #f6f7fb; --panel: #fff; --text: #172033; --muted: #667085; --border: #d9e0ec; --accent: #5b3f8c; --gold: #b8862b; --soft: #f4f0fa; --danger: #b42318; --ok: #027a48; --shadow: 0 10px 28px rgba(16,24,40,.08); --radius: 18px; }
+* { box-sizing: border-box; }
+body { margin: 0px; font-family: Arial, Helvetica, sans-serif; color: var(--text); background: linear-gradient(180deg,#fbfcff,var(--bg)); }
+header { padding: 22px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0px; z-index: 10; box-shadow: rgba(16, 24, 40, 0.05) 0px 4px 18px; }
+.wrap { max-width: 1240px; margin: 0px auto; }
+.header-row { display: flex; gap: 18px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+h1 { margin: 0px 0px 5px; font-size: 26px; }
+.subtitle, .hint { color: var(--muted); line-height: 1.45; }
+.subtitle { margin: 0px; }
+.hint { font-size: 13px; margin: 6px 0px 0px; }
+main { max-width: 1240px; margin: 22px auto 60px; padding: 0px 20px; display: grid; grid-template-columns: 310px minmax(0px, 1fr); gap: 20px; transition: grid-template-columns 0.22s; }
+main.menu-retracted { grid-template-columns: 66px minmax(0px, 1fr); }
+main.tools-hidden { grid-template-columns: minmax(0px, 1fr); }
+main.tools-hidden .side { display: none; }
+@media (max-width: 900px) {
+  main, main.menu-retracted, main.tools-hidden { grid-template-columns: 1fr; }
+  header { position: static; }
+}
+.side, .card, .static-section, .static-top { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.side { padding: 16px; align-self: start; position: sticky; top: 112px; overflow: hidden; transition: padding 0.22s; }
+.side-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.side-head label { margin: 0px; white-space: nowrap; }
+.menu-toggle { min-width: 42px; padding: 8px 10px; }
+.side-body { display: block; }
+.side.retracted { padding: 12px 8px; }
+.side.retracted .side-body, .side.retracted .side-head label { display: none; }
+.side.retracted .side-head { justify-content: center; }
+@media (max-width: 900px) {
+  .side { position: static; }
+}
+.card { padding: 22px; margin-bottom: 18px; }
+.meta { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 700px) {
+  .meta { grid-template-columns: 1fr; }
+}
+label { display: block; font-weight: 700; margin-bottom: 8px; }
+input[type="text"], textarea { width: 100%; border: 1px solid var(--border); border-radius: 12px; padding: 12px 13px; font-size: 15px; background: rgb(255, 255, 255); color: var(--text); outline: none; }
+textarea { min-height: 150px; resize: vertical; line-height: 1.55; }
+.section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.section-title h2 { margin: 0px; font-size: 20px; }
+.pill, .badge { display: inline-block; border-radius: 999px; background: var(--soft); border: 1px solid rgb(231, 221, 245); color: var(--accent); padding: 5px 10px; font-size: 12px; font-weight: 700; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+button, .file-btn { border: 0px; border-radius: 12px; background: rgb(238, 241, 246); color: var(--text); font-weight: 700; padding: 10px 12px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
+button:hover, .file-btn:hover { filter: brightness(0.97); }
+button:disabled { cursor: not-allowed; opacity: 0.48; filter: none; }
+.primary { background: var(--accent); color: white; }
+.gold { background: var(--gold); color: white; }
+.danger { background: rgb(254, 228, 226); color: var(--danger); }
+.full { width: 100%; margin-top: 8px; }
+.small { padding: 7px 9px; font-size: 12px; border-radius: 9px; }
+.hidden-input { display: none; }
+.status { margin-top: 12px; padding: 11px; border-radius: 12px; background: rgb(238, 241, 246); color: var(--text); font-size: 13px; line-height: 1.4; }
+.status.ok { background: rgb(236, 253, 243); color: var(--ok); }
+.status.err { background: rgb(254, 243, 242); color: var(--danger); }
+hr { border-right: 0px; border-bottom: 0px; border-left: 0px; border-image: initial; border-top: 1px solid var(--border); margin: 16px 0px; }
+.attachment-box { margin-top: 14px; border: 1px dashed rgb(185, 194, 211); border-radius: 16px; background: rgb(251, 252, 255); padding: 14px; }
+.attachment-box.drag { background: var(--soft); border-color: var(--accent); }
+.attachment-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.attachment-list { margin-top: 12px; display: grid; gap: 10px; }
+.attachment-item { display: grid; grid-template-columns: 58px minmax(0px, 1fr) auto; gap: 10px; align-items: center; padding: 10px; border: 1px solid var(--border); border-radius: 14px; background: rgb(255, 255, 255); }
+.thumb { width: 58px; height: 46px; border: 1px solid var(--border); border-radius: 10px; object-fit: cover; background: rgb(242, 244, 247); display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); }
+.att-name { font-weight: 700; word-break: break-word; }
+.att-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.att-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 620px) {
+  .attachment-item { grid-template-columns: 48px 1fr; }
+  .att-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .thumb { width: 48px; height: 40px; }
+}
+.tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.tab { background: rgb(238, 241, 246); }
+.tab.active { background: var(--accent); color: rgb(255, 255, 255); }
+.view { display: none; }
+.view.active { display: block; }
+.search-row { display: grid; grid-template-columns: minmax(0px, 1fr) auto auto; gap: 10px; align-items: end; }
+@media (max-width: 760px) {
+  .search-row { grid-template-columns: 1fr; }
+  .search-row button { width: 100%; }
+}
+.article-grid { display: grid; gap: 12px; margin-top: 16px; }
+.article-result { border: 1px solid var(--border); background: rgb(255, 255, 255); border-radius: 16px; padding: 14px; display: grid; grid-template-columns: minmax(0px, 1fr) auto; gap: 12px; align-items: start; }
+.article-result h3 { margin: 0px 0px 6px; font-size: 17px; }
+.article-result p { margin: 4px 0px; }
+.muted { color: var(--muted); }
+.result-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 700px) {
+  .article-result { grid-template-columns: 1fr; }
+  .result-actions { justify-content: flex-start; }
+}
+.static-body { max-width: 980px; margin: 28px auto 60px; padding: 0px 18px; }
+.static-top { padding: 26px; margin-bottom: 18px; }
+.static-section { padding: 24px; margin-bottom: 16px; }
+.static-section h2 { margin-top: 0px; }
+.static-section h3 { margin-bottom: 8px; font-size: 15px; }
+.static-content { white-space: pre-wrap; line-height: 1.6; border-left: 4px solid var(--accent); padding: 10px 14px; background: rgb(251, 252, 255); border-radius: 10px; }
+.static-content a { color: var(--accent); font-weight: 700; overflow-wrap: anywhere; }
+.static-att-grid { display: grid; gap: 10px; }
+.image-attachment { border: 1px solid var(--border); border-radius: 14px; background: rgb(255, 255, 255); padding: 10px; }
+.image-attachment summary { cursor: pointer; font-weight: 700; color: var(--text); padding: 4px; }
+.image-frame { width: 100%; height: min(70vh, 720px); min-height: 420px; border: 1px solid var(--border); border-radius: 12px; background: rgb(248, 250, 252); margin-top: 10px; }
+footer { text-align: center; color: var(--muted); font-size: 13px; padding: 30px; }
+</style></head><body><div class="static-body"><div class="static-top"><span class="badge">Knowledge Base Article</span><h1>Teams Presenter/Admin Access</h1><p class="subtitle"><strong>Keywords:</strong> teams, admin access, presenter access, lecture sharing, share, meetings, sessions, organizer, co-organizer</p><p class="hint">Created: 5/14/2026, 12:50:08 PM</p><p class="hint">Edited: 5/14/2026, 12:51:16 PM</p></div><section class="static-section"><h2>1. Inquiry</h2><div class="static-content">I have just joined my class for this morning and I can&#039;t share my lecture slides because I don&#039;t have permission.
+
+Can you quickly fix this please?</div><h3>Attachments</h3><div class="static-att-grid"><p class="hint">No attachments added.</p></div></section><section class="static-section"><h2>2. Summary</h2><div class="static-content">Support needs to contact session creator; to give the user &quot;Presenter&quot; or Admin access permanently, or can reach co-organizer/organizer for quick change.</div><h3>Attachments</h3><div class="static-att-grid"><p class="hint">No attachments added.</p></div></section><section class="static-section"><h2>3. Steps</h2><div class="static-content">1.Contact Session creator/Organizer.
+2.Wait on update while engaging the user.
+3.Inform user when access is permitted</div><h3>Attachments</h3><div class="static-att-grid"><p class="hint">No attachments added.</p></div></section><section class="static-section"><h2>4. Resources</h2><div class="static-content">Support: Khaled Ashraf (AI Team)</div><h3>Attachments</h3><div class="static-att-grid"><p class="hint">No attachments added.</p></div></section></div><template id="kb-article-json">{&quot;schema&quot;:&quot;kb-article-builder&quot;,&quot;version&quot;:&quot;knowledge-center-v10&quot;,&quot;title&quot;:&quot;Teams Presenter/Admin Access&quot;,&quot;keywords&quot;:&quot;teams, admin access, presenter access, lecture sharing, share, meetings, sessions, organizer, co-organizer&quot;,&quot;sections&quot;:{&quot;inquiry&quot;:&quot;I have just joined my class for this morning and I can&#039;t share my lecture slides because I don&#039;t have permission.\n\nCan you quickly fix this please?&quot;,&quot;summary&quot;:&quot;Support needs to contact session creator; to give the user \&quot;Presenter\&quot; or Admin access permanently, or can reach co-organizer/organizer for quick change.&quot;,&quot;steps&quot;:&quot;1.Contact Session creator/Organizer.\n2.Wait on update while engaging the user.\n3.Inform user when access is permitted&quot;,&quot;resources&quot;:&quot;Support: Khaled Ashraf (AI Team)&quot;},&quot;attachments&quot;:{&quot;inquiry&quot;:[],&quot;summary&quot;:[],&quot;steps&quot;:[],&quot;resources&quot;:[]},&quot;createdAt&quot;:&quot;2026-05-14T09:50:08.851Z&quot;,&quot;updatedAt&quot;:&quot;2026-05-14T09:51:16.865Z&quot;}</template></body></html>

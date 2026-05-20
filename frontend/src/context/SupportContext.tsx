@@ -9,6 +9,7 @@ export type RequesterRole = "user" | "coach" | "employer";
 export interface ChatMessage {
   id: string;
   sender: "bot" | "user" | "agent";
+  source?: "message" | "history_event" | "intro";
   text: string;
   timestamp: string;
 }
@@ -32,6 +33,7 @@ export interface Ticket {
   evidence: EvidenceFile[];
   status: TicketStatus;
   statusReason: string;
+  assignedAgentId: number | null;
   assignedTeam: string;
   slaStatus: string;
   createdAt: string;
@@ -58,6 +60,7 @@ const defaultTicket: Ticket = {
   evidence: [],
   status: "Open",
   statusReason: "",
+  assignedAgentId: null,
   assignedTeam: "Unassigned",
   slaStatus: "Pending Review",
   createdAt: "",

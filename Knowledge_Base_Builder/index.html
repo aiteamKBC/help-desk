@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Knowledge Base</title>
+  <link rel="stylesheet" href="src/styles.css">
+</head>
+<body>
+<header>
+  <div class="wrap header-row">
+    <div><h1>Knowledge Base</h1><p class="subtitle">Search, open, and edit technical support articles.</p></div>
+    <div class="toolbar"><button class="tab" id="knowledgeTab">Knowledge Base</button><button class="tab active" id="creationTab">Article Creation</button></div>
+  </div>
+</header>
+<main id="appMain">
+  <aside class="side" id="toolsMenu">
+    <div class="side-head"><label>Article tools</label><button class="menu-toggle" id="menuToggleBtn" aria-expanded="true" aria-controls="toolsMenuBody" title="Retract menu">Hide</button></div>
+    <div class="side-body" id="toolsMenuBody">
+      <button class="full primary" id="newArticleBtn">New article</button>
+      <button class="full danger" id="clearBtn" disabled>Clear form</button>
+      <hr>
+      <label for="importFile">Import article for editing</label>
+      <input class="hidden-input" type="file" id="importFile" accept=".html,.htm,.json,application/json,text/html">
+      <button class="full" id="importBtn">Choose article file</button>
+      <p class="hint">Import an article, edit it, then save it from the editor.</p>
+      <div id="status" class="status">Ready. Version: knowledge-center-v10</div>
+    </div>
+  </aside>
+  <section>
+    <div class="view active" id="builderView">
+      <article class="card">
+        <div class="section-title"><h2>Article Creation</h2><div class="toolbar"><button class="primary" id="saveArticleBtn">Save article</button></div></div>
+        <div class="meta">
+          <div><label for="title">Article title</label><input id="title" type="text" placeholder="Example: Reset Microsoft Authenticator"></div>
+          <div><label for="keywords">Keywords</label><input id="keywords" type="text" placeholder="authenticator, MFA, reset, phone"></div>
+        </div>
+      </article>
+      <article class="card" id="inquiry"><div class="section-title"><h2>1. Inquiry</h2><span class="pill">Question</span></div><label for="inquiryText">Inquiry</label><textarea id="inquiryText" placeholder="State the user question or problem this article answers."></textarea><div class="attachment-box" data-attach="inquiry"></div></article>
+      <article class="card" id="summary"><div class="section-title"><h2>2. Summary</h2><span class="pill">Short answer</span></div><label for="summaryText">Summary</label><textarea id="summaryText" placeholder="Give the short answer first."></textarea><div class="attachment-box" data-attach="summary"></div></article>
+      <article class="card" id="steps"><div class="section-title"><h2>3. Steps</h2><span class="pill">Instructions</span></div><label for="stepsText">Steps</label><textarea id="stepsText" placeholder="1. Open ...&#10;2. Select ...&#10;3. Confirm ...&#10;Expected result: ...&#10;If it fails: ..."></textarea><div class="attachment-box" data-attach="steps"></div></article>
+      <article class="card" id="resources"><div class="section-title"><h2>4. Resources</h2><span class="pill">Links and sources</span></div><label for="resourcesText">Resources</label><textarea id="resourcesText" placeholder="Source link 1: ...&#10;Source link 2: ...&#10;Related article: ..."></textarea><div class="attachment-box" data-attach="resources"></div></article>
+    </div>
+    <div class="view" id="centerView">
+      <article class="card">
+        <div class="section-title"><h2>Knowledge Center</h2><span class="pill" id="indexCount">0 articles indexed</span></div>
+        <p class="subtitle">Open existing articles and search by title, keywords, inquiry, summary, steps, or resources.</p>
+        <div class="search-row" style="margin-top:16px">
+          <div><label for="knowledgeSearch">Search articles</label><input id="knowledgeSearch" type="text" placeholder="Search by keyword or title, for example MFA, Teams, Aptem"></div>
+          <button class="primary" id="searchBtn">Search</button>
+          <button id="clearSearchBtn">Clear</button>
+        </div>
+        <div id="knowledgeResults" class="article-grid"></div>
+      </article>
+    </div>
+  </section>
+</main>
+<footer>Internal knowledge base.</footer>
+<script src="src/default-articles.js?v=article-bin-v2" defer></script>
+<script src="src/app.js?v=article-bin-v2" defer></script>
+</body>
+</html>

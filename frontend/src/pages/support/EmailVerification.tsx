@@ -79,6 +79,7 @@ interface RestoredTicketPayload {
   inquiry: string;
   status: "Open" | "Pending" | "Closed";
   statusReason?: string;
+  assignedAgentId?: number | null;
   assignedTeam: string;
   slaStatus: string;
   createdAt: string;
@@ -101,6 +102,7 @@ function buildRestoredTicket(
     evidence: [],
     status: restoredTicket.status,
     statusReason: restoredTicket.statusReason || "",
+    assignedAgentId: restoredTicket.assignedAgentId ?? null,
     assignedTeam: restoredTicket.assignedTeam,
     slaStatus: restoredTicket.slaStatus,
     createdAt: restoredTicket.createdAt,
@@ -141,6 +143,7 @@ const EmailVerification = () => {
       evidence: [],
       status: "Open",
       statusReason: "",
+      assignedAgentId: null,
       assignedTeam: "Unassigned",
       slaStatus: "Pending Review",
       createdAt: "",
@@ -191,6 +194,7 @@ const EmailVerification = () => {
               inquiry: string;
               status: "Open" | "Pending" | "Closed";
               statusReason?: string;
+              assignedAgentId?: number | null;
               assignedTeam: string;
               slaStatus: string;
               createdAt: string;

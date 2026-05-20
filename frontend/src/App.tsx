@@ -16,6 +16,8 @@ import Documentation from "./pages/support/Documentation.tsx";
 import AgentDashboard from "./pages/support/AgentDashboard.tsx";
 import AdminLogin from "./pages/support/AdminLogin.tsx";
 import { RequireAdmin } from "./components/support/RequireAdmin.tsx";
+import KnowledgeBaseWorkspace from "./pages/knowledge-base/KnowledgeBaseWorkspace.tsx";
+import KnowledgeBaseArticle from "./pages/knowledge-base/KnowledgeBaseArticle.tsx";
 
 const queryClient = new QueryClient();
 
@@ -39,6 +41,8 @@ const App = () => (
             <Route path="/admin/login" element={<AdminLogin />} />
             <Route path="/admin" element={<RequireAdmin><AgentDashboard /></RequireAdmin>} />
             <Route path="/agent" element={<RequireAdmin><AgentDashboard /></RequireAdmin>} />
+            <Route path="/knowledge-base" element={<RequireAdmin><KnowledgeBaseWorkspace /></RequireAdmin>} />
+            <Route path="/knowledge-base/articles/:fileName" element={<RequireAdmin><KnowledgeBaseArticle /></RequireAdmin>} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>

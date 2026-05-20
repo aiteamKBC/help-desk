@@ -102,6 +102,7 @@ LATEST_TRANSFER_DECISION_METADATA_KEY = "latest_transfer_decision"
 PENDING_ESCALATION_NOTIFICATION_METADATA_KEY = "pending_escalation_notification"
 LATEST_ESCALATION_CLOSURE_METADATA_KEY = "latest_escalation_closure"
 PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY = "pending_teams_call_notification"
+TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
 LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
 MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0"
 MICROSOFT_GRAPH_BETA_BASE_URL = "https://graph.microsoft.com/beta"
@@ -331,6 +332,10 @@ def normalize_pending_teams_call_notification(value: Any) -> dict[str, Any] | No
 
 def get_pending_teams_call_notification(metadata: Any) -> dict[str, Any] | None:
     return normalize_pending_teams_call_notification(normalize_json_object(metadata).get(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY))
+
+
+def is_teams_call_requested(metadata: Any) -> bool:
+    return normalize_bool(normalize_json_object(metadata).get(TEAMS_CALL_REQUESTED_METADATA_KEY))
 
 
 def normalize_latest_escalation_closure(value: Any) -> dict[str, Any] | None:
@@ -1120,6 +1125,7 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           t.inquiry,
           t.status,
           t.status_reason,
+          t.assigned_agent_id,
           t.assigned_team,
           t.sla_status,
           t.created_at,
@@ -1244,6 +1250,7 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "pendingTransferRequest": get_pending_transfer_request(ticket_metadata),
         "pendingEscalationNotification": get_pending_escalation_notification(ticket_metadata),
         "pendingTeamsCallNotification": get_pending_teams_call_notification(ticket_metadata),
+        "teamsCallRequested": is_teams_call_requested(ticket_metadata),
         "latestEscalationClosure": get_latest_escalation_closure(ticket_metadata),
         "latestTransferDecision": get_latest_transfer_decision(ticket_metadata),
         "documentation": normalize_admin_documentation(
@@ -1323,7 +1330,12 @@ def format_chat_message_timestamp(value: Any) -> str:
         except (TypeError, ValueError):
             return ""
 
-    return parsed_value.strftime("%I:%M %p").lstrip("0")
+    if parsed_value.tzinfo is None:
+        localized_value = parsed_value.replace(tzinfo=ZoneInfo(settings.TIME_ZONE))
+    else:
+        localized_value = parsed_value.astimezone(ZoneInfo(settings.TIME_ZONE))
+
+    return localized_value.strftime("%I:%M %p").lstrip("0")
 
 
 def ensure_intro_message_row(
@@ -1337,8 +1349,11 @@ def ensure_intro_message_row(
     if not normalized_intro_message:
         return rows
 
-    if any(sanitize_text(row.get("content")) == normalized_intro_message for row in rows):
-        return rows
+    rows_without_intro = [
+        row
+        for row in rows
+        if sanitize_text(row.get("content")) != normalized_intro_message
+    ]
 
     return [
         {
@@ -1348,7 +1363,7 @@ def ensure_intro_message_row(
             "metadata": {"original_sender": "bot"},
             "created_at": created_at,
         },
-        *rows,
+        *rows_without_intro,
     ]
 
 
@@ -1383,6 +1398,141 @@ def serialize_chat_history_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
             or format_chat_message_timestamp(row.get("created_at")),
         }
         for row in rows
+    ]
+
+
+def build_assignment_changed_chat_notice(payload: Any) -> str:
+    to_agent_name = sanitize_text(normalize_json_object(payload).get("toAgentName"))
+    if not to_agent_name:
+        return ""
+
+    return f"You are now talking to {to_agent_name}."
+
+
+def build_chat_history_event_notice(event_type: Any, payload: Any) -> str:
+    normalized_event_type = sanitize_text(event_type).lower()
+
+    if normalized_event_type == "assignment_changed":
+        return build_assignment_changed_chat_notice(payload)
+
+    return ""
+
+
+def build_chat_timeline_entries(
+    message_rows: list[dict[str, Any]],
+    history_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    timeline_entries: list[dict[str, Any]] = []
+    assignment_notice_texts = {
+        build_chat_history_event_notice(row.get("event_type"), row.get("payload"))
+        for row in history_rows
+        if sanitize_text(row.get("event_type")).lower() == "assignment_changed"
+    }
+    assignment_notice_texts.discard("")
+
+    for row in message_rows:
+        message_metadata = normalize_json_object(row.get("metadata"))
+        is_bot_message = (
+            sanitize_text(row.get("role")).lower() == "assistant"
+            and sanitize_text(message_metadata.get("original_sender")).lower() == "bot"
+        )
+        if is_bot_message and sanitize_text(row.get("content")) in assignment_notice_texts:
+            continue
+
+        timeline_entries.append(
+            {
+                "id": str(row["id"]),
+                "role": row["role"],
+                "metadata": message_metadata,
+                "source": "intro" if str(row.get("id", "")).startswith("intro-") else "message",
+                "text": row["content"],
+                "timestamp": sanitize_text(message_metadata.get("client_timestamp"))
+                or format_chat_message_timestamp(row.get("created_at")),
+                "created_at": row.get("created_at"),
+                "sort_priority": 0,
+            }
+        )
+
+    for row in history_rows:
+        notice_text = build_chat_history_event_notice(row.get("event_type"), row.get("payload"))
+        if not notice_text:
+            continue
+
+        timeline_entries.append(
+            {
+                "id": f"history-{row['id']}",
+                "role": "assistant",
+                "metadata": {"original_sender": "bot", "source_event": sanitize_text(row.get("event_type")).lower()},
+                "source": "history_event",
+                "text": notice_text,
+                "timestamp": format_chat_message_timestamp(row.get("created_at")),
+                "created_at": row.get("created_at"),
+                "sort_priority": 1,
+            }
+        )
+
+    timeline_entries.sort(
+        key=lambda entry: (
+            entry.get("created_at") or datetime.min.replace(tzinfo=timezone.utc),
+            entry.get("sort_priority", 0),
+            entry["id"],
+        )
+    )
+
+    deduped_entries: list[dict[str, Any]] = []
+    for entry in timeline_entries:
+        if deduped_entries:
+            previous_entry = deduped_entries[-1]
+            previous_is_bot_notice = (
+                sanitize_text(previous_entry.get("role")).lower() == "assistant"
+                and sanitize_text(normalize_json_object(previous_entry.get("metadata")).get("original_sender")).lower() == "bot"
+            )
+            current_is_bot_notice = (
+                sanitize_text(entry.get("role")).lower() == "assistant"
+                and sanitize_text(normalize_json_object(entry.get("metadata")).get("original_sender")).lower() == "bot"
+            )
+            if previous_is_bot_notice and current_is_bot_notice and sanitize_text(previous_entry.get("text")) == sanitize_text(entry.get("text")):
+                continue
+
+        deduped_entries.append(entry)
+
+    return deduped_entries
+
+
+def serialize_chat_timeline_rows(
+    message_rows: list[dict[str, Any]],
+    history_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    timeline_entries = build_chat_timeline_entries(message_rows, history_rows)
+
+    return [
+        {
+            "id": entry["id"],
+            "sender": map_role_to_sender(entry["role"], entry.get("metadata")),
+            "source": entry.get("source") or "message",
+            "text": entry["text"],
+            "timestamp": entry["timestamp"],
+        }
+        for entry in timeline_entries
+    ]
+
+
+def serialize_admin_chat_timeline_rows(
+    message_rows: list[dict[str, Any]],
+    history_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    timeline_entries = build_chat_timeline_entries(message_rows, history_rows)
+
+    return [
+        {
+            "id": int(entry["id"]) if isinstance(entry.get("id"), int) else str(entry.get("id")),
+            "role": entry["role"],
+            "source": entry.get("source") or "message",
+            "senderLabel": to_sender_label(entry["role"], entry.get("metadata")),
+            "text": entry["text"],
+            "createdAt": entry["created_at"],
+        }
+        for entry in timeline_entries
     ]
 
 
@@ -2822,8 +2972,22 @@ def select_next_live_chat_agent(
     now: datetime | None = None,
     open_assigned_chat_agent_ids: set[int] | None = None,
 ) -> dict[str, Any] | None:
-    sorted_agents = sort_agents_for_live_chat_queue(agents, now, open_assigned_chat_agent_ids)
-    return sorted_agents[0] if sorted_agents else None
+    comparison_now = now or datetime.now(timezone.utc)
+    busy_agent_ids = open_assigned_chat_agent_ids or set()
+    sorted_agents = sort_agents_for_live_chat_queue(agents, comparison_now, busy_agent_ids)
+
+    for agent in sorted_agents:
+        metadata = normalize_json_object(agent.get("metadata"))
+        agent_id = int(agent["id"])
+        effective_console_status = resolve_agent_console_status(
+            metadata,
+            session_active=True,
+            has_open_assigned_chat=agent_id in busy_agent_ids,
+        )
+        if effective_console_status == "Available":
+            return agent
+
+    return None
 
 
 def sort_admins_for_quick_ticket_queue(
@@ -3392,6 +3556,11 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
         """,
         [ticket["id"]],
     )
+    chat_history_events = [
+        row
+        for row in history
+        if sanitize_text(row.get("event_type")).lower() == "assignment_changed"
+    ]
     session_requests = run_query(
         """
         SELECT id, requested_date, requested_time, status, created_by, notes, metadata, created_at
@@ -3404,16 +3573,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
 
     return {
         "ticket": serialize_ticket_detail(ticket),
-        "chatHistory": [
-            {
-                "id": int(row["id"]) if isinstance(row.get("id"), int) else str(row.get("id")),
-                "role": row["role"],
-                "senderLabel": to_sender_label(row["role"], row.get("metadata")),
-                "text": row["content"],
-                "createdAt": row["created_at"],
-            }
-            for row in messages
-        ],
+        "chatHistory": serialize_admin_chat_timeline_rows(messages, chat_history_events),
         "attachments": [
             {
                 "id": int(row["id"]),
@@ -3499,6 +3659,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         "inquiry": existing_ticket.get("inquiry") or "",
         "status": existing_ticket["status"],
         "statusReason": existing_ticket.get("status_reason") or "",
+        "assignedAgentId": int(existing_ticket["assigned_agent_id"]) if existing_ticket.get("assigned_agent_id") else None,
         "assignedTeam": existing_ticket.get("assigned_team") or "Unassigned",
         "slaStatus": existing_ticket["sla_status"],
         "createdAt": existing_ticket["created_at"],
@@ -4026,6 +4187,7 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
                 "requestedAt": serialize_datetime_value(datetime.now(timezone.utc)),
             }
             ticket_metadata[PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY] = pending_notification
+        ticket_metadata[TEAMS_CALL_REQUESTED_METADATA_KEY] = True
         next_assigned_team = derive_assigned_team(target_agent)
 
         with connection.cursor() as cursor:
@@ -5381,6 +5543,7 @@ def get_ticket_chat_history_response(public_id: str) -> dict[str, Any]:
           t.technical_subcategory,
           t.status,
           t.status_reason,
+          t.assigned_agent_id,
           t.assigned_team,
           t.sla_status,
           t.created_at,
@@ -5423,6 +5586,16 @@ def get_ticket_chat_history_response(public_id: str) -> dict[str, Any]:
         created_at=ticket.get("created_at"),
         intro_id=f"intro-{ticket['public_id']}",
     )
+    history_rows = run_query(
+        """
+        SELECT id, event_type, payload, created_at
+        FROM ticket_history
+        WHERE ticket_id = %s
+          AND event_type = 'assignment_changed'
+        ORDER BY created_at ASC, id ASC
+        """,
+        [ticket["id"]],
+    )
     booking_summary = get_latest_ticket_booking_summary(int(ticket["id"]))
 
     return {
@@ -5430,15 +5603,16 @@ def get_ticket_chat_history_response(public_id: str) -> dict[str, Any]:
             "id": ticket["public_id"],
             "status": ticket["status"],
             "statusReason": ticket.get("status_reason") or "",
+            "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
             "assignedTeam": ticket.get("assigned_team") or "Unassigned",
             "slaStatus": ticket["sla_status"],
             "createdAt": ticket["created_at"],
             "chatState": derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status")),
             "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
         },
-        "chatHistory": serialize_chat_history_rows(messages),
+        "chatHistory": serialize_chat_timeline_rows(messages, history_rows),
         "bookingSummary": booking_summary,
-        "historyCount": len(messages),
+        "historyCount": len(messages) + len(history_rows),
     }
 
 
@@ -5607,6 +5781,7 @@ def get_ticket_chat_context_response(public_id: str) -> dict[str, Any]:
           t.conversation_id,
           t.status,
           t.status_reason,
+          t.assigned_agent_id,
           t.category,
           t.technical_subcategory,
           c.status AS conversation_status,
@@ -5652,6 +5827,7 @@ def get_ticket_chat_context_response(public_id: str) -> dict[str, Any]:
             "technicalSubcategory": ticket.get("technical_subcategory") or "",
             "status": ticket.get("status") or "Open",
             "statusReason": ticket.get("status_reason") or "",
+            "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
             "chatState": chat_state,
             "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
         },

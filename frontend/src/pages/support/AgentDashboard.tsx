@@ -174,6 +174,7 @@ interface TicketSummary {
   pendingTransferRequest?: PendingTransferRequest | null;
   pendingEscalationNotification?: PendingEscalationNotification | null;
   pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
+  teamsCallRequested?: boolean;
   latestEscalationClosure?: LatestEscalationClosure | null;
   latestTransferDecision?: LatestTransferDecision | null;
   documentation?: AdminDocumentation | null;
@@ -193,6 +194,7 @@ interface TicketDetail extends TicketSummary {
 interface ChatHistoryItem {
   id: string | number;
   role: string;
+  source?: "message" | "history_event" | "intro";
   senderLabel: string;
   text: string;
   createdAt: string;
@@ -536,6 +538,25 @@ const AgentDashboard = () => {
     mediaQuery.addListener(handleChange);
     return () => mediaQuery.removeListener(handleChange);
   }, []);
+
+  useEffect(() => {
+    if (!session?.username || !browserDesktopNotificationsSupported()) {
+      return;
+    }
+
+    if (window.Notification.permission !== "default") {
+      return;
+    }
+
+    const promptStorageKey = getAdminDesktopNotificationPromptStorageKey(session.username);
+    if (window.localStorage.getItem(promptStorageKey) === "1") {
+      return;
+    }
+
+    window.localStorage.setItem(promptStorageKey, "1");
+    void window.Notification.requestPermission().catch(() => undefined);
+  }, [session?.username]);
+
   const searchMatchedConsoleTickets = scopedConsoleTickets.filter((ticket) => {
     if (!normalizedConsoleSearch) {
       return true;
@@ -543,7 +564,7 @@ const AgentDashboard = () => {
 
     const searchableFields = [
       ticket.id,
-      ticket.chatId,
+      getDisplayedChatReference(ticket),
       ticket.learnerName,
       ticket.email,
       formatRequesterRoleLabel(ticket.requesterRole),
@@ -597,6 +618,38 @@ const AgentDashboard = () => {
   const myOpenChatCardToneClassName = myOpenChatCount === 0
     ? "border-emerald-200 bg-emerald-50/90"
     : "border-red-200 bg-red-50/90";
+
+  function openAdminNotificationsFromDesktopAlert() {
+    if (typeof window !== "undefined") {
+      window.focus();
+    }
+
+    setAdminView("dashboard");
+    setIsTransferNotificationsOpen(true);
+  }
+
+  function showAdminDesktopNotification(key: string, title: string, body: string) {
+    if (!shouldDispatchAdminDesktopNotification()) {
+      return;
+    }
+
+    try {
+      const notification = new window.Notification(title, {
+        body,
+        tag: `support-admin:${key}`,
+        icon: "/kent-crest.svg",
+        requireInteraction: true,
+      });
+
+      notification.onclick = () => {
+        notification.close();
+        openAdminNotificationsFromDesktopAlert();
+      };
+    } catch {
+      // Ignore browser notification failures so in-app alerts still work.
+    }
+  }
+
   const signedInAgent = agents.find((agent) => (
     (session?.id && agent.id === session.id)
     || (session?.username && agent.username === session.username)
@@ -693,7 +746,7 @@ const AgentDashboard = () => {
       }
 
       const searchableFields = [
-        ticket.chatId,
+        getDisplayedChatReference(ticket),
         ticket.id,
         ticket.learnerName,
         ticket.email,
@@ -831,6 +884,20 @@ const AgentDashboard = () => {
       const rightRequestedAt = Date.parse(rightTicket.pendingTeamsCallNotification?.requestedAt || "");
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
+  const waitingLiveChatNotifications = myActualConsoleStatus === "Off"
+    ? tickets
+      .filter((ticket) => (
+        ticket.liveChatRequested
+        && ticket.chatState !== "closed"
+        && ticket.status !== "Closed"
+        && !ticket.assignedAgentId
+      ))
+      .sort((leftTicket, rightTicket) => {
+        const leftRequestedAt = Date.parse(leftTicket.liveChatRequestedAt || "");
+        const rightRequestedAt = Date.parse(rightTicket.liveChatRequestedAt || "");
+        return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
+      })
+    : [];
   const transferDecisionNotifications = tickets
     .filter((ticket) => {
       const latestTransferDecision = ticket.latestTransferDecision;
@@ -870,6 +937,7 @@ const AgentDashboard = () => {
   const totalAdminNotificationCount = pendingTransferRequests.length
     + pendingEscalationNotifications.length
     + pendingTeamsCallNotifications.length
+    + waitingLiveChatNotifications.length
     + transferDecisionNotifications.length
     + escalationClosureNotifications.length;
   const archivedNotificationLog = notificationLog
@@ -1160,6 +1228,7 @@ const AgentDashboard = () => {
     const newTransferRequests: TicketSummary[] = [];
     const newEscalationNotifications: TicketSummary[] = [];
     const newTeamsCallNotifications: TicketSummary[] = [];
+    const newWaitingLiveChatNotifications: TicketSummary[] = [];
     const newTransferDecisions: TicketSummary[] = [];
     const newEscalationClosures: TicketSummary[] = [];
 
@@ -1202,6 +1271,14 @@ const AgentDashboard = () => {
       }
     }
 
+    for (const ticket of waitingLiveChatNotifications) {
+      const notificationKey = `waiting-live-chat:${ticket.id}:${ticket.liveChatRequestedAt || ticket.createdAt}`;
+      nextNotificationKeys.add(notificationKey);
+      if (!seenTransferNotificationKeysRef.current.has(notificationKey)) {
+        newWaitingLiveChatNotifications.push(ticket);
+      }
+    }
+
     for (const ticket of transferDecisionNotifications) {
       const latestTransferDecision = ticket.latestTransferDecision;
       if (!latestTransferDecision) {
@@ -1241,6 +1318,11 @@ const AgentDashboard = () => {
       }
 
       toast.info(`New transfer request for ${ticket.id} from ${pendingTransferRequest.fromAgentName}.`);
+      showAdminDesktopNotification(
+        `request:${ticket.id}:${pendingTransferRequest.requestedAt}:${pendingTransferRequest.toAgentId}`,
+        "New Transfer Request",
+        `${ticket.id} from ${pendingTransferRequest.fromAgentName}.`,
+      );
     }
 
     for (const ticket of newEscalationNotifications) {
@@ -1250,6 +1332,11 @@ const AgentDashboard = () => {
       }
 
       toast.info(`Escalation notice received for ${pendingEscalationNotification.ticketId} from ${pendingEscalationNotification.fromAgentName}.`);
+      showAdminDesktopNotification(
+        `escalation:${ticket.id}:${pendingEscalationNotification.requestedAt}:${pendingEscalationNotification.toAgentId}`,
+        "Escalation Notice",
+        `${pendingEscalationNotification.ticketId} from ${pendingEscalationNotification.fromAgentName}.`,
+      );
     }
 
     for (const ticket of newTeamsCallNotifications) {
@@ -1260,6 +1347,22 @@ const AgentDashboard = () => {
 
       toast.info(
         `Teams call request received for ${pendingTeamsCallNotification.ticketId} from ${pendingTeamsCallNotification.requesterName}.`,
+      );
+      showAdminDesktopNotification(
+        `teams-call:${ticket.id}:${pendingTeamsCallNotification.requestedAt}:${pendingTeamsCallNotification.toAgentId}`,
+        "Teams Call Request",
+        `${pendingTeamsCallNotification.ticketId} from ${pendingTeamsCallNotification.requesterName}.`,
+      );
+    }
+
+    for (const ticket of newWaitingLiveChatNotifications) {
+      toast.info(
+        `Live chat is waiting for an available admin for ${ticket.id} (${ticket.learnerName || ticket.email || "Learner"}).`,
+      );
+      showAdminDesktopNotification(
+        `waiting-live-chat:${ticket.id}:${ticket.liveChatRequestedAt || ticket.createdAt}`,
+        "Waiting Live Chat",
+        `${ticket.id} is waiting for an available admin.`,
       );
     }
 
@@ -1274,6 +1377,11 @@ const AgentDashboard = () => {
           ? `Transfer accepted for ${ticket.id} by ${latestTransferDecision.decidedByName}.`
           : `Transfer declined for ${ticket.id} by ${latestTransferDecision.decidedByName}.`,
       );
+      showAdminDesktopNotification(
+        `decision:${ticket.id}:${latestTransferDecision.status}:${latestTransferDecision.decidedAt}`,
+        latestTransferDecision.status === "accepted" ? "Transfer Accepted" : "Transfer Declined",
+        `${ticket.id} by ${latestTransferDecision.decidedByName}.`,
+      );
     }
 
     for (const ticket of newEscalationClosures) {
@@ -1283,12 +1391,18 @@ const AgentDashboard = () => {
       }
 
       toast.info(`Escalated ticket ${latestEscalationClosure.ticketId} was closed by ${latestEscalationClosure.closedByName}.`);
+      showAdminDesktopNotification(
+        `escalation-closed:${ticket.id}:${latestEscalationClosure.closedAt}:${latestEscalationClosure.fromAgentId}`,
+        "Escalated Ticket Closed",
+        `${latestEscalationClosure.ticketId} was closed by ${latestEscalationClosure.closedByName}.`,
+      );
     }
 
     if (
       newTransferRequests.length > 0
       || newEscalationNotifications.length > 0
       || newTeamsCallNotifications.length > 0
+      || newWaitingLiveChatNotifications.length > 0
       || newTransferDecisions.length > 0
       || newEscalationClosures.length > 0
     ) {
@@ -1296,7 +1410,7 @@ const AgentDashboard = () => {
     }
 
     seenTransferNotificationKeysRef.current = nextNotificationKeys;
-  }, [escalationClosureNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications]);
+  }, [escalationClosureNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications, waitingLiveChatNotifications]);
 
   useEffect(() => {
     if (!documentationTicketStatus) {
@@ -2581,6 +2695,7 @@ const AgentDashboard = () => {
 
     const synced = await syncAgentSessionHeartbeat(false, nextStatus);
     if (synced) {
+      void refreshTicketsOnly(true);
       setIsUpdatingConsoleStatus(false);
       return;
     }
@@ -2755,6 +2870,9 @@ const AgentDashboard = () => {
                         requests={pendingTransferRequests}
                         escalations={pendingEscalationNotifications}
                         teamsCalls={pendingTeamsCallNotifications}
+                        waitingLiveChats={waitingLiveChatNotifications}
+                        currentConsoleStatus={myActualConsoleStatus}
+                        isUpdatingConsoleStatus={isUpdatingConsoleStatus}
                         escalationUpdates={escalationClosureNotifications}
                         decisionUpdates={transferDecisionNotifications}
                         notificationLog={archivedNotificationLog}
@@ -2765,6 +2883,7 @@ const AgentDashboard = () => {
                         onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
                         onAcknowledgeDecision={handleTransferDecisionAcknowledge}
                         onOpenTicket={openNotificationLogTicket}
+                        onSetAvailable={() => void updateConsoleStatus("Available")}
                       />
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -2807,6 +2926,9 @@ const AgentDashboard = () => {
                         requests={pendingTransferRequests}
                         escalations={pendingEscalationNotifications}
                         teamsCalls={pendingTeamsCallNotifications}
+                        waitingLiveChats={waitingLiveChatNotifications}
+                        currentConsoleStatus={myActualConsoleStatus}
+                        isUpdatingConsoleStatus={isUpdatingConsoleStatus}
                         escalationUpdates={escalationClosureNotifications}
                         decisionUpdates={transferDecisionNotifications}
                         notificationLog={archivedNotificationLog}
@@ -2817,6 +2939,7 @@ const AgentDashboard = () => {
                         onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
                         onAcknowledgeDecision={handleTransferDecisionAcknowledge}
                         onOpenTicket={openNotificationLogTicket}
+                        onSetAvailable={() => void updateConsoleStatus("Available")}
                       />
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -3284,7 +3407,7 @@ const AgentDashboard = () => {
                             getTicketTransferRowClassName(ticket),
                           )}
                         >
-                          <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.chatId || "-"}</td>
+                          <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
                           <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
                           <td className="px-4 py-3 min-w-[240px]">
                             <div className="font-medium">{ticket.learnerName || "Learner"}</div>
@@ -3921,7 +4044,7 @@ const AgentDashboard = () => {
                               <ConsoleField label="Requester Role" icon={UserRound} value={formatRequesterRoleLabel(consoleDetail.ticket.requesterRole)} />
                               <ConsoleField label="Phone" icon={Phone} value={consoleDetail.ticket.learnerPhone || "-"} />
                               <ConsoleField label="Category / Subcategory" icon={TicketIcon} value={formatCategoryLabel(consoleDetail.ticket.category, consoleDetail.ticket.technicalSubcategory)} />
-                              <ConsoleField label="Chat ID" icon={Hash} value={consoleDetail.ticket.chatId || "-"} />
+                              <ConsoleField label="Chat ID" icon={Hash} value={getDisplayedChatReference(consoleDetail.ticket)} />
                               <ConsoleField label="Ticket ID" icon={Hash} value={consoleDetail.ticket.id} />
                               <ConsoleField label="Inquiry" icon={MessageSquareText} value={consoleDetail.ticket.inquiry || "-"} className="sm:col-span-2" />
                             </div>
@@ -4603,7 +4726,7 @@ const ConsoleQueueList = ({
               className={cn("absolute inset-y-0 left-0 w-1 rounded-l-2xl", assignedAgentAccent.stripeClassName)}
             />
             <div className="flex items-center justify-between gap-3">
-              <span className="font-mono text-xs font-semibold">{ticket.chatId || ticket.id}</span>
+              <span className="font-mono text-xs font-semibold">{getDisplayedChatReference(ticket, true)}</span>
               <span className={cn(
                 "rounded-full px-2 py-0.5 text-[11px] font-medium",
                 ticket.chatState === "closed"
@@ -4696,6 +4819,9 @@ const AdminNotificationsPanel = ({
   requests,
   escalations,
   teamsCalls,
+  waitingLiveChats,
+  currentConsoleStatus,
+  isUpdatingConsoleStatus,
   escalationUpdates,
   decisionUpdates,
   notificationLog,
@@ -4706,10 +4832,14 @@ const AdminNotificationsPanel = ({
   onAcknowledgeEscalationUpdate,
   onAcknowledgeDecision,
   onOpenTicket,
+  onSetAvailable,
 }: {
   requests: TicketSummary[];
   escalations: TicketSummary[];
   teamsCalls: TicketSummary[];
+  waitingLiveChats: TicketSummary[];
+  currentConsoleStatus: AdminConsoleStatus;
+  isUpdatingConsoleStatus: boolean;
   escalationUpdates: TicketSummary[];
   decisionUpdates: TicketSummary[];
   notificationLog: AdminNotificationLogItem[];
@@ -4720,11 +4850,13 @@ const AdminNotificationsPanel = ({
   onAcknowledgeEscalationUpdate: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeDecision: (ticket: TicketSummary) => Promise<void>;
   onOpenTicket: (ticketId: string) => Promise<void>;
+  onSetAvailable: () => void;
 }) => {
   if (
     requests.length === 0
     && escalations.length === 0
     && teamsCalls.length === 0
+    && waitingLiveChats.length === 0
     && escalationUpdates.length === 0
     && decisionUpdates.length === 0
     && notificationLog.length === 0
@@ -4743,7 +4875,7 @@ const AdminNotificationsPanel = ({
           Admin Notifications
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
-          Review active alerts and the recent notification log for transfer, escalation, and Teams call activity.
+          Review active alerts and the recent notification log for transfer, escalation, Teams call, and waiting live chat activity.
         </div>
       </div>
       <div className="max-h-[420px] space-y-2 overflow-y-auto p-2">
@@ -4896,6 +5028,64 @@ const AdminNotificationsPanel = ({
                 >
                   {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
                   Open Documentation
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+        {waitingLiveChats.length > 0 ? (
+          <div className="px-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            Waiting Live Chats
+          </div>
+        ) : null}
+        {waitingLiveChats.map((ticket) => {
+          const isBusy = activeTicketId === ticket.id;
+          const canSetAvailable = currentConsoleStatus === "Off";
+
+          return (
+            <div key={`${ticket.id}-${ticket.liveChatRequestedAt || ticket.createdAt}`} className="rounded-2xl border border-amber-200 bg-amber-50/60 px-3 py-3 shadow-soft">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-mono text-xs font-semibold text-amber-900">{ticket.id}</div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground">
+                    {ticket.learnerName || ticket.email || "Learner"}
+                  </div>
+                  <div className="mt-2">
+                    <RequesterRoleBadge role={ticket.requesterRole} className="border-amber-300 bg-white/70 text-amber-900" />
+                  </div>
+                  <div className="mt-1 text-xs text-amber-900/75">
+                    Live chat requested • {formatDateTime(ticket.liveChatRequestedAt || ticket.createdAt)}
+                  </div>
+                </div>
+                <StatusBadge status={ticket.status} />
+              </div>
+              <div className="mt-3 rounded-xl border border-amber-200 bg-background px-3 py-2 text-sm leading-6 text-foreground">
+                A learner is waiting for a live agent, but no admin was available at the time of the request.
+              </div>
+              {ticket.inquiryPreview ? (
+                <div className="mt-2 rounded-xl border bg-secondary/30 px-3 py-2 text-sm leading-6 text-foreground">
+                  {ticket.inquiryPreview}
+                </div>
+              ) : null}
+              <div className="mt-3 flex gap-2">
+                {canSetAvailable ? (
+                  <Button
+                    size="sm"
+                    disabled={isUpdatingConsoleStatus}
+                    onClick={onSetAvailable}
+                  >
+                    {isUpdatingConsoleStatus ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                    Set Available
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  variant={canSetAvailable ? "outline" : "default"}
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onOpenTicket(ticket.id)}
+                >
+                  {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Open Ticket
                 </Button>
               </div>
             </div>
@@ -5054,7 +5244,7 @@ const AdminNotificationLogCard = ({
             {getActivityEventLabel(item.eventType)}
           </span>
           <div className="mt-2 font-mono text-xs font-semibold text-primary">
-            {item.chatId || item.ticketId}
+            {getDisplayedChatReference(item, true)}
           </div>
           <div className="mt-1 truncate text-sm font-semibold text-foreground">
             {item.learnerName || item.email || "Learner"}
@@ -5188,6 +5378,7 @@ const ConsoleChatPanel = ({
   resizeHandlePosition?: "top" | "bottom";
 }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const shouldStickToBottomRef = useRef(true);
   const { height, startResize } = useVerticalPanelResize({
     enabled: resizable,
     defaultHeight,
@@ -5196,12 +5387,35 @@ const ConsoleChatPanel = ({
   });
 
   useEffect(() => {
+    shouldStickToBottomRef.current = true;
+
     if (!scrollRef.current) {
       return;
     }
 
     scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [headerMeta]);
+
+  useEffect(() => {
+    if (!scrollRef.current) {
+      return;
+    }
+
+    if (!shouldStickToBottomRef.current) {
+      return;
+    }
+
+    scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
+
+  const handleScroll = () => {
+    if (!scrollRef.current) {
+      return;
+    }
+
+    const distanceFromBottom = scrollRef.current.scrollHeight - scrollRef.current.scrollTop - scrollRef.current.clientHeight;
+    shouldStickToBottomRef.current = distanceFromBottom <= 80;
+  };
 
   return (
     <section
@@ -5236,7 +5450,7 @@ const ConsoleChatPanel = ({
       </div>
 
       <div className="min-h-0 flex-1 bg-gradient-to-b from-background to-card">
-        <div ref={scrollRef} className="h-full space-y-4 overflow-y-auto px-4 py-5">
+        <div ref={scrollRef} onScroll={handleScroll} className="h-full space-y-4 overflow-y-auto px-4 py-5">
           {messages.length === 0 ? (
             <div className="rounded-2xl border border-dashed bg-background/70 px-4 py-6 text-sm text-muted-foreground">
               {emptyMessage}
@@ -6564,6 +6778,41 @@ function isQuickResolutionTicket(ticket: Pick<TicketSummary, "status" | "statusR
   return normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket";
 }
 
+function getDisplayedChatReference(
+  source: {
+    status: "Open" | "Pending" | "Closed";
+    statusReason: string;
+    chatId?: string | null;
+    pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
+    teamsCallRequested?: boolean;
+    ticketId?: string;
+    id?: string;
+  },
+  fallbackToTicketId = false,
+) {
+  if (source.status === "Pending" && normalizeQuickTicketStatusReason(source.statusReason) === "Quick Ticket") {
+    return "Quick Ticket";
+  }
+
+  if (source.pendingTeamsCallNotification) {
+    return "Teams Call";
+  }
+
+  if (source.teamsCallRequested) {
+    return "Teams Call";
+  }
+
+  if (source.chatId) {
+    return source.chatId;
+  }
+
+  if (fallbackToTicketId) {
+    return source.ticketId || source.id || "-";
+  }
+
+  return "-";
+}
+
 function isDashboardOpenTicket(ticket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested">) {
   return (
     ticket.status === "Open"
@@ -6740,11 +6989,13 @@ function getConsoleTicketSortTime(ticket: TicketSummary, queueTab: "open" | "clo
 }
 
 function serializeConsoleChatHistory(messages: ChatHistoryItem[]) {
-  return messages.map((message) => ({
-    sender: message.role === "user" ? "user" : message.role === "agent" ? "agent" : "bot",
-    text: message.text,
-    timestamp: message.createdAt,
-  }));
+  return messages
+    .filter((message) => message.source !== "history_event" && message.source !== "intro")
+    .map((message) => ({
+      sender: message.role === "user" ? "user" : message.role === "agent" ? "agent" : "bot",
+      text: message.text,
+      timestamp: message.createdAt,
+    }));
 }
 
 function createAiThreadMessage(role: AiConsoleMessage["role"], text: string): AiConsoleMessage {
@@ -6926,6 +7177,28 @@ function playTransferNotificationSound() {
   } catch {
     // Ignore sound playback failures so notifications still render.
   }
+}
+
+const adminDesktopNotificationPromptStorageKeyPrefix = "support-admin-desktop-notification-prompted";
+
+function getAdminDesktopNotificationPromptStorageKey(username: string) {
+  return `${adminDesktopNotificationPromptStorageKeyPrefix}:${username.toLowerCase()}`;
+}
+
+function browserDesktopNotificationsSupported() {
+  return typeof window !== "undefined" && "Notification" in window;
+}
+
+function shouldDispatchAdminDesktopNotification() {
+  if (!browserDesktopNotificationsSupported() || typeof document === "undefined") {
+    return false;
+  }
+
+  if (window.Notification.permission !== "granted") {
+    return false;
+  }
+
+  return document.visibilityState !== "visible" || !document.hasFocus();
 }
 
 function formatBytes(value: number) {

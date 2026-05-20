@@ -43,7 +43,7 @@ const chatbotClosingReason = "Closed via Chatbot";
 const awaitingMeetingReason = "Awaiting support meeting";
 const inactivityClosingReason = "Closed due to inactivity";
 const closedChatDescription = "If you still need help, you can start a new chat and continue with a fresh support request.";
-const liveAgentRequestedMessage = "Live chat has been requested. Please stay connected while we connect you.";
+const liveAgentQueueWaitingMessage = "No support admins are available right now. You're in queue and we'll connect you as soon as one becomes available.";
 
 function getIssueLabel(category: string, technicalSubcategory: string) {
   return technicalSubcategory.trim() || category.trim() || "your request";
@@ -81,7 +81,20 @@ function ensureIntroMessage(messages: ChatMessage[], introText: string) {
     (message) => !(message.sender === "bot" && message.text === introText),
   );
 
-  return [buildBotMessage(introText), ...messagesWithoutIntro];
+  return [{
+    ...buildBotMessage(introText),
+    source: "intro",
+  }, ...messagesWithoutIntro];
+}
+
+function serializeLearnerChatHistory(messages: ChatMessage[]) {
+  return messages
+    .filter((message) => message.source !== "history_event" && message.source !== "intro")
+    .map((message) => ({
+      sender: message.sender,
+      text: message.text,
+      timestamp: message.timestamp,
+    }));
 }
 
 function isSameChatMessage(left: Pick<ChatMessage, "sender" | "text">, right: Pick<ChatMessage, "sender" | "text">) {
@@ -115,6 +128,18 @@ function reconcileChatHistory(
 
 function isLearnerChatClosed(ticket: Pick<Ticket, "status" | "chatState">) {
   return ticket.status === "Closed" || ticket.chatState === "closed";
+}
+
+function isWaitingForLiveAgentAssignment(ticket: Pick<Ticket, "liveChatRequested" | "assignedAgentId" | "status" | "chatState">) {
+  return ticket.liveChatRequested && !ticket.assignedAgentId && !isLearnerChatClosed(ticket);
+}
+
+function ensureBotStatusMessage(messages: ChatMessage[], text: string) {
+  if (!text.trim() || messages.some((message) => message.sender === "bot" && message.text === text)) {
+    return messages;
+  }
+
+  return [...messages, buildBotMessage(text)];
 }
 
 function formatDateInputValue(date: Date) {
@@ -343,19 +368,29 @@ const ChatSupport = () => {
           technicalSubcategory?: TechnicalSubcategory;
           status?: "Open" | "Pending" | "Closed";
           statusReason?: string;
+          assignedAgentId?: number | null;
           chatState?: "open" | "closed";
           liveChatRequested?: boolean;
         },
       ) => {
       const nextMessages = ensureIntroMessage(ticket.chatHistory, introMessage);
+      const decoratedMessages = isWaitingForLiveAgentAssignment({
+        liveChatRequested: patch?.liveChatRequested ?? ticket.liveChatRequested,
+        assignedAgentId: patch?.assignedAgentId ?? ticket.assignedAgentId,
+        status: patch?.status ?? ticket.status,
+        chatState: patch?.chatState ?? ticket.chatState,
+      })
+        ? ensureBotStatusMessage(nextMessages, liveAgentQueueWaitingMessage)
+        : nextMessages;
+
       if (cancelled) {
         return;
       }
 
-      replaceMessages(nextMessages);
+      replaceMessages(decoratedMessages);
       updateTicket({
         ...patch,
-        chatHistory: nextMessages,
+        chatHistory: decoratedMessages,
       });
     };
 
@@ -366,8 +401,11 @@ const ChatSupport = () => {
       }
 
       try {
-        const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-context`);
-        const payload = (await response.json().catch(() => null)) as
+        const [contextResponse, historyResponse] = await Promise.all([
+          fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-context`),
+          fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`),
+        ]);
+        const payload = (await contextResponse.json().catch(() => null)) as
           | {
               introMessage?: string;
               learner?: { fullName?: string };
@@ -376,13 +414,73 @@ const ChatSupport = () => {
                 technicalSubcategory?: TechnicalSubcategory;
                 status?: "Open" | "Pending" | "Closed";
                 statusReason?: string;
+                assignedAgentId?: number | null;
                 chatState?: "open" | "closed";
                 liveChatRequested?: boolean;
               };
             }
           | null;
+        const historyPayload = (await historyResponse.json().catch(() => null)) as
+          | {
+              ticket?: {
+                status?: "Open" | "Pending" | "Closed";
+                statusReason?: string;
+                assignedAgentId?: number | null;
+                assignedTeam?: string;
+                slaStatus?: string;
+                createdAt?: string;
+                chatState?: "open" | "closed";
+                liveChatRequested?: boolean;
+              };
+              chatHistory?: Array<{
+                  id: string;
+                  sender: "bot" | "user" | "agent";
+                  source?: "message" | "history_event" | "intro";
+                  text: string;
+                  timestamp: string;
+                }>;
+            }
+          | null;
 
-        if (!response.ok || !payload?.introMessage) {
+        const resolvedIntroMessage = contextResponse.ok && payload?.introMessage
+          ? payload.introMessage
+          : fallbackIntroMessage;
+
+        if (historyResponse.ok && historyPayload?.ticket) {
+          const nextMessages = ensureIntroMessage(historyPayload.chatHistory || [], resolvedIntroMessage);
+          const decoratedMessages = isWaitingForLiveAgentAssignment({
+            liveChatRequested: Boolean(historyPayload.ticket.liveChatRequested),
+            assignedAgentId: historyPayload.ticket.assignedAgentId ?? ticket.assignedAgentId,
+            status: historyPayload.ticket.status || ticket.status,
+            chatState: historyPayload.ticket.chatState ?? ticket.chatState,
+          })
+            ? ensureBotStatusMessage(nextMessages, liveAgentQueueWaitingMessage)
+            : nextMessages;
+
+          if (cancelled) {
+            return;
+          }
+
+          hasPendingOptimisticHistoryRef.current = false;
+          replaceMessages(decoratedMessages);
+          updateTicket({
+            learnerName: payload?.learner?.fullName || ticket.learnerName,
+            category: payload?.ticket?.category || ticket.category,
+            technicalSubcategory: payload?.ticket?.technicalSubcategory || ticket.technicalSubcategory,
+            status: historyPayload.ticket.status || ticket.status,
+            statusReason: historyPayload.ticket.statusReason || ticket.statusReason,
+            assignedAgentId: historyPayload.ticket.assignedAgentId ?? ticket.assignedAgentId,
+            assignedTeam: historyPayload.ticket.assignedTeam || ticket.assignedTeam,
+            slaStatus: historyPayload.ticket.slaStatus || ticket.slaStatus,
+            createdAt: historyPayload.ticket.createdAt || ticket.createdAt,
+            chatState: historyPayload.ticket.chatState ?? ticket.chatState,
+            liveChatRequested: Boolean(historyPayload.ticket.liveChatRequested),
+            chatHistory: decoratedMessages,
+          });
+          return;
+        }
+
+        if (!contextResponse.ok || !payload?.introMessage) {
           applyIntroMessage(fallbackIntroMessage);
           return;
         }
@@ -393,6 +491,7 @@ const ChatSupport = () => {
           technicalSubcategory: payload.ticket?.technicalSubcategory || "",
           status: payload.ticket?.status || ticket.status,
           statusReason: payload.ticket?.statusReason || ticket.statusReason,
+          assignedAgentId: payload.ticket?.assignedAgentId ?? ticket.assignedAgentId,
           chatState: payload.ticket?.chatState ?? ticket.chatState,
           ...(typeof payload.ticket?.liveChatRequested === "boolean" ? { liveChatRequested: payload.ticket.liveChatRequested } : {}),
         });
@@ -432,6 +531,7 @@ const ChatSupport = () => {
                 ticket?: {
                   status?: "Open" | "Pending" | "Closed";
                   statusReason?: string;
+                  assignedAgentId?: number | null;
                   assignedTeam?: string;
                   slaStatus?: string;
                   createdAt?: string;
@@ -442,6 +542,7 @@ const ChatSupport = () => {
                 chatHistory?: Array<{
                   id: string;
                   sender: "bot" | "user" | "agent";
+                  source?: "message" | "history_event" | "intro";
                   text: string;
                   timestamp: string;
                 }>;
@@ -458,16 +559,25 @@ const ChatSupport = () => {
             payload.chatHistory || [],
             hasPendingOptimisticHistoryRef.current,
           );
+          const decoratedMessages = isWaitingForLiveAgentAssignment({
+            liveChatRequested: Boolean(payload.ticket.liveChatRequested),
+            assignedAgentId: payload.ticket.assignedAgentId ?? ticketRef.current.assignedAgentId,
+            status: payload.ticket.status || ticketRef.current.status,
+            chatState: payload.ticket.chatState ?? ticketRef.current.chatState,
+          })
+            ? ensureBotStatusMessage(nextMessages, liveAgentQueueWaitingMessage)
+            : nextMessages;
           hasPendingOptimisticHistoryRef.current = !backendCaughtUp;
 
-          if (!areMessageListsEquivalent(currentMessages, nextMessages)) {
-            replaceMessages(nextMessages);
+          if (!areMessageListsEquivalent(currentMessages, decoratedMessages)) {
+            replaceMessages(decoratedMessages);
           }
 
           updateTicket({
-            chatHistory: nextMessages,
+            chatHistory: decoratedMessages,
             status: payload.ticket.status || ticketRef.current.status,
             statusReason: payload.ticket.statusReason || ticketRef.current.statusReason,
+            assignedAgentId: payload.ticket.assignedAgentId ?? ticketRef.current.assignedAgentId,
             assignedTeam: payload.ticket.assignedTeam || ticketRef.current.assignedTeam,
             slaStatus: payload.ticket.slaStatus || ticketRef.current.slaStatus,
             createdAt: payload.ticket.createdAt || ticketRef.current.createdAt,
@@ -542,11 +652,7 @@ const ChatSupport = () => {
           body: JSON.stringify({
             status: ticket.status,
             statusReason: ticket.statusReason,
-            messages: nextMessages.map((message) => ({
-              sender: message.sender,
-              text: message.text,
-              timestamp: message.timestamp,
-            })),
+            messages: serializeLearnerChatHistory(nextMessages),
           }),
         });
 
@@ -555,6 +661,7 @@ const ChatSupport = () => {
           ticket?: {
             status?: "Open" | "Pending" | "Closed";
             statusReason?: string;
+            assignedAgentId?: number | null;
             assignedTeam?: string;
             slaStatus?: string;
             createdAt?: string;
@@ -574,6 +681,7 @@ const ChatSupport = () => {
           chatHistory: nextMessages,
           status: payload?.ticket?.status || ticket.status,
           statusReason: payload?.ticket?.statusReason || ticket.statusReason,
+          assignedAgentId: payload?.ticket?.assignedAgentId ?? ticket.assignedAgentId,
           assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
           slaStatus: payload?.ticket?.slaStatus || ticket.slaStatus,
           createdAt: payload?.ticket?.createdAt || ticket.createdAt,
@@ -591,11 +699,7 @@ const ChatSupport = () => {
         body: JSON.stringify({
           message: trimmedInput,
           clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
-          messages: nextMessages.map((message) => ({
-            sender: message.sender,
-            text: message.text,
-            timestamp: message.timestamp,
-          })),
+          messages: serializeLearnerChatHistory(nextMessages),
         }),
       });
 
@@ -658,6 +762,8 @@ const ChatSupport = () => {
         ticket?: {
           chatState?: "open" | "closed";
           liveChatRequested?: boolean;
+          assignedAgentId?: number | null;
+          assignedAgentName?: string | null;
         };
       } | null;
 
@@ -666,32 +772,85 @@ const ChatSupport = () => {
         return;
       }
 
-      const announcement = buildBotMessage(liveAgentRequestedMessage);
-      const nextMessages = [...messagesRef.current, announcement];
-      replaceMessages(nextMessages);
+      if (payload?.ticket?.assignedAgentId) {
+        try {
+          const historyResponse = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`);
+          const historyPayload = (await historyResponse.json().catch(() => null)) as
+            | {
+                ticket?: {
+                  status?: "Open" | "Pending" | "Closed";
+                  statusReason?: string;
+                  assignedAgentId?: number | null;
+                  assignedTeam?: string;
+                  slaStatus?: string;
+                  createdAt?: string;
+                  chatState?: "open" | "closed";
+                  liveChatRequested?: boolean;
+                };
+                chatHistory?: Array<{
+                  id: string;
+                  sender: "bot" | "user" | "agent";
+                  source?: "message" | "history_event" | "intro";
+                  text: string;
+                  timestamp: string;
+                }>;
+              }
+            | null;
 
-      await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          status: ticket.status,
-          statusReason: ticket.statusReason,
-          messages: nextMessages.map((message) => ({
-            sender: message.sender,
-            text: message.text,
-            timestamp: message.timestamp,
-          })),
-        }),
-      }).catch(() => null);
+          if (historyResponse.ok && historyPayload?.ticket) {
+            const nextMessages = historyPayload.chatHistory || [];
+            replaceMessages(nextMessages);
+            updateTicket({
+              chatHistory: nextMessages,
+              status: historyPayload.ticket.status || ticket.status,
+              statusReason: historyPayload.ticket.statusReason || ticket.statusReason,
+              assignedAgentId: historyPayload.ticket.assignedAgentId ?? payload.ticket.assignedAgentId ?? null,
+              assignedTeam: historyPayload.ticket.assignedTeam || ticket.assignedTeam,
+              slaStatus: historyPayload.ticket.slaStatus || ticket.slaStatus,
+              createdAt: historyPayload.ticket.createdAt || ticket.createdAt,
+              chatState: historyPayload.ticket.chatState ?? payload.ticket.chatState ?? ticket.chatState,
+              liveChatRequested: Boolean(historyPayload.ticket.liveChatRequested ?? payload.ticket.liveChatRequested ?? true),
+            });
+          } else {
+            updateTicket({
+              assignedAgentId: payload.ticket.assignedAgentId ?? null,
+              chatState: payload.ticket.chatState ?? ticket.chatState,
+              liveChatRequested: payload.ticket.liveChatRequested ?? true,
+            });
+          }
+        } catch {
+          updateTicket({
+            assignedAgentId: payload.ticket.assignedAgentId ?? null,
+            chatState: payload.ticket.chatState ?? ticket.chatState,
+            liveChatRequested: payload.ticket.liveChatRequested ?? true,
+          });
+        }
 
-      updateTicket({
-        chatHistory: nextMessages,
-        chatState: payload?.ticket?.chatState ?? ticket.chatState,
-        liveChatRequested: payload?.ticket?.liveChatRequested ?? true,
-      });
-      toast.success("Live support has been requested. Please stay connected.");
+        toast.success(`You are now talking to ${payload.ticket.assignedAgentName || "the assigned support admin"}.`);
+      } else {
+        const nextMessages = ensureBotStatusMessage(messagesRef.current, liveAgentQueueWaitingMessage);
+        replaceMessages(nextMessages);
+
+        await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            status: ticket.status,
+            statusReason: ticket.statusReason,
+            messages: serializeLearnerChatHistory(nextMessages),
+          }),
+        }).catch(() => null);
+
+        updateTicket({
+          chatHistory: nextMessages,
+          assignedAgentId: payload?.ticket?.assignedAgentId ?? null,
+          chatState: payload?.ticket?.chatState ?? ticket.chatState,
+          liveChatRequested: payload?.ticket?.liveChatRequested ?? true,
+        });
+        toast.info(liveAgentQueueWaitingMessage);
+      }
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
@@ -746,7 +905,7 @@ const ChatSupport = () => {
         body: JSON.stringify({
           status: "Closed",
           statusReason: chatbotClosingReason,
-          messages: nextMessages,
+          messages: serializeLearnerChatHistory(nextMessages),
         }),
       });
 
@@ -884,6 +1043,7 @@ const ChatSupport = () => {
       evidence: [],
       status: "Open",
       statusReason: "",
+      assignedAgentId: null,
       assignedTeam: "Unassigned",
       slaStatus: "Pending Review",
       createdAt: "",
@@ -921,20 +1081,23 @@ const ChatSupport = () => {
   const isInactivityClosed = ticket.statusReason === inactivityClosingReason;
   const closedPanelTitle = isInactivityClosed ? "Chat closed due to inactivity" : "Chat closed";
   const showReadOnlyPanel = !isChatClosed && isMeetingChatReadOnly;
+  const isWaitingForAssignment = isWaitingForLiveAgentAssignment(ticket);
 
   return (
     <SupportLayout>
       <StepIndicator current={3} />
-      <div className="max-w-5xl mx-auto">
-        <div className="relative flex h-[calc(100dvh-185px)] min-h-[480px] flex-col overflow-hidden rounded-2xl border border-primary/10 bg-card shadow-[0_12px_30px_-18px_hsl(var(--primary)/0.35),0_6px_16px_-10px_hsl(var(--primary)/0.18)] sm:h-[calc(100vh-220px)] sm:min-h-[560px]">
-          <div className="relative z-10 flex flex-col gap-3 border-b border-primary/10 bg-gradient-to-r from-primary/[0.05] via-card to-card px-4 py-3.5 shadow-[0_10px_22px_-18px_hsl(var(--primary)/0.4)] sm:flex-row sm:items-center sm:justify-between md:px-6">
+      <div className="mx-auto max-w-5xl min-h-0">
+        <div className="relative flex h-[calc(100dvh-245px)] min-h-[420px] max-h-[760px] flex-col overflow-hidden rounded-2xl border border-primary/10 bg-card shadow-[0_12px_30px_-18px_hsl(var(--primary)/0.35),0_6px_16px_-10px_hsl(var(--primary)/0.18)] sm:h-[calc(100dvh-260px)] sm:min-h-[520px]">
+          <div className="relative z-10 shrink-0 flex flex-col gap-3 border-b border-primary/10 bg-gradient-to-r from-primary/[0.05] via-card to-card px-4 py-3.5 shadow-[0_10px_22px_-18px_hsl(var(--primary)/0.4)] sm:flex-row sm:items-center sm:justify-between md:px-6">
             <div className="flex items-center gap-2">
               <div className="flex items-center justify-center w-8 h-8 rounded-lg gradient-primary">
                 <Headphones className="w-4 h-4 text-primary-foreground" />
               </div>
               <div className="text-left">
                 <div className="text-sm font-semibold">Kent Chatbot</div>
-                {ticket.liveChatRequested ? (
+                {isWaitingForAssignment ? (
+                  <div className="text-xs font-medium text-amber-600">Waiting for an available support admin</div>
+                ) : ticket.liveChatRequested ? (
                   <div className="text-xs font-medium text-success">Live chat requested</div>
                 ) : null}
               </div>
@@ -952,10 +1115,10 @@ const ChatSupport = () => {
             </div>
           </div>
 
-          <div className="relative flex-1 min-h-0">
+          <div className="relative flex min-h-0 flex-1 flex-col">
             <div
               ref={scrollRef}
-              className="h-full space-y-4 overflow-y-auto bg-gradient-to-b from-background to-card px-3 py-4 pr-16 sm:px-4 sm:py-5 sm:pr-24 md:px-6 md:pr-28"
+              className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-gradient-to-b from-background to-card px-3 py-4 pr-16 sm:px-4 sm:py-5 sm:pr-24 md:px-6 md:pr-28"
             >
               {messages.map((message) => (
                 <MessageBubble key={message.id} m={message} />
@@ -973,7 +1136,7 @@ const ChatSupport = () => {
             />
           </div>
 
-          <div className="p-3 border-t md:p-4 bg-card">
+          <div className="shrink-0 border-t bg-card p-3 md:p-4">
             {isChatClosed ? (
               <div className="rounded-2xl border border-primary/10 bg-muted/30 px-4 py-4 shadow-[0_10px_24px_-18px_hsl(var(--primary)/0.35)]">
                 <div className="text-sm font-semibold text-foreground">{closedPanelTitle}</div>

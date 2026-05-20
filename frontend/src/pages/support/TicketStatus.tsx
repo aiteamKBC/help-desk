@@ -53,6 +53,7 @@ const TicketStatus = () => {
               ticket?: {
                 status?: "Open" | "Pending" | "Closed";
                 statusReason?: string;
+                assignedAgentId?: number | null;
                 assignedTeam?: string;
                 slaStatus?: string;
                 createdAt?: string;
@@ -71,6 +72,7 @@ const TicketStatus = () => {
           updateTicket({
             status: payload.ticket.status || ticket.status,
             statusReason: payload.ticket.statusReason || ticket.statusReason,
+            assignedAgentId: payload.ticket.assignedAgentId ?? ticket.assignedAgentId,
             assignedTeam: payload.ticket.assignedTeam || ticket.assignedTeam,
             slaStatus: payload.ticket.slaStatus || ticket.slaStatus,
             createdAt: payload.ticket.createdAt || ticket.createdAt,

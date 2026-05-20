@@ -15,6 +15,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "support_portal",
+    "knowledge_base",
 ]
 
 MIDDLEWARE = [
@@ -80,3 +81,4 @@ SUPPORT_BOOKING_URL = get_env(
     "SUPPORT_BOOKING_URL",
     "https://outlook.office.com/book/StudentSupport1@kentbusinesscollege.com/s/Z4Zc9rZxw0mEOB417C5bVQ2",
 )
+KNOWLEDGE_BASE_ROOT = Path(get_env("KNOWLEDGE_BASE_ROOT", str(BASE_DIR.parent / "Knowledge_Base_Builder")))

@@ -940,6 +940,40 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertFalse(inactive_summary["chatIsActive"])
         self.assertFalse(inactive_summary["liveChatRequested"])
 
+    def test_serialize_ticket_summary_marks_teams_call_requested_without_pending_notification(self):
+        ticket_row = {
+            "public_id": "KBC-000125",
+            "learner_name": "Coach One",
+            "learner_email": "coach@example.com",
+            "learner_phone": "01000000000",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "inquiry": "Need call",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": 5,
+            "assigned_agent_name": "Omar1",
+            "assigned_agent_username": "omar1",
+            "assigned_team": "Support Desk",
+            "conversation_id": 22,
+            "conversation_status": "open",
+            "conversation_metadata": {"chat_public_id": "CHAT-000022"},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {
+                "requester_role": "coach",
+                "teams_call_requested": True,
+            },
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertTrue(summary["teamsCallRequested"])
+        self.assertIsNone(summary["pendingTeamsCallNotification"])
+
     def test_serialize_ticket_summary_includes_escalation_documentation(self):
         ticket_row = {
             "public_id": "KBC-000124",
@@ -3350,6 +3384,25 @@ class AgentQueueTests(SimpleTestCase):
         self.assertIsNotNone(selected_agent)
         self.assertEqual(selected_agent["id"], 2)
 
+    def test_select_next_live_chat_agent_returns_none_when_only_busy_agents_exist(self):
+        comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+        agents = [
+            {
+                "id": 1,
+                "username": "busy-agent",
+                "metadata": {
+                    "session_active": True,
+                    "session_last_seen_at": comparison_now.isoformat(),
+                    "console_status": "Available",
+                    "queue_joined_at": datetime(2026, 5, 8, 9, 0, tzinfo=timezone.utc).isoformat(),
+                },
+            },
+        ]
+
+        selected_agent = services.select_next_live_chat_agent(agents, comparison_now, {1})
+
+        self.assertIsNone(selected_agent)
+
     def test_assign_waiting_live_chat_tickets_keeps_active_assigned_chat_with_current_agent(self):
         comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
         busy_agent_metadata = {
@@ -3447,7 +3500,7 @@ class AgentQueueTests(SimpleTestCase):
         self.assertEqual(persisted_agent_metadata["console_status"], "Available")
         self.assertEqual(persisted_agent_metadata["last_live_chat_assigned_at"], comparison_now.isoformat())
 
-    def test_assign_waiting_live_chat_tickets_falls_back_to_busy_agent_when_no_available_agent_exists(self):
+    def test_assign_waiting_live_chat_tickets_keeps_waiting_when_only_busy_agents_exist(self):
         comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
         busy_agent = {
             "id": 1,
@@ -3504,11 +3557,70 @@ class AgentQueueTests(SimpleTestCase):
         ):
             assigned_ticket_ids = services.assign_waiting_live_chat_tickets(comparison_now)
 
+        self.assertEqual(assigned_ticket_ids, [])
+        assign_ticket_to_agent.assert_not_called()
+        persist_agent_metadata.assert_not_called()
+
+    def test_assign_waiting_live_chat_tickets_assigns_one_ticket_per_available_agent(self):
+        comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+        available_agent = {
+            "id": 2,
+            "username": "available-agent",
+            "full_name": "Available Agent",
+            "metadata": {
+                "session_active": True,
+                "session_last_seen_at": comparison_now.isoformat(),
+                "console_status": "Available",
+                "queue_joined_at": datetime(2026, 5, 8, 11, 0, tzinfo=timezone.utc).isoformat(),
+            },
+        }
+        first_waiting_ticket = {
+            "id": 56,
+            "public_id": "KBC-000056",
+            "status": "Open",
+            "metadata": {"live_chat_requested": True},
+            "created_at": comparison_now - timedelta(minutes=6),
+            "updated_at": comparison_now - timedelta(minutes=2),
+            "conversation_id": 82,
+            "assigned_agent_id": None,
+            "assigned_team": "Unassigned",
+            "conversation_status": "open",
+            "conversation_metadata": {
+                "is_active_conversation": True,
+                "live_chat_requested": True,
+                "latest_ticket_public_id": "KBC-000056",
+            },
+            "assigned_agent_metadata": None,
+        }
+        second_waiting_ticket = {
+            "id": 57,
+            "public_id": "KBC-000057",
+            "status": "Open",
+            "metadata": {"live_chat_requested": True},
+            "created_at": comparison_now - timedelta(minutes=5),
+            "updated_at": comparison_now - timedelta(minutes=1),
+            "conversation_id": 83,
+            "assigned_agent_id": None,
+            "assigned_team": "Unassigned",
+            "conversation_status": "open",
+            "conversation_metadata": {
+                "is_active_conversation": True,
+                "live_chat_requested": True,
+                "latest_ticket_public_id": "KBC-000057",
+            },
+            "assigned_agent_metadata": None,
+        }
+
+        with (
+            patch.object(services, "run_query", side_effect=[[available_agent], [first_waiting_ticket, second_waiting_ticket]]),
+            patch.object(services, "assign_ticket_to_agent", return_value=True) as assign_ticket_to_agent,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+        ):
+            assigned_ticket_ids = services.assign_waiting_live_chat_tickets(comparison_now)
+
         self.assertEqual(assigned_ticket_ids, [56])
-        assign_ticket_to_agent.assert_called_once_with(waiting_ticket, busy_agent, comparison_now)
-        persisted_agent_metadata = persist_agent_metadata.call_args.args[1]
-        self.assertEqual(persisted_agent_metadata["console_status"], "Available")
-        self.assertEqual(persisted_agent_metadata["last_live_chat_assigned_at"], comparison_now.isoformat())
+        assign_ticket_to_agent.assert_called_once_with(first_waiting_ticket, available_agent, comparison_now)
+        persist_agent_metadata.assert_called_once()
 
     def test_serialize_ticket_summary_exposes_queue_timestamps(self):
         ticket_row = {
@@ -4171,6 +4283,7 @@ class BookingContextTests(SimpleTestCase):
         updated_metadata = json.loads(ticket_update_params[2])
         self.assertEqual(updated_metadata["pending_teams_call_notification"]["toAgentId"], 9)
         self.assertEqual(updated_metadata["pending_teams_call_notification"]["requesterEmail"], "coach@example.com")
+        self.assertTrue(updated_metadata["teams_call_requested"])
         insert_history_event.assert_any_call(
             17,
             "teams_call_requested",
@@ -4204,6 +4317,7 @@ class BookingContextTests(SimpleTestCase):
             "id": 17,
             "public_id": "KBC-000017",
             "metadata": {
+                "teams_call_requested": True,
                 "pending_teams_call_notification": {
                     "toAgentId": 9,
                     "toAgentName": "Ahmed Hamamo",
@@ -4252,6 +4366,7 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(response, detail)
         updated_metadata = json.loads(cursor.execute.call_args.args[1][0])
         self.assertNotIn("pending_teams_call_notification", updated_metadata)
+        self.assertTrue(updated_metadata["teams_call_requested"])
 
     def test_get_ticket_booking_context_response_returns_prefill_payload(self):
         ticket_row = {
@@ -4285,6 +4400,7 @@ class BookingContextTests(SimpleTestCase):
             "metadata": {},
             "status": "Open",
             "status_reason": "",
+            "assigned_agent_id": None,
             "category": "Technical",
             "technical_subcategory": "Teams",
             "learner_id": 11,
@@ -4305,6 +4421,7 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(response["learner"]["fullName"], "Ali Test")
         self.assertEqual(response["ticket"]["category"], "Technical")
         self.assertEqual(response["ticket"]["technicalSubcategory"], "Teams")
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
         run_query_one.assert_called_once()
 
     def test_get_ticket_chat_context_response_rejects_coach_quick_ticket_only_role(self):
@@ -4338,6 +4455,7 @@ class BookingContextTests(SimpleTestCase):
             "technical_subcategory": "Teams",
             "status": "Open",
             "status_reason": "",
+            "assigned_agent_id": None,
             "assigned_team": "Unassigned",
             "sla_status": "Pending Review",
             "created_at": datetime(2026, 5, 7, 10, 0, tzinfo=timezone.utc),
@@ -4358,6 +4476,214 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(len(response["chatHistory"]), 1)
         self.assertEqual(response["chatHistory"][0]["sender"], "bot")
         self.assertIn("Hello Ali Test", response["chatHistory"][0]["text"])
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
+
+    def test_get_ticket_chat_history_response_moves_intro_message_to_top_when_it_was_persisted_late(self):
+        ticket_row = {
+            "id": 1,
+            "public_id": "KBC-000123",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": None,
+            "assigned_team": "Unassigned",
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 5, 7, 10, 0, tzinfo=timezone.utc),
+            "metadata": {},
+            "conversation_id": 55,
+            "conversation_metadata": {},
+            "learner_name": "Ali Test",
+        }
+        persisted_intro = "Hello Ali Test, Thank you for reaching Kent College Support, I understand you are reaching us for an issue related to Teams, am I correct?"
+        message_rows = [
+            {
+                "id": 301,
+                "role": "assistant",
+                "content": "Live chat has been requested. Please stay connected while we connect you.",
+                "metadata": {"original_sender": "bot", "client_timestamp": "10:51 AM"},
+                "created_at": datetime(2026, 5, 7, 10, 51, tzinfo=timezone.utc),
+            },
+            {
+                "id": 302,
+                "role": "assistant",
+                "content": persisted_intro,
+                "metadata": {"original_sender": "bot", "client_timestamp": "10:51 AM"},
+                "created_at": datetime(2026, 5, 7, 10, 51, tzinfo=timezone.utc),
+            },
+        ]
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services, "run_query_one", return_value=ticket_row),
+            patch.object(services, "run_query", side_effect=[message_rows, []]),
+            patch.object(services, "get_latest_ticket_booking_summary", return_value=None),
+        ):
+            response = services.get_ticket_chat_history_response("KBC-000123")
+
+        self.assertEqual(response["chatHistory"][0]["text"], persisted_intro)
+        self.assertEqual(response["chatHistory"][1]["text"], "Live chat has been requested. Please stay connected while we connect you.")
+
+    def test_get_ticket_chat_history_response_includes_assigned_agent_id_when_present(self):
+        ticket_row = {
+            "id": 1,
+            "public_id": "KBC-000123",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": 7,
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 5, 7, 10, 0, tzinfo=timezone.utc),
+            "metadata": {"live_chat_requested": True},
+            "conversation_id": 55,
+            "conversation_status": "open",
+            "conversation_metadata": {"live_chat_requested": True},
+            "learner_name": "Ali Test",
+        }
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services, "run_query_one", return_value=ticket_row),
+            patch.object(services, "run_query", return_value=[]),
+            patch.object(services, "get_latest_ticket_booking_summary", return_value=None),
+        ):
+            response = services.get_ticket_chat_history_response("KBC-000123")
+
+        self.assertEqual(response["ticket"]["assignedAgentId"], 7)
+
+    def test_get_ticket_chat_history_response_includes_assignment_change_notice(self):
+        ticket_row = {
+            "id": 1,
+            "public_id": "KBC-000123",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": 7,
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 5, 7, 10, 0, tzinfo=timezone.utc),
+            "metadata": {"live_chat_requested": True},
+            "conversation_id": 55,
+            "conversation_status": "open",
+            "conversation_metadata": {"live_chat_requested": True},
+            "learner_name": "Ali Test",
+        }
+        message_rows = [
+            {
+                "id": 101,
+                "role": "user",
+                "content": "Hello",
+                "metadata": {"original_sender": "user"},
+                "created_at": datetime(2026, 5, 7, 10, 1, tzinfo=timezone.utc),
+            },
+            {
+                "id": 102,
+                "role": "assistant",
+                "content": "You are now talking to Ahmed Hamamo.",
+                "metadata": {"original_sender": "bot", "client_timestamp": "10:02 AM"},
+                "created_at": datetime(2026, 5, 7, 10, 2, tzinfo=timezone.utc),
+            },
+        ]
+        history_rows = [
+            {
+                "id": 202,
+                "event_type": "assignment_changed",
+                "payload": {"toAgentName": "Ahmed Hamamo"},
+                "created_at": datetime(2026, 5, 7, 10, 2, tzinfo=timezone.utc),
+            },
+        ]
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services, "run_query_one", return_value=ticket_row),
+            patch.object(services, "run_query", side_effect=[message_rows, history_rows]),
+            patch.object(services, "get_latest_ticket_booking_summary", return_value=None),
+        ):
+            response = services.get_ticket_chat_history_response("KBC-000123")
+
+        matching_notices = [
+            message
+            for message in response["chatHistory"]
+            if message["text"] == "You are now talking to Ahmed Hamamo."
+        ]
+        self.assertEqual(len(matching_notices), 1)
+        self.assertEqual(matching_notices[0]["sender"], "bot")
+
+    def test_fetch_admin_ticket_detail_includes_assignment_change_notice_in_chat_history(self):
+        ticket_row = {
+            "id": 1,
+            "public_id": "KBC-000123",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "inquiry": "Need help with LMS",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "priority": "Normal",
+            "evidence_count": 0,
+            "metadata": {"live_chat_requested": True},
+            "created_at": datetime(2026, 5, 7, 10, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 7, 10, 3, tzinfo=timezone.utc),
+            "closed_at": None,
+            "conversation_id": 55,
+            "conversation_status": "open",
+            "conversation_metadata": {"live_chat_requested": True},
+            "chat_duration_minutes": 0,
+            "last_message_at": datetime(2026, 5, 7, 10, 2, tzinfo=timezone.utc),
+            "learner_name": "Ali Test",
+            "learner_email": "ali@example.com",
+            "learner_phone": "01010000000",
+            "assigned_agent_id": 7,
+            "assigned_agent_username": "ahmed",
+            "assigned_agent_name": "Ahmed Hamamo",
+        }
+        message_rows = [
+            {
+                "id": 101,
+                "role": "user",
+                "content": "Hello",
+                "metadata": {"original_sender": "user"},
+                "created_at": datetime(2026, 5, 7, 10, 1, tzinfo=timezone.utc),
+            },
+            {
+                "id": 102,
+                "role": "assistant",
+                "content": "You are now talking to Ahmed Hamamo.",
+                "metadata": {"original_sender": "bot", "client_timestamp": "10:02 AM"},
+                "created_at": datetime(2026, 5, 7, 10, 2, tzinfo=timezone.utc),
+            },
+        ]
+        history_rows = [
+            {
+                "id": 202,
+                "event_type": "assignment_changed",
+                "actor_type": "system",
+                "actor_label": "live_chat_queue",
+                "payload": {"toAgentName": "Ahmed Hamamo"},
+                "created_at": datetime(2026, 5, 7, 10, 2, tzinfo=timezone.utc),
+            },
+        ]
+
+        with (
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "run_query_one", return_value=ticket_row),
+            patch.object(services, "run_query", side_effect=[message_rows, [], history_rows, []]),
+        ):
+            response = services.fetch_admin_ticket_detail("KBC-000123")
+
+        self.assertIsNotNone(response)
+        assert response is not None
+        matching_notices = [
+            message
+            for message in response["chatHistory"]
+            if message["text"] == "You are now talking to Ahmed Hamamo."
+        ]
+        self.assertEqual(len(matching_notices), 1)
+        self.assertEqual(matching_notices[0]["senderLabel"], "Bot")
 
     def test_get_ticket_chat_history_response_includes_booking_summary(self):
         ticket_row = {

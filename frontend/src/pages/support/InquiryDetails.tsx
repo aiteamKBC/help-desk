@@ -194,6 +194,7 @@ const InquiryDetails = () => {
               inquiry: string;
               status: "Open" | "Pending" | "Closed";
               statusReason?: string;
+              assignedAgentId?: number | null;
               assignedTeam: string;
               slaStatus: string;
               createdAt: string;
@@ -219,6 +220,7 @@ const InquiryDetails = () => {
         inquiry: payload.ticket.inquiry,
         evidence,
         statusReason: payload.ticket.statusReason || ticket.statusReason,
+        assignedAgentId: payload.ticket.assignedAgentId ?? (hasExistingTicket ? ticket.assignedAgentId : null),
         createdAt: payload.ticket.createdAt,
         status: payload.ticket.status,
         assignedTeam: payload.ticket.assignedTeam,

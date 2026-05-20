@@ -1,6 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { ReactNode, useEffect, useState } from "react";
-import { Menu, ShieldCheck, UserRound, X } from "lucide-react";
+import { BookOpen, Menu, ShieldCheck, UserRound, X } from "lucide-react";
 import { KentCrestMark } from "@/components/support/KentCrestMark";
 import { cn } from "@/lib/utils";
 
@@ -20,15 +20,41 @@ export const SupportLayout = ({
   mainClassName?: string;
 }) => {
   const location = useLocation();
-  const isAdminArea = location.pathname.startsWith("/admin") || location.pathname.startsWith("/agent");
+  const isKnowledgeBaseArea = location.pathname.startsWith("/knowledge-base");
+  const isAdminDashboardArea = location.pathname === "/admin" || location.pathname === "/agent";
+  const isAdminArea =
+    location.pathname.startsWith("/admin") ||
+    location.pathname.startsWith("/agent") ||
+    isKnowledgeBaseArea;
   const [isAdminMobileNavOpen, setIsAdminMobileNavOpen] = useState(false);
   const adminHeaderShellClassName = fullWidth
     ? "w-full px-4 sm:px-6 lg:px-8 xl:px-10"
     : "mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8";
+  const internalLinkClassName = (active: boolean) =>
+    cn(
+      "inline-flex items-center gap-2 whitespace-nowrap rounded-full border px-3.5 py-2 text-[13px] font-medium shadow-soft transition-all sm:text-sm",
+      active
+        ? "border-primary/18 bg-primary/10 text-primary"
+        : "border-primary/12 bg-white text-foreground hover:border-primary/25 hover:bg-primary/5 hover:text-primary",
+    );
+  const knowledgeBaseLink = (
+    <Link to="/knowledge-base" className={internalLinkClassName(isKnowledgeBaseArea)}>
+      <BookOpen className="h-4 w-4 text-primary" />
+      <span className="sm:hidden">KB</span>
+      <span className="hidden sm:inline">Knowledge Base</span>
+    </Link>
+  );
+  const adminDashboardLink = isKnowledgeBaseArea ? (
+    <Link to="/admin" className={internalLinkClassName(false)}>
+      <ShieldCheck className="h-4 w-4 text-primary" />
+      <span className="sm:hidden">Admin</span>
+      <span className="hidden sm:inline">Admin Dashboard</span>
+    </Link>
+  ) : null;
   const adminPortalLink = isAdminArea ? (
     <Link
       to="/"
-      className="inline-flex items-center gap-2 whitespace-nowrap rounded-full border border-primary/12 bg-white px-3.5 py-2 text-[13px] font-medium text-foreground shadow-soft transition-all hover:border-primary/25 hover:bg-primary/5 hover:text-primary sm:text-sm"
+      className={internalLinkClassName(!isKnowledgeBaseArea)}
     >
       <UserRound className="h-4 w-4 text-primary" />
       <span className="sm:hidden">Portal</span>
@@ -73,6 +99,8 @@ export const SupportLayout = ({
                 <div className="border-t border-black/5 pb-3 pt-3">
                   <div className="flex flex-col gap-2 [&_a]:w-full [&_a]:justify-start">
                     {left}
+                    {isAdminDashboardArea ? knowledgeBaseLink : null}
+                    {adminDashboardLink}
                     {adminPortalLink}
                     {right}
                   </div>
@@ -106,6 +134,8 @@ export const SupportLayout = ({
               ) : null}
 
               <div className="ml-auto flex items-center gap-2">
+                {isAdminDashboardArea ? knowledgeBaseLink : null}
+                {adminDashboardLink}
                 {adminPortalLink}
                 {right}
               </div>
