@@ -1,8 +1,11 @@
+import base64
 import json
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from django.contrib.auth.hashers import make_password
+from django.core.exceptions import ImproperlyConfigured
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.utils import OperationalError as DjangoOperationalError
 from django.core.management import call_command
 from django.test import RequestFactory, SimpleTestCase
@@ -10,8 +13,33 @@ from psycopg import OperationalError as PsycopgOperationalError
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from config import env as config_env
 from support_portal import services
 from support_portal import views
+
+
+class DummySession(dict):
+    def __init__(self, initial: dict | None = None):
+        super().__init__(initial or {})
+        self.cycle_key_called = False
+        self.expiry = None
+        self.flushed = False
+
+    def cycle_key(self):
+        self.cycle_key_called = True
+
+    def set_expiry(self, value):
+        self.expiry = value
+
+    def flush(self):
+        self.flushed = True
+        self.clear()
+
+
+def build_unverified_jwt(payload: dict) -> str:
+    encoded_header = base64.urlsafe_b64encode(json.dumps({"alg": "none", "typ": "JWT"}).encode("utf-8")).decode("utf-8").rstrip("=")
+    encoded_payload = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"{encoded_header}.{encoded_payload}.signature"
 
 
 class LearnerLookupTests(SimpleTestCase):
@@ -52,6 +80,24 @@ class LearnerLookupTests(SimpleTestCase):
             metadata={"legacy_source": "kbc_users_data", "synced_on_demand": True},
         )
 
+    def test_find_kbc_learner_by_email_ignores_local_support_requester_records(self):
+        local_requester_learner = {
+            "id": 11,
+            "full_name": "Manual Requester",
+            "email": "manual@example.com",
+            "source": "support_portal_requester",
+            "metadata": {"managed_public_requester": True},
+        }
+
+        with (
+            patch.object(services, "fetch_local_learner_by_email", return_value=local_requester_learner),
+            patch.object(services, "fetch_legacy_learner_by_email", return_value=None) as fetch_legacy,
+        ):
+            result = services.find_kbc_learner_by_email("manual@example.com")
+
+        self.assertIsNone(result)
+        fetch_legacy.assert_called_once_with("manual@example.com")
+
     def test_verify_email_response_uses_synced_learner(self):
         learner = {"id": 9, "full_name": "Synced Learner", "email": "synced@example.com"}
         requester = {
@@ -82,6 +128,134 @@ class LearnerLookupTests(SimpleTestCase):
             },
         )
         resolve_public_support_requester.assert_called_once_with("synced@example.com")
+
+    def test_resolve_public_support_requester_accepts_entra_user_after_kbc_miss(self):
+        entra_user = {
+            "id": "entra-user-123",
+            "displayName": "Entra User",
+            "mail": "entra.user@kentbusinesscollege.com",
+            "userPrincipalName": "entra.user@kentbusinesscollege.com",
+            "email": "entra.user@kentbusinesscollege.com",
+        }
+
+        with (
+            patch.object(services, "find_kbc_learner_by_email", return_value=None) as find_kbc_learner_by_email,
+            patch.object(services, "fetch_microsoft_entra_user_by_email", return_value=entra_user) as fetch_microsoft_entra_user_by_email,
+            patch.object(services, "fetch_local_learner_by_email", return_value=None) as fetch_local_learner_by_email,
+        ):
+            requester = services.resolve_public_support_requester("entra.user@kentbusinesscollege.com")
+
+        self.assertEqual(requester["email"], "entra.user@kentbusinesscollege.com")
+        self.assertEqual(requester["role"], "user")
+        self.assertIsNone(requester["learner"])
+        self.assertEqual(requester["display_name"], "Entra User")
+        self.assertEqual(requester["source"], "microsoft_entra")
+        self.assertEqual(requester["entra_user"], entra_user)
+        find_kbc_learner_by_email.assert_called_once_with("entra.user@kentbusinesscollege.com")
+        fetch_microsoft_entra_user_by_email.assert_called_once_with("entra.user@kentbusinesscollege.com")
+        fetch_local_learner_by_email.assert_called_once_with("entra.user@kentbusinesscollege.com")
+
+    def test_ensure_public_requester_learner_creates_entra_runtime_learner(self):
+        entra_user = {
+            "id": "entra-user-123",
+            "displayName": "Entra User",
+            "mail": "entra.user@kentbusinesscollege.com",
+            "userPrincipalName": "entra.user@kentbusinesscollege.com",
+            "email": "entra.user@kentbusinesscollege.com",
+        }
+        requester = {
+            "email": "entra.user@kentbusinesscollege.com",
+            "role": "user",
+            "display_name": "Entra User",
+            "learner": None,
+            "account": None,
+            "entra_user": entra_user,
+        }
+        synced_learner = {
+            "id": 44,
+            "external_learner_id": "entra-user-123",
+            "full_name": "Entra User",
+            "email": "entra.user@kentbusinesscollege.com",
+            "phone": None,
+        }
+
+        with patch.object(services, "upsert_learner_record", return_value=synced_learner) as upsert_learner_record:
+            learner = services.ensure_public_requester_learner(requester)
+
+        self.assertEqual(learner, synced_learner)
+        upsert_learner_record.assert_called_once_with(
+            {
+                "external_learner_id": "entra-user-123",
+                "support_account_id": None,
+                "full_name": "Entra User",
+                "email": "entra.user@kentbusinesscollege.com",
+                "phone": None,
+            },
+            source="microsoft_entra",
+            metadata={
+                "microsoft_entra_requester": True,
+                "entra_object_id": "entra-user-123",
+                "entra_user_principal_name": "entra.user@kentbusinesscollege.com",
+                "synced_on_demand": True,
+            },
+        )
+
+    def test_fetch_microsoft_entra_user_by_email_returns_first_enabled_match(self):
+        with (
+            patch.object(
+                services,
+                "request_microsoft_login_graph_access_token",
+                return_value=(True, True, 200, {"access_token": "graph-token"}),
+            ) as request_microsoft_login_graph_access_token,
+            patch.object(
+                services,
+                "fetch_microsoft_graph_user_by_email",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    {
+                        "value": [
+                            {
+                                "id": "entra-user-123",
+                                "displayName": "Entra User",
+                                "mail": "entra.user@kentbusinesscollege.com",
+                                "userPrincipalName": "entra.user@kentbusinesscollege.com",
+                                "accountEnabled": True,
+                            }
+                        ]
+                    },
+                ),
+            ) as fetch_microsoft_graph_user_by_email,
+        ):
+            user = services.fetch_microsoft_entra_user_by_email("ENTRA.USER@kentbusinesscollege.com")
+
+        self.assertEqual(user["id"], "entra-user-123")
+        self.assertEqual(user["email"], "entra.user@kentbusinesscollege.com")
+        request_microsoft_login_graph_access_token.assert_called_once_with()
+        fetch_microsoft_graph_user_by_email.assert_called_once_with("graph-token", "entra.user@kentbusinesscollege.com")
+
+    def test_fetch_microsoft_entra_user_by_email_returns_none_on_missing_graph_permission(self):
+        with (
+            patch.object(
+                services,
+                "request_microsoft_login_graph_access_token",
+                return_value=(True, True, 200, {"access_token": "graph-token"}),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_user_by_email",
+                return_value=(
+                    True,
+                    False,
+                    403,
+                    {"error": {"code": "Authorization_RequestDenied", "message": "Insufficient privileges to complete the operation."}},
+                ),
+            ),
+        ):
+            user = services.fetch_microsoft_entra_user_by_email("entra.user@kentbusinesscollege.com")
+
+        self.assertIsNone(user)
 
     def test_verify_email_response_includes_existing_ticket_and_booking_summary(self):
         learner = {"id": 9, "full_name": "Synced Learner", "email": "synced@example.com"}
@@ -158,16 +332,46 @@ class LearnerLookupTests(SimpleTestCase):
         )
         resolve_public_support_requester.assert_called_once_with("coach@example.com")
 
-    def test_resolve_public_support_requester_requires_managed_requester_account(self):
+    def test_resolve_public_support_requester_accepts_legacy_kbc_learner_without_managed_requester_account(self):
         learner = {"id": 22, "full_name": "Legacy Learner", "email": "legacy@example.com", "source": "legacy_kbc_users_data"}
 
         with (
             patch.object(services, "fetch_public_requester_account_by_email", return_value=None),
-            patch.object(services, "fetch_local_learner_by_email", return_value=learner),
+            patch.object(services, "find_kbc_learner_by_email", return_value=learner),
         ):
             result = services.resolve_public_support_requester("legacy@example.com")
 
+        self.assertEqual(
+            result,
+            {
+                "email": "legacy@example.com",
+                "role": "user",
+                "account": None,
+                "learner": learner,
+                "display_name": "Legacy Learner",
+                "source": "kbc_users_data",
+            },
+        )
+
+    def test_resolve_public_support_requester_rejects_email_without_kbc_or_entra_match(self):
+        managed_account = {
+            "id": 14,
+            "username": "coach1",
+            "full_name": "Coach One",
+            "email": "coach@example.com",
+            "role": "coach",
+        }
+
+        with (
+            patch.object(services, "find_kbc_learner_by_email", return_value=None),
+            patch.object(services, "fetch_microsoft_entra_user_by_email", return_value=None) as fetch_microsoft_entra_user_by_email,
+            patch.object(services, "fetch_public_requester_account_by_email", return_value=managed_account) as fetch_public_requester,
+        ):
+            result = services.resolve_public_support_requester("coach@example.com")
+
         self.assertIsNone(result)
+        fetch_microsoft_entra_user_by_email.assert_called_once_with("coach@example.com")
+        fetch_public_requester.assert_not_called()
 
 
 class ApiErrorHandlingTests(SimpleTestCase):
@@ -209,8 +413,584 @@ class ApiErrorHandlingTests(SimpleTestCase):
         )
 
 
+class DatabaseEnvironmentConfigTests(SimpleTestCase):
+    def test_build_database_config_allows_sqlite_fallback_for_local_development(self):
+        config = config_env.build_database_config("")
+
+        self.assertEqual(config["default"]["ENGINE"], "django.db.backends.sqlite3")
+        self.assertTrue(str(config["default"]["NAME"]).endswith("db.sqlite3"))
+
+    def test_build_database_config_requires_database_url_for_production_style_settings(self):
+        with self.assertRaises(ImproperlyConfigured) as error_context:
+            config_env.build_database_config("", require_database_url=True)
+
+        self.assertIn("DATABASE_URL is required", str(error_context.exception))
+
+    def test_build_database_config_rejects_sqlite_url_for_production_style_settings(self):
+        with self.assertRaises(ImproperlyConfigured) as error_context:
+            config_env.build_database_config(
+                "sqlite:///tmp/support.db",
+                require_database_url=True,
+                require_postgresql=True,
+            )
+
+        self.assertIn("target PostgreSQL", str(error_context.exception))
+
+
+class AdminSessionViewTests(SimpleTestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def attach_session(self, request, session_payload: dict | None = None) -> DummySession:
+        session = DummySession(session_payload)
+        request.session = session
+        return session
+
+    def test_admin_login_stores_server_managed_session(self):
+        request = self.factory.post(
+            "/api/admin/login",
+            data=json.dumps({"username": "omar1", "password": "omar1", "instanceId": "instance-1"}),
+            content_type="application/json",
+        )
+        session = self.attach_session(request)
+
+        with patch.object(
+            views,
+            "get_admin_login_response",
+            return_value={
+                "admin": {
+                    "id": 4,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": None,
+                    "role": "admin",
+                    "consoleStatus": "Off",
+                },
+                "message": "Login successful.",
+            },
+        ):
+            response = views.admin_login(request)
+
+        payload = json.loads(response.content.decode())
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(session.cycle_key_called)
+        self.assertEqual(session[views.ADMIN_SESSION_KEY]["username"], "omar1")
+        self.assertEqual(session[views.ADMIN_SESSION_KEY]["instanceId"], "instance-1")
+        self.assertEqual(payload["admin"]["instanceId"], "instance-1")
+
+    def test_admin_microsoft_login_redirects_to_authorize_url_and_stores_oauth_state(self):
+        request = self.factory.get("/api/admin/microsoft/login?origin=http://127.0.0.1:3000")
+        session = self.attach_session(request)
+
+        with (
+            patch.object(views.settings, "AZURE_LOGIN_REDIRECT_URI", "http://localhost:3000/api/admin/microsoft/callback"),
+            patch.object(views.settings, "CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:3000"]),
+            patch.object(
+                views,
+                "build_microsoft_admin_authorize_url",
+                return_value="https://login.microsoftonline.com/example/oauth2/v2.0/authorize?state=test-state",
+            ) as build_microsoft_admin_authorize_url,
+        ):
+            response = views.admin_microsoft_login(request)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "https://login.microsoftonline.com/example/oauth2/v2.0/authorize?state=test-state")
+        self.assertIn(views.ADMIN_MICROSOFT_AUTH_SESSION_KEY, session)
+        self.assertEqual(
+            session[views.ADMIN_MICROSOFT_AUTH_SESSION_KEY]["redirectUri"],
+            "http://localhost:3000/api/admin/microsoft/callback",
+        )
+        build_microsoft_admin_authorize_url.assert_called_once()
+
+    def test_admin_microsoft_callback_stores_admin_session_and_redirects_to_dashboard(self):
+        request = self.factory.get("/api/admin/microsoft/callback?state=state-1&code=auth-code-1")
+        session = self.attach_session(
+            request,
+            {
+                views.ADMIN_MICROSOFT_AUTH_SESSION_KEY: {
+                    "state": "state-1",
+                    "nonce": "nonce-1",
+                    "redirectUri": "http://localhost:3000/api/admin/microsoft/callback",
+                }
+            },
+        )
+
+        with patch.object(
+            views,
+            "get_admin_microsoft_login_response",
+            return_value={
+                "admin": {
+                    "id": 23,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": "omar1@kentbusinesscollege.com",
+                    "role": "admin",
+                    "consoleStatus": "Off",
+                },
+                "message": "Microsoft sign-in successful.",
+            },
+        ) as get_admin_microsoft_login_response:
+            response = views.admin_microsoft_callback(request)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/admin")
+        self.assertTrue(session.cycle_key_called)
+        self.assertEqual(session[views.ADMIN_SESSION_KEY]["username"], "omar1")
+        self.assertNotIn(views.ADMIN_MICROSOFT_AUTH_SESSION_KEY, session)
+        get_admin_microsoft_login_response.assert_called_once()
+
+    def test_admin_session_returns_authenticated_admin_from_server_session(self):
+        request = self.factory.get("/api/admin/session")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 4,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with patch.object(
+            views,
+            "require_agent_session_actor",
+            return_value={
+                "id": 4,
+                "username": "omar1",
+                "full_name": "Omar One",
+                "email": None,
+                "role": "admin",
+                "metadata": {},
+            },
+        ), patch.object(views, "get_open_assigned_live_chat_agent_ids", return_value=set()):
+            response = views.admin_session(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertJSONEqual(
+            response.content.decode(),
+            {
+                "admin": {
+                    "id": 4,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                    "sessionActive": False,
+                    "consoleStatus": "Off",
+                    "selectedConsoleStatus": "Off",
+                    "legacyAdminAccess": False,
+                    "entraDirectoryAdmin": False,
+                }
+            },
+        )
+        self.assertIn("csrftoken", response.cookies)
+
+    def test_admin_session_heartbeat_returns_server_managed_admin_identity(self):
+        request = self.factory.post(
+            "/api/admin/session-heartbeat",
+            data=json.dumps({"consoleStatus": "Available", "actorUsername": "attacker", "instanceId": "stale-instance"}),
+            content_type="application/json",
+        )
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 4,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        actor = {
+            "id": 4,
+            "username": "omar1",
+            "full_name": "Omar One",
+            "email": None,
+            "role": "admin",
+            "metadata": {},
+        }
+
+        with (
+            patch.object(views, "require_agent_session_actor", side_effect=[actor, actor]),
+            patch.object(views, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+            patch.object(
+                views,
+                "heartbeat_agent_session",
+                return_value={"ok": True, "sessionActive": True, "sessionReplaced": False},
+            ) as heartbeat_agent_session,
+        ):
+            response = views.admin_session_heartbeat(request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertJSONEqual(
+            response.content.decode(),
+            {
+                "ok": True,
+                "sessionActive": True,
+                "sessionReplaced": False,
+                "admin": {
+                    "id": 4,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                    "sessionActive": False,
+                    "consoleStatus": "Off",
+                    "selectedConsoleStatus": "Off",
+                    "legacyAdminAccess": False,
+                    "entraDirectoryAdmin": False,
+                },
+            },
+        )
+        heartbeat_agent_session.assert_called_once_with(
+            {
+                "actorUsername": "omar1",
+                "instanceId": "instance-1",
+                "consoleStatus": "Available",
+            }
+        )
+
+    def test_admin_tickets_requires_server_session(self):
+        request = self.factory.get("/api/admin/tickets")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 7,
+                    "username": "admin1",
+                    "full_name": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                },
+            ) as require_agent_session_actor,
+            patch.object(views, "list_admin_tickets", return_value={"tickets": []}) as list_admin_tickets,
+        ):
+            response = views.admin_tickets(request)
+
+        self.assertEqual(response.status_code, 200)
+        require_agent_session_actor.assert_called_once_with(
+            "admin1",
+            "instance-1",
+            allowed_roles=views.ADMIN_ACCESS_ROLES,
+        )
+        list_admin_tickets.assert_called_once_with()
+
+    def test_admin_ticket_detail_uses_server_session_actor_for_updates(self):
+        request = self.factory.patch(
+            "/api/admin/tickets/KBC-000001",
+            data=json.dumps({"note": "Resolved", "actorUsername": "attacker", "instanceId": "stale-instance"}),
+            content_type="application/json",
+        )
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 9,
+                    "username": "fatma",
+                    "fullName": "Fatma Queue",
+                    "email": "fatma@example.com",
+                    "role": "admin",
+                    "instanceId": "current-instance",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 9,
+                    "username": "fatma",
+                    "full_name": "Fatma Queue",
+                    "email": "fatma@example.com",
+                    "role": "admin",
+                },
+            ),
+            patch.object(views, "update_admin_ticket", return_value={"ticket": {"id": "KBC-000001"}}) as update_admin_ticket,
+        ):
+            response = views.admin_ticket_detail(request, "KBC-000001")
+
+        self.assertEqual(response.status_code, 200)
+        update_admin_ticket.assert_called_once_with(
+            "KBC-000001",
+            {
+                "note": "Resolved",
+                "actorUsername": "fatma",
+                "instanceId": "current-instance",
+            },
+        )
+
+    def test_admin_ticket_chat_history_uses_server_session_actor(self):
+        request = self.factory.post(
+            "/api/admin/tickets/KBC-000001/chat-history",
+            data=json.dumps(
+                {
+                    "status": "Open",
+                    "actorUsername": "attacker",
+                    "messages": [{"sender": "agent", "text": "Hello"}],
+                }
+            ),
+            content_type="application/json",
+        )
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 9,
+                    "username": "fatma",
+                    "fullName": "Fatma Queue",
+                    "email": "fatma@example.com",
+                    "role": "admin",
+                    "instanceId": "current-instance",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 9,
+                    "username": "fatma",
+                    "full_name": "Fatma Queue",
+                    "email": "fatma@example.com",
+                    "role": "admin",
+                },
+            ),
+            patch.object(views, "save_chat_history", return_value={"ok": True}) as save_chat_history,
+        ):
+            response = views.admin_ticket_chat_history(request, "KBC-000001")
+
+        self.assertEqual(response.status_code, 200)
+        save_chat_history.assert_called_once_with(
+            "KBC-000001",
+            {
+                "status": "Open",
+                "actorUsername": "fatma",
+                "instanceId": "current-instance",
+                "messages": [{"sender": "agent", "text": "Hello"}],
+            },
+        )
+
+
+class TicketAttachmentUploadTests(SimpleTestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def test_tickets_create_accepts_multipart_attachment_uploads(self):
+        uploaded_file = SimpleUploadedFile("evidence.png", b"png", content_type="image/png")
+        request = self.factory.post(
+            "/api/tickets",
+            data={
+                "email": "learner@example.com",
+                "requesterRole": "user",
+                "category": "Technical",
+                "technicalSubcategory": "Teams",
+                "inquiry": "Need help with Teams.",
+                "evidenceFiles": uploaded_file,
+            },
+        )
+
+        with patch.object(views, "create_ticket", return_value={"ticket": {"id": "KBC-000001"}}) as create_ticket:
+            response = views.tickets_create(request)
+
+        self.assertEqual(response.status_code, 201)
+        create_ticket.assert_called_once()
+        payload = create_ticket.call_args.args[0]
+        uploaded_files = create_ticket.call_args.kwargs["uploaded_files"]
+        self.assertEqual(payload["email"], "learner@example.com")
+        self.assertEqual(payload["technicalSubcategory"], "Teams")
+        self.assertEqual(len(uploaded_files), 1)
+        self.assertEqual(uploaded_files[0].name, "evidence.png")
+
+    def test_tickets_update_accepts_multipart_attachment_uploads_via_post(self):
+        uploaded_file = SimpleUploadedFile("evidence.pdf", b"%PDF-1.7", content_type="application/pdf")
+        request = self.factory.post(
+            "/api/tickets/KBC-000001",
+            data={
+                "category": "Technical",
+                "technicalSubcategory": "Teams",
+                "inquiry": "Updated inquiry details.",
+                "evidenceFiles": uploaded_file,
+            },
+        )
+
+        with patch.object(views, "update_ticket", return_value={"ticket": {"id": "KBC-000001"}}) as update_ticket:
+            response = views.tickets_update(request, "KBC-000001")
+
+        self.assertEqual(response.status_code, 200)
+        update_ticket.assert_called_once()
+        self.assertEqual(update_ticket.call_args.args[0], "KBC-000001")
+        self.assertEqual(update_ticket.call_args.args[1]["inquiry"], "Updated inquiry details.")
+        uploaded_files = update_ticket.call_args.kwargs["uploaded_files"]
+        self.assertEqual(len(uploaded_files), 1)
+        self.assertEqual(uploaded_files[0].name, "evidence.pdf")
+
+
 class SupportSessionValidationTests(SimpleTestCase):
     databases = {"default"}
+
+    def test_create_ticket_persists_uploaded_attachment_storage_key(self):
+        requester = {
+            "email": "employer@example.com",
+            "role": "employer",
+            "display_name": "Employer One",
+            "learner": None,
+            "account": {
+                "id": 21,
+                "username": "employer1",
+                "full_name": "Employer One",
+                "email": "employer@example.com",
+                "role": "employer",
+            },
+        }
+        learner = {
+            "id": 11,
+            "full_name": "Employer One",
+            "email": "employer@example.com",
+            "phone": None,
+        }
+        cursor = MagicMock()
+        cursor_manager = MagicMock()
+        cursor_manager.__enter__.return_value = cursor
+        cursor_manager.__exit__.return_value = False
+        stored_attachment = {
+            "name": "evidence.png",
+            "mimeType": "image/png",
+            "size": 3,
+            "storageKey": "KBC-000071/2026/05/evidence.png",
+            "metadata": {"storage": "local_filesystem"},
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "resolve_public_support_requester", return_value=requester),
+            patch.object(services, "ensure_public_requester_learner", return_value=learner),
+            patch.object(services, "dictfetchone", side_effect=[{"id": 71, "status": "Open", "assigned_team": "Unassigned", "sla_status": "Pending Review", "created_at": datetime(2026, 5, 14, 10, 0, tzinfo=timezone.utc)}, {"id": 88}]),
+            patch.object(services, "build_public_ticket_id", return_value="KBC-000071"),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_attachment]),
+            patch.object(services, "insert_history_event"),
+            patch.object(services.connection, "cursor", return_value=cursor_manager),
+        ):
+            services.create_ticket(
+                {
+                    "email": "employer@example.com",
+                    "category": "Technical",
+                    "technicalSubcategory": "Teams",
+                    "inquiry": "Need urgent employer support.",
+                    "evidence": [],
+                },
+                uploaded_files=[SimpleUploadedFile("evidence.png", b"png", content_type="image/png")],
+            )
+
+        ticket_insert_call = next(
+            call for call in cursor.execute.call_args_list
+            if "INSERT INTO tickets" in call.args[0]
+        )
+        ticket_insert_params = ticket_insert_call.args[1]
+        self.assertEqual(ticket_insert_params[6], 1)
+
+        attachment_insert_call = next(
+            call for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        attachment_insert_params = attachment_insert_call.args[1]
+        self.assertEqual(attachment_insert_params[1], "evidence.png")
+        self.assertEqual(attachment_insert_params[4], "KBC-000071/2026/05/evidence.png")
+
+    def test_create_ticket_accepts_others_technical_subcategory(self):
+        requester = {
+            "email": "learner@example.com",
+            "role": "user",
+            "display_name": "Learner One",
+            "learner": None,
+            "account": {
+                "id": 31,
+                "username": "learner1",
+                "full_name": "Learner One",
+                "email": "learner@example.com",
+                "role": "user",
+            },
+        }
+        learner = {
+            "id": 12,
+            "full_name": "Learner One",
+            "email": "learner@example.com",
+            "phone": None,
+        }
+        cursor = MagicMock()
+        cursor_manager = MagicMock()
+        cursor_manager.__enter__.return_value = cursor
+        cursor_manager.__exit__.return_value = False
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "resolve_public_support_requester", return_value=requester),
+            patch.object(services, "ensure_public_requester_learner", return_value=learner),
+            patch.object(
+                services,
+                "dictfetchone",
+                side_effect=[
+                    {
+                        "id": 72,
+                        "status": "Open",
+                        "assigned_team": "Unassigned",
+                        "sla_status": "Pending Review",
+                        "created_at": datetime(2026, 5, 23, 17, 0, tzinfo=timezone.utc),
+                    },
+                    {"id": 89},
+                ],
+            ),
+            patch.object(services, "build_public_ticket_id", return_value="KBC-000072"),
+            patch.object(services, "insert_history_event"),
+            patch.object(services.connection, "cursor", return_value=cursor_manager),
+        ):
+            response = services.create_ticket(
+                {
+                    "email": "learner@example.com",
+                    "category": "Technical",
+                    "technicalSubcategory": "Others",
+                    "inquiry": "I need support with a different platform.",
+                    "evidence": [],
+                }
+            )
+
+        self.assertEqual(response["ticket"]["technicalSubcategory"], "Others")
+        ticket_insert_call = next(
+            call for call in cursor.execute.call_args_list
+            if "INSERT INTO tickets" in call.args[0]
+        )
+        ticket_insert_params = ticket_insert_call.args[1]
+        self.assertEqual(ticket_insert_params[3], "Others")
+        ticket_metadata = json.loads(ticket_insert_params[7])
+        self.assertEqual(ticket_metadata["technical_subcategory"], "Others")
 
     def test_create_ticket_sets_high_priority_for_employer_requester(self):
         requester = {
@@ -1109,31 +1889,43 @@ class SlaPolicyTests(SimpleTestCase):
 
 
 class AdminLoginTests(SimpleTestCase):
-    def test_admin_login_accepts_hashed_agent_password(self):
-        agent = {
+    def test_admin_login_accepts_kbc_auth_password_for_support_access_user(self):
+        legacy_user = {
+            "id": 4,
+            "username": "omar1",
+            "first_name": "Omar",
+            "last_name": "One",
+            "full_name": "Omar One",
+            "email": "omar1@kentbusinesscollege.com",
+            "password_hash": make_password("omar1"),
+            "is_staff": False,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": True,
+            "has_admin_access": False,
+        }
+        synced_agent = {
             "id": 4,
             "username": "omar1",
             "full_name": "Omar One",
-            "email": None,
+            "email": "omar1@kentbusinesscollege.com",
             "role": "admin",
-            "metadata": {
-                "password_hash": make_password("omar1"),
-            },
+            "metadata": {},
         }
         registered_session = {
             "id": 4,
             "username": "omar1",
             "fullName": "Omar One",
-            "email": None,
+            "email": "omar1@kentbusinesscollege.com",
             "role": "admin",
             "sessionActive": True,
             "consoleStatus": "Off",
         }
 
         with (
-            patch.object(services, "fetch_agent_with_metadata_by_username", return_value=agent),
+            patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user) as fetch_legacy_support_user_by_username,
+            patch.object(services, "sync_support_staff_account_from_legacy_auth_user", return_value=synced_agent) as sync_support_staff_account_from_legacy_auth_user,
             patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
-            patch.object(services.settings, "SUPPORT_PORTAL_PASSWORD", ""),
         ):
             response = services.get_admin_login_response(
                 {"username": "Omar1", "password": "omar1", "instanceId": "instance-1"}
@@ -1141,188 +1933,451 @@ class AdminLoginTests(SimpleTestCase):
 
         self.assertEqual(response["admin"], registered_session)
         self.assertEqual(response["message"], "Login successful.")
+        fetch_legacy_support_user_by_username.assert_called_once_with("omar1")
+        sync_support_staff_account_from_legacy_auth_user.assert_called_once_with(legacy_user)
         register_agent_session.assert_called_once_with("omar1", "instance-1", "Off")
 
-    def test_admin_login_falls_back_to_shared_password_when_hash_missing(self):
-        agent = {
-            "id": 7,
-            "username": "legacyadmin",
-            "full_name": "Legacy Admin",
-            "email": None,
+    def test_admin_login_accepts_kbc_auth_password_for_admin_access_user(self):
+        legacy_user = {
+            "id": 5,
+            "username": "ayman",
+            "first_name": "Ayman",
+            "last_name": "Admin",
+            "full_name": "Ayman Admin",
+            "email": "ayman@kentbusinesscollege.com",
+            "password_hash": make_password("admin-pass"),
+            "is_staff": False,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": False,
+            "has_admin_access": True,
+        }
+        synced_agent = {
+            "id": 5,
+            "username": "ayman",
+            "full_name": "Ayman Admin",
+            "email": "ayman@kentbusinesscollege.com",
             "role": "admin",
             "metadata": {},
         }
         registered_session = {
-            "id": 7,
-            "username": "legacyadmin",
-            "fullName": "Legacy Admin",
-            "email": None,
+            "id": 5,
+            "username": "ayman",
+            "fullName": "Ayman Admin",
+            "email": "ayman@kentbusinesscollege.com",
             "role": "admin",
             "sessionActive": True,
             "consoleStatus": "Off",
         }
 
         with (
-            patch.object(services, "fetch_agent_with_metadata_by_username", return_value=agent),
-            patch.object(services, "register_agent_session", return_value=registered_session),
-            patch.object(services.settings, "SUPPORT_PORTAL_PASSWORD", "shared-secret"),
+            patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user) as fetch_legacy_support_user_by_username,
+            patch.object(services, "sync_support_staff_account_from_legacy_auth_user", return_value=synced_agent) as sync_support_staff_account_from_legacy_auth_user,
+            patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
         ):
-            response = services.get_admin_login_response({"username": "legacyadmin", "password": "shared-secret"})
+            response = services.get_admin_login_response(
+                {"username": "Ayman", "password": "admin-pass", "instanceId": "instance-2"}
+            )
 
         self.assertEqual(response["admin"], registered_session)
+        self.assertEqual(response["message"], "Login successful.")
+        fetch_legacy_support_user_by_username.assert_called_once_with("ayman")
+        sync_support_staff_account_from_legacy_auth_user.assert_called_once_with(legacy_user)
+        register_agent_session.assert_called_once_with("ayman", "instance-2", "Off")
 
-    def test_admin_login_rejects_non_admin_roles(self):
-        agent = {
-            "id": 11,
+    def test_admin_login_rejects_kbc_auth_user_without_support_or_admin_access_after_password_check(self):
+        legacy_user = {
+            "id": 6,
             "username": "coach1",
+            "first_name": "Coach",
+            "last_name": "One",
             "full_name": "Coach One",
-            "email": "coach@example.com",
-            "role": "coach",
-            "metadata": {
-                "password_hash": make_password("coach-pass"),
-            },
+            "email": "coach1@kentbusinesscollege.com",
+            "password_hash": make_password("coach-pass"),
+            "is_staff": False,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": False,
+            "has_admin_access": False,
         }
 
         with (
-            patch.object(services, "fetch_agent_with_metadata_by_username", return_value=agent),
-            patch.object(services.settings, "SUPPORT_PORTAL_PASSWORD", ""),
+            patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user),
+            patch.object(services, "sync_support_staff_account_from_legacy_auth_user") as sync_support_staff_account_from_legacy_auth_user,
+            patch.object(services, "register_agent_session") as register_agent_session,
         ):
+            with self.assertRaises(services.ApiError) as error_context:
+                services.get_admin_login_response(
+                    {"username": "coach1", "password": "coach-pass", "instanceId": "instance-3"}
+                )
+
+        self.assertEqual(error_context.exception.status_code, 403)
+        self.assertEqual(error_context.exception.message, "This account must have support access or admin access.")
+        sync_support_staff_account_from_legacy_auth_user.assert_not_called()
+        register_agent_session.assert_not_called()
+
+    def test_admin_login_rejects_kbc_auth_user_without_support_or_admin_access(self):
+        with patch.object(services, "fetch_legacy_support_user_by_username", return_value=None):
             with self.assertRaises(services.ApiError) as error_context:
                 services.get_admin_login_response({"username": "coach1", "password": "coach-pass", "instanceId": "instance-1"})
 
-        self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "This account does not have admin access.")
+        self.assertEqual(error_context.exception.status_code, 401)
+        self.assertEqual(error_context.exception.message, "Invalid username or password.")
 
+    def test_build_microsoft_admin_authorize_url_uses_expected_query_parameters(self):
+        with (
+            patch.object(services.settings, "AZURE_LOGIN_TENANT_ID", "tenant-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_ID", "client-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_SECRET", "secret-123"),
+        ):
+            authorize_url = services.build_microsoft_admin_authorize_url(
+                redirect_uri="http://127.0.0.1:3000/api/admin/microsoft/callback",
+                state="state-123",
+                nonce="nonce-123",
+            )
 
-class SupportAccountManagementTests(SimpleTestCase):
-    def test_require_agent_session_actor_rejects_non_admin_roles_for_user_management(self):
-        actor = {
-            "id": 12,
-            "username": "coach1",
-            "full_name": "Coach One",
-            "email": "coach@example.com",
-            "role": "coach",
-            "metadata": {
-                "session_active": True,
-                "session_instance_id": "instance-1",
-                "session_last_seen_at": datetime.now(timezone.utc).isoformat(),
-            },
+        self.assertIn("login.microsoftonline.com/tenant-123/oauth2/v2.0/authorize", authorize_url)
+        self.assertIn("client_id=client-123", authorize_url)
+        self.assertIn("response_type=code", authorize_url)
+        self.assertIn("state=state-123", authorize_url)
+        self.assertIn("nonce=nonce-123", authorize_url)
+
+    def test_admin_microsoft_login_allows_entra_directory_admin_and_registers_session(self):
+        id_token = build_unverified_jwt(
+            {
+                "nonce": "nonce-123",
+                "preferred_username": "omar1@kentbusinesscollege.com",
+                "name": "Omar One",
+            }
+        )
+        registered_session = {
+            "id": 23,
+            "username": "omar1",
+            "fullName": "Omar One",
+            "email": "omar1@kentbusinesscollege.com",
+            "role": "admin",
+            "sessionActive": True,
+            "consoleStatus": "Off",
         }
 
         with (
-            patch.object(services, "fetch_agent_with_metadata_by_username", return_value=actor),
-            patch.object(services, "is_agent_session_active", return_value=True),
+            patch.object(services.settings, "AZURE_LOGIN_TENANT_ID", "tenant-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_ID", "client-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_SECRET", "secret-123"),
+            patch.object(
+                services,
+                "post_form_request",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    {
+                        "access_token": "access-token-123",
+                        "id_token": id_token,
+                    },
+                ),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_me",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    {
+                        "id": "entra-object-123",
+                        "mail": "omar1@kentbusinesscollege.com",
+                        "userPrincipalName": "omar1@kentbusinesscollege.com",
+                        "displayName": "Omar One",
+                    },
+                ),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_directory_roles",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    [
+                        {
+                            "id": "role-1",
+                            "displayName": "User Administrator",
+                            "roleTemplateId": "role-template-1",
+                        }
+                    ],
+                ),
+            ) as fetch_microsoft_graph_directory_roles,
+            patch.object(
+                services,
+                "sync_support_staff_account_from_entra_directory_user",
+                return_value={
+                    "id": 23,
+                    "username": "omar1",
+                    "full_name": "Omar One",
+                    "email": "omar1@kentbusinesscollege.com",
+                    "role": "admin",
+                    "account_scope": "staff",
+                    "is_active": True,
+                    "metadata": {},
+                },
+            ) as sync_support_staff_account_from_entra_directory_user,
+            patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
+        ):
+            response = services.get_admin_microsoft_login_response(
+                {
+                    "code": "auth-code-123",
+                    "redirectUri": "http://127.0.0.1:3000/api/admin/microsoft/callback",
+                    "expectedNonce": "nonce-123",
+                    "instanceId": "instance-123",
+                    "consoleStatus": "Off",
+                }
+            )
+
+        self.assertEqual(response["admin"], registered_session)
+        fetch_microsoft_graph_directory_roles.assert_called_once_with("access-token-123")
+        sync_support_staff_account_from_entra_directory_user.assert_called_once()
+        sync_args = sync_support_staff_account_from_entra_directory_user.call_args.args
+        self.assertEqual(sync_args[0]["id"], "entra-object-123")
+        self.assertEqual(sync_args[2], "admin")
+        register_agent_session.assert_called_once_with("omar1", "instance-123", "Off")
+
+    def test_admin_microsoft_login_rejects_user_without_entra_directory_admin_role(self):
+        id_token = build_unverified_jwt(
+            {
+                "nonce": "nonce-123",
+                "preferred_username": "learner@kentbusinesscollege.com",
+            }
+        )
+
+        with (
+            patch.object(services.settings, "AZURE_LOGIN_TENANT_ID", "tenant-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_ID", "client-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_SECRET", "secret-123"),
+            patch.object(
+                services,
+                "post_form_request",
+                return_value=(True, True, 200, {"access_token": "access-token-123", "id_token": id_token}),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_me",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    {
+                        "id": "entra-object-456",
+                        "mail": "learner@kentbusinesscollege.com",
+                        "userPrincipalName": "learner@kentbusinesscollege.com",
+                        "displayName": "Learner One",
+                    },
+                ),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_directory_roles",
+                return_value=(True, True, 200, []),
+            ),
         ):
             with self.assertRaises(services.ApiError) as error_context:
-                services.require_agent_session_actor("coach1", "instance-1", allowed_roles=services.MANAGE_ACCOUNT_ROLES)
+                services.get_admin_microsoft_login_response(
+                    {
+                        "code": "auth-code-123",
+                        "redirectUri": "http://127.0.0.1:3000/api/admin/microsoft/callback",
+                        "expectedNonce": "nonce-123",
+                        "instanceId": "instance-123",
+                    }
+                )
 
         self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "You do not have permission to manage support accounts.")
+        self.assertEqual(error_context.exception.message, "Your Microsoft account does not have Entra admin center access.")
 
-    def test_create_support_account_inserts_hashed_password(self):
+    def test_build_support_staff_role_from_legacy_auth_user_uses_django_superuser_for_superadmin(self):
+        self.assertEqual(
+            services.build_support_staff_role_from_legacy_auth_user(
+                {"has_support_access": True, "has_admin_access": True, "is_superuser": False}
+            ),
+            "admin",
+        )
+        self.assertEqual(
+            services.build_support_staff_role_from_legacy_auth_user(
+                {"has_support_access": True, "has_admin_access": True, "is_superuser": True}
+            ),
+            "superadmin",
+        )
+
+
+class SupportDirectoryTests(SimpleTestCase):
+    def test_list_agents_returns_only_current_support_access_staff_profiles(self):
+        with (
+            patch.object(
+                services,
+                "fetch_legacy_support_directory_users",
+                return_value=[
+                    {
+                        "id": 77,
+                        "username": "omar1",
+                        "first_name": "Omar",
+                        "last_name": "One",
+                        "full_name": "Omar One",
+                        "email": "omar1@kentbusinesscollege.com",
+                        "is_staff": False,
+                        "is_superuser": False,
+                        "is_active": True,
+                        "has_support_access": True,
+                        "has_admin_access": False,
+                    }
+                ],
+            ),
+            patch.object(
+                services,
+                "sync_support_staff_account_from_legacy_auth_user",
+                return_value={
+                    "id": 23,
+                    "username": "omar1",
+                    "full_name": "Omar One",
+                    "email": "omar1@kentbusinesscollege.com",
+                    "account_scope": "staff",
+                    "role": "admin",
+                    "is_active": True,
+                    "metadata": {
+                        "legacy_auth_user_id": 77,
+                        "legacy_support_access": True,
+                        "legacy_admin_access": False,
+                    },
+                },
+            ),
+            patch.object(
+                services,
+                "run_query",
+                return_value=[
+                    {
+                        "id": 23,
+                        "username": "omar1",
+                        "full_name": "Omar One",
+                        "email": "omar1@kentbusinesscollege.com",
+                        "account_scope": "staff",
+                        "role": "admin",
+                        "is_active": True,
+                        "metadata": {
+                            "legacy_auth_user_id": 77,
+                            "legacy_support_access": True,
+                            "legacy_admin_access": False,
+                        },
+                    },
+                    {
+                        "id": 24,
+                        "username": "legacyadmin",
+                        "full_name": "Legacy Admin",
+                        "email": "legacyadmin@example.com",
+                        "account_scope": "staff",
+                        "role": "admin",
+                        "is_active": True,
+                        "metadata": {
+                            "legacy_auth_user_id": 88,
+                            "legacy_support_access": False,
+                            "legacy_admin_access": True,
+                        },
+                    },
+                    {
+                        "id": 25,
+                        "username": "student1",
+                        "full_name": "Student One",
+                        "email": "student1@example.com",
+                        "account_scope": "requester",
+                        "role": "user",
+                        "is_active": True,
+                        "metadata": {},
+                    },
+                ],
+            ),
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = services.list_agents()
+
+        returned_ids = {account["id"] for account in response["accounts"]}
+        self.assertEqual(returned_ids, {23})
+
+    def test_serialize_agent_falls_back_to_legacy_auth_email_for_support_profiles(self):
+        serialized = services.serialize_agent(
+            {
+                "id": 77,
+                "username": "rewan.yasser.staff",
+                "full_name": "Rewan Yasser",
+                "email": None,
+                "account_scope": "staff",
+                "role": "superadmin",
+                "is_active": True,
+                "metadata": {
+                    "legacy_auth_email": "rewan.yasser@kentbusinesscollege.com",
+                    "legacy_support_access": False,
+                    "legacy_admin_access": True,
+                    "console_status": "Off",
+                    "session_active": False,
+                },
+            },
+            open_assigned_chat_agent_ids=set(),
+        )
+
+        self.assertEqual(serialized["email"], "rewan.yasser@kentbusinesscollege.com")
+
+
+class SupportStaffSyncTests(SimpleTestCase):
+    def test_sync_support_staff_account_creates_runtime_profile_without_colliding_requester_email(self):
+        legacy_user = {
+            "id": 368,
+            "username": "Rewan.yasser",
+            "first_name": "Rewan",
+            "last_name": "Yasser",
+            "full_name": "Rewan Yasser",
+            "email": "rewan.yasser@kentbusinesscollege.com",
+            "is_staff": True,
+            "is_superuser": True,
+            "is_active": True,
+            "has_support_access": False,
+            "has_admin_access": True,
+        }
         cursor = MagicMock()
-        cursor.fetchone.return_value = (13,)
+        cursor.fetchone.return_value = (601,)
         cursor_context = MagicMock()
         cursor_context.__enter__.return_value = cursor
         cursor_context.__exit__.return_value = None
         mock_connection = MagicMock()
         mock_connection.cursor.return_value = cursor_context
-        created_agent = {
-            "id": 13,
-            "username": "mariam",
-            "full_name": "Mariam",
-            "email": "mariam@example.com",
-            "account_scope": "requester",
-            "role": "coach",
+        created_account = {
+            "id": 601,
+            "username": "rewan.yasser.staff",
+            "full_name": "Rewan Yasser",
+            "email": None,
+            "account_scope": "staff",
+            "role": "superadmin",
             "is_active": True,
-            "metadata": {},
+            "metadata": {
+                "legacy_auth_user_id": 368,
+                "legacy_auth_email": "rewan.yasser@kentbusinesscollege.com",
+                "legacy_admin_access": True,
+            },
         }
 
         with (
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "connection", mock_connection),
-            patch.object(services, "require_agent_session_actor", return_value={"id": 1, "username": "admin1", "role": "admin"}),
-            patch.object(services, "find_agent_account_by_username", return_value=None),
-            patch.object(services, "find_agent_account_by_email", return_value=None),
-            patch.object(services, "fetch_agent_account_by_id", return_value=created_agent),
-            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+            patch.object(services, "fetch_staff_support_account_by_legacy_auth_user_id", return_value=None),
+            patch.object(services, "fetch_staff_support_account_by_email", return_value=None),
+            patch.object(services, "fetch_staff_admin_account_by_email", return_value=None),
+            patch.object(services, "find_agent_account_by_email", return_value={"id": 380, "email": "rewan.yasser@kentbusinesscollege.com"}),
+            patch.object(services, "resolve_unique_support_staff_username", return_value="rewan.yasser.staff"),
+            patch.object(services, "fetch_agent_account_by_id", return_value=created_account),
         ):
-            response = services.create_support_account(
-                {
-                    "actorUsername": "admin1",
-                    "instanceId": "instance-1",
-                    "username": "mariam",
-                    "fullName": "Mariam",
-                    "email": "mariam@example.com",
-                    "role": "coach",
-                    "password": "StrongPass123",
-                    "isActive": True,
-                }
-            )
+            response = services.sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
-        self.assertEqual(response["agent"]["id"], 13)
-        insert_call = next(
-            call
-            for call in cursor.execute.call_args_list
-            if "INSERT INTO support_accounts" in call.args[0]
-        )
-        insert_params = insert_call.args[1]
-        self.assertEqual(insert_params[0], "mariam")
-        self.assertEqual(insert_params[3], "requester")
-        self.assertEqual(insert_params[4], "coach")
-        inserted_metadata = json.loads(insert_params[6])
-        self.assertIn("password_hash", inserted_metadata)
-        self.assertNotEqual(inserted_metadata["password_hash"], "StrongPass123")
-
-    def test_update_support_account_prevents_self_deactivation(self):
-        existing_agent = {
-            "id": 7,
-            "username": "admin7",
-            "full_name": "Admin Seven",
-            "email": "admin7@example.com",
-            "role": "admin",
-            "is_active": True,
-            "metadata": {},
-        }
-
-        with (
-            patch.object(services, "require_agent_session_actor", return_value={"id": 7, "username": "admin7", "role": "admin"}),
-            patch.object(services, "fetch_agent_account_by_id", return_value=existing_agent),
-        ):
-            with self.assertRaises(services.ApiError) as error_context:
-                services.update_support_account(
-                    7,
-                    {
-                        "actorUsername": "admin7",
-                        "instanceId": "instance-1",
-                        "username": "admin7",
-                        "fullName": "Admin Seven",
-                        "email": "admin7@example.com",
-                        "role": "admin",
-                        "isActive": False,
-                    },
-                )
-
-        self.assertEqual(error_context.exception.status_code, 400)
-        self.assertEqual(error_context.exception.message, "You cannot deactivate your own account.")
-
-    def test_create_support_account_requires_email_for_requesters(self):
-        with patch.object(services, "require_agent_session_actor", return_value={"id": 1, "username": "admin1", "role": "admin"}):
-            with self.assertRaises(services.ApiError) as error_context:
-                services.create_support_account(
-                    {
-                        "actorUsername": "admin1",
-                        "instanceId": "instance-1",
-                        "username": "coach2",
-                        "fullName": "Coach Two",
-                        "role": "coach",
-                        "password": "StrongPass123",
-                        "isActive": True,
-                    }
-                )
-
-        self.assertEqual(error_context.exception.status_code, 400)
-        self.assertEqual(error_context.exception.message, "An email address is required for support requester accounts.")
+        self.assertEqual(response, created_account)
+        insert_params = cursor.execute.call_args.args[1]
+        self.assertIsNone(insert_params[2])
+        inserted_metadata = json.loads(insert_params[5])
+        self.assertEqual(inserted_metadata["legacy_auth_email"], "rewan.yasser@kentbusinesscollege.com")
+        self.assertEqual(inserted_metadata["legacy_auth_user_id"], 368)
 
 
 class SlaSyncCommandTests(SimpleTestCase):
@@ -2459,6 +3514,10 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "full_name": "Ahmed Hamamo",
             "email": None,
             "role": "admin",
+            "metadata": {
+                "session_active": True,
+                "console_status": "Off",
+            },
         }
         actor = {"id": 5, "username": "omar", "full_name": "Omar", "role": "admin"}
         detail = {
@@ -2554,6 +3613,12 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "full_name": "Ahmed Hamamo",
             "email": None,
             "role": "admin",
+            "metadata": {
+                "password_hash": "hashed-password",
+                "session_active": True,
+                "session_instance_id": "session-123",
+                "queue_joined_at": "2026-05-13T00:00:00+00:00",
+            },
         }
         detail = {
             "ticket": {
@@ -2606,6 +3671,17 @@ class AdminTicketUpdateTests(SimpleTestCase):
         updated_metadata = json.loads(first_update_params[2])
         self.assertEqual(updated_metadata["latest_transfer_decision"]["status"], "accepted")
         self.assertFalse(updated_metadata["latest_transfer_decision"]["requesterAcknowledged"])
+        support_account_update_params = next(
+            call.args[1]
+            for call in cursor.execute.call_args_list
+            if "UPDATE support_accounts" in call.args[0]
+        )
+        persisted_target_metadata = json.loads(support_account_update_params[0])
+        self.assertEqual(persisted_target_metadata["console_status"], "Available")
+        self.assertEqual(persisted_target_metadata["password_hash"], "hashed-password")
+        self.assertTrue(persisted_target_metadata["session_active"])
+        self.assertEqual(persisted_target_metadata["session_instance_id"], "session-123")
+        self.assertEqual(support_account_update_params[1], 9)
         insert_history_event.assert_any_call(
             17,
             "transfer_request_accepted",
@@ -3228,11 +4304,11 @@ class AgentQueueTests(SimpleTestCase):
 
         active_metadata = {
             "session_active": True,
-            "session_last_seen_at": (comparison_now - timedelta(minutes=4)).isoformat(),
+            "session_last_seen_at": (comparison_now - timedelta(minutes=59)).isoformat(),
         }
         stale_metadata = {
             "session_active": True,
-            "session_last_seen_at": (comparison_now - timedelta(minutes=6)).isoformat(),
+            "session_last_seen_at": (comparison_now - timedelta(minutes=61)).isoformat(),
         }
 
         self.assertTrue(services.is_agent_session_active(active_metadata, comparison_now))
@@ -3247,6 +4323,7 @@ class AgentQueueTests(SimpleTestCase):
                 "metadata": {
                     "session_active": True,
                     "session_last_seen_at": comparison_now.isoformat(),
+                    "console_status": "Available",
                     "queue_joined_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc).isoformat(),
                 },
             },
@@ -3256,6 +4333,7 @@ class AgentQueueTests(SimpleTestCase):
                 "metadata": {
                     "session_active": True,
                     "session_last_seen_at": comparison_now.isoformat(),
+                    "console_status": "Available",
                     "queue_joined_at": datetime(2026, 5, 8, 9, 30, tzinfo=timezone.utc).isoformat(),
                     "last_live_chat_assigned_at": datetime(2026, 5, 8, 11, 45, tzinfo=timezone.utc).isoformat(),
                 },

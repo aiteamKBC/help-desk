@@ -1,5 +1,5 @@
 import { type ComponentType, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
   Bot,
@@ -29,7 +29,16 @@ import { SupportLayout } from "@/components/support/SupportLayout";
 import { type Category, type ChatMessage, type TechnicalSubcategory, type Ticket, useSupport } from "@/context/SupportContext";
 import { downloadChatPdf } from "@/lib/chatPdf";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
-import { getSupportResumePath, isAwaitingMeetingTicket, isAwaitingSupportReviewTicket, isQuickTicketOnlyRequesterRole } from "@/lib/supportFlow";
+import {
+  getSupportResumePath,
+  isAwaitingMeetingTicket,
+  isAwaitingSupportReviewTicket,
+  isQuickTicketOnlyRequesterRole,
+  quickTicketReason,
+  type SupportChatEntryAction,
+  type SupportBookingLocationState,
+  type SupportChatLocationState,
+} from "@/lib/supportFlow";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -43,7 +52,9 @@ const chatbotClosingReason = "Closed via Chatbot";
 const awaitingMeetingReason = "Awaiting support meeting";
 const inactivityClosingReason = "Closed due to inactivity";
 const closedChatDescription = "If you still need help, you can start a new chat and continue with a fresh support request.";
-const liveAgentQueueWaitingMessage = "No support admins are available right now. You're in queue and we'll connect you as soon as one becomes available.";
+const legacyLiveAgentQueueWaitingMessage = "No support admins are available right now. You're in queue and we'll connect you as soon as one becomes available.";
+const previousLiveAgentQueueWaitingMessage = `${legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through booking session or quick ticket.`;
+export const liveAgentQueueWaitingMessage = `${legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through booking session or submit ticket directly.`;
 
 function getIssueLabel(category: string, technicalSubcategory: string) {
   return technicalSubcategory.trim() || category.trim() || "your request";
@@ -134,12 +145,22 @@ function isWaitingForLiveAgentAssignment(ticket: Pick<Ticket, "liveChatRequested
   return ticket.liveChatRequested && !ticket.assignedAgentId && !isLearnerChatClosed(ticket);
 }
 
-function ensureBotStatusMessage(messages: ChatMessage[], text: string) {
-  if (!text.trim() || messages.some((message) => message.sender === "bot" && message.text === text)) {
-    return messages;
-  }
+function isLiveAgentQueueStatusMessageText(text: string) {
+  const normalizedText = text.trim();
+  return normalizedText === legacyLiveAgentQueueWaitingMessage
+    || normalizedText === previousLiveAgentQueueWaitingMessage
+    || normalizedText === liveAgentQueueWaitingMessage;
+}
 
-  return [...messages, buildBotMessage(text)];
+function ensureLiveAgentQueueStatusMessage(messages: ChatMessage[]) {
+  const currentMessage = messages.find(
+    (message) => message.sender === "bot" && message.text === liveAgentQueueWaitingMessage,
+  );
+  const messagesWithoutQueueStatus = messages.filter(
+    (message) => !(message.sender === "bot" && isLiveAgentQueueStatusMessageText(message.text)),
+  );
+
+  return [...messagesWithoutQueueStatus, currentMessage || buildBotMessage(liveAgentQueueWaitingMessage)];
 }
 
 function formatDateInputValue(date: Date) {
@@ -294,6 +315,7 @@ function formatSupportSessionDetails(dateValue: string, timeValue: string) {
 }
 
 const ChatSupport = () => {
+  const location = useLocation();
   const navigate = useNavigate();
   const { ticket, bookingSummary, setTicket, updateTicket, setBookingSummary, clearBookingSummary } = useSupport();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -305,15 +327,18 @@ const ChatSupport = () => {
   const [isBooking, setIsBooking] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isRequestingLiveAgent, setIsRequestingLiveAgent] = useState(false);
+  const [isQuickSubmitting, setIsQuickSubmitting] = useState(false);
   const [isDownloadingTranscript, setIsDownloadingTranscript] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const hasPendingOptimisticHistoryRef = useRef(false);
   const ticketRef = useRef(ticket);
+  const consumedEntryActionRef = useRef<SupportChatEntryAction | null>(null);
   const isSupportReviewChatLocked = isAwaitingSupportReviewTicket(ticket);
   const isQuickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
   const isMeetingChatReadOnly = Boolean(bookingSummary) || isAwaitingMeetingTicket(ticket);
+  const entryAction = ((location.state as SupportChatLocationState | null)?.entryAction || null);
 
   const replaceMessages = (nextMessages: ChatMessage[], persistToTicket = false) => {
     messagesRef.current = nextMessages;
@@ -347,8 +372,8 @@ const ChatSupport = () => {
   }, [navigate, isSupportReviewChatLocked]);
 
   useEffect(() => {
-    if (!ticket.email) {
-      navigate("/support");
+    if (!ticket.id) {
+      navigate(ticket.email ? "/support/inquiry" : "/support");
       return;
     }
 
@@ -364,6 +389,7 @@ const ChatSupport = () => {
         introMessage: string,
         patch?: {
           learnerName?: string;
+          email?: string;
           category?: Category;
           technicalSubcategory?: TechnicalSubcategory;
           status?: "Open" | "Pending" | "Closed";
@@ -380,7 +406,7 @@ const ChatSupport = () => {
         status: patch?.status ?? ticket.status,
         chatState: patch?.chatState ?? ticket.chatState,
       })
-        ? ensureBotStatusMessage(nextMessages, liveAgentQueueWaitingMessage)
+        ? ensureLiveAgentQueueStatusMessage(nextMessages)
         : nextMessages;
 
       if (cancelled) {
@@ -408,7 +434,7 @@ const ChatSupport = () => {
         const payload = (await contextResponse.json().catch(() => null)) as
           | {
               introMessage?: string;
-              learner?: { fullName?: string };
+              learner?: { fullName?: string; email?: string };
               ticket?: {
                 category?: Category;
                 technicalSubcategory?: TechnicalSubcategory;
@@ -454,7 +480,7 @@ const ChatSupport = () => {
             status: historyPayload.ticket.status || ticket.status,
             chatState: historyPayload.ticket.chatState ?? ticket.chatState,
           })
-            ? ensureBotStatusMessage(nextMessages, liveAgentQueueWaitingMessage)
+            ? ensureLiveAgentQueueStatusMessage(nextMessages)
             : nextMessages;
 
           if (cancelled) {
@@ -465,6 +491,7 @@ const ChatSupport = () => {
           replaceMessages(decoratedMessages);
           updateTicket({
             learnerName: payload?.learner?.fullName || ticket.learnerName,
+            email: payload?.learner?.email || ticket.email,
             category: payload?.ticket?.category || ticket.category,
             technicalSubcategory: payload?.ticket?.technicalSubcategory || ticket.technicalSubcategory,
             status: historyPayload.ticket.status || ticket.status,
@@ -487,6 +514,7 @@ const ChatSupport = () => {
 
         applyIntroMessage(payload.introMessage, {
           learnerName: payload.learner?.fullName || "",
+          email: payload.learner?.email || ticket.email,
           category: payload.ticket?.category || ticket.category,
           technicalSubcategory: payload.ticket?.technicalSubcategory || "",
           status: payload.ticket?.status || ticket.status,
@@ -565,7 +593,7 @@ const ChatSupport = () => {
             status: payload.ticket.status || ticketRef.current.status,
             chatState: payload.ticket.chatState ?? ticketRef.current.chatState,
           })
-            ? ensureBotStatusMessage(nextMessages, liveAgentQueueWaitingMessage)
+            ? ensureLiveAgentQueueStatusMessage(nextMessages)
             : nextMessages;
           hasPendingOptimisticHistoryRef.current = !backendCaughtUp;
 
@@ -828,7 +856,7 @@ const ChatSupport = () => {
 
         toast.success(`You are now talking to ${payload.ticket.assignedAgentName || "the assigned support admin"}.`);
       } else {
-        const nextMessages = ensureBotStatusMessage(messagesRef.current, liveAgentQueueWaitingMessage);
+        const nextMessages = ensureLiveAgentQueueStatusMessage(messagesRef.current);
         replaceMessages(nextMessages);
 
         await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
@@ -874,8 +902,115 @@ const ChatSupport = () => {
       return;
     }
 
-    setBookingOpen(true);
+    navigate("/support/booking", {
+      state: {
+        returnPath: "/support/chat",
+      } satisfies SupportBookingLocationState,
+    });
   };
+
+  const handleSubmitQuickTicket = async () => {
+    if (!ticket.id || isQuickSubmitting) {
+      return;
+    }
+
+    const nextMessages = messagesRef.current;
+    setIsQuickSubmitting(true);
+
+    try {
+      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          status: "Pending",
+          statusReason: quickTicketReason,
+          messages: serializeLearnerChatHistory(nextMessages),
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            message?: string;
+            ticket?: {
+              status?: "Open" | "Pending" | "Closed";
+              statusReason?: string;
+              assignedTeam?: string;
+              assignedAgentId?: number | null;
+              slaStatus?: string;
+              createdAt?: string;
+              chatState?: "open" | "closed";
+            };
+          }
+        | null;
+
+      if (!response.ok || !payload?.ticket) {
+        toast.error(payload?.message || "We could not submit the ticket right now.");
+        return;
+      }
+
+      clearBookingSummary();
+      updateTicket({
+        chatHistory: nextMessages,
+        status: payload.ticket.status || "Pending",
+        statusReason: payload.ticket.statusReason || quickTicketReason,
+        assignedTeam: payload.ticket.assignedTeam || ticket.assignedTeam,
+        assignedAgentId: payload.ticket.assignedAgentId ?? ticket.assignedAgentId,
+        slaStatus: payload.ticket.slaStatus || ticket.slaStatus,
+        createdAt: payload.ticket.createdAt || ticket.createdAt,
+        chatState: payload.ticket.chatState || ticket.chatState,
+      });
+      toast.success("Your ticket has been submitted directly for team review.");
+      navigate("/support/status");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsQuickSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!entryAction || !ticket.id) {
+      return;
+    }
+
+    if (consumedEntryActionRef.current === entryAction) {
+      return;
+    }
+
+    consumedEntryActionRef.current = entryAction;
+    navigate("/support/chat", { replace: true, state: null });
+
+    if (entryAction === "booking") {
+      navigate("/support/booking", {
+        replace: true,
+        state: {
+          returnPath: "/support/chat",
+        } satisfies SupportBookingLocationState,
+      });
+      return;
+    }
+
+    if (entryAction === "live-chat") {
+      if (ticket.liveChatRequested) {
+        toast.info("Your live chat request is already active. Please stay connected.");
+        return;
+      }
+
+      if (isLearnerChatClosed(ticket)) {
+        toast.error("This chat is already closed.");
+        return;
+      }
+
+      if (isMeetingChatReadOnly) {
+        toast.error("Live chat requests are unavailable while your support meeting is active.");
+        return;
+      }
+
+      void handleRequestLiveAgent();
+    }
+  }, [entryAction, isMeetingChatReadOnly, navigate, ticket, ticket.id, ticket.liveChatRequested]);
 
   const minBookingDate = formatDateInputValue(new Date());
   const bookingValidationMessage = getSupportSessionValidationMessage(bookingDate, bookingTime);
@@ -1033,6 +1168,12 @@ const ChatSupport = () => {
   };
 
   const handleStartNewChat = () => {
+    if (!ticket.email) {
+      clearBookingSummary();
+      navigate("/support");
+      return;
+    }
+
     setTicket({
       id: "",
       learnerName: ticket.learnerName,
@@ -1121,7 +1262,14 @@ const ChatSupport = () => {
               className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-gradient-to-b from-background to-card px-3 py-4 pr-16 sm:px-4 sm:py-5 sm:pr-24 md:px-6 md:pr-28"
             >
               {messages.map((message) => (
-                <MessageBubble key={message.id} m={message} />
+                <MessageBubble
+                  key={message.id}
+                  m={message}
+                  allowLiveAgentQueueActions={isWaitingForAssignment}
+                  onBookingClick={openBookingDialog}
+                  onQuickTicketClick={handleSubmitQuickTicket}
+                  quickTicketDisabled={isQuickSubmitting}
+                />
               ))}
 
               {isSendingMessage && <TypingBubble />}
@@ -1261,9 +1409,22 @@ const ChatSupport = () => {
   );
 };
 
-const MessageBubble = ({ m }: { m: ChatMessage }) => {
+export const MessageBubble = ({
+  m,
+  allowLiveAgentQueueActions = false,
+  onBookingClick,
+  onQuickTicketClick,
+  quickTicketDisabled = false,
+}: {
+  m: ChatMessage;
+  allowLiveAgentQueueActions?: boolean;
+  onBookingClick?: () => void | Promise<void>;
+  onQuickTicketClick?: () => void | Promise<void>;
+  quickTicketDisabled?: boolean;
+}) => {
   const isUser = m.sender === "user";
   const isAgent = m.sender === "agent";
+  const showLiveAgentQueueActions = !isUser && !isAgent && allowLiveAgentQueueActions && isLiveAgentQueueStatusMessageText(m.text);
 
   return (
     <div className={cn("flex gap-2.5", isUser && "flex-row-reverse")}>
@@ -1297,7 +1458,33 @@ const MessageBubble = ({ m }: { m: ChatMessage }) => {
               : "bg-card border rounded-tl-sm",
           )}
         >
-          {m.text}
+          {showLiveAgentQueueActions ? (
+            <>
+              {legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through{" "}
+              <button
+                type="button"
+                onClick={() => void onBookingClick?.()}
+                className="inline p-0 align-baseline font-medium text-primary underline underline-offset-2 transition-colors hover:text-primary/80"
+              >
+                booking session
+              </button>
+              {" "}or{" "}
+              <button
+                type="button"
+                onClick={() => void onQuickTicketClick?.()}
+                disabled={quickTicketDisabled}
+                className={cn(
+                  "inline p-0 align-baseline font-medium text-primary underline underline-offset-2 transition-colors",
+                  quickTicketDisabled ? "cursor-default opacity-60" : "hover:text-primary/80",
+                )}
+              >
+                submit ticket directly
+              </button>
+              .
+            </>
+          ) : (
+            m.text
+          )}
         </div>
       </div>
     </div>

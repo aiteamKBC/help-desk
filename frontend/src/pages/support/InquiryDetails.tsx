@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowLeft, ArrowRight, FileText, Paperclip, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -44,7 +44,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams"];
+const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "Others"];
 const acceptedEvidenceExtensions = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".pdf", ".mp4", ".mov", ".avi", ".mkv", ".webm"]);
 
 const getExtension = (name: string) => {
@@ -78,6 +78,7 @@ const toEvidenceFile = async (file: File): Promise<EvidenceFile> => {
     size: file.size,
     mimeType: file.type,
     previewUrl: URL.createObjectURL(file),
+    file,
   };
 
   if (!isTextPreviewable(file)) {
@@ -115,6 +116,17 @@ const InquiryDetails = () => {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const canSubmit = Boolean(technicalSubcategory && inquiry.trim().length > 0);
+
+  useEffect(() => {
+    if (ticket.id && !ticket.email) {
+      navigate("/support/options");
+      return;
+    }
+
+    if (!ticket.id && !ticket.email) {
+      navigate("/support");
+    }
+  }, [navigate, ticket.email, ticket.id]);
 
   const onFiles = async (files: FileList | null) => {
     if (!files) return;
@@ -162,23 +174,23 @@ const InquiryDetails = () => {
 
     try {
       const hasExistingTicket = Boolean(ticket.id);
+      const formData = new FormData();
+      if (!hasExistingTicket) {
+        formData.set("email", ticket.email);
+      }
+      formData.set("requesterRole", ticket.requesterRole);
+      formData.set("category", "Technical");
+      formData.set("technicalSubcategory", technicalSubcategory);
+      formData.set("inquiry", inquiry);
+      evidence.forEach((file) => {
+        if (file.file) {
+          formData.append("evidenceFiles", file.file, file.name);
+        }
+      });
+
       const response = await fetch(hasExistingTicket ? `/api/tickets/${encodeURIComponent(ticket.id)}` : "/api/tickets", {
-        method: hasExistingTicket ? "PATCH" : "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          email: ticket.email,
-          requesterRole: ticket.requesterRole,
-          category: "Technical",
-          technicalSubcategory,
-          inquiry,
-          evidence: evidence.map((file) => ({
-            name: file.name,
-            size: file.size,
-            mimeType: file.mimeType,
-          })),
-        }),
+        method: "POST",
+        body: formData,
       });
 
       const payload = (await response.json().catch(() => null)) as
@@ -249,7 +261,7 @@ const InquiryDetails = () => {
         <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8 lg:col-span-2">
           <h1 className="mb-1 text-2xl font-bold text-primary">Create Support Inquiry</h1>
           <p className="mb-6 text-sm text-muted-foreground">
-            Choose the platform and describe your issue.
+            Choose the inquiry category and describe your issue.
           </p>
 
           <div className="space-y-5">
@@ -260,7 +272,7 @@ const InquiryDetails = () => {
                 onValueChange={(value) => setTechnicalSubcategory(value as TechnicalSubcategory)}
               >
                 <SelectTrigger className="h-11">
-                  <SelectValue placeholder="Select a platform" />
+                  <SelectValue placeholder="Select a category" />
                 </SelectTrigger>
                 <SelectContent>
                   {inquiryPlatforms.map((item) => (

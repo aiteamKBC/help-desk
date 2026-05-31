@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlparse
 
+from django.core.exceptions import ImproperlyConfigured
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -42,8 +44,17 @@ def get_env_list(name: str, default: str = "") -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def build_database_config(database_url: str) -> dict[str, dict[str, object]]:
+def build_database_config(
+    database_url: str,
+    *,
+    require_database_url: bool = False,
+    require_postgresql: bool = False,
+) -> dict[str, dict[str, object]]:
     if not database_url:
+        if require_database_url:
+            raise ImproperlyConfigured(
+                "DATABASE_URL is required when running with production-style settings."
+            )
         return {
             "default": {
                 "ENGINE": "django.db.backends.sqlite3",
@@ -52,13 +63,32 @@ def build_database_config(database_url: str) -> dict[str, dict[str, object]]:
         }
 
     parsed = urlparse(database_url)
-    engine = {
+    engine_map = {
         "postgres": "django.db.backends.postgresql",
         "postgresql": "django.db.backends.postgresql",
-    }.get(parsed.scheme, "django.db.backends.postgresql")
+        "sqlite": "django.db.backends.sqlite3",
+    }
+    engine = engine_map.get(parsed.scheme, "django.db.backends.postgresql")
+
+    if require_postgresql and parsed.scheme not in {"postgres", "postgresql"}:
+        raise ImproperlyConfigured(
+            "Production-style settings require DATABASE_URL to target PostgreSQL."
+        )
 
     options = dict(parse_qsl(parsed.query, keep_blank_values=True))
     options.pop("channel_binding", None)
+
+    if engine == "django.db.backends.sqlite3":
+        sqlite_path = unquote(parsed.path.lstrip("/")) or unquote(parsed.netloc or "")
+        if not sqlite_path:
+            sqlite_path = str(BASE_DIR / "db.sqlite3")
+
+        return {
+            "default": {
+                "ENGINE": engine,
+                "NAME": sqlite_path,
+            }
+        }
 
     sslmode = options.pop("sslmode", "")
     if sslmode:

@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from urllib import parse as urllib_parse
+from uuid import uuid4
 
 from psycopg import OperationalError as PsycopgOperationalError
 from django.conf import settings
 from django.db.utils import OperationalError as DjangoOperationalError
 from django.http import FileResponse, Http404, HttpResponseRedirect, JsonResponse
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
 
 from .contracts import LEGACY_ENDPOINTS
+from .roles import ADMIN_ACCESS_ROLES
 from .services import (
     acknowledge_ticket_escalation_closure,
     acknowledge_ticket_escalation_notification,
@@ -24,14 +28,17 @@ from .services import (
     request_ticket_transfer,
     cancel_support_session_request,
     close_agent_session,
-    create_support_account,
     create_follow_up_ticket,
     create_support_session_request,
     create_ticket,
     get_admin_login_response,
+    get_admin_microsoft_login_response,
+    get_admin_ticket_attachment_file,
     list_admin_notifications,
     get_admin_ticket_detail_response,
+    get_open_assigned_live_chat_agent_ids,
     heartbeat_agent_session,
+    build_microsoft_admin_authorize_url,
     get_support_booking_url,
     get_support_teams_call_context_response,
     get_ticket_booking_context_response,
@@ -43,16 +50,21 @@ from .services import (
     require_agent_session_actor,
     request_live_chat,
     save_chat_history,
+    sanitize_text,
     send_admin_ai_agent_message,
     send_chatbot_message,
+    serialize_agent,
     serve_frontend_asset,
-    update_support_account,
     update_admin_ticket,
+    update_agent_support_access,
     update_ticket,
 )
 
 logger = logging.getLogger(__name__)
 DATABASE_UNAVAILABLE_MESSAGE = "The support data service is unavailable right now. Please try again in a moment."
+ADMIN_SESSION_KEY = "support_admin_session"
+ADMIN_MICROSOFT_AUTH_SESSION_KEY = "support_admin_microsoft_auth"
+ADMIN_MICROSOFT_ERROR_QUERY_PARAM = "microsoftError"
 
 
 def log_unexpected_api_error(message: str, error: Exception) -> None:
@@ -71,6 +83,132 @@ def parse_json_body(request) -> dict:
 
 def parse_query_params(request) -> dict:
     return {key: value for key, value in request.GET.items()}
+
+
+def normalize_frontend_origin(value: object) -> str:
+    normalized_value = sanitize_text(value).rstrip("/")
+    if not normalized_value:
+        return ""
+
+    parsed = urllib_parse.urlparse(normalized_value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
+        return ""
+
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def normalize_login_redirect_uri(value: object) -> str:
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return ""
+
+    parsed = urllib_parse.urlparse(normalized_value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.path:
+        return ""
+
+    return urllib_parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def is_allowed_frontend_origin(origin: str) -> bool:
+    normalized_origin = normalize_frontend_origin(origin)
+    if not normalized_origin:
+        return False
+
+    allowed_origins = {
+        normalize_frontend_origin(value)
+        for value in getattr(settings, "CSRF_TRUSTED_ORIGINS", [])
+    }
+    return normalized_origin in allowed_origins
+
+
+def build_admin_login_error_redirect(message: str) -> str:
+    query_string = urllib_parse.urlencode({ADMIN_MICROSOFT_ERROR_QUERY_PARAM: message})
+    return f"/admin/login?{query_string}"
+
+
+def parse_public_ticket_submission_request(request) -> tuple[dict, list]:
+    content_type = (request.content_type or "").strip().lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        return ({key: value for key, value in request.POST.items()}, list(request.FILES.getlist("evidenceFiles")))
+
+    return parse_json_body(request), []
+
+
+def normalize_request_session_instance_id(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def store_request_admin_session(request, admin_payload: dict, instance_id: str) -> None:
+    request.session.cycle_key()
+    request.session[ADMIN_SESSION_KEY] = {
+        "id": int(admin_payload["id"]),
+        "username": admin_payload["username"],
+        "fullName": admin_payload.get("fullName") or admin_payload["username"],
+        "email": admin_payload.get("email"),
+        "role": admin_payload["role"],
+        "instanceId": instance_id,
+    }
+    request.session.set_expiry(settings.SUPPORT_ADMIN_SESSION_COOKIE_AGE)
+
+
+def clear_request_admin_session(request) -> None:
+    request.session.flush()
+
+
+def require_request_admin_session(request, *, allowed_roles: set[str] | None = ADMIN_ACCESS_ROLES) -> tuple[dict, dict]:
+    session_payload = request.session.get(ADMIN_SESSION_KEY)
+    if not isinstance(session_payload, dict):
+        raise ApiError(401, "Admin session is required.")
+
+    instance_id = normalize_request_session_instance_id(session_payload.get("instanceId"))
+    username = session_payload.get("username")
+
+    try:
+        actor = require_agent_session_actor(username, instance_id, allowed_roles=allowed_roles)
+    except ApiError as error:
+        if error.status_code in {401, 403}:
+            clear_request_admin_session(request)
+        raise
+
+    request.session[ADMIN_SESSION_KEY] = {
+        **session_payload,
+        "id": int(actor["id"]),
+        "username": actor["username"],
+        "fullName": actor.get("full_name") or actor["username"],
+        "email": actor.get("email"),
+        "role": actor["role"],
+        "instanceId": instance_id,
+    }
+    request.session.set_expiry(settings.SUPPORT_ADMIN_SESSION_COOKIE_AGE)
+    return actor, request.session[ADMIN_SESSION_KEY]
+
+
+def build_session_bound_admin_payload(request, *, allowed_roles: set[str] | None = ADMIN_ACCESS_ROLES) -> dict:
+    actor, session_payload = require_request_admin_session(request, allowed_roles=allowed_roles)
+    payload = parse_json_body(request)
+    payload["actorUsername"] = actor["username"]
+    payload["instanceId"] = session_payload["instanceId"]
+    return payload
+
+
+def build_admin_session_response(actor: dict, session_payload: dict) -> dict:
+    serialized_actor = serialize_agent(
+        actor,
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
+    return {
+        "id": int(serialized_actor["id"]),
+        "username": serialized_actor["username"],
+        "fullName": serialized_actor["fullName"],
+        "email": serialized_actor.get("email") or None,
+        "role": serialized_actor["role"],
+        "instanceId": session_payload["instanceId"],
+        "sessionActive": serialized_actor.get("sessionActive"),
+        "consoleStatus": serialized_actor.get("consoleStatus"),
+        "selectedConsoleStatus": serialized_actor.get("selectedConsoleStatus"),
+        "legacyAdminAccess": bool(serialized_actor.get("legacyAdminAccess")),
+        "entraDirectoryAdmin": bool(serialized_actor.get("entraDirectoryAdmin")),
+    }
 
 
 def handle_api_error(error: Exception) -> JsonResponse:
@@ -120,63 +258,206 @@ def verify_email(request):
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_login(request):
     try:
-        return JsonResponse(get_admin_login_response(parse_json_body(request)))
+        payload = parse_json_body(request)
+        instance_id = normalize_request_session_instance_id(payload.get("instanceId")) or uuid4().hex
+        payload["instanceId"] = instance_id
+        response_payload = get_admin_login_response(payload)
+        admin_payload = response_payload.get("admin")
+        if not isinstance(admin_payload, dict):
+            raise ApiError(500, "We could not start the admin session right now.")
+
+        store_request_admin_session(request, admin_payload, instance_id)
+        response_payload["admin"] = {
+            **admin_payload,
+            "instanceId": instance_id,
+        }
+        return JsonResponse(response_payload)
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
+@require_GET
+def admin_microsoft_login(request):
+    origin = normalize_frontend_origin(request.GET.get("origin"))
+    configured_redirect_uri = normalize_login_redirect_uri(settings.AZURE_LOGIN_REDIRECT_URI)
+
+    try:
+        if settings.AZURE_LOGIN_REDIRECT_URI and not configured_redirect_uri:
+            raise ApiError(500, "The configured Microsoft sign-in redirect URI is invalid.")
+
+        if not configured_redirect_uri and not is_allowed_frontend_origin(origin):
+            raise ApiError(400, "Microsoft sign-in must start from an allowed portal origin.")
+
+        state = uuid4().hex
+        nonce = uuid4().hex
+        redirect_uri = configured_redirect_uri or f"{origin}/api/admin/microsoft/callback"
+
+        request.session[ADMIN_MICROSOFT_AUTH_SESSION_KEY] = {
+            "state": state,
+            "nonce": nonce,
+            "redirectUri": redirect_uri,
+        }
+        request.session.set_expiry(settings.SUPPORT_ADMIN_SESSION_COOKIE_AGE)
+
+        return HttpResponseRedirect(
+            build_microsoft_admin_authorize_url(
+                redirect_uri=redirect_uri,
+                state=state,
+                nonce=nonce,
+            )
+        )
+    except Exception as error:
+        if origin:
+            if isinstance(error, ApiError):
+                return HttpResponseRedirect(build_admin_login_error_redirect(error.message))
+            log_unexpected_api_error("Unexpected Microsoft admin sign-in start error.", error)
+            return HttpResponseRedirect(build_admin_login_error_redirect("We could not start Microsoft sign-in right now."))
+
+        return handle_api_error(error)
+
+
+@require_GET
+def admin_microsoft_callback(request):
+    auth_session = request.session.get(ADMIN_MICROSOFT_AUTH_SESSION_KEY)
+    if not isinstance(auth_session, dict):
+        return HttpResponseRedirect(build_admin_login_error_redirect("The Microsoft sign-in session expired. Please try again."))
+
+    request.session.pop(ADMIN_MICROSOFT_AUTH_SESSION_KEY, None)
+
+    try:
+        returned_state = sanitize_text(request.GET.get("state"))
+        expected_state = sanitize_text(auth_session.get("state"))
+        if not returned_state or not expected_state or returned_state != expected_state:
+            raise ApiError(401, "Microsoft sign-in validation failed. Please try again.")
+
+        oauth_error = sanitize_text(request.GET.get("error"))
+        if oauth_error:
+            oauth_error_description = sanitize_text(request.GET.get("error_description"))
+            raise ApiError(401, oauth_error_description or oauth_error.replace("_", " ").capitalize())
+
+        code = sanitize_text(request.GET.get("code"))
+        if not code:
+            raise ApiError(400, "Microsoft sign-in did not return an authorization code.")
+
+        instance_id = uuid4().hex
+        response_payload = get_admin_microsoft_login_response(
+            {
+                "code": code,
+                "redirectUri": auth_session.get("redirectUri"),
+                "expectedNonce": auth_session.get("nonce"),
+                "instanceId": instance_id,
+                "consoleStatus": "Off",
+            }
+        )
+        admin_payload = response_payload.get("admin")
+        if not isinstance(admin_payload, dict):
+            raise ApiError(500, "We could not start the admin session right now.")
+
+        store_request_admin_session(request, admin_payload, instance_id)
+        return HttpResponseRedirect("/admin")
+    except Exception as error:
+        if isinstance(error, ApiError):
+            return HttpResponseRedirect(build_admin_login_error_redirect(error.message))
+
+        log_unexpected_api_error("Unexpected Microsoft admin sign-in callback error.", error)
+        return HttpResponseRedirect(build_admin_login_error_redirect("We could not complete Microsoft sign-in right now."))
+
+
+@ensure_csrf_cookie
+@require_http_methods(["GET"])
+def admin_session(request):
+    try:
+        actor, session_payload = require_request_admin_session(request)
+        return JsonResponse({"admin": build_admin_session_response(actor, session_payload)})
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @require_http_methods(["POST"])
 def admin_session_heartbeat(request):
     try:
-        return JsonResponse(heartbeat_agent_session(parse_json_body(request)))
+        try:
+            actor, session_payload = require_request_admin_session(request)
+        except ApiError as error:
+            if error.status_code == 401:
+                return JsonResponse({"ok": True, "sessionActive": False, "sessionReplaced": False})
+            raise
+
+        payload = parse_json_body(request)
+        response_payload = heartbeat_agent_session(
+            {
+                "actorUsername": request.session[ADMIN_SESSION_KEY]["username"],
+                "instanceId": session_payload["instanceId"],
+                "consoleStatus": payload.get("consoleStatus"),
+            }
+        )
+        if response_payload.get("sessionActive") is False:
+            clear_request_admin_session(request)
+            return JsonResponse(response_payload)
+
+        refreshed_actor, refreshed_session_payload = require_request_admin_session(request)
+        return JsonResponse(
+            {
+                **response_payload,
+                "admin": build_admin_session_response(refreshed_actor, refreshed_session_payload),
+            }
+        )
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_logout(request):
     try:
-        return JsonResponse(close_agent_session(parse_json_body(request)))
+        session_payload = request.session.get(ADMIN_SESSION_KEY)
+        if not isinstance(session_payload, dict):
+            return JsonResponse({"ok": True, "sessionClosed": False, "sessionReplaced": False})
+
+        response_payload = close_agent_session(
+            {
+                "actorUsername": session_payload.get("username"),
+                "instanceId": session_payload.get("instanceId"),
+            }
+        )
+        clear_request_admin_session(request)
+        return JsonResponse(response_payload)
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
-@require_http_methods(["GET", "POST"])
+@require_http_methods(["GET"])
 def admin_accounts(request):
     try:
-        if request.method == "GET":
-            payload = parse_query_params(request)
-            require_agent_session_actor(payload.get("actorUsername"), payload.get("instanceId"))
-            return JsonResponse(list_agents(include_inactive=True))
-
-        return JsonResponse(create_support_account(parse_json_body(request)), status=201)
-    except Exception as error:
-        return handle_api_error(error)
-
-
-@csrf_exempt
-@require_http_methods(["PATCH"])
-def admin_account_detail(request, agent_id: int):
-    try:
-        return JsonResponse(update_support_account(agent_id, parse_json_body(request)))
+        require_request_admin_session(request)
+        return JsonResponse(list_agents(include_inactive=True))
     except Exception as error:
         return handle_api_error(error)
 
 
 admin_agents = admin_accounts
-admin_agent_detail = admin_account_detail
+
+
+@require_http_methods(["PATCH"])
+def admin_account_detail(request, account_id: int):
+    try:
+        require_request_admin_session(request)
+        payload = parse_json_body(request)
+        if "supportAccess" not in payload:
+            raise ApiError(400, "supportAccess field is required.")
+        support_access = bool(payload["supportAccess"])
+        agent = update_agent_support_access(account_id, support_access=support_access)
+        return JsonResponse({"agent": agent})
+    except Exception as error:
+        return handle_api_error(error)
 
 
 @require_http_methods(["GET"])
 def admin_tickets(request):
     try:
+        require_request_admin_session(request)
         return JsonResponse(list_admin_tickets())
     except Exception as error:
         return handle_api_error(error)
@@ -185,11 +466,12 @@ def admin_tickets(request):
 @require_http_methods(["GET"])
 def admin_notifications(request):
     try:
+        _actor, session_payload = require_request_admin_session(request)
         payload = parse_query_params(request)
         return JsonResponse(
             list_admin_notifications(
-                payload.get("actorUsername"),
-                payload.get("instanceId"),
+                request.session[ADMIN_SESSION_KEY]["username"],
+                session_payload["instanceId"],
                 limit=payload.get("limit"),
             )
         )
@@ -197,95 +479,111 @@ def admin_notifications(request):
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["GET", "PATCH"])
 def admin_ticket_detail(request, public_id: str):
     try:
+        require_request_admin_session(request)
         if request.method == "GET":
             return JsonResponse(get_admin_ticket_detail_response(public_id))
 
-        return JsonResponse(update_admin_ticket(public_id, parse_json_body(request)))
+        return JsonResponse(update_admin_ticket(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
+@require_http_methods(["GET"])
+def admin_ticket_attachment_download(request, public_id: str, attachment_id: int):
+    try:
+        require_request_admin_session(request)
+        attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
+        response = FileResponse(
+            attachment["path"].open("rb"),
+            as_attachment=False,
+            filename=attachment["fileName"],
+            content_type=attachment.get("mimeType") or "application/octet-stream",
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_chat_history(request, public_id: str):
+    try:
+        return JsonResponse(save_chat_history(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @require_http_methods(["POST"])
 def admin_ticket_ai_message(request, public_id: str):
     try:
-        return JsonResponse(send_admin_ai_agent_message(public_id, parse_json_body(request)))
+        return JsonResponse(send_admin_ai_agent_message(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_follow_up(request, public_id: str):
     try:
-        return JsonResponse(create_follow_up_ticket(public_id, parse_json_body(request)), status=201)
+        return JsonResponse(create_follow_up_ticket(public_id, build_session_bound_admin_payload(request)), status=201)
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_transfer_request(request, public_id: str):
     try:
-        return JsonResponse(request_ticket_transfer(public_id, parse_json_body(request)))
+        return JsonResponse(request_ticket_transfer(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_transfer_request_accept(request, public_id: str):
     try:
-        return JsonResponse(accept_ticket_transfer_request(public_id, parse_json_body(request)))
+        return JsonResponse(accept_ticket_transfer_request(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_transfer_request_reject(request, public_id: str):
     try:
-        return JsonResponse(reject_ticket_transfer_request(public_id, parse_json_body(request)))
+        return JsonResponse(reject_ticket_transfer_request(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_transfer_decision_acknowledge(request, public_id: str):
     try:
-        return JsonResponse(acknowledge_ticket_transfer_decision(public_id, parse_json_body(request)))
+        return JsonResponse(acknowledge_ticket_transfer_decision(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_teams_call_notification_acknowledge(request, public_id: str):
     try:
-        return JsonResponse(acknowledge_ticket_teams_call_notification(public_id, parse_json_body(request)))
+        return JsonResponse(acknowledge_ticket_teams_call_notification(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_escalation_notification_acknowledge(request, public_id: str):
     try:
-        return JsonResponse(acknowledge_ticket_escalation_notification(public_id, parse_json_body(request)))
+        return JsonResponse(acknowledge_ticket_escalation_notification(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
 
-@csrf_exempt
 @require_http_methods(["POST"])
 def admin_ticket_escalation_closure_acknowledge(request, public_id: str):
     try:
-        return JsonResponse(acknowledge_ticket_escalation_closure(public_id, parse_json_body(request)))
+        return JsonResponse(acknowledge_ticket_escalation_closure(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
@@ -294,16 +592,18 @@ def admin_ticket_escalation_closure_acknowledge(request, public_id: str):
 @require_http_methods(["POST"])
 def tickets_create(request):
     try:
-        return JsonResponse(create_ticket(parse_json_body(request)), status=201)
+        payload, uploaded_files = parse_public_ticket_submission_request(request)
+        return JsonResponse(create_ticket(payload, uploaded_files=uploaded_files), status=201)
     except Exception as error:
         return handle_api_error(error)
 
 
 @csrf_exempt
-@require_http_methods(["PATCH"])
+@require_http_methods(["PATCH", "POST"])
 def tickets_update(request, public_id: str):
     try:
-        return JsonResponse(update_ticket(public_id, parse_json_body(request)))
+        payload, uploaded_files = parse_public_ticket_submission_request(request)
+        return JsonResponse(update_ticket(public_id, payload, uploaded_files=uploaded_files))
     except Exception as error:
         return handle_api_error(error)
 
@@ -396,6 +696,7 @@ def ticket_session_request_cancel(request, public_id: str):
         return handle_api_error(error)
 
 
+@ensure_csrf_cookie
 @require_http_methods(["GET", "HEAD"])
 def frontend_entry(request, path: str = ""):
     asset_path = serve_frontend_asset(path or request.path)

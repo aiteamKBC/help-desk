@@ -28,7 +28,7 @@ describe("SupportOptions", () => {
     window.localStorage.clear();
   });
 
-  it("renders the quick call / quick ticket options for coach requests", async () => {
+  it("renders the quick call / direct ticket options for coach requests", async () => {
     window.localStorage.setItem(
       supportStorageKey,
       JSON.stringify({
@@ -63,10 +63,52 @@ describe("SupportOptions", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText("Choose quick call or quick ticket")).toBeInTheDocument();
+    expect(screen.getByText("Choose quick call or submit ticket directly")).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByText("Call on Microsoft Teams")).toBeInTheDocument();
     });
-    expect(screen.getByRole("button", { name: /submit quick ticket/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /submit ticket directly/i })).toBeInTheDocument();
+  });
+
+  it("renders direct support actions inside one card for learner requests", () => {
+    window.localStorage.setItem(
+      supportStorageKey,
+      JSON.stringify({
+        ticket: {
+          id: "KBC-000247",
+          learnerName: "omar2",
+          email: "omar2@gmail.com",
+          requesterRole: "user",
+          category: "Technical",
+          technicalSubcategory: "Others",
+          inquiry: "Need help with another system",
+          evidence: [],
+          status: "Open",
+          statusReason: "",
+          assignedAgentId: null,
+          assignedTeam: "Unassigned",
+          slaStatus: "Pending Review",
+          createdAt: "2026-05-23T11:52:00+00:00",
+          chatState: "open",
+          liveChatRequested: false,
+          chatHistory: [],
+        },
+        bookingSummary: null,
+      }),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/support/options"]}>
+        <SupportProvider>
+          <SupportOptions />
+        </SupportProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Choose how you want to continue")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /chatbot/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /live chat/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /booking session/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /submit ticket directly/i })).toBeInTheDocument();
   });
 });

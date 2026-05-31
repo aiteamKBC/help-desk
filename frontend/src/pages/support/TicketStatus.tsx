@@ -102,7 +102,7 @@ const TicketStatus = () => {
     : isAwaitingMeeting
       ? "Support Session In Progress"
       : isAwaitingSupportReview
-        ? "Quick Ticket Submitted"
+        ? "Direct Ticket Submitted"
         : ticket.status === "Pending"
           ? "Support Request Updated"
           : "Chat Closed";
@@ -114,7 +114,7 @@ const TicketStatus = () => {
     : isAwaitingMeeting
       ? "Your support request is currently waiting for the scheduled support session. Chat is available in read-only mode while this meeting remains active."
     : isAwaitingSupportReview
-        ? "Your quick ticket has been sent directly to the support team. We will review the saved details and follow up using your registered contact information."
+        ? "Your ticket has been submitted directly to the support team. We will review the saved details and follow up using your registered contact information."
         : ticket.status === "Pending"
           ? "Your support request is currently awaiting resolution. Our team will continue working on it and follow up with you."
           : "Thank you for contacting Kent College Support. It was a pleasure assisting you today. We appreciate your time and look forward to supporting you again in the future.";

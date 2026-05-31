@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 from django.conf import settings
-from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.hashers import check_password
 from django.db import connection, transaction
 
 from .roles import (
@@ -22,6 +24,7 @@ from .roles import (
     ACCOUNT_SCOPE_REQUESTER,
     ACCOUNT_SCOPE_STAFF,
     ACCOUNT_SCOPES,
+    ADMIN_ACCESS_GROUP_NAME,
     ADMIN_ACCESS_ROLES,
     DEFAULT_ACCOUNT_ROLE,
     PUBLIC_SUPPORT_ACCOUNT_ROLE_SET,
@@ -32,13 +35,14 @@ from .roles import (
     ROLE_EMPLOYER,
     ROLE_SUPERADMIN,
     ROLE_USER,
+    SUPPORT_ACCESS_GROUP_NAME,
 )
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
-ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "LMS", "Teams"}
+ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "LMS", "Teams", "Others"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
 ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
@@ -92,7 +96,7 @@ UK_SUPPORT_SESSION_START_MINUTES = 8 * 60
 UK_SUPPORT_SESSION_END_MINUTES = 16 * 60
 SUPPORT_SESSION_LEAD_TIME_SECONDS = 24 * 60 * 60
 WEBHOOK_RESPONSE_WRAPPER_KEYS = ("data", "body", "result", "payload", "json", "content", "booking", "meeting", "event", "error")
-AGENT_SESSION_TIMEOUT = timedelta(minutes=5)
+AGENT_SESSION_TIMEOUT = timedelta(minutes=60)
 DEFAULT_AGENT_CONSOLE_STATUS = "Off"
 AGENT_CONSOLE_STATUSES = {"Available", "Busy", "Off"}
 SELECTABLE_AGENT_CONSOLE_STATUSES = {"Available", "Off"}
@@ -107,6 +111,15 @@ LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
 MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0"
 MICROSOFT_GRAPH_BETA_BASE_URL = "https://graph.microsoft.com/beta"
 MICROSOFT_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+MICROSOFT_OIDC_AUTHORIZE_BASE_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+MICROSOFT_OIDC_TOKEN_BASE_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+MICROSOFT_OIDC_SCOPES = ("openid", "profile", "email", "User.Read", "Directory.Read.All")
+MICROSOFT_GRAPH_ME_URL = f"{MICROSOFT_GRAPH_V1_BASE_URL}/me?$select=id,displayName,mail,userPrincipalName"
+MICROSOFT_GRAPH_USERS_URL = f"{MICROSOFT_GRAPH_V1_BASE_URL}/users"
+MICROSOFT_GRAPH_ME_DIRECTORY_ROLES_URL = (
+    f"{MICROSOFT_GRAPH_V1_BASE_URL}/me/transitiveMemberOf/microsoft.graph.directoryRole"
+    "?$select=id,displayName,roleTemplateId"
+)
 MICROSOFT_TEAMS_CALL_DEEP_LINK_URL = "https://teams.microsoft.com/l/call/0/0"
 MICROSOFT_GRAPH_BOOKINGS_TIMEZONE = "GMT Standard Time"
 MICROSOFT_GRAPH_TIMEZONE_ALIASES = {
@@ -126,8 +139,25 @@ MICROSOFT_GRAPH_STAFF_ROLE_PRIORITY = {
     "viewer": 2,
     "externalguest": 3,
 }
-MANAGE_ACCOUNT_ROLES = ADMIN_ACCESS_ROLES
 MANAGED_PUBLIC_REQUESTER_SOURCE = "support_portal_requester"
+ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".pdf",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm",
+}
+ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES = {"application/pdf"}
+ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
+DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
 
 
 @dataclass
@@ -138,6 +168,207 @@ class ApiError(Exception):
 
 def sanitize_text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def sanitize_support_attachment_name(value: Any) -> str:
+    normalized_value = sanitize_text(value).replace("\\", "/").split("/")[-1]
+    if not normalized_value:
+        return "attachment"
+    return normalized_value[:255]
+
+
+def get_support_attachment_root() -> Path:
+    configured_root = getattr(settings, "SUPPORT_ATTACHMENT_ROOT", settings.BASE_DIR / "media" / "support_attachments")
+    return Path(configured_root)
+
+
+def get_support_attachment_max_file_bytes() -> int:
+    configured_value = getattr(settings, "SUPPORT_ATTACHMENT_MAX_FILE_BYTES", DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES)
+
+    try:
+        normalized_value = int(configured_value)
+    except (TypeError, ValueError):
+        normalized_value = DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES
+
+    return max(normalized_value, 1024)
+
+
+def get_support_attachment_extension(file_name: str) -> str:
+    return Path(file_name).suffix.lower()
+
+
+def is_allowed_support_attachment_type(*, file_name: str, mime_type: str) -> bool:
+    extension = get_support_attachment_extension(file_name)
+    if extension not in ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS:
+        return False
+
+    if not mime_type:
+        return True
+
+    if mime_type in ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES:
+        return True
+
+    return mime_type.startswith(ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES)
+
+
+def build_support_attachment_storage_key(ticket_public_id: str, file_name: str) -> str:
+    extension = get_support_attachment_extension(file_name)
+    ticket_segment = sanitize_text(ticket_public_id) or "ticket"
+    created_at = datetime.now(timezone.utc)
+    return (
+        f"{ticket_segment}/"
+        f"{created_at.strftime('%Y/%m')}/"
+        f"{uuid4().hex}{extension}"
+    )
+
+
+def resolve_support_attachment_path(storage_key: str) -> Path:
+    normalized_storage_key = sanitize_text(storage_key)
+    if not normalized_storage_key or "://" in normalized_storage_key:
+        raise ApiError(404, "Attachment file is unavailable.")
+
+    attachment_root = get_support_attachment_root().resolve()
+    candidate_path = (attachment_root / normalized_storage_key).resolve()
+    if attachment_root not in candidate_path.parents and candidate_path != attachment_root:
+        raise ApiError(404, "Attachment file is unavailable.")
+
+    return candidate_path
+
+
+def delete_support_attachment_file(storage_key: str) -> None:
+    normalized_storage_key = sanitize_text(storage_key)
+    if not normalized_storage_key or "://" in normalized_storage_key:
+        return
+
+    try:
+        attachment_path = resolve_support_attachment_path(normalized_storage_key)
+    except ApiError:
+        return
+
+    if attachment_path.exists():
+        attachment_path.unlink()
+
+    attachment_root = get_support_attachment_root().resolve()
+    current_directory = attachment_path.parent
+    while current_directory != attachment_root and current_directory.exists():
+        try:
+            current_directory.rmdir()
+        except OSError:
+            break
+        current_directory = current_directory.parent
+
+
+def build_admin_ticket_attachment_download_url(public_id: str, attachment_id: int) -> str:
+    return f"/api/admin/tickets/{urllib_parse.quote(public_id)}/attachments/{attachment_id}/download"
+
+
+def normalize_ticket_attachment_row_payload(file: dict[str, Any]) -> dict[str, Any]:
+    metadata = normalize_json_object(file.get("metadata"))
+    return {
+        "name": sanitize_support_attachment_name(file.get("name")),
+        "mimeType": sanitize_text(file.get("mimeType")) or None,
+        "size": int(file["size"]) if isinstance(file.get("size"), (int, float)) else None,
+        "storageKey": sanitize_text(file.get("storageKey")) or sanitize_text(file.get("storageUrl")) or None,
+        "metadata": metadata or file,
+    }
+
+
+def store_uploaded_ticket_attachment(ticket_public_id: str, uploaded_file: Any) -> dict[str, Any]:
+    file_name = sanitize_support_attachment_name(getattr(uploaded_file, "name", ""))
+    mime_type = sanitize_text(getattr(uploaded_file, "content_type", "")) or mimetypes.guess_type(file_name)[0] or ""
+    file_size = int(getattr(uploaded_file, "size", 0) or 0)
+
+    if file_size <= 0:
+        raise ApiError(400, "Uploaded attachments must not be empty.")
+    if file_size > get_support_attachment_max_file_bytes():
+        raise ApiError(400, "Uploaded attachments exceed the maximum allowed size.")
+    if not is_allowed_support_attachment_type(file_name=file_name, mime_type=mime_type):
+        raise ApiError(400, "Unsupported attachment type. Please upload an image, PDF, or video file.")
+
+    storage_key = build_support_attachment_storage_key(ticket_public_id, file_name)
+    attachment_path = resolve_support_attachment_path(storage_key)
+    attachment_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with attachment_path.open("wb") as destination:
+        if hasattr(uploaded_file, "chunks"):
+            for chunk in uploaded_file.chunks():
+                destination.write(chunk)
+        else:
+            destination.write(uploaded_file.read())
+
+    return {
+        "name": file_name,
+        "mimeType": mime_type or None,
+        "size": file_size,
+        "storageKey": storage_key,
+        "metadata": {
+            "originalName": file_name,
+            "storage": "local_filesystem",
+        },
+    }
+
+
+def store_uploaded_ticket_attachments(ticket_public_id: str, uploaded_files: list[Any]) -> list[dict[str, Any]]:
+    stored_attachments: list[dict[str, Any]] = []
+
+    try:
+        for uploaded_file in uploaded_files:
+            stored_attachments.append(store_uploaded_ticket_attachment(ticket_public_id, uploaded_file))
+    except Exception:
+        for attachment in stored_attachments:
+            delete_support_attachment_file(attachment.get("storageKey", ""))
+        raise
+
+    return stored_attachments
+
+
+def list_ticket_attachment_storage_keys(ticket_id: int) -> list[str]:
+    rows = run_query(
+        """
+        SELECT storage_url
+        FROM ticket_attachments
+        WHERE ticket_id = %s
+        """,
+        [ticket_id],
+    )
+    return [sanitize_text(row.get("storage_url")) for row in rows if sanitize_text(row.get("storage_url"))]
+
+
+def get_admin_ticket_attachment_file(public_id: str, attachment_id: int) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if attachment_id <= 0:
+        raise ApiError(400, "Attachment id is required.")
+
+    attachment = run_query_one(
+        """
+        SELECT a.id, a.file_name, a.mime_type, a.storage_url
+        FROM ticket_attachments a
+        JOIN tickets t
+          ON t.id = a.ticket_id
+        WHERE t.public_id = %s
+          AND a.id = %s
+        LIMIT 1
+        """,
+        [public_id, attachment_id],
+    )
+
+    if not attachment:
+        raise ApiError(404, "Attachment not found.")
+
+    storage_key = sanitize_text(attachment.get("storage_url"))
+    if not storage_key:
+        raise ApiError(404, "Attachment file is unavailable.")
+
+    attachment_path = resolve_support_attachment_path(storage_key)
+    if not attachment_path.exists() or not attachment_path.is_file():
+        raise ApiError(404, "Attachment file is unavailable.")
+
+    return {
+        "fileName": sanitize_support_attachment_name(attachment.get("file_name")),
+        "mimeType": sanitize_text(attachment.get("mime_type")) or None,
+        "path": attachment_path,
+    }
 
 
 def get_default_status_reason_for_status(status: str) -> str:
@@ -935,22 +1166,26 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
     if not settings.LEGACY_DATABASE_URL:
         return None
 
-    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
-        with source_connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT DISTINCT
-                  NULLIF(TRIM("ID"::text), '') AS external_learner_id,
-                  NULLIF(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName"))), '') AS full_name,
-                  LOWER(TRIM("Email")) AS email,
-                  NULLIF(TRIM(COALESCE("Learner_Phone", "learner-phone")), '') AS phone
-                FROM kbc_users_data
-                WHERE LOWER(TRIM("Email")) = %s
-                LIMIT 1
-                """,
-                [email],
-            )
-            row = cursor.fetchone()
+    try:
+        with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT
+                      NULLIF(TRIM("ID"::text), '') AS external_learner_id,
+                      NULLIF(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName"))), '') AS full_name,
+                      LOWER(TRIM("Email")) AS email,
+                      NULLIF(TRIM(COALESCE("Learner_Phone", "learner-phone")), '') AS phone
+                    FROM kbc_users_data
+                    WHERE LOWER(TRIM("Email")) = %s
+                    LIMIT 1
+                    """,
+                    [email],
+                )
+                row = cursor.fetchone()
+    except Exception:
+        logger.warning("Legacy database lookup failed for email verification; skipping kbc_users_data check.")
+        return None
 
     if not row:
         return None
@@ -962,6 +1197,223 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
         "email": normalized_email,
         "phone": phone,
     }
+
+
+def fetch_legacy_support_user_by_email(email: str) -> dict[str, Any] | None:
+    normalized_email = normalize_account_email(email)
+    if not normalized_email or not settings.LEGACY_DATABASE_URL:
+        return None
+
+    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  u.id,
+                  u.username,
+                  u.first_name,
+                  u.last_name,
+                  LOWER(TRIM(u.email)) AS email,
+                  u.is_staff,
+                  u.is_superuser,
+                  u.is_active,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_support_access,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_admin_access
+                FROM auth_user u
+                WHERE LOWER(TRIM(u.email)) = %s
+                  AND u.is_active = TRUE
+                LIMIT 1
+                """,
+                [SUPPORT_ACCESS_GROUP_NAME, ADMIN_ACCESS_GROUP_NAME, normalized_email],
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    user_id, username, first_name, last_name, returned_email, is_staff, is_superuser, is_active, has_support_access, has_admin_access = row
+    if not (bool(has_support_access) or bool(has_admin_access)):
+        return None
+
+    full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
+
+    return {
+        "id": int(user_id),
+        "username": sanitize_text(username),
+        "first_name": sanitize_text(first_name),
+        "last_name": sanitize_text(last_name),
+        "full_name": full_name,
+        "email": sanitize_text(returned_email).lower(),
+        "is_staff": bool(is_staff),
+        "is_superuser": bool(is_superuser),
+        "is_active": bool(is_active),
+        "has_support_access": bool(has_support_access),
+        "has_admin_access": bool(has_admin_access),
+    }
+
+
+def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | None:
+    normalized_username = sanitize_text(username).lower()
+    if not normalized_username or not settings.LEGACY_DATABASE_URL:
+        return None
+
+    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  u.id,
+                  u.username,
+                  u.first_name,
+                  u.last_name,
+                  LOWER(TRIM(u.email)) AS email,
+                  u.password,
+                  u.is_staff,
+                  u.is_superuser,
+                  u.is_active,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_support_access,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_admin_access
+                FROM auth_user u
+                WHERE LOWER(TRIM(u.username)) = %s
+                  AND u.is_active = TRUE
+                LIMIT 1
+                """,
+                [SUPPORT_ACCESS_GROUP_NAME, ADMIN_ACCESS_GROUP_NAME, normalized_username],
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    user_id, username_val, first_name, last_name, returned_email, password_hash, is_staff, is_superuser, is_active, has_support_access, has_admin_access = row
+    if not (bool(has_support_access) or bool(has_admin_access)):
+        return None
+
+    full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
+
+    return {
+        "id": int(user_id),
+        "username": sanitize_text(username_val),
+        "first_name": sanitize_text(first_name),
+        "last_name": sanitize_text(last_name),
+        "full_name": full_name,
+        "email": sanitize_text(returned_email).lower(),
+        "password_hash": sanitize_text(password_hash),
+        "is_staff": bool(is_staff),
+        "is_superuser": bool(is_superuser),
+        "is_active": bool(is_active),
+        "has_support_access": bool(has_support_access),
+        "has_admin_access": bool(has_admin_access),
+    }
+
+
+def fetch_legacy_support_directory_users() -> list[dict[str, Any]]:
+    if not settings.LEGACY_DATABASE_URL:
+        return []
+
+    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  u.id,
+                  u.username,
+                  u.first_name,
+                  u.last_name,
+                  LOWER(TRIM(u.email)) AS email,
+                  u.is_staff,
+                  u.is_superuser,
+                  u.is_active,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_support_access,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_admin_access
+                FROM auth_user u
+                WHERE u.is_active = TRUE
+                  AND (
+                    EXISTS(
+                      SELECT 1
+                      FROM auth_user_groups ug
+                      INNER JOIN auth_group g ON g.id = ug.group_id
+                      WHERE ug.user_id = u.id
+                        AND LOWER(TRIM(g.name)) = %s
+                    )
+                    OR EXISTS(
+                      SELECT 1
+                      FROM auth_user_groups ug
+                      INNER JOIN auth_group g ON g.id = ug.group_id
+                      WHERE ug.user_id = u.id
+                        AND LOWER(TRIM(g.name)) = %s
+                    )
+                  )
+                ORDER BY
+                  COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), NULLIF(TRIM(u.username), '')) ASC,
+                  u.id ASC
+                """,
+                [
+                    SUPPORT_ACCESS_GROUP_NAME,
+                    ADMIN_ACCESS_GROUP_NAME,
+                    SUPPORT_ACCESS_GROUP_NAME,
+                    ADMIN_ACCESS_GROUP_NAME,
+                ],
+            )
+            rows = cursor.fetchall()
+
+    legacy_users: list[dict[str, Any]] = []
+    for row in rows:
+        user_id, username, first_name, last_name, returned_email, is_staff, is_superuser, is_active, has_support_access, has_admin_access = row
+        full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
+        legacy_users.append(
+            {
+                "id": int(user_id),
+                "username": sanitize_text(username),
+                "first_name": sanitize_text(first_name),
+                "last_name": sanitize_text(last_name),
+                "full_name": full_name,
+                "email": sanitize_text(returned_email).lower(),
+                "is_staff": bool(is_staff),
+                "is_superuser": bool(is_superuser),
+                "is_active": bool(is_active),
+                "has_support_access": bool(has_support_access),
+                "has_admin_access": bool(has_admin_access),
+            }
+        )
+
+    return legacy_users
 
 
 def upsert_learner_record(learner: dict[str, Any], source: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -1049,6 +1501,72 @@ def find_learner_by_email(email: str) -> dict[str, Any] | None:
             "synced_on_demand": True,
         },
     )
+
+
+def is_kbc_learner_record(learner: dict[str, Any] | None) -> bool:
+    if not learner:
+        return False
+
+    source = sanitize_text(learner.get("source")).lower()
+    metadata = normalize_json_object(learner.get("metadata"))
+    return source == "legacy_kbc_users_data" or sanitize_text(metadata.get("legacy_source")).lower() == "kbc_users_data"
+
+
+def find_kbc_learner_by_email(email: str) -> dict[str, Any] | None:
+    learner = fetch_local_learner_by_email(email)
+    if is_kbc_learner_record(learner):
+        return learner
+
+    legacy_learner = fetch_legacy_learner_by_email(email)
+    if not legacy_learner:
+        return None
+
+    return upsert_learner_record(
+        legacy_learner,
+        source="legacy_kbc_users_data",
+        metadata={
+            "legacy_source": "kbc_users_data",
+            "synced_on_demand": True,
+        },
+    )
+
+
+def normalize_entra_public_requester_user(profile: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(profile, dict):
+        return None
+
+    if profile.get("accountEnabled") is False:
+        return None
+
+    try:
+        mail = normalize_account_email(profile.get("mail")) or ""
+        user_principal_name = normalize_account_email(profile.get("userPrincipalName")) or ""
+    except ApiError:
+        return None
+
+    email = mail or user_principal_name
+    if not email:
+        return None
+
+    display_name = sanitize_text(profile.get("displayName")) or email
+    return {
+        "id": sanitize_text(profile.get("id")),
+        "displayName": display_name,
+        "mail": mail,
+        "userPrincipalName": user_principal_name,
+        "email": email,
+        "accountEnabled": profile.get("accountEnabled") is not False,
+    }
+
+
+def build_entra_public_requester_learner_payload(email: str, entra_user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "external_learner_id": sanitize_text(entra_user.get("id")) or None,
+        "support_account_id": None,
+        "full_name": sanitize_text(entra_user.get("displayName")) or email,
+        "email": email,
+        "phone": None,
+    }
 
 
 def get_ticket_requester_role(ticket_metadata: Any, *, default: str = ROLE_USER) -> str:
@@ -1196,15 +1714,23 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
     agent_id = int(row["id"])
     has_open_assigned_chat = agent_id in (open_assigned_chat_agent_ids or set())
     selected_console_status = normalize_selectable_console_status(metadata.get("console_status")) if session_active else "Off"
+    display_email = (
+        row.get("email")
+        or sanitize_text(metadata.get("legacy_auth_email"))
+        or None
+    )
     return {
         "id": agent_id,
         "username": row["username"],
         "fullName": row.get("full_name") or row["username"],
-        "email": row.get("email") or None,
+        "email": display_email,
         "accountScope": account_scope,
         "role": row["role"],
         "isActive": is_active,
         "sessionActive": session_active,
+        "legacySupportAccess": normalize_bool(metadata.get("legacy_support_access")),
+        "legacyAdminAccess": normalize_bool(metadata.get("legacy_admin_access")),
+        "entraDirectoryAdmin": normalize_bool(metadata.get("entra_directory_admin_access")),
         "consoleStatus": resolve_agent_console_status(
             metadata,
             session_active=session_active,
@@ -1792,9 +2318,9 @@ def is_direct_microsoft_booking_configured() -> bool:
     return all(
         sanitize_text(value)
         for value in (
-            settings.AZURE_TENANT_ID,
-            settings.AZURE_CLIENT_ID,
-            settings.AZURE_CLIENT_SECRET,
+            settings.AZURE_BOOKING_TENANT_ID,
+            settings.AZURE_BOOKING_CLIENT_ID,
+            settings.AZURE_BOOKING_CLIENT_SECRET,
             settings.BOOKING_BUSINESS_ID,
             settings.BOOKING_SERVICE_ID,
         )
@@ -2565,6 +3091,416 @@ def fetch_agent_with_metadata_by_username(username: str) -> dict[str, Any] | Non
     return fetch_agent_account_by_username(username, active_only=True)
 
 
+def fetch_staff_admin_account_by_email(email: str | None) -> dict[str, Any] | None:
+    normalized_email = normalize_account_email(email)
+    if not normalized_email:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE LOWER(TRIM(email)) = %s
+          AND is_active = TRUE
+          AND account_scope = %s
+          AND role = ANY(%s)
+        LIMIT 1
+        """,
+        [normalized_email, ACCOUNT_SCOPE_STAFF, list(ADMIN_ACCESS_ROLES)],
+    )
+
+
+def fetch_staff_support_account_by_email(email: str | None) -> dict[str, Any] | None:
+    normalized_email = normalize_account_email(email)
+    if not normalized_email:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE LOWER(TRIM(email)) = %s
+          AND account_scope = %s
+        ORDER BY
+          CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [normalized_email, ACCOUNT_SCOPE_STAFF],
+    )
+
+
+def fetch_staff_support_account_by_legacy_auth_user_id(legacy_auth_user_id: int) -> dict[str, Any] | None:
+    if legacy_auth_user_id <= 0:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE account_scope = %s
+          AND COALESCE(metadata->>'legacy_auth_user_id', '') ~ '^[0-9]+$'
+          AND (metadata->>'legacy_auth_user_id')::integer = %s
+        ORDER BY
+          CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [ACCOUNT_SCOPE_STAFF, legacy_auth_user_id],
+    )
+
+
+def fetch_staff_support_account_by_entra_object_id(entra_object_id: str | None) -> dict[str, Any] | None:
+    normalized_object_id = sanitize_text(entra_object_id)
+    if not normalized_object_id:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE account_scope = %s
+          AND metadata->>'entra_object_id' = %s
+        ORDER BY
+          CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [ACCOUNT_SCOPE_STAFF, normalized_object_id],
+    )
+
+
+def legacy_auth_user_has_admin_login_access(legacy_user: dict[str, Any]) -> bool:
+    return normalize_bool(legacy_user.get("has_support_access")) or normalize_bool(legacy_user.get("has_admin_access"))
+
+
+def build_support_staff_role_from_legacy_auth_user(legacy_user: dict[str, Any]) -> str:
+    return ROLE_SUPERADMIN if normalize_bool(legacy_user.get("is_superuser")) else ROLE_ADMIN
+
+
+def build_support_staff_username_candidate(legacy_user: dict[str, Any]) -> str:
+    base_username = sanitize_text(legacy_user.get("username")).lower()
+    if not base_username:
+        email = sanitize_text(legacy_user.get("email")).lower()
+        base_username = email.split("@", 1)[0] if "@" in email else ""
+    if not base_username:
+        base_username = f"kbcstaff{int(legacy_user.get('id') or 0)}"
+
+    normalized_username = re.sub(r"[^a-z0-9._-]+", ".", base_username).strip("._-")
+    return normalized_username or f"kbcstaff{int(legacy_user.get('id') or 0)}"
+
+
+def build_support_staff_username_candidate_from_entra_profile(profile: dict[str, Any], email: str) -> str:
+    for key in ("userPrincipalName", "mail", "preferred_username", "upn", "email"):
+        raw_value = sanitize_text(profile.get(key)).lower()
+        if raw_value:
+            base_username = raw_value.split("@", 1)[0]
+            break
+    else:
+        base_username = sanitize_text(profile.get("displayName") or profile.get("name")).lower()
+
+    if not base_username:
+        base_username = email.split("@", 1)[0] if "@" in email else ""
+    if not base_username:
+        base_username = f"entrauser{sanitize_text(profile.get('id') or profile.get('oid'))[:8]}"
+
+    normalized_username = re.sub(r"[^a-z0-9._-]+", ".", base_username).strip("._-")
+    return normalized_username or "entrauser"
+
+
+def resolve_unique_support_staff_username(base_username: str, *, exclude_agent_id: int | None = None) -> str:
+    normalized_base_username = sanitize_text(base_username).lower()
+    if not normalized_base_username:
+        normalized_base_username = "kbcstaff"
+
+    if not find_agent_account_by_username(normalized_base_username, exclude_agent_id=exclude_agent_id):
+        return normalized_base_username
+
+    suffix = 2
+    while True:
+        candidate_username = f"{normalized_base_username}.{suffix}"
+        if not find_agent_account_by_username(candidate_username, exclude_agent_id=exclude_agent_id):
+            return candidate_username
+        suffix += 1
+
+
+def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]) -> dict[str, Any]:
+    normalized_email = normalize_account_email(legacy_user.get("email"))
+    if not normalized_email:
+        raise ApiError(403, "Your Microsoft account must provide a valid email address.")
+
+    legacy_auth_user_id = int(legacy_user.get("id") or 0)
+    legacy_full_name = sanitize_text(legacy_user.get("full_name")) or sanitize_text(legacy_user.get("username"))
+    legacy_role = build_support_staff_role_from_legacy_auth_user(legacy_user)
+    metadata_patch = {
+        "legacy_auth_user_id": legacy_auth_user_id,
+        "legacy_auth_source": "kbc_auth_user",
+        "legacy_auth_synced_at": datetime.now(timezone.utc).isoformat(),
+        "legacy_auth_email": normalized_email,
+        "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
+        "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
+        "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
+    }
+
+    existing_account = (
+        fetch_staff_support_account_by_legacy_auth_user_id(legacy_auth_user_id)
+        or fetch_staff_support_account_by_email(normalized_email)
+        or fetch_staff_admin_account_by_email(normalized_email)
+    )
+    if existing_account:
+        updated_metadata = normalize_json_object(existing_account.get("metadata"))
+        updated_metadata.update(metadata_patch)
+        email_owner = find_agent_account_by_email(normalized_email, exclude_agent_id=int(existing_account["id"]))
+        resolved_email = normalized_email if not email_owner else None
+
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE support_accounts
+                    SET
+                      username = %s,
+                      full_name = %s,
+                      email = %s,
+                      account_scope = %s,
+                      role = %s,
+                      is_active = TRUE,
+                      metadata = %s::jsonb,
+                      updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [
+                        resolve_unique_support_staff_username(
+                            build_support_staff_username_candidate(legacy_user),
+                            exclude_agent_id=int(existing_account["id"]),
+                        ),
+                        legacy_full_name,
+                        resolved_email,
+                        ACCOUNT_SCOPE_STAFF,
+                        legacy_role,
+                        json.dumps(updated_metadata),
+                        int(existing_account["id"]),
+                    ],
+                )
+
+        refreshed_account = fetch_agent_account_by_id(int(existing_account["id"]))
+        if refreshed_account:
+            return refreshed_account
+        raise ApiError(500, "We could not refresh the linked support account right now.")
+
+    username_candidate = resolve_unique_support_staff_username(
+        build_support_staff_username_candidate(legacy_user)
+    )
+    email_owner = find_agent_account_by_email(normalized_email)
+    initial_metadata = {
+        **metadata_patch,
+        "session_active": False,
+        "created_via": "microsoft_legacy_auth_sync",
+    }
+
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO support_accounts (
+                  username,
+                  full_name,
+                  email,
+                  account_scope,
+                  role,
+                  is_active,
+                  metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, TRUE, %s::jsonb)
+                RETURNING id
+                """,
+                [
+                    username_candidate,
+                    legacy_full_name,
+                    None if email_owner else normalized_email,
+                    ACCOUNT_SCOPE_STAFF,
+                    legacy_role,
+                    json.dumps(initial_metadata),
+                ],
+            )
+            created_row = cursor.fetchone()
+
+    if not created_row:
+        raise ApiError(500, "We could not create the linked support account right now.")
+
+    created_account = fetch_agent_account_by_id(int(created_row[0]))
+    if created_account:
+        return created_account
+
+    raise ApiError(500, "We could not load the linked support account right now.")
+
+
+def normalize_entra_directory_role(role: dict[str, Any]) -> dict[str, str]:
+    return {
+        "id": sanitize_text(role.get("id")),
+        "displayName": sanitize_text(role.get("displayName")),
+        "roleTemplateId": sanitize_text(role.get("roleTemplateId")),
+    }
+
+
+def normalize_directory_role_name(value: Any) -> str:
+    return sanitize_text(value).lower()
+
+
+def get_configured_directory_role_names(values: list[str]) -> set[str]:
+    return {normalize_directory_role_name(value) for value in values if normalize_directory_role_name(value)}
+
+
+def derive_support_role_from_entra_directory_roles(directory_roles: list[dict[str, Any]]) -> str | None:
+    role_names = {
+        normalize_directory_role_name(role.get("displayName"))
+        for role in directory_roles
+        if normalize_directory_role_name(role.get("displayName"))
+    }
+    if not role_names:
+        return None
+
+    superadmin_role_names = get_configured_directory_role_names(settings.AZURE_LOGIN_SUPERADMIN_DIRECTORY_ROLES)
+    if role_names & superadmin_role_names:
+        return ROLE_SUPERADMIN
+
+    admin_role_names = get_configured_directory_role_names(settings.AZURE_LOGIN_ADMIN_DIRECTORY_ROLES)
+    if admin_role_names and role_names & admin_role_names:
+        return ROLE_ADMIN
+
+    if normalize_bool(settings.AZURE_LOGIN_ALLOW_ANY_DIRECTORY_ROLE):
+        return ROLE_ADMIN
+
+    return None
+
+
+def sync_support_staff_account_from_entra_directory_user(
+    profile: dict[str, Any],
+    directory_roles: list[dict[str, Any]],
+    support_role: str,
+) -> dict[str, Any]:
+    candidate_emails = extract_microsoft_login_email_candidates(profile)
+    normalized_email = candidate_emails[0] if candidate_emails else ""
+    if not normalized_email:
+        raise ApiError(403, "Your Microsoft account must provide a valid email address.")
+
+    normalized_role = ROLE_SUPERADMIN if support_role == ROLE_SUPERADMIN else ROLE_ADMIN
+    entra_object_id = sanitize_text(profile.get("id") or profile.get("oid") or profile.get("sub"))
+    if not entra_object_id:
+        raise ApiError(403, "Your Microsoft account must provide a directory object id.")
+
+    full_name = (
+        sanitize_text(profile.get("displayName"))
+        or sanitize_text(profile.get("name"))
+        or normalized_email.split("@", 1)[0]
+    )
+    normalized_directory_roles = [normalize_entra_directory_role(role) for role in directory_roles]
+    metadata_patch = {
+        "entra_object_id": entra_object_id,
+        "entra_source": "microsoft_graph_directory_roles",
+        "entra_synced_at": datetime.now(timezone.utc).isoformat(),
+        "entra_email": normalized_email,
+        "entra_directory_admin_access": True,
+        "entra_directory_roles": normalized_directory_roles,
+        "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
+    }
+
+    existing_account = (
+        fetch_staff_support_account_by_entra_object_id(entra_object_id)
+        or fetch_staff_support_account_by_email(normalized_email)
+        or fetch_staff_admin_account_by_email(normalized_email)
+    )
+    if existing_account:
+        updated_metadata = normalize_json_object(existing_account.get("metadata"))
+        updated_metadata.update(metadata_patch)
+        email_owner = find_agent_account_by_email(normalized_email, exclude_agent_id=int(existing_account["id"]))
+        resolved_email = normalized_email if not email_owner else None
+
+        existing_username = sanitize_text(existing_account.get("username"))
+        preserved_username = existing_username or resolve_unique_support_staff_username(
+            build_support_staff_username_candidate_from_entra_profile(profile, normalized_email),
+            exclude_agent_id=int(existing_account["id"]),
+        )
+
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE support_accounts
+                    SET
+                      username = %s,
+                      full_name = %s,
+                      email = %s,
+                      account_scope = %s,
+                      role = %s,
+                      is_active = TRUE,
+                      metadata = %s::jsonb,
+                      updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [
+                        preserved_username,
+                        full_name,
+                        resolved_email,
+                        ACCOUNT_SCOPE_STAFF,
+                        normalized_role,
+                        json.dumps(updated_metadata),
+                        int(existing_account["id"]),
+                    ],
+                )
+
+        refreshed_account = fetch_agent_account_by_id(int(existing_account["id"]))
+        if refreshed_account:
+            return refreshed_account
+        raise ApiError(500, "We could not refresh the Microsoft support account right now.")
+
+    username_candidate = resolve_unique_support_staff_username(
+        build_support_staff_username_candidate_from_entra_profile(profile, normalized_email)
+    )
+    email_owner = find_agent_account_by_email(normalized_email)
+    initial_metadata = {
+        **metadata_patch,
+        "session_active": False,
+        "created_via": "microsoft_entra_directory_role_sync",
+    }
+
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO support_accounts (
+                  username,
+                  full_name,
+                  email,
+                  account_scope,
+                  role,
+                  is_active,
+                  metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, TRUE, %s::jsonb)
+                RETURNING id
+                """,
+                [
+                    username_candidate,
+                    full_name,
+                    None if email_owner else normalized_email,
+                    ACCOUNT_SCOPE_STAFF,
+                    normalized_role,
+                    json.dumps(initial_metadata),
+                ],
+            )
+            created_row = cursor.fetchone()
+
+    if not created_row:
+        raise ApiError(500, "We could not create the Microsoft support account right now.")
+
+    created_account = fetch_agent_account_by_id(int(created_row[0]))
+    if created_account:
+        return created_account
+
+    raise ApiError(500, "We could not load the Microsoft support account right now.")
+
+
 def find_agent_account_by_username(username: str, *, exclude_agent_id: int | None = None) -> dict[str, Any] | None:
     if not username:
         return None
@@ -2638,21 +3574,44 @@ def fetch_public_requester_account_by_email(email: str) -> dict[str, Any] | None
 
 
 def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
-    managed_account = fetch_public_requester_account_by_email(email)
-    if not managed_account:
+    local_learner = find_kbc_learner_by_email(email)
+
+    if local_learner:
+        managed_account = fetch_public_requester_account_by_email(email)
+        if managed_account:
+            return {
+                "email": email,
+                "role": normalize_public_requester_role(managed_account.get("role")),
+                "account": managed_account,
+                "learner": local_learner,
+                "display_name": (
+                    sanitize_text(managed_account.get("full_name"))
+                    or sanitize_text(local_learner.get("full_name") if local_learner else "")
+                    or sanitize_text(managed_account.get("username"))
+                ),
+            }
+
+        return {
+            "email": email,
+            "role": ROLE_USER,
+            "account": None,
+            "learner": local_learner,
+            "display_name": sanitize_text(local_learner.get("full_name")) or email,
+            "source": "kbc_users_data",
+        }
+
+    entra_user = fetch_microsoft_entra_user_by_email(email)
+    if not entra_user:
         return None
 
-    local_learner = fetch_local_learner_by_email(email)
     return {
         "email": email,
-        "role": normalize_public_requester_role(managed_account.get("role")),
-        "account": managed_account,
-        "learner": local_learner,
-        "display_name": (
-            sanitize_text(managed_account.get("full_name"))
-            or sanitize_text(local_learner.get("full_name") if local_learner else "")
-            or sanitize_text(managed_account.get("username"))
-        ),
+        "role": ROLE_USER,
+        "account": None,
+        "learner": fetch_local_learner_by_email(email),
+        "display_name": sanitize_text(entra_user.get("displayName")) or email,
+        "entra_user": entra_user,
+        "source": "microsoft_entra",
     }
 
 
@@ -2661,9 +3620,26 @@ def ensure_public_requester_learner(requester: dict[str, Any]) -> dict[str, Any]
     managed_account = requester.get("account")
 
     if not managed_account:
-        if not existing_learner:
-            raise ApiError(404, "This email is not registered in our records.")
-        return existing_learner
+        if existing_learner:
+            return existing_learner
+
+        entra_user = requester.get("entra_user")
+        if entra_user:
+            ensured_entra_learner = upsert_learner_record(
+                build_entra_public_requester_learner_payload(requester["email"], entra_user),
+                source="microsoft_entra",
+                metadata={
+                    "microsoft_entra_requester": True,
+                    "entra_object_id": sanitize_text(entra_user.get("id")),
+                    "entra_user_principal_name": sanitize_text(entra_user.get("userPrincipalName")),
+                    "synced_on_demand": True,
+                },
+            )
+            if not ensured_entra_learner:
+                raise ApiError(500, "We could not prepare this Microsoft Entra requester right now.")
+            return ensured_entra_learner
+
+        raise ApiError(404, "This email is not registered in our records.")
 
     learner_payload = {
         "external_learner_id": existing_learner.get("external_learner_id") if existing_learner else None,
@@ -2726,6 +3702,37 @@ def persist_agent_metadata(agent_id: int, metadata: dict[str, Any]) -> None:
             """,
             [json.dumps(metadata or {}), agent_id],
         )
+
+
+def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
+    from django.contrib.auth import get_user_model
+    from .admin import sync_support_access_group_membership
+
+    agent = run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE id = %s AND account_scope = %s
+        LIMIT 1
+        """,
+        [agent_id, ACCOUNT_SCOPE_STAFF],
+    )
+    if not agent:
+        raise ApiError(404, "Agent not found.")
+
+    metadata = normalize_json_object(agent.get("metadata"))
+    metadata["legacy_support_access"] = support_access
+    persist_agent_metadata(agent_id, metadata)
+
+    legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
+    if legacy_auth_user_id > 0:
+        User = get_user_model()
+        django_user = User.objects.filter(pk=legacy_auth_user_id).first()
+        if django_user:
+            sync_support_access_group_membership(django_user, support_access)
+
+    agent["metadata"] = metadata
+    return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
 
 
 def is_agent_session_active(metadata: Any, now: datetime | None = None) -> bool:
@@ -3230,6 +4237,7 @@ def try_auto_assign_quick_ticket(ticket: dict[str, Any], now: datetime | None = 
         WHERE is_active = TRUE
           AND account_scope = %s
           AND role = %s
+          AND (metadata->>'legacy_support_access')::boolean = TRUE
         ORDER BY id ASC
         """,
         [ACCOUNT_SCOPE_STAFF, ROLE_ADMIN],
@@ -3257,6 +4265,7 @@ def assign_waiting_live_chat_tickets(now: datetime | None = None) -> list[int]:
             FROM support_accounts
             WHERE is_active = TRUE
               AND account_scope = %s
+              AND (metadata->>'legacy_support_access')::boolean = TRUE
             ORDER BY id ASC
             """,
             [ACCOUNT_SCOPE_STAFF],
@@ -3580,7 +4589,15 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
                 "name": row["file_name"],
                 "mimeType": row.get("mime_type"),
                 "size": int(row["file_size"]) if row.get("file_size") else 0,
-                "storageUrl": row.get("storage_url"),
+                "storageUrl": (
+                    row.get("storage_url")
+                    if "://" in sanitize_text(row.get("storage_url"))
+                    else (
+                        build_admin_ticket_attachment_download_url(ticket["public_id"], int(row["id"]))
+                        if sanitize_text(row.get("storage_url"))
+                        else None
+                    )
+                ),
                 "metadata": normalize_json_object(row.get("metadata")),
                 "createdAt": row["created_at"],
             }
@@ -3683,23 +4700,309 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not username or not password:
         raise ApiError(400, "Username and password are required.")
 
-    agent = fetch_agent_with_metadata_by_username(username)
-
-    if not verify_agent_password(agent, password):
+    legacy_user = fetch_legacy_support_user_by_username(username)
+    if not legacy_user:
         raise ApiError(401, "Invalid username or password.")
-    if normalize_account_scope(agent.get("account_scope"), fallback_role=agent.get("role")) != ACCOUNT_SCOPE_STAFF:
-        raise ApiError(403, "This account does not have admin access.")
-    if sanitize_text(agent.get("role")).lower() not in ADMIN_ACCESS_ROLES:
-        raise ApiError(403, "This account does not have admin access.")
+
+    password_hash = legacy_user.get("password_hash") or ""
+    if not password_hash or not check_password(password, password_hash):
+        raise ApiError(401, "Invalid username or password.")
+
+    if not legacy_auth_user_has_admin_login_access(legacy_user):
+        raise ApiError(403, "This account must have support access or admin access.")
+
+    matched_agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
     return {
-        "admin": register_agent_session(username, instance_id, console_status),
+        "admin": register_agent_session(
+            sanitize_text(matched_agent.get("username")).lower(),
+            instance_id,
+            console_status,
+        ),
         "message": "Login successful.",
     }
 
 
+def is_microsoft_admin_login_configured() -> bool:
+    return all(
+        sanitize_text(value)
+        for value in (
+            settings.AZURE_LOGIN_TENANT_ID,
+            settings.AZURE_LOGIN_CLIENT_ID,
+            settings.AZURE_LOGIN_CLIENT_SECRET,
+        )
+    )
+
+
+def build_microsoft_admin_authorize_url(*, redirect_uri: str, state: str, nonce: str) -> str:
+    if not is_microsoft_admin_login_configured():
+        raise ApiError(503, "Microsoft sign-in is not configured on the server.")
+
+    query_string = urllib_parse.urlencode(
+        {
+            "client_id": settings.AZURE_LOGIN_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "response_mode": "query",
+            "scope": " ".join(MICROSOFT_OIDC_SCOPES),
+            "state": state,
+            "nonce": nonce,
+            "prompt": "select_account",
+        },
+        quote_via=urllib_parse.quote,
+    )
+    return f"{MICROSOFT_OIDC_AUTHORIZE_BASE_URL.format(tenant=settings.AZURE_LOGIN_TENANT_ID)}?{query_string}"
+
+
+def decode_microsoft_jwt_payload(token: str) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        return {}
+
+    segments = normalized_token.split(".")
+    if len(segments) < 2:
+        return {}
+
+    payload_segment = segments[1]
+    padding = "=" * (-len(payload_segment) % 4)
+    try:
+        decoded_payload = base64.urlsafe_b64decode(f"{payload_segment}{padding}".encode("utf-8"))
+        parsed_payload = json.loads(decoded_payload.decode("utf-8"))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+
+    return parsed_payload if isinstance(parsed_payload, dict) else {}
+
+
+def get_json_request(url: str, headers: dict[str, str] | None = None) -> tuple[bool, bool, int | None, Any]:
+    if not url:
+        return False, False, None, None
+
+    request = urllib_request.Request(
+        url,
+        headers=headers or {},
+        method="GET",
+    )
+    return execute_http_request(request)
+
+
+def request_microsoft_login_graph_access_token() -> tuple[bool, bool, int | None, Any]:
+    if not is_microsoft_admin_login_configured():
+        return False, False, None, None
+
+    return post_form_request(
+        MICROSOFT_OIDC_TOKEN_BASE_URL.format(tenant=settings.AZURE_LOGIN_TENANT_ID),
+        {
+            "client_id": settings.AZURE_LOGIN_CLIENT_ID,
+            "client_secret": settings.AZURE_LOGIN_CLIENT_SECRET,
+            "grant_type": "client_credentials",
+            "scope": MICROSOFT_GRAPH_SCOPE,
+        },
+    )
+
+
+def fetch_microsoft_graph_me(access_token: str) -> tuple[bool, bool, int | None, Any]:
+    normalized_access_token = sanitize_text(access_token)
+    if not normalized_access_token:
+        return False, False, None, None
+
+    return get_json_request(
+        MICROSOFT_GRAPH_ME_URL,
+        headers={"Authorization": f"Bearer {normalized_access_token}"},
+    )
+
+
+def fetch_microsoft_graph_user_by_email(access_token: str, email: str) -> tuple[bool, bool, int | None, Any]:
+    normalized_access_token = sanitize_text(access_token)
+    normalized_email = normalize_email(email)
+    if not normalized_access_token or not is_valid_email(normalized_email):
+        return False, False, None, None
+
+    escaped_email = normalized_email.replace("'", "''")
+    query_string = urllib_parse.urlencode(
+        {
+            "$select": "id,displayName,mail,userPrincipalName,accountEnabled",
+            "$filter": f"mail eq '{escaped_email}' or userPrincipalName eq '{escaped_email}'",
+        },
+        quote_via=urllib_parse.quote,
+    )
+    return get_json_request(
+        f"{MICROSOFT_GRAPH_USERS_URL}?{query_string}",
+        headers={"Authorization": f"Bearer {normalized_access_token}"},
+    )
+
+
+def fetch_microsoft_entra_user_by_email(email: str) -> dict[str, Any] | None:
+    normalized_email = normalize_email(email)
+    if not is_valid_email(normalized_email):
+        return None
+
+    _, token_delivered, token_status, token_payload = request_microsoft_login_graph_access_token()
+    if not token_delivered:
+        return None
+    if token_status is None or not (200 <= token_status < 300) or not isinstance(token_payload, dict):
+        return None
+
+    access_token = sanitize_text(token_payload.get("access_token"))
+    if not access_token:
+        return None
+
+    _, user_delivered, user_status, user_payload = fetch_microsoft_graph_user_by_email(access_token, normalized_email)
+    if user_status == 404:
+        return None
+    if user_status is None or not (200 <= user_status < 300) or not isinstance(user_payload, dict):
+        if not user_delivered or user_status in {401, 403}:
+            return None
+        raise ApiError(
+            502,
+            extract_external_service_message(user_payload) or "We could not verify this email in Microsoft Entra right now.",
+        )
+
+    values = user_payload.get("value")
+    if not isinstance(values, list) or not values:
+        return None
+
+    for candidate in values:
+        normalized_candidate = normalize_entra_public_requester_user(candidate)
+        if normalized_candidate:
+            return normalized_candidate
+
+    return None
+
+
+def fetch_microsoft_graph_directory_roles(access_token: str) -> tuple[bool, bool, int | None, Any]:
+    normalized_access_token = sanitize_text(access_token)
+    if not normalized_access_token:
+        return False, False, None, None
+
+    directory_roles: list[dict[str, Any]] = []
+    next_url = MICROSOFT_GRAPH_ME_DIRECTORY_ROLES_URL
+    while next_url:
+        delivered, response_delivered, status_code, payload = get_json_request(
+            next_url,
+            headers={"Authorization": f"Bearer {normalized_access_token}"},
+        )
+        if not delivered or not response_delivered:
+            return delivered, response_delivered, status_code, payload
+        if status_code is None or not (200 <= status_code < 300) or not isinstance(payload, dict):
+            return delivered, response_delivered, status_code, payload
+
+        page_values = payload.get("value")
+        if isinstance(page_values, list):
+            directory_roles.extend(role for role in page_values if isinstance(role, dict))
+
+        next_url = sanitize_text(payload.get("@odata.nextLink"))
+
+    return True, True, 200, directory_roles
+
+
+def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("email", "preferred_username", "upn", "userPrincipalName", "mail", "unique_name"):
+        raw_value = sanitize_text(profile.get(key))
+        if not raw_value:
+            continue
+        try:
+            normalized_value = normalize_account_email(raw_value)
+        except ApiError:
+            continue
+        if normalized_value:
+            candidates.append(normalized_value)
+
+    return list(dict.fromkeys(candidates))
+
+
+def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any]:
+    code = sanitize_text(payload.get("code"))
+    redirect_uri = sanitize_text(payload.get("redirectUri"))
+    expected_nonce = sanitize_text(payload.get("expectedNonce"))
+
+    if not code or not redirect_uri:
+        raise ApiError(400, "Microsoft sign-in details are required.")
+    if not is_microsoft_admin_login_configured():
+        raise ApiError(503, "Microsoft sign-in is not configured on the server.")
+
+    _, token_delivered, token_status, token_payload = post_form_request(
+        MICROSOFT_OIDC_TOKEN_BASE_URL.format(tenant=settings.AZURE_LOGIN_TENANT_ID),
+        {
+            "client_id": settings.AZURE_LOGIN_CLIENT_ID,
+            "client_secret": settings.AZURE_LOGIN_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "scope": " ".join(MICROSOFT_OIDC_SCOPES),
+        },
+    )
+    if not token_delivered:
+        raise ApiError(502, "We could not reach Microsoft sign-in right now.")
+    if token_status is None or not (200 <= token_status < 300) or not isinstance(token_payload, dict):
+        raise ApiError(
+            401 if token_status in {400, 401, 403} else 502,
+            extract_external_service_message(token_payload) or "Microsoft sign-in could not be completed right now.",
+        )
+
+    id_token_payload = decode_microsoft_jwt_payload(sanitize_text(token_payload.get("id_token")))
+    returned_nonce = sanitize_text(id_token_payload.get("nonce"))
+    if expected_nonce and returned_nonce != expected_nonce:
+        raise ApiError(401, "Microsoft sign-in validation failed. Please try again.")
+
+    access_token = sanitize_text(token_payload.get("access_token"))
+    if not access_token:
+        raise ApiError(401, "Microsoft sign-in did not return a Graph access token.")
+
+    _, graph_delivered, graph_status, graph_payload = fetch_microsoft_graph_me(access_token)
+    if not graph_delivered or graph_status is None or not (200 <= graph_status < 300) or not isinstance(graph_payload, dict):
+        raise ApiError(
+            401 if graph_status in {400, 401, 403} else 502,
+            extract_external_service_message(graph_payload) or "We could not read your Microsoft directory profile.",
+        )
+
+    _, roles_delivered, roles_status, roles_payload = fetch_microsoft_graph_directory_roles(access_token)
+    if not roles_delivered or roles_status is None or not (200 <= roles_status < 300) or not isinstance(roles_payload, list):
+        raise ApiError(
+            401 if roles_status in {400, 401, 403} else 502,
+            extract_external_service_message(roles_payload) or "We could not read your Microsoft admin center access.",
+        )
+
+    merged_profile = {
+        **id_token_payload,
+        **graph_payload,
+    }
+    support_role = derive_support_role_from_entra_directory_roles(roles_payload)
+    if not support_role:
+        raise ApiError(403, "Your Microsoft account does not have Entra admin center access.")
+
+    matched_agent = sync_support_staff_account_from_entra_directory_user(merged_profile, roles_payload, support_role)
+
+    instance_id = sanitize_text(payload.get("instanceId")) or uuid4().hex
+    console_status = normalize_selectable_console_status(payload.get("consoleStatus"))
+    registered_session = register_agent_session(
+        sanitize_text(matched_agent.get("username")).lower(),
+        instance_id,
+        console_status,
+    )
+
+    return {
+        "admin": registered_session,
+        "message": "Microsoft sign-in successful.",
+    }
+
+
 def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
-    where_clause = "" if include_inactive else "WHERE is_active = TRUE"
+    current_legacy_staff_accounts: list[dict[str, Any]] = []
+    current_legacy_staff_ids: set[int] = set()
+
+    for legacy_user in fetch_legacy_support_directory_users():
+        current_legacy_staff_ids.add(int(legacy_user["id"]))
+        try:
+            current_legacy_staff_accounts.append(sync_support_staff_account_from_legacy_auth_user(legacy_user))
+        except ApiError:
+            continue
+
+    where_clause = "WHERE account_scope = %s"
+    query_params: list[Any] = [ACCOUNT_SCOPE_STAFF]
+    if not include_inactive:
+        where_clause += " AND is_active = TRUE"
     accounts = run_query(
         f"""
         SELECT id, username, full_name, email, account_scope, role, is_active, metadata
@@ -3707,11 +5010,6 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         {where_clause}
         ORDER BY
           CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
-          CASE account_scope
-            WHEN 'staff' THEN 0
-            WHEN 'requester' THEN 1
-            ELSE 2
-          END,
           CASE role
             WHEN 'superadmin' THEN 0
             WHEN 'admin' THEN 1
@@ -3723,178 +5021,35 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
           END,
           full_name ASC NULLS LAST,
           username ASC
-        """
+        """,
+        query_params,
     )
+    synced_staff_account_ids = {int(account["id"]) for account in current_legacy_staff_accounts if account.get("id")}
+    filtered_accounts: list[dict[str, Any]] = []
+    for account in accounts:
+        account_scope = normalize_account_scope(account.get("account_scope"), fallback_role=account.get("role"))
+        if account_scope != ACCOUNT_SCOPE_STAFF:
+            continue
+
+        metadata = normalize_json_object(account.get("metadata"))
+        legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
+        has_entra_admin_access = normalize_bool(metadata.get("entra_directory_admin_access"))
+        if (
+            int(account.get("id") or 0) in synced_staff_account_ids
+            or (legacy_auth_user_id and legacy_auth_user_id in current_legacy_staff_ids)
+            or has_entra_admin_access
+        ):
+            filtered_accounts.append(account)
+
     open_assigned_chat_agent_ids = get_open_assigned_live_chat_agent_ids()
     serialized_accounts = [
         serialize_agent(account, open_assigned_chat_agent_ids=open_assigned_chat_agent_ids)
-        for account in accounts
+        for account in filtered_accounts
     ]
 
     return {
         "accounts": serialized_accounts,
         "agents": serialized_accounts,
-    }
-
-
-def create_support_account(payload: dict[str, Any]) -> dict[str, Any]:
-    actor = require_agent_session_actor(
-        payload.get("actorUsername"),
-        payload.get("instanceId"),
-        allowed_roles=MANAGE_ACCOUNT_ROLES,
-    )
-    username = sanitize_text(payload.get("username"))
-    password = payload.get("password") if isinstance(payload.get("password"), str) else ""
-    full_name = sanitize_text(payload.get("fullName")) or username
-    email = normalize_account_email(payload.get("email"))
-    role = normalize_account_role(payload.get("role"))
-    account_scope = derive_account_scope_from_role(role)
-    is_active = normalize_bool(payload.get("isActive")) if "isActive" in payload else True
-
-    if not username:
-        raise ApiError(400, "Username is required.")
-    if not password:
-        raise ApiError(400, "Password is required.")
-    if account_scope == ACCOUNT_SCOPE_REQUESTER and not email:
-        raise ApiError(400, "An email address is required for support requester accounts.")
-    if find_agent_account_by_username(username):
-        raise ApiError(409, "That username is already in use.")
-    if email and find_agent_account_by_email(email):
-        raise ApiError(409, "That email address is already in use.")
-
-    metadata = {
-        "password_hash": make_password(password),
-        "password_updated_at": datetime.now(timezone.utc).isoformat(),
-        "created_by_username": actor["username"],
-    }
-    if not is_active or account_scope != ACCOUNT_SCOPE_STAFF:
-        metadata["session_active"] = False
-        metadata["console_status"] = DEFAULT_AGENT_CONSOLE_STATUS
-
-    with transaction.atomic():
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO support_accounts (
-                  username,
-                  full_name,
-                  email,
-                  account_scope,
-                  role,
-                  is_active,
-                  metadata
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
-                RETURNING id
-                """,
-                [
-                    username,
-                    full_name,
-                    email,
-                    account_scope,
-                    role,
-                    is_active,
-                    json.dumps(metadata),
-                ],
-            )
-            created_row = cursor.fetchone()
-
-    if not created_row:
-        raise ApiError(500, "We could not create this support account right now.")
-
-    if account_scope == ACCOUNT_SCOPE_REQUESTER and email:
-        link_support_account_to_learner(support_account_id=int(created_row[0]), email=email)
-
-    created_agent = fetch_agent_account_by_id(int(created_row[0]))
-    if not created_agent:
-        raise ApiError(500, "We could not load the new support account right now.")
-
-    return {
-        "account": serialize_agent(created_agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids()),
-        "agent": serialize_agent(created_agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids()),
-        "message": f"Support account {username} created successfully.",
-    }
-
-
-def update_support_account(agent_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    actor = require_agent_session_actor(
-        payload.get("actorUsername"),
-        payload.get("instanceId"),
-        allowed_roles=MANAGE_ACCOUNT_ROLES,
-    )
-    existing_agent = fetch_agent_account_by_id(agent_id)
-    if not existing_agent:
-        raise ApiError(404, "Support account not found.")
-
-    username = sanitize_text(payload.get("username"))
-    password = payload.get("password") if isinstance(payload.get("password"), str) else ""
-    full_name = sanitize_text(payload.get("fullName")) or username
-    email = normalize_account_email(payload.get("email"))
-    role = normalize_account_role(payload.get("role"), default=sanitize_text(existing_agent.get("role")).lower() or DEFAULT_ACCOUNT_ROLE)
-    account_scope = derive_account_scope_from_role(role)
-    is_active = normalize_bool(payload.get("isActive")) if "isActive" in payload else normalize_bool(existing_agent.get("is_active"))
-
-    if not username:
-        raise ApiError(400, "Username is required.")
-    if not is_active and int(existing_agent["id"]) == int(actor["id"]):
-        raise ApiError(400, "You cannot deactivate your own account.")
-    if account_scope == ACCOUNT_SCOPE_REQUESTER and not email:
-        raise ApiError(400, "An email address is required for support requester accounts.")
-    if find_agent_account_by_username(username, exclude_agent_id=agent_id):
-        raise ApiError(409, "That username is already in use.")
-    if email and find_agent_account_by_email(email, exclude_agent_id=agent_id):
-        raise ApiError(409, "That email address is already in use.")
-
-    metadata = normalize_json_object(existing_agent.get("metadata"))
-    if password:
-        metadata.update(
-            {
-                "password_hash": make_password(password),
-                "password_updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-    if not is_active or account_scope != ACCOUNT_SCOPE_STAFF:
-        metadata["session_active"] = False
-        metadata["console_status"] = DEFAULT_AGENT_CONSOLE_STATUS
-
-    with transaction.atomic():
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE support_accounts
-                SET username = %s,
-                    full_name = %s,
-                    email = %s,
-                    account_scope = %s,
-                    role = %s,
-                    is_active = %s,
-                    metadata = %s::jsonb,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                [
-                    username,
-                    full_name,
-                    email,
-                    account_scope,
-                    role,
-                    is_active,
-                    json.dumps(metadata),
-                    agent_id,
-                ],
-            )
-        unlink_support_account_from_learners(support_account_id=agent_id)
-        if account_scope == ACCOUNT_SCOPE_REQUESTER and email:
-            link_support_account_to_learner(support_account_id=agent_id, email=email)
-
-    updated_agent = fetch_agent_account_by_id(agent_id)
-    if not updated_agent:
-        raise ApiError(500, "We could not load the updated support account right now.")
-
-    return {
-        "account": serialize_agent(updated_agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids()),
-        "agent": serialize_agent(updated_agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids()),
-        "message": f"Support account {username} updated successfully.",
     }
 
 
@@ -4366,7 +5521,7 @@ def request_ticket_transfer(public_id: str, payload: dict[str, Any]) -> dict[str
 
         target_agent = run_query_one(
             """
-            SELECT id, username, full_name, email, role
+            SELECT id, username, full_name, email, role, metadata
             FROM support_accounts
             WHERE id = %s
               AND is_active = TRUE
@@ -4482,7 +5637,7 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
 
         target_agent = run_query_one(
             """
-            SELECT id, username, full_name, email, role
+            SELECT id, username, full_name, email, role, metadata
             FROM support_accounts
             WHERE id = %s
               AND is_active = TRUE
@@ -4542,6 +5697,10 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
                         ticket["conversation_id"],
                     ],
                 )
+
+        target_agent_metadata = normalize_json_object(target_agent.get("metadata"))
+        target_agent_metadata["console_status"] = "Available"
+        persist_agent_metadata(int(target_agent["id"]), target_agent_metadata)
 
         insert_history_event(int(ticket["id"]), "transfer_request_accepted", actor, pending_transfer_request)
         insert_history_event(
@@ -6204,12 +7363,15 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
     return detail
 
 
-def create_ticket(payload: dict[str, Any]) -> dict[str, Any]:
+def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
     email = normalize_email(payload.get("email"))
     category = sanitize_text(payload.get("category"))
     technical_subcategory = normalize_technical_subcategory(payload.get("technicalSubcategory"))
     inquiry = sanitize_text(payload.get("inquiry"))
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    uploaded_files = list(uploaded_files or [])
+    evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
+    stored_attachment_keys: list[str] = []
 
     if not is_valid_email(email):
         raise ApiError(400, "Please enter a valid email address.")
@@ -6222,163 +7384,187 @@ def create_ticket(payload: dict[str, Any]) -> dict[str, Any]:
     if not inquiry:
         raise ApiError(400, "Inquiry details are required.")
 
-    with transaction.atomic():
-        requester = resolve_public_support_requester(email)
-        if not requester:
-            raise ApiError(404, "This email is not registered in our records.")
+    try:
+        with transaction.atomic():
+            requester = resolve_public_support_requester(email)
+            if not requester:
+                raise ApiError(404, "This email is not registered in our records.")
 
-        requester_role = requester["role"]
-        ticket_priority = derive_requester_ticket_priority(requester_role)
-        learner = ensure_public_requester_learner(requester)
-        managed_account = requester.get("account")
-        ticket_metadata = {
-            "source": "support_portal",
-            "technical_subcategory": technical_subcategory or None,
-            "requester_role": requester_role,
-        }
-        if managed_account:
-            ticket_metadata.update(
-                {
-                    "requester_account_id": int(managed_account["id"]),
-                    "requester_username": sanitize_text(managed_account.get("username")),
-                }
-            )
-
-        draft_public_id = f"TMP-{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:8]}"
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO tickets (
-                  public_id,
-                  learner_id,
-                  category,
-                  technical_subcategory,
-                  inquiry,
-                  priority,
-                  evidence_count,
-                  metadata
+            requester_role = requester["role"]
+            ticket_priority = derive_requester_ticket_priority(requester_role)
+            learner = ensure_public_requester_learner(requester)
+            managed_account = requester.get("account")
+            ticket_metadata = {
+                "source": "support_portal",
+                "technical_subcategory": technical_subcategory or None,
+                "requester_role": requester_role,
+            }
+            if managed_account:
+                ticket_metadata.update(
+                    {
+                        "requester_account_id": int(managed_account["id"]),
+                        "requester_username": sanitize_text(managed_account.get("username")),
+                    }
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                RETURNING id, status, assigned_team, sla_status, created_at
-                """,
-                [
-                    draft_public_id,
-                    learner["id"],
-                    category,
-                    technical_subcategory or None,
-                    inquiry,
-                    ticket_priority,
-                    len(evidence),
-                    json.dumps(ticket_metadata),
-                ],
-            )
-            ticket_row = dictfetchone(cursor)
-            if not ticket_row:
-                raise ApiError(500, "We could not create the ticket right now.")
-
-            public_id = build_public_ticket_id(int(ticket_row["id"]))
-
-            cursor.execute(
-                """
-                INSERT INTO conversations (
-                  channel,
-                  customer_id,
-                  customer_name,
-                  customer_email,
-                  customer_phone,
-                  status,
-                  intent,
-                  language,
-                  created_at,
-                  last_message_at,
-                  metadata
+            entra_user = requester.get("entra_user")
+            if entra_user:
+                ticket_metadata.update(
+                    {
+                        "requester_source": "microsoft_entra",
+                        "entra_object_id": sanitize_text(entra_user.get("id")),
+                        "entra_user_principal_name": sanitize_text(entra_user.get("userPrincipalName")),
+                    }
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s::jsonb)
-                RETURNING id
-                """,
-                [
-                    "support",
-                    public_id,
-                    requester.get("display_name") or learner.get("full_name"),
-                    learner["email"],
-                    learner.get("phone"),
-                    "open",
-                    category,
-                    "en",
-                    json.dumps(
-                        {
-                            "ticket_public_id": public_id,
-                            "learner_id": learner["id"],
-                            "technical_subcategory": technical_subcategory or None,
-                            "requester_role": requester_role,
-                            "requester_account_id": int(managed_account["id"]) if managed_account else None,
-                            "requester_username": sanitize_text(managed_account.get("username")) if managed_account else "",
-                        }
-                    ),
-                ],
-            )
-            conversation_row = dictfetchone(cursor)
-            conversation_id = conversation_row["id"] if conversation_row else None
 
-            cursor.execute(
-                """
-                UPDATE tickets
-                SET public_id = %s, conversation_id = %s, updated_at = NOW()
-                WHERE id = %s
-                """,
-                [public_id, conversation_id, ticket_row["id"]],
-            )
-
-            if conversation_id:
+            draft_public_id = f"TMP-{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:8]}"
+            with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE conversations
-                    SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
-                    WHERE id = %s
-                    """,
-                    [
-                        json.dumps(
-                            {
-                                "chat_public_id": build_public_chat_id(public_id, conversation_id),
-                            }
-                        ),
-                        conversation_id,
-                    ],
-                )
-
-            for file in evidence:
-                cursor.execute(
-                    """
-                    INSERT INTO ticket_attachments (
-                      ticket_id,
-                      file_name,
-                      mime_type,
-                      file_size,
-                      storage_url,
+                    INSERT INTO tickets (
+                      public_id,
+                      learner_id,
+                      category,
+                      technical_subcategory,
+                      inquiry,
+                      priority,
+                      evidence_count,
                       metadata
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    RETURNING id, status, assigned_team, sla_status, created_at
                     """,
                     [
-                        ticket_row["id"],
-                        sanitize_text(file.get("name")),
-                        sanitize_text(file.get("mimeType")) or None,
-                        int(file["size"]) if isinstance(file.get("size"), (int, float)) else None,
-                        None,
-                        json.dumps(file),
+                        draft_public_id,
+                        learner["id"],
+                        category,
+                        technical_subcategory or None,
+                        inquiry,
+                        ticket_priority,
+                        evidence_count,
+                        json.dumps(ticket_metadata),
                     ],
                 )
+                ticket_row = dictfetchone(cursor)
+                if not ticket_row:
+                    raise ApiError(500, "We could not create the ticket right now.")
 
-        insert_history_event(
-            int(ticket_row["id"]),
-            "ticket_created",
-            {"role": requester_role, "label": learner["email"]},
-            {
-                "category": category,
-                "technical_subcategory": technical_subcategory or None,
-                "evidence_count": len(evidence),
-            },
-        )
+                public_id = build_public_ticket_id(int(ticket_row["id"]))
+
+                cursor.execute(
+                    """
+                    INSERT INTO conversations (
+                      channel,
+                      customer_id,
+                      customer_name,
+                      customer_email,
+                      customer_phone,
+                      status,
+                      intent,
+                      language,
+                      created_at,
+                      last_message_at,
+                      metadata
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s::jsonb)
+                    RETURNING id
+                    """,
+                    [
+                        "support",
+                        public_id,
+                        requester.get("display_name") or learner.get("full_name"),
+                        learner["email"],
+                        learner.get("phone"),
+                        "open",
+                        category,
+                        "en",
+                        json.dumps(
+                            {
+                                "ticket_public_id": public_id,
+                                "learner_id": learner["id"],
+                                "technical_subcategory": technical_subcategory or None,
+                                "requester_role": requester_role,
+                                "requester_account_id": int(managed_account["id"]) if managed_account else None,
+                                "requester_username": sanitize_text(managed_account.get("username")) if managed_account else "",
+                            }
+                        ),
+                    ],
+                )
+                conversation_row = dictfetchone(cursor)
+                conversation_id = conversation_row["id"] if conversation_row else None
+
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET public_id = %s, conversation_id = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [public_id, conversation_id, ticket_row["id"]],
+                )
+
+                if conversation_id:
+                    cursor.execute(
+                        """
+                        UPDATE conversations
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                        WHERE id = %s
+                        """,
+                        [
+                            json.dumps(
+                                {
+                                    "chat_public_id": build_public_chat_id(public_id, conversation_id),
+                                }
+                            ),
+                            conversation_id,
+                        ],
+                    )
+
+                attachment_rows = [normalize_ticket_attachment_row_payload(file) for file in evidence]
+                if uploaded_files:
+                    attachment_rows = store_uploaded_ticket_attachments(public_id, uploaded_files)
+                    stored_attachment_keys = [
+                        attachment.get("storageKey")
+                        for attachment in attachment_rows
+                        if sanitize_text(attachment.get("storageKey"))
+                    ]
+
+                for file in attachment_rows:
+                    normalized_file = normalize_ticket_attachment_row_payload(file)
+                    cursor.execute(
+                        """
+                        INSERT INTO ticket_attachments (
+                          ticket_id,
+                          file_name,
+                          mime_type,
+                          file_size,
+                          storage_url,
+                          metadata
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                        """,
+                        [
+                            ticket_row["id"],
+                            normalized_file["name"],
+                            normalized_file["mimeType"],
+                            normalized_file["size"],
+                            normalized_file["storageKey"],
+                            json.dumps(normalized_file["metadata"]),
+                        ],
+                    )
+
+            insert_history_event(
+                int(ticket_row["id"]),
+                "ticket_created",
+                {"role": requester_role, "label": learner["email"]},
+                {
+                    "category": category,
+                    "technical_subcategory": technical_subcategory or None,
+                    "evidence_count": evidence_count,
+                },
+            )
+    except Exception:
+        for storage_key in stored_attachment_keys:
+            delete_support_attachment_file(storage_key)
+        raise
 
     return {
         "ticket": {
@@ -6400,11 +7586,15 @@ def create_ticket(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def update_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
     category = sanitize_text(payload.get("category"))
     technical_subcategory = normalize_technical_subcategory(payload.get("technicalSubcategory"))
     inquiry = sanitize_text(payload.get("inquiry"))
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    uploaded_files = list(uploaded_files or [])
+    evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
+    stored_attachment_keys: list[str] = []
+    existing_attachment_storage_keys: list[str] = []
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -6417,119 +7607,142 @@ def update_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     if not inquiry:
         raise ApiError(400, "Inquiry details are required.")
 
-    with transaction.atomic():
-        existing_ticket = run_query_one(
-            """
-            SELECT
-              t.id,
-              t.public_id,
-              t.status,
-              t.status_reason,
-              t.priority,
-              t.assigned_team,
-              t.sla_status,
-              t.metadata,
-              t.created_at,
-              t.conversation_id,
-              t.technical_subcategory,
-              l.full_name AS learner_name,
-              l.email
-            FROM tickets t
-            JOIN learners l
-              ON l.id = t.learner_id
-            WHERE t.public_id = %s
-            LIMIT 1
-            """,
-            [public_id],
-        )
-
-        if not existing_ticket:
-            raise ApiError(404, "Ticket not found.")
-        requester_role = get_ticket_requester_role(existing_ticket.get("metadata"))
-        next_priority = derive_requester_ticket_priority(requester_role, existing_ticket.get("priority"))
-
-        apply_ticket_sla_policy(existing_ticket, persist=True)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
+    try:
+        with transaction.atomic():
+            existing_ticket = run_query_one(
                 """
-                UPDATE tickets
-                SET
-                  category = %s,
-                  technical_subcategory = %s,
-                  inquiry = %s,
-                  priority = %s,
-                  evidence_count = %s,
-                  updated_at = NOW()
-                WHERE id = %s
+                SELECT
+                  t.id,
+                  t.public_id,
+                  t.status,
+                  t.status_reason,
+                  t.priority,
+                  t.assigned_team,
+                  t.sla_status,
+                  t.metadata,
+                  t.created_at,
+                  t.conversation_id,
+                  t.technical_subcategory,
+                  l.full_name AS learner_name,
+                  l.email
+                FROM tickets t
+                JOIN learners l
+                  ON l.id = t.learner_id
+                WHERE t.public_id = %s
+                LIMIT 1
                 """,
-                [category, technical_subcategory or None, inquiry, next_priority, len(evidence), existing_ticket["id"]],
+                [public_id],
             )
 
-            if existing_ticket.get("conversation_id"):
+            if not existing_ticket:
+                raise ApiError(404, "Ticket not found.")
+            requester_role = get_ticket_requester_role(existing_ticket.get("metadata"))
+            next_priority = derive_requester_ticket_priority(requester_role, existing_ticket.get("priority"))
+            existing_attachment_storage_keys = list_ticket_attachment_storage_keys(int(existing_ticket["id"]))
+
+            apply_ticket_sla_policy(existing_ticket, persist=True)
+
+            with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE conversations
+                    UPDATE tickets
                     SET
-                      intent = %s,
-                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
-                      last_message_at = NOW()
+                      category = %s,
+                      technical_subcategory = %s,
+                      inquiry = %s,
+                      priority = %s,
+                      evidence_count = %s,
+                      updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [
-                        category,
-                        json.dumps(
-                            {
-                                "chat_public_id": build_public_chat_id(
-                                    existing_ticket.get("public_id"),
-                                    existing_ticket.get("conversation_id"),
-                                ),
-                                "ticket_category": category,
-                                "technical_subcategory": technical_subcategory or None,
-                                "latest_inquiry": inquiry,
-                                "evidence_count": len(evidence),
-                            }
-                        ),
-                        existing_ticket["conversation_id"],
-                    ],
+                    [category, technical_subcategory or None, inquiry, next_priority, evidence_count, existing_ticket["id"]],
                 )
 
-            cursor.execute("DELETE FROM ticket_attachments WHERE ticket_id = %s", [existing_ticket["id"]])
-
-            for file in evidence:
-                cursor.execute(
-                    """
-                    INSERT INTO ticket_attachments (
-                      ticket_id,
-                      file_name,
-                      mime_type,
-                      file_size,
-                      storage_url,
-                      metadata
+                if existing_ticket.get("conversation_id"):
+                    cursor.execute(
+                        """
+                        UPDATE conversations
+                        SET
+                          intent = %s,
+                          metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                          last_message_at = NOW()
+                        WHERE id = %s
+                        """,
+                        [
+                            category,
+                            json.dumps(
+                                {
+                                    "chat_public_id": build_public_chat_id(
+                                        existing_ticket.get("public_id"),
+                                        existing_ticket.get("conversation_id"),
+                                    ),
+                                    "ticket_category": category,
+                                    "technical_subcategory": technical_subcategory or None,
+                                    "latest_inquiry": inquiry,
+                                    "evidence_count": evidence_count,
+                                }
+                            ),
+                            existing_ticket["conversation_id"],
+                        ],
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-                    """,
-                    [
-                        existing_ticket["id"],
-                        sanitize_text(file.get("name")),
-                        sanitize_text(file.get("mimeType")) or None,
-                        int(file["size"]) if isinstance(file.get("size"), (int, float)) else None,
-                        None,
-                        json.dumps(file),
-                    ],
-                )
 
-        insert_history_event(
-            int(existing_ticket["id"]),
-            "ticket_updated",
-            {"role": requester_role, "label": existing_ticket["email"]},
-            {
-                "category": category,
-                "technical_subcategory": technical_subcategory or None,
-                "priority": next_priority,
-                "evidence_count": len(evidence),
-            },
-        )
+                attachment_rows = [normalize_ticket_attachment_row_payload(file) for file in evidence]
+                if uploaded_files:
+                    attachment_rows = store_uploaded_ticket_attachments(existing_ticket["public_id"], uploaded_files)
+                    stored_attachment_keys = [
+                        attachment.get("storageKey")
+                        for attachment in attachment_rows
+                        if sanitize_text(attachment.get("storageKey"))
+                    ]
+
+                cursor.execute("DELETE FROM ticket_attachments WHERE ticket_id = %s", [existing_ticket["id"]])
+
+                for file in attachment_rows:
+                    normalized_file = normalize_ticket_attachment_row_payload(file)
+                    cursor.execute(
+                        """
+                        INSERT INTO ticket_attachments (
+                          ticket_id,
+                          file_name,
+                          mime_type,
+                          file_size,
+                          storage_url,
+                          metadata
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                        """,
+                        [
+                            existing_ticket["id"],
+                            normalized_file["name"],
+                            normalized_file["mimeType"],
+                            normalized_file["size"],
+                            normalized_file["storageKey"],
+                            json.dumps(normalized_file["metadata"]),
+                        ],
+                    )
+
+            transaction.on_commit(
+                lambda old_storage_keys=list(existing_attachment_storage_keys): [
+                    delete_support_attachment_file(storage_key)
+                    for storage_key in old_storage_keys
+                ]
+            )
+
+            insert_history_event(
+                int(existing_ticket["id"]),
+                "ticket_updated",
+                {"role": requester_role, "label": existing_ticket["email"]},
+                {
+                    "category": category,
+                    "technical_subcategory": technical_subcategory or None,
+                    "priority": next_priority,
+                    "evidence_count": evidence_count,
+                },
+            )
+    except Exception:
+        for storage_key in stored_attachment_keys:
+            delete_support_attachment_file(storage_key)
+        raise
 
     return {
         "ticket": {
@@ -6797,12 +8010,12 @@ def build_support_session_cancellation_webhook_payload(
 
 
 def request_microsoft_graph_access_token() -> tuple[bool, bool, int | None, Any]:
-    token_url = f"https://login.microsoftonline.com/{settings.AZURE_TENANT_ID}/oauth2/v2.0/token"
+    token_url = f"https://login.microsoftonline.com/{settings.AZURE_BOOKING_TENANT_ID}/oauth2/v2.0/token"
     return post_form_request(
         token_url,
         {
-            "client_id": settings.AZURE_CLIENT_ID,
-            "client_secret": settings.AZURE_CLIENT_SECRET,
+            "client_id": settings.AZURE_BOOKING_CLIENT_ID,
+            "client_secret": settings.AZURE_BOOKING_CLIENT_SECRET,
             "scope": MICROSOFT_GRAPH_SCOPE,
             "grant_type": "client_credentials",
         },
@@ -7603,4 +8816,3 @@ def serve_frontend_asset(request_path: str) -> Path:
             return candidate
 
     return index_file
-

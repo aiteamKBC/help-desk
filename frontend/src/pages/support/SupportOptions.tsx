@@ -1,11 +1,10 @@
-import { useEffect, useState } from "react";
+import { type ComponentType, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
   ArrowRight,
   Bot,
   CalendarClock,
-  Clock3,
   FileText,
   Headphones,
   PhoneCall,
@@ -14,8 +13,24 @@ import { Button } from "@/components/ui/button";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { useSupport } from "@/context/SupportContext";
-import { getSupportResumePath, isQuickTicketOnlyRequesterRole, quickTicketReason, shouldShowStatusStep } from "@/lib/supportFlow";
+import {
+  getSupportResumePath,
+  isQuickTicketOnlyRequesterRole,
+  quickTicketReason,
+  shouldShowStatusStep,
+  type SupportChatEntryAction,
+} from "@/lib/supportFlow";
 import { toast } from "sonner";
+
+interface SupportOptionAction {
+  id: string;
+  title: string;
+  description: string;
+  icon: ComponentType<{ className?: string }>;
+  onClick: () => void | Promise<void>;
+  disabled?: boolean;
+  statusText?: string;
+}
 
 const SupportOptions = () => {
   const navigate = useNavigate();
@@ -31,13 +46,8 @@ const SupportOptions = () => {
   const quickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
 
   useEffect(() => {
-    if (!ticket.email) {
-      navigate("/support");
-      return;
-    }
-
     if (!ticket.id) {
-      navigate("/support/inquiry");
+      navigate(ticket.email ? "/support/inquiry" : "/support");
       return;
     }
 
@@ -108,8 +118,17 @@ const SupportOptions = () => {
     };
   }, [quickTicketOnlyFlow, ticket.id]);
 
-  const handleContinueToChat = () => {
+  const handleContinueToChat = (entryAction?: SupportChatEntryAction) => {
     clearBookingSummary();
+    if (entryAction) {
+      navigate("/support/chat", {
+        state: {
+          entryAction,
+        },
+      });
+      return;
+    }
+
     navigate("/support/chat");
   };
 
@@ -152,32 +171,6 @@ const SupportOptions = () => {
     } finally {
       setIsPreparingTeamsCall(false);
     }
-  };
-
-  const handleQuickCallPathClick = (event: React.MouseEvent<HTMLElement>) => {
-    if (!quickTicketOnlyFlow) {
-      return;
-    }
-
-    const clickTarget = event.target;
-    if (clickTarget instanceof HTMLElement && clickTarget.closest("button, a, input, textarea, select")) {
-      return;
-    }
-
-    void prepareQuickCall();
-  };
-
-  const handleQuickCallPathKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
-    if (!quickTicketOnlyFlow) {
-      return;
-    }
-
-    if (event.key !== "Enter" && event.key !== " ") {
-      return;
-    }
-
-    event.preventDefault();
-    void prepareQuickCall();
   };
 
   const handleOpenQuickCall = async () => {
@@ -259,7 +252,7 @@ const SupportOptions = () => {
         slaStatus: payload.ticket.slaStatus || ticket.slaStatus,
         createdAt: payload.ticket.createdAt || ticket.createdAt,
       });
-      toast.success("Your quick ticket has been submitted for team review.");
+      toast.success("Your ticket has been submitted directly for team review.");
       navigate("/support/status");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
@@ -268,187 +261,236 @@ const SupportOptions = () => {
     }
   };
 
+  const supportActions: SupportOptionAction[] = quickTicketOnlyFlow
+    ? [
+        {
+          id: "teams-call",
+          title: "Call on Microsoft Teams",
+          description: hasPreparedTeamsCall
+            ? `Your ticket is already assigned to ${teamsCallTargetLabel || "the support admin"} and ready for the Teams call.`
+            : teamsCallTargetLabel
+              ? `Open Teams and call ${teamsCallTargetLabel} directly from your saved inquiry.`
+              : (teamsCallMessage || "Open Microsoft Teams and place the call directly from this saved inquiry."),
+          icon: PhoneCall,
+          onClick: handleOpenQuickCall,
+          disabled: isLoadingTeamsCall || isPreparingTeamsCall || isOpeningTeamsCall,
+          statusText: isLoadingTeamsCall
+            ? "Preparing..."
+            : isPreparingTeamsCall
+              ? "Assigning..."
+              : isOpeningTeamsCall
+                ? "Opening..."
+                : hasPreparedTeamsCall
+                  ? "Assigned"
+                  : "Start call",
+        },
+        {
+          id: "quick-ticket",
+          title: "Submit Ticket Directly",
+          description: "Send the saved inquiry straight to the support team for review without opening chat first.",
+          icon: FileText,
+          onClick: handleQuickSubmit,
+          disabled: isQuickSubmitting,
+          statusText: isQuickSubmitting ? "Submitting..." : "Send now",
+        },
+      ]
+    : [
+        {
+          id: "chatbot",
+          title: "Chatbot",
+          description: "Open the chatbot immediately and continue the conversation from your saved inquiry.",
+          icon: Bot,
+          onClick: () => handleContinueToChat(),
+          statusText: "Open chat",
+        },
+        {
+          id: "live-chat",
+          title: ticket.liveChatRequested ? "Live Chat Requested" : "Live Chat",
+          description: ticket.liveChatRequested
+            ? "Continue to the chat and stay connected while the support team picks up your request."
+            : "Open chat and request a live support admin directly from the conversation.",
+          icon: Headphones,
+          onClick: () => handleContinueToChat("live-chat"),
+          statusText: ticket.liveChatRequested ? "Resume" : "Request now",
+        },
+        {
+          id: "booking-session",
+          title: "Booking Session",
+          description: "Open the dedicated booking page and reserve your support session without the chat popup.",
+          icon: CalendarClock,
+          onClick: () => {
+            clearBookingSummary();
+            navigate("/support/booking", {
+              state: {
+                returnPath: "/support/options",
+              },
+            });
+          },
+          statusText: "Book now",
+        },
+        {
+          id: "quick-ticket",
+          title: "Submit Ticket Directly",
+          description: "Submit the saved inquiry directly to the support team without entering the chat flow.",
+          icon: FileText,
+          onClick: handleQuickSubmit,
+          disabled: isQuickSubmitting,
+          statusText: isQuickSubmitting ? "Submitting..." : "Send now",
+        },
+      ];
+  const pageTitle = quickTicketOnlyFlow
+    ? "Choose quick call or submit ticket directly"
+    : "Choose how you want to continue";
+  const pageDescription = quickTicketOnlyFlow
+    ? "Your inquiry details are saved. Pick the fastest support route below: start a Teams call or submit the ticket directly for review."
+    : "Your inquiry details are saved. Pick the route that fits your issue and we will take you straight there.";
+  const actionTitle = quickTicketOnlyFlow ? "Quick Support Actions" : "Support Actions";
+  const actionDescription = quickTicketOnlyFlow
+    ? "Everything is in one focused panel. Choose to open a Teams call or send the ticket directly from here."
+    : "Everything is in one focused panel. Choose chatbot, live chat, booking, or direct ticket submission.";
+  const ticketSummaryItems = [
+    {
+      label: "Requester",
+      value: ticket.learnerName || ticket.email || "Requester",
+    },
+    {
+      label: "Issue Type",
+      value: ticket.category
+        ? [ticket.category, ticket.technicalSubcategory].filter(Boolean).join(" - ")
+        : "Not selected",
+    },
+    {
+      label: "Current Status",
+      value: ticket.status || "Open",
+    },
+  ];
+
   return (
     <SupportLayout>
       <StepIndicator current={quickTicketOnlyFlow ? 3 : 2.5} />
-      <div className="max-w-5xl mx-auto">
-        <div className="p-6 border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.04] rounded-[28px] shadow-card md:p-8">
-          <div className="flex items-start justify-between gap-4">
-            <div className="inline-flex items-center gap-2 rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80">
+      <div className="mx-auto max-w-6xl">
+        <div className="relative overflow-hidden rounded-[32px] border border-primary/10 bg-[radial-gradient(circle_at_top_right,rgba(98,73,238,0.14),transparent_32%),linear-gradient(135deg,#ffffff_0%,#ffffff_58%,rgba(98,73,238,0.055)_100%)] p-6 shadow-card md:p-8 lg:p-10">
+          <div className="pointer-events-none absolute -right-24 top-20 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
+          <div className="pointer-events-none absolute bottom-0 right-10 h-28 w-72 rounded-full bg-sky-200/25 blur-3xl" />
+
+          <div className="relative flex items-start justify-between gap-4">
+            <div className="inline-flex items-center gap-2 rounded-full border border-primary/15 bg-white/75 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80 shadow-soft backdrop-blur">
               <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
               Support Options
             </div>
-            <Button variant="ghost" onClick={() => navigate("/support/inquiry")} className="shrink-0">
+            <Button variant="ghost" onClick={() => navigate("/support/inquiry")} className="shrink-0 rounded-full bg-white/60 hover:bg-white">
               <ArrowLeft className="w-4 h-4 mr-2" /> Back
             </Button>
           </div>
-          <h1 className="mt-4 text-2xl font-bold text-primary">
-            {quickTicketOnlyFlow ? "Choose quick call or quick ticket" : "Choose how you want to continue"}
-          </h1>
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-            {quickTicketOnlyFlow
-              ? "Your inquiry details are saved. You can either request a quick support call directly or send the inquiry as a quick ticket for team review."
-              : "Your inquiry details are saved. You can continue with the chatbot and escalate to a live agent or a booked session when needed, or submit the ticket directly for faster team review."}
-          </p>
 
-          <div className="grid gap-4 mt-6 md:grid-cols-2">
-            <section
-              className={quickTicketOnlyFlow
-                ? "flex h-full cursor-pointer flex-col rounded-[26px] border border-primary/12 bg-card/90 p-5 shadow-soft transition hover:border-primary/35"
-                : "flex h-full flex-col rounded-[26px] border border-primary/12 bg-card/90 p-5 shadow-soft"}
-              onClick={handleQuickCallPathClick}
-              onKeyDown={handleQuickCallPathKeyDown}
-              role={quickTicketOnlyFlow ? "button" : undefined}
-              tabIndex={quickTicketOnlyFlow ? 0 : undefined}
-              aria-pressed={quickTicketOnlyFlow ? hasPreparedTeamsCall : undefined}
-            >
-              <div className="flex items-start gap-3">
-                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-soft">
-                  {quickTicketOnlyFlow ? <PhoneCall className="h-5 w-5" /> : <Bot className="h-5 w-5" />}
+          <div className="relative mt-6 grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.15fr)] lg:items-end">
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight text-primary md:text-3xl">
+                {pageTitle}
+              </h1>
+              <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground md:text-base">
+                {pageDescription}
+              </p>
+            </div>
+
+            <div className="grid gap-3 rounded-[26px] border border-primary/10 bg-white/70 p-4 shadow-soft backdrop-blur sm:grid-cols-3">
+              {ticketSummaryItems.map((item) => (
+                <div key={item.label} className="rounded-2xl border border-primary/10 bg-white/80 px-4 py-3">
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                    {item.label}
+                  </div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground" title={item.value}>
+                    {item.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <section className="relative mt-7 rounded-[28px] border border-primary/12 bg-card/90 p-5 shadow-soft backdrop-blur md:p-6">
+            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <div className="flex items-start gap-4">
+                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-soft">
+                  {quickTicketOnlyFlow ? <PhoneCall className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
                 </div>
                 <div>
-                  <h2 className="text-lg font-semibold text-foreground">
-                    {quickTicketOnlyFlow ? "Call on Microsoft Teams" : "Chatbot and Live Chat"}
+                  <h2 className="text-xl font-semibold text-foreground">
+                    {actionTitle}
                   </h2>
-                  <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                    {quickTicketOnlyFlow
-                      ? "Skip chat and place a direct Teams call to the support team from the inquiry you already saved."
-                      : "Start with the chatbot, then request live chat or book a support session if you still need more help."}
+                  <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+                    {actionDescription}
                   </p>
                 </div>
               </div>
-
-              <div className="grid gap-3 mt-5">
-                {quickTicketOnlyFlow ? (
-                  <>
-                    <div className="rounded-2xl border border-primary/10 bg-primary/[0.04] px-4 py-3">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                        <PhoneCall className="h-4 w-4 text-primary" />
-                        Direct Teams ring
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        Open Microsoft Teams and place the call without entering the chatbot or live chat flow.
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-primary/10 bg-primary/[0.04] px-4 py-3">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                        <Clock3 className="h-4 w-4 text-primary" />
-                        Inquiry stays saved
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        Your registered email and saved inquiry stay available in case you need to fall back to a quick ticket after the call.
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-primary/10 bg-primary/[0.04] px-4 py-3">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                        <Headphones className="h-4 w-4 text-primary" />
-                        {hasPreparedTeamsCall ? "Ticket assigned" : (teamsCallTargetLabel ? "Teams target ready" : "Teams hand-off")}
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        {hasPreparedTeamsCall
-                          ? `This ticket is already assigned to ${teamsCallTargetLabel || "the support admin"} and ready for the Teams call.`
-                          : teamsCallTargetLabel
-                          ? `This button will call ${teamsCallTargetLabel} directly in Microsoft Teams.`
-                          : (teamsCallMessage || "Microsoft Teams will ask you to confirm the call before it starts.")}
-                      </p>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="rounded-2xl border border-primary/10 bg-primary/[0.04] px-4 py-3">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                        <Bot className="h-4 w-4 text-primary" />
-                        Instant chatbot support
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        Get immediate guidance based on the inquiry you just entered.
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-primary/10 bg-primary/[0.04] px-4 py-3">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                        <Headphones className="h-4 w-4 text-primary" />
-                        Live agent escalation
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        Ask for human support directly from chat whenever the bot is not enough.
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-primary/10 bg-primary/[0.04] px-4 py-3">
-                      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                        <CalendarClock className="h-4 w-4 text-primary" />
-                        Book a support session
-                      </div>
-                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                        Reserve a guided session directly from the chat flow.
-                      </p>
-                    </div>
-                  </>
-                )}
+              <div className="rounded-full border border-primary/10 bg-primary/[0.05] px-4 py-2 text-xs font-semibold text-primary">
+                {quickTicketOnlyFlow ? "2 fast options" : "4 support paths"}
               </div>
+            </div>
 
-              <div className="mt-5 flex flex-1 items-end">
-                <Button
-                  onClick={quickTicketOnlyFlow ? () => void handleOpenQuickCall() : handleContinueToChat}
-                  disabled={quickTicketOnlyFlow ? (isLoadingTeamsCall || isPreparingTeamsCall || isOpeningTeamsCall || !teamsCallUrl) : false}
-                  className="w-full border-0 gradient-primary"
-                >
-                  {quickTicketOnlyFlow
-                    ? (isLoadingTeamsCall
-                      ? "Preparing Teams Call..."
-                      : isPreparingTeamsCall
-                        ? "Assigning to Admin..."
-                      : isOpeningTeamsCall
-                        ? "Opening Teams..."
-                        : "Call on Teams")
-                    : "Continue to Chat"}
-                  <ArrowRight className="w-4 h-4 ml-2" />
-                </Button>
-              </div>
-            </section>
-
-            <section className="flex h-full flex-col rounded-[26px] border border-primary/12 bg-card/90 p-5 shadow-soft">
-              <div className="flex items-start gap-3">
-                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-secondary text-foreground shadow-soft">
-                  <FileText className="h-5 w-5" />
-                </div>
-                <div>
-                  <h2 className="text-lg font-semibold text-foreground">
-                    {quickTicketOnlyFlow ? "Submit Quick Ticket" : "Create Ticket Quickly"}
-                  </h2>
-                  <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                    Skip the chat and send your saved inquiry straight to the support team for review.
-                  </p>
-                </div>
-              </div>
-
-              <div className="mt-5 rounded-[24px] border border-dashed border-primary/20 bg-primary/[0.03] px-4 py-4">
-                <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <Clock3 className="h-4 w-4 text-primary" />
-                  Faster hand-off
+            {quickTicketOnlyFlow && (
+              <div className="mt-5 rounded-[24px] border border-primary/15 bg-primary/[0.04] px-4 py-4">
+                <div className="text-sm font-semibold text-foreground">
+                  {hasPreparedTeamsCall
+                    ? "Teams hand-off is already assigned"
+                    : teamsCallTargetLabel
+                      ? "Teams target is ready"
+                      : "Direct Teams support is available"}
                 </div>
                 <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                  We will mark this request as a quick ticket so the team can pick it up without opening
-                  the chat step first.
+                  {hasPreparedTeamsCall
+                    ? `This ticket is already assigned to ${teamsCallTargetLabel || "the support admin"} and ready for your Teams call.`
+                    : teamsCallTargetLabel
+                      ? `You can call ${teamsCallTargetLabel} directly in Microsoft Teams from the first option below.`
+                      : "Your saved inquiry stays attached so you can still submit the ticket directly later if you need written follow-up."}
                 </p>
               </div>
+            )}
 
-              <div className="mt-5 flex flex-1 items-end">
-                <Button
-                  variant="outline"
-                  onClick={() => void handleQuickSubmit()}
-                  disabled={isQuickSubmitting}
-                  className="w-full"
-                >
-                  {isQuickSubmitting
-                    ? "Submitting..."
-                    : quickTicketOnlyFlow
-                      ? "Submit Quick Ticket"
-                      : "Create Ticket Quickly"}
-                  {!isQuickSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
-                </Button>
-              </div>
-            </section>
-          </div>
+            <div className={`mt-6 grid gap-4 ${quickTicketOnlyFlow ? "lg:grid-cols-2" : "lg:grid-cols-2"}`}>
+              {supportActions.map((action, index) => {
+                const Icon = action.icon;
+
+                return (
+                  <button
+                    key={action.id}
+                    type="button"
+                    onClick={() => void action.onClick()}
+                    disabled={action.disabled}
+                    className="group flex min-h-[148px] w-full flex-col justify-between rounded-[24px] border border-primary/12 bg-gradient-to-br from-white to-primary/[0.045] p-5 text-left shadow-soft transition-all duration-1000 ease-out hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-card disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0"
+                  >
+                    <span className="flex items-start justify-between gap-4">
+                      <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/[0.08] text-primary ring-1 ring-primary/10 transition group-hover:bg-primary group-hover:text-primary-foreground">
+                        <Icon className="h-5 w-5" />
+                      </span>
+                      <span className="rounded-full border border-primary/10 bg-white/80 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                        {String(index + 1).padStart(2, "0")}
+                      </span>
+                    </span>
+
+                    <span className="mt-5 block">
+                      <span className="block text-base font-semibold text-foreground">
+                        {action.title}
+                      </span>
+                      <span className="mt-2 block text-sm leading-6 text-muted-foreground">
+                        {action.description}
+                      </span>
+                    </span>
+
+                    <span className="mt-5 flex items-center justify-between gap-3 text-primary">
+                      {action.statusText && (
+                        <span className="text-sm font-semibold">
+                          {action.statusText}
+                        </span>
+                      )}
+                      <span className="ml-auto flex h-9 w-9 items-center justify-center rounded-full bg-primary/[0.08] transition group-hover:bg-primary group-hover:text-primary-foreground">
+                        <ArrowRight className="h-4 w-4" />
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
         </div>
       </div>
     </SupportLayout>

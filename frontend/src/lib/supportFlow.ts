@@ -3,6 +3,13 @@ import { type BookingSummary, type RequesterRole, type Ticket } from "@/context/
 export const awaitingMeetingReason = "Awaiting support meeting";
 export const quickTicketReason = "Quick Ticket";
 export const awaitingSupportReviewReason = quickTicketReason;
+export type SupportChatEntryAction = "live-chat" | "booking";
+export interface SupportChatLocationState {
+  entryAction?: SupportChatEntryAction;
+}
+export interface SupportBookingLocationState {
+  returnPath?: "/support/chat" | "/support/options";
+}
 const legacyQuickTicketReasons = ["Awaiting resolution", "Awaiting Resolution", "Awaiting support review"] as const;
 
 type TicketFlowState = Pick<Ticket, "id" | "status" | "statusReason" | "requesterRole">;

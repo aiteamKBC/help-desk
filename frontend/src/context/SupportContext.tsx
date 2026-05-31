@@ -3,7 +3,7 @@ import { createContext, useContext, useEffect, useState, ReactNode } from "react
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
-export type TechnicalSubcategory = "Aptem" | "LMS" | "Teams" | "";
+export type TechnicalSubcategory = "Aptem" | "LMS" | "Teams" | "Others" | "";
 export type RequesterRole = "user" | "coach" | "employer";
 
 export interface ChatMessage {
@@ -20,6 +20,7 @@ export interface EvidenceFile {
   mimeType?: string;
   previewUrl?: string;
   textContent?: string;
+  file?: File;
 }
 
 export interface Ticket {
@@ -49,6 +50,10 @@ export interface BookingSummary {
   meetingJoinUrl: string | null;
 }
 
+interface PersistedSupportState {
+  ticket?: Partial<Ticket>;
+}
+
 const defaultTicket: Ticket = {
   id: "",
   learnerName: "",
@@ -69,7 +74,51 @@ const defaultTicket: Ticket = {
   chatHistory: [],
 };
 
-const supportStorageKey = "kbc-support-state-v1";
+const legacySupportStorageKey = "kbc-support-state-v1";
+const supportStorageKey = "kbc-support-state-v2";
+
+function normalizeCategory(value: unknown, fallback: Category = defaultTicket.category): Category {
+  if (value === "Learning" || value === "Technical" || value === "Others" || value === "") {
+    return value;
+  }
+
+  return fallback;
+}
+
+function normalizeTechnicalSubcategory(
+  value: unknown,
+  fallback: TechnicalSubcategory = defaultTicket.technicalSubcategory,
+): TechnicalSubcategory {
+  if (value === "Aptem" || value === "LMS" || value === "Teams" || value === "Others" || value === "") {
+    return value;
+  }
+
+  return fallback;
+}
+
+function normalizeTicketStatus(value: unknown, fallback: TicketStatus = defaultTicket.status): TicketStatus {
+  if (value === "Open" || value === "Pending" || value === "Closed") {
+    return value;
+  }
+
+  return fallback;
+}
+
+function normalizeTicketChatState(value: unknown, fallback: TicketChatState = defaultTicket.chatState): TicketChatState {
+  if (value === "open" || value === "closed") {
+    return value;
+  }
+
+  return fallback;
+}
+
+function normalizeString(value: unknown, fallback = "") {
+  return typeof value === "string" ? value : fallback;
+}
+
+function normalizeNullableNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
 
 function normalizeRequesterRole(value: unknown, fallback: RequesterRole = defaultTicket.requesterRole): RequesterRole {
   if (typeof value !== "string") {
@@ -90,6 +139,42 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
   return {
     ...nextTicket,
     requesterRole: normalizeRequesterRole(nextTicket.requesterRole),
+    learnerName: normalizeString(nextTicket.learnerName),
+    email: normalizeString(nextTicket.email),
+    category: normalizeCategory(nextTicket.category),
+    technicalSubcategory: normalizeTechnicalSubcategory(nextTicket.technicalSubcategory),
+    inquiry: normalizeString(nextTicket.inquiry),
+    evidence: Array.isArray(nextTicket.evidence) ? nextTicket.evidence : [],
+    status: normalizeTicketStatus(nextTicket.status),
+    statusReason: normalizeString(nextTicket.statusReason),
+    assignedAgentId: normalizeNullableNumber(nextTicket.assignedAgentId),
+    assignedTeam: normalizeString(nextTicket.assignedTeam, defaultTicket.assignedTeam),
+    slaStatus: normalizeString(nextTicket.slaStatus, defaultTicket.slaStatus),
+    createdAt: normalizeString(nextTicket.createdAt),
+    chatState: normalizeTicketChatState(nextTicket.chatState),
+    liveChatRequested: Boolean(nextTicket.liveChatRequested),
+    chatHistory: Array.isArray(nextTicket.chatHistory) ? nextTicket.chatHistory : [],
+  };
+}
+
+function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
+  if (!ticket.id) {
+    return null;
+  }
+
+  return {
+    id: ticket.id,
+    requesterRole: ticket.requesterRole,
+    category: ticket.category,
+    technicalSubcategory: ticket.technicalSubcategory,
+    status: ticket.status,
+    statusReason: ticket.statusReason,
+    assignedAgentId: ticket.assignedAgentId,
+    assignedTeam: ticket.assignedTeam,
+    slaStatus: ticket.slaStatus,
+    createdAt: ticket.createdAt,
+    chatState: ticket.chatState,
+    liveChatRequested: ticket.liveChatRequested,
   };
 }
 
@@ -102,7 +187,8 @@ function readPersistedSupportState() {
   }
 
   try {
-    const rawValue = window.localStorage.getItem(supportStorageKey);
+    const rawValue = window.localStorage.getItem(supportStorageKey)
+      || window.localStorage.getItem(legacySupportStorageKey);
     if (!rawValue) {
       return {
         ticket: defaultTicket,
@@ -110,14 +196,11 @@ function readPersistedSupportState() {
       };
     }
 
-    const parsedValue = JSON.parse(rawValue) as {
-      ticket?: Partial<Ticket>;
-      bookingSummary?: BookingSummary | null;
-    };
+    const parsedValue = JSON.parse(rawValue) as PersistedSupportState;
 
     return {
       ticket: normalizeTicketState(parsedValue.ticket),
-      bookingSummary: parsedValue.bookingSummary || null,
+      bookingSummary: null as BookingSummary | null,
     };
   } catch {
     return {
@@ -157,14 +240,22 @@ export const SupportProvider = ({ children }: { children: ReactNode }) => {
       return;
     }
 
+    const persistedTicket = buildPersistedTicket(ticket);
+
+    window.localStorage.removeItem(legacySupportStorageKey);
+
+    if (!persistedTicket) {
+      window.localStorage.removeItem(supportStorageKey);
+      return;
+    }
+
     window.localStorage.setItem(
       supportStorageKey,
       JSON.stringify({
-        ticket,
-        bookingSummary,
-      }),
+        ticket: persistedTicket,
+      } satisfies PersistedSupportState),
     );
-  }, [ticket, bookingSummary]);
+  }, [ticket]);
 
   return (
     <Ctx.Provider

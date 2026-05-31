@@ -75,6 +75,7 @@ Minimum production values to change:
 - `N8N_CHATBOT_WEBHOOK_URL`
 - `N8N_ADMIN_AI_WEBHOOK_URL` if needed
 - `DJANGO_SECRET_KEY`
+- `DJANGO_ENV=production`
 - `DJANGO_DEBUG=false`
 - `DJANGO_ALLOWED_HOSTS=your-domain.com,www.your-domain.com`
 - `DJANGO_CSRF_TRUSTED_ORIGINS=https://your-domain.com,https://www.your-domain.com`

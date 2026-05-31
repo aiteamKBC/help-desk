@@ -2,6 +2,11 @@ import { Link, useLocation } from "react-router-dom";
 import { ReactNode, useEffect, useState } from "react";
 import { BookOpen, Menu, ShieldCheck, UserRound, X } from "lucide-react";
 import { KentCrestMark } from "@/components/support/KentCrestMark";
+import {
+  adminPortalReturnQueryParam,
+  canReturnToAdminDashboard,
+  syncAdminPortalReturnFromSearch,
+} from "@/lib/adminSession";
 import { cn } from "@/lib/utils";
 
 export const SupportLayout = ({
@@ -27,6 +32,8 @@ export const SupportLayout = ({
     location.pathname.startsWith("/agent") ||
     isKnowledgeBaseArea;
   const [isAdminMobileNavOpen, setIsAdminMobileNavOpen] = useState(false);
+  const [showAdminReturnLink, setShowAdminReturnLink] = useState(() => !isAdminArea && canReturnToAdminDashboard());
+  const effectiveShowHeader = showHeader && (isAdminArea || showAdminReturnLink);
   const adminHeaderShellClassName = fullWidth
     ? "w-full px-4 sm:px-6 lg:px-8 xl:px-10"
     : "mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8";
@@ -51,9 +58,19 @@ export const SupportLayout = ({
       <span className="hidden sm:inline">Admin Dashboard</span>
     </Link>
   ) : null;
+  const adminReturnLink = showAdminReturnLink ? (
+    <Link to="/admin" className={internalLinkClassName(false)}>
+      <ShieldCheck className="h-4 w-4 text-primary" />
+      <span className="sm:hidden">Admin</span>
+      <span className="hidden sm:inline">Admin</span>
+    </Link>
+  ) : null;
   const adminPortalLink = isAdminArea ? (
     <Link
-      to="/"
+      to={{
+        pathname: "/",
+        search: `?${adminPortalReturnQueryParam}=1`,
+      }}
       className={internalLinkClassName(!isKnowledgeBaseArea)}
     >
       <UserRound className="h-4 w-4 text-primary" />
@@ -63,12 +80,14 @@ export const SupportLayout = ({
   ) : null;
 
   useEffect(() => {
+    syncAdminPortalReturnFromSearch(location.search);
+    setShowAdminReturnLink(!isAdminArea && canReturnToAdminDashboard());
     setIsAdminMobileNavOpen(false);
-  }, [location.pathname, location.search]);
+  }, [isAdminArea, location.pathname, location.search]);
 
   return (
     <div className="min-h-screen gradient-soft">
-      {showHeader ? (
+      {effectiveShowHeader ? (
         isAdminArea ? (
           <header className="sticky top-0 z-30 border-b border-black/5 bg-white">
             <div className={cn("sm:hidden", adminHeaderShellClassName)}>
@@ -164,16 +183,12 @@ export const SupportLayout = ({
 
               {left ? <div className="flex items-center gap-2">{left}</div> : null}
 
-              <div className="ml-auto flex items-center gap-2">
-                <Link
-                  to="/admin/login"
-                  className="inline-flex items-center gap-2 rounded-full bg-primary px-3.5 py-2 text-[13px] font-semibold text-primary-foreground shadow-card transition-all hover:opacity-95 sm:text-sm"
-                >
-                  <ShieldCheck className="h-4 w-4" />
-                  <span>Admin</span>
-                </Link>
-                {right}
-              </div>
+              {showAdminReturnLink || right ? (
+                <div className="ml-auto flex items-center gap-2">
+                  {adminReturnLink}
+                  {right}
+                </div>
+              ) : null}
             </div>
           </header>
         )

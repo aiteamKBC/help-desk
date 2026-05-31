@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useEffect, useRef } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Mail, AlertTriangle, ArrowRight, CalendarClock, MessageSquarePlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,6 +17,7 @@ import { StepIndicator } from "@/components/support/StepIndicator";
 import { type BookingSummary, type RequesterRole, type Ticket, useSupport } from "@/context/SupportContext";
 import { getSupportResumePath, isAwaitingSupportReviewTicket } from "@/lib/supportFlow";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
+import { adminPortalReturnQueryParam, clearAdminPortalReturnFlag } from "@/lib/adminSession";
 
 const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 
@@ -35,6 +36,13 @@ const getVerificationErrorState = (
     return {
       title: "Email Not Found",
       message: payload?.message || "This email is not registered in our records.",
+    };
+  }
+
+  if (payload?.message?.toLowerCase().includes("microsoft entra")) {
+    return {
+      title: "Microsoft Entra Setup Required",
+      message: payload.message,
     };
   }
 
@@ -75,7 +83,7 @@ interface RestoredTicketPayload {
   email: string;
   requesterRole?: RequesterRole;
   category: "" | "Learning" | "Technical" | "Others";
-  technicalSubcategory: "" | "Aptem" | "LMS" | "Teams";
+  technicalSubcategory: "" | "Aptem" | "LMS" | "Teams" | "Others";
   inquiry: string;
   status: "Open" | "Pending" | "Closed";
   statusReason?: string;
@@ -114,8 +122,11 @@ function buildRestoredTicket(
 
 const EmailVerification = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { ticket, setTicket, setBookingSummary, clearBookingSummary } = useSupport();
-  const [email, setEmail] = useState(ticket.email);
+  const prefillEmail = searchParams.get("email")?.trim().toLowerCase() || "";
+  const [email, setEmail] = useState(ticket.email || prefillEmail);
+  const autoSubmittedRef = useRef(false);
   const [errorTitle, setErrorTitle] = useState("Invalid Email");
   const [errorMessage, setErrorMessage] = useState("Please enter a valid email address.");
   const [errorOpen, setErrorOpen] = useState(false);
@@ -123,6 +134,20 @@ const EmailVerification = () => {
   const [existingRequestOpen, setExistingRequestOpen] = useState(false);
   const [existingRequestTicket, setExistingRequestTicket] = useState<Ticket | null>(null);
   const [existingRequestBookingSummary, setExistingRequestBookingSummary] = useState<BookingSummary | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get(adminPortalReturnQueryParam) !== "1") {
+      clearAdminPortalReturnFlag();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!prefillEmail || autoSubmittedRef.current) return;
+    if (!isValidEmailFormat(prefillEmail)) return;
+    autoSubmittedRef.current = true;
+    submitEmail(prefillEmail);
+  }, [prefillEmail]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const restoreExistingRequest = (restoredTicket: Ticket, restoredBookingSummary: BookingSummary | null) => {
     setTicket(restoredTicket);
@@ -156,25 +181,13 @@ const EmailVerification = () => {
     navigate("/support/inquiry");
   };
 
-  const handleNext = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmedEmail = email.trim().toLowerCase();
-
-    if (!isValidEmailFormat(trimmedEmail)) {
-      setErrorTitle("Invalid Email");
-      setErrorMessage("Please enter a valid email address.");
-      setErrorOpen(true);
-      return;
-    }
-
+  const submitEmail = async (trimmedEmail: string) => {
     setIsSubmitting(true);
 
     try {
       const response = await fetch("/api/verify-email", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: trimmedEmail }),
       });
 
@@ -190,7 +203,7 @@ const EmailVerification = () => {
               email: string;
               requesterRole?: RequesterRole;
               category: "" | "Learning" | "Technical" | "Others";
-              technicalSubcategory: "" | "Aptem" | "LMS" | "Teams";
+              technicalSubcategory: "" | "Aptem" | "LMS" | "Teams" | "Others";
               inquiry: string;
               status: "Open" | "Pending" | "Closed";
               statusReason?: string;
@@ -201,7 +214,7 @@ const EmailVerification = () => {
               chatState?: "open" | "closed";
               liveChatRequested?: boolean;
             };
-          bookingSummary?: ApiBookingSummary | null;
+            bookingSummary?: ApiBookingSummary | null;
           }
         | null;
 
@@ -236,6 +249,20 @@ const EmailVerification = () => {
     }
   };
 
+  const handleNext = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmedEmail = email.trim().toLowerCase();
+
+    if (!isValidEmailFormat(trimmedEmail)) {
+      setErrorTitle("Invalid Email");
+      setErrorMessage("Please enter a valid email address.");
+      setErrorOpen(true);
+      return;
+    }
+
+    await submitEmail(trimmedEmail);
+  };
+
   return (
     <SupportLayout>
       <StepIndicator current={1} />
@@ -259,7 +286,9 @@ const EmailVerification = () => {
             </h1>
           </div>
           <p className="mx-auto mb-6 max-w-[320px] text-center text-sm leading-6 text-muted-foreground sm:mb-7 sm:text-[15px] sm:leading-7">
-            Enter the email address your KBC admin registered for you to continue.
+            {isSubmitting && prefillEmail
+              ? "Verifying your account, please wait..."
+              : "Enter your registered email address to continue. For learners, this is usually your Aptem email."}
           </p>
           <form onSubmit={handleNext} className="space-y-4 sm:space-y-5">
             <div>

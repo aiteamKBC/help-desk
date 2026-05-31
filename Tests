@@ -1,5 +1,35 @@
-Please test code for this cases and tell me what state is its ticket as an output:
+## QA Matrix Template
+
+Use this matrix when validating support flows end-to-end.
+
+| Scenario | Backend Status | Chat State | Learner UI | Admin UI | Proof Source |
+| --- | --- | --- | --- | --- | --- |
+| User choose quick ticket | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User call agent and no agent available | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User call agent and agent available | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User open chatbot, when he is still speaking with chat | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User open chatbot, when he goes inactive | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User open chatbot, when he closes chat from his side | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User choose live agent | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User choose live agent and admin transfered chat | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User choose live agent and agent chose pending escalation | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User choose live agent and agent chose closed | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User chooses live agent, answers then close his chat tab, not the chat itself | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+| User chooses live agent, user answers then live agent and user close their chat tabs, not the chat itself | `TBD` | `TBD` | `TBD` | `TBD` | `TBD` |
+
+Row guidance:
+- `Backend Status`: ticket status, status reason, assignment, or special backend outcome.
+- `Chat State`: usually `open`, `closed`, or `not created`.
+- `Learner UI`: what the learner sees, receives, or is redirected to.
+- `Admin UI`: what the admin sees in dashboard, queue, notification, or assignment state.
+- `Proof Source`: service/test/frontend file references used to verify the row.
+===============================================================
+
+Please test code for this cases and tell me what state is its ticket & chat if exists as an output also add what will learned/ user see or get:
 ->User choose quick ticket
+->User call agent and no agent available
+->User call agent and agent available
+
 ->User open chatbot, when he is still speaking with chat
 -> User open chatbot, when he goes inactive
 ->User open chatbot, when he closes chat from his side
@@ -7,4 +37,17 @@ Please test code for this cases and tell me what state is its ticket as an outpu
 ->User choose live agent and admin transfered chat
 ->User choose live agnet and agent chose pending escalation
 ->User choose live agnet and agent chose closed
+->User chooses live agent, answers then close his chat tab, not the chat itself, chat status vs ticket status
+->User chooses live agent, user answers then live agent and user close their chat tabs, not the chat itself, what will be chat status vs ticket status?
 ->
+===============================================================
+[Needs Solution]
+1.User call agent and no agent available:
+Ticket: unchanged, usually still Open. Chat: unchanged, usually open. User sees: error path, no assignment is made. Backend returns 503 with Microsoft Teams calling is not linked to a support admin right now.
+(Notify user to wait// Notify agnets via e-mail and dashboard// link dashboard notification to browser (notif. like Teams call))
+2.Check chat open in quick ticket and call cases, in call create call-id instead of chat
+3.Create admin button in knowledge base
+4.If an agent is available, assignment is added; if not, it waits unassigned. User sees: bot message Live chat has been requested. Please stay connected while we connect you. plus a success toast. (notify all agents)
+5.Add transfer message (you are currently speaking to ...)
+6.Solve duplication in messages![alt text](image.png)
+7.After duplication when trying to scroll upward I am forced to chat bottom

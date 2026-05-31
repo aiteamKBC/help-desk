@@ -1,11 +1,12 @@
-import { useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
-import { Lock, ShieldCheck, Eye, EyeOff } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useNavigate, Link, useLocation } from "react-router-dom";
+import { Lock, ShieldCheck, Eye, EyeOff, Building2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { createAdminSessionInstanceId, setAdminSession } from "@/lib/adminSession";
+import { buildCsrfHeaders } from "@/lib/csrf";
 import { toast } from "sonner";
 
 interface LoginResponse {
@@ -16,17 +17,50 @@ interface LoginResponse {
     fullName: string;
     email: string | null;
     role: string;
+    instanceId?: string;
     consoleStatus?: string;
   };
 }
 
 const AdminLogin = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPass, setShowPass] = useState(false);
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const microsoftPortalOrigin = typeof window !== "undefined"
+    ? (() => {
+        const { protocol, hostname, port, origin } = window.location;
+        if (hostname === "127.0.0.1") {
+          return `${protocol}//localhost${port ? `:${port}` : ""}`;
+        }
+        return origin;
+      })()
+    : "";
+  const microsoftLoginUrl = microsoftPortalOrigin
+    ? `${microsoftPortalOrigin}/api/admin/microsoft/login?origin=${encodeURIComponent(microsoftPortalOrigin)}`
+    : "/api/admin/microsoft/login";
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    void fetch("/api/admin/session", {
+      method: "GET",
+      signal: controller.signal,
+    }).catch(() => undefined);
+
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const searchParams = new URLSearchParams(location.search);
+    const microsoftError = searchParams.get("microsoftError");
+    if (microsoftError) {
+      setError(microsoftError);
+    }
+  }, [location.search]);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -42,9 +76,9 @@ const AdminLogin = () => {
       const instanceId = createAdminSessionInstanceId();
       const response = await fetch("/api/admin/login", {
         method: "POST",
-        headers: {
+        headers: buildCsrfHeaders({
           "Content-Type": "application/json",
-        },
+        }),
         body: JSON.stringify({
           username,
           password,
@@ -62,7 +96,7 @@ const AdminLogin = () => {
 
       setAdminSession({
         ...payload.admin,
-        instanceId,
+        instanceId: payload.admin.instanceId || instanceId,
         consoleStatus: "Off",
       });
       toast.success(`Welcome back, ${payload.admin.fullName}`);
@@ -140,8 +174,27 @@ const AdminLogin = () => {
               {isSubmitting ? "Signing In..." : "Sign In"}
             </Button>
 
+            <div className="relative py-1">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-border/70" />
+              </div>
+              <div className="relative flex justify-center text-[11px] uppercase tracking-[0.28em] text-muted-foreground">
+                <span className="bg-card px-3">or continue with</span>
+              </div>
+            </div>
+
+            <Button asChild variant="outline" className="w-full h-11 border-primary/20 text-foreground hover:bg-primary/5">
+              <a href={microsoftLoginUrl}>
+                <Building2 className="h-4 w-4 text-primary" />
+                Sign in with Microsoft Teams
+              </a>
+            </Button>
+
             <div className="text-xs text-center text-muted-foreground pt-2">
               Use an active support username and the password configured on the server.
+            </div>
+            <div className="text-xs text-center text-muted-foreground">
+              Use your Kent Microsoft work account for direct admin access.
             </div>
           </form>
         </div>

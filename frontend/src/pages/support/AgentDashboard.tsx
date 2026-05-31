@@ -9,7 +9,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  Eye,
   FileText,
   Hash,
   Headphones,
@@ -25,6 +24,7 @@ import {
   Search,
   Save,
   SendHorizontal,
+  Settings2,
   Ticket as TicketIcon,
   UserRound,
   UserPlus,
@@ -51,6 +51,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import {
   DropdownMenu,
@@ -59,7 +60,17 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StatusBadge } from "@/components/support/StatusBadge";
-import { clearAdminSession, getAdminSession, setAdminSession, setAdminSessionOnWindow } from "@/lib/adminSession";
+import {
+  clearAdminSession,
+  fetchVerifiedAdminSession,
+  getAdminSession,
+  isSameAdminIdentity,
+  isSameAdminSession,
+  setAdminSession,
+  setAdminSessionOnWindow,
+  type AdminSession,
+} from "@/lib/adminSession";
+import { buildCsrfHeaders } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -74,6 +85,8 @@ interface AdminAgent {
   sessionActive?: boolean;
   consoleStatus?: string;
   selectedConsoleStatus?: string;
+  legacySupportAccess?: boolean;
+  legacyAdminAccess?: boolean;
 }
 
 interface PendingTransferRequest {
@@ -304,6 +317,7 @@ interface NotificationLogResponse {
 }
 
 interface AdminSessionHeartbeatResponse {
+  admin?: AdminSession;
   ok?: boolean;
   sessionActive?: boolean;
   sessionReplaced?: boolean;
@@ -343,13 +357,7 @@ const adminAccountRoleOptions = [
   { value: "superadmin", label: "Super Admin" },
   { value: "admin", label: "Admin" },
 ] as const;
-const requesterAccountRoleOptions = [
-  { value: "coach", label: "Coach" },
-  { value: "employer", label: "Employer" },
-  { value: "user", label: "User" },
-] as const;
 const adminDirectoryRoles = new Set<string>(["admin", "superadmin"]);
-const requesterDirectoryRoles = new Set<string>(["user", "coach", "employer"]);
 const userManagementRoles = new Set<string>(["admin", "superadmin"]);
 type AdminConsoleStatus = (typeof adminConsoleStatuses)[number];
 type AdminSelectableConsoleStatus = (typeof adminSelectableConsoleStatuses)[number];
@@ -358,39 +366,23 @@ type DocumentationIssuesAddressed = "yes" | "no" | "";
 type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreached" | "quickResolution" | "escalation";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
-type AdminView = "dashboard" | "console" | "users" | "requesters";
+type AdminView = "dashboard" | "console" | "users" | "management";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type UserStatusFilter = "all" | "active" | "inactive";
-type ManagedAccountScope = "staff" | "requester";
 
-interface UserEditorState {
-  id: number | null;
-  username: string;
-  fullName: string;
-  email: string;
-  role: string;
-  password: string;
-  isActive: boolean;
-}
-
-function createEmptyUserEditorState(scope: ManagedAccountScope = "staff"): UserEditorState {
-  return {
-    id: null,
-    username: "",
-    fullName: "",
-    email: "",
-    role: scope === "requester" ? "user" : "admin",
-    password: "",
-    isActive: true,
-  };
+function buildAdminJsonHeaders() {
+  return buildCsrfHeaders({
+    "Content-Type": "application/json",
+  });
 }
 
 const AgentDashboard = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const session = getAdminSession();
+  const [session, setSessionState] = useState<AdminSession | null>(() => getAdminSession());
   const initialConsoleDeepLink = parseAdminDeepLink(location.search);
   const isMountedRef = useRef(true);
+  const sessionRef = useRef<AdminSession | null>(session);
   const previousConsoleChatStateRef = useRef<{ ticketId: string; chatState: string } | null>(null);
   const processedConsoleDeepLinkRef = useRef<string>("");
   const pendingConsoleStatusRef = useRef<AdminSelectableConsoleStatus | null>(null);
@@ -418,13 +410,7 @@ const AgentDashboard = () => {
   const [consoleAiInput, setConsoleAiInput] = useState("");
   const [dashboardTicketFilter, setDashboardTicketFilter] = useState<DashboardTicketFilter>("all");
   const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>("newest");
-  const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>(() => (
-    (session?.role || "").toLowerCase() === "superadmin"
-      ? "all"
-      : session?.id
-        ? "me"
-        : "all"
-  ));
+  const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [documentationStep, setDocumentationStep] = useState(1);
@@ -451,31 +437,24 @@ const AgentDashboard = () => {
   const [isSendingAiMessage, setIsSendingAiMessage] = useState(false);
   const [isSavingDocumentation, setIsSavingDocumentation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [isSavingUser, setIsSavingUser] = useState(false);
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
-  const [isUserEditorOpen, setIsUserEditorOpen] = useState(false);
   const [userStatusFilter, setUserStatusFilter] = useState<UserStatusFilter>("all");
   const [userRoleFilter, setUserRoleFilter] = useState<string>("all");
+  const [managementSearch, setManagementSearch] = useState("");
+  const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
   const [userSearch, setUserSearch] = useState("");
-  const [requesterStatusFilter, setRequesterStatusFilter] = useState<UserStatusFilter>("all");
-  const [requesterRoleFilter, setRequesterRoleFilter] = useState<string>("all");
-  const [requesterSearch, setRequesterSearch] = useState("");
-  const [userEditorScope, setUserEditorScope] = useState<ManagedAccountScope>("staff");
-  const [userEditor, setUserEditor] = useState<UserEditorState>(() => createEmptyUserEditorState());
   const [error, setError] = useState("");
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
   const [consoleTimerNow, setConsoleTimerNow] = useState(() => Date.now());
   const [notificationLog, setNotificationLog] = useState<AdminNotificationLogItem[]>([]);
   const seenTransferNotificationKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedTransferNotificationsRef = useRef(false);
-  const canManageUsers = userManagementRoles.has((session?.role || "").toLowerCase());
+  const canManageUsers = userManagementRoles.has((session?.role || "").toLowerCase())
+    && !!(session?.legacyAdminAccess || session?.entraDirectoryAdmin);
   const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
   const isConsoleView = adminView === "console";
   const useCompactAdminSidebar = !isStackedAdminLayout && isAdminSidebarCollapsed;
-  const userEditorRoleOptions = userEditorScope === "requester" ? requesterAccountRoleOptions : adminAccountRoleOptions;
-  const userEditorEntityLabel = userEditorScope === "requester" ? "Requester" : "Admin";
   const trimmedNotes = notes.trim();
-  const dashboardSessionAgentId = session?.id ?? null;
   const dashboardSessionAgentName = session?.fullName || session?.username || "Me";
   const isSlaAutoManaged = Boolean(activeDetail) && autoManagedSlaStatuses.has(draftStatus);
   const effectiveDraftSlaStatus = activeDetail
@@ -487,7 +466,13 @@ const AgentDashboard = () => {
   const compactConsoleSearch = compactConsoleSearchValue(normalizedConsoleSearch);
   const normalizedDashboardSearch = normalizeConsoleSearchValue(dashboardSearch);
   const compactDashboardSearch = compactConsoleSearchValue(normalizedDashboardSearch);
-  const activeAgents = agents.filter((agent) => agent.isActive !== false && isStaffSupportAccount(agent));
+  const activeAgents = agents.filter((agent) => agent.isActive !== false && isStaffSupportAccount(agent) && agent.legacySupportAccess === true);
+  const signedInAgent = agents.find((agent) => (
+    (session?.id && agent.id === session.id)
+    || (session?.username && agent.username === session.username)
+  ));
+  const resolvedSessionAgentId = signedInAgent?.id ?? session?.id ?? null;
+  const dashboardSessionAgentId = resolvedSessionAgentId;
   const scopedConsoleTickets = tickets.filter((ticket) => {
     if (isQuickResolutionTicket(ticket)) {
       return false;
@@ -500,7 +485,7 @@ const AgentDashboard = () => {
     }
 
     if (consoleCaseScope === "my") {
-      return ticket.assignedAgentId === session?.id;
+      return ticket.assignedAgentId === resolvedSessionAgentId;
     }
 
     return true;
@@ -513,6 +498,94 @@ const AgentDashboard = () => {
     scopedConsoleTickets.filter((ticket) => ticket.chatState === "closed"),
     "closed",
   );
+
+  function persistAdminSessionState(nextSession: AdminSession | null) {
+    sessionRef.current = nextSession;
+    setSessionState(nextSession);
+    if (nextSession) {
+      setAdminSession(nextSession);
+      return;
+    }
+
+    clearAdminSession();
+  }
+
+  function redirectForEndedAdminSession(message: string, redirectTarget: "/admin/login" | "/support" = "/admin/login") {
+    persistAdminSessionState(null);
+    toast.error(message);
+    navigate(redirectTarget);
+  }
+
+  async function revalidateAdminSession(options?: {
+    silent?: boolean;
+    mismatchMessage?: string;
+    expiredMessage?: string;
+  }) {
+    try {
+      const { response, admin } = await fetchVerifiedAdminSession();
+      if (response.status === 401) {
+        redirectForEndedAdminSession(options?.expiredMessage || "Your admin session ended. Please sign in again.");
+        return null;
+      }
+
+      if (response.status === 403) {
+        redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has admin access.", "/support");
+        return null;
+      }
+
+      if (!response.ok) {
+        if (!options?.silent) {
+          toast.error("We could not verify your admin session right now.");
+        }
+        return sessionRef.current;
+      }
+
+      if (!admin) {
+        redirectForEndedAdminSession(options?.expiredMessage || "Your admin session ended. Please sign in again.");
+        return null;
+      }
+
+      const normalizedRole = (admin.role || "").trim().toLowerCase();
+      if (normalizedRole !== "admin" && normalizedRole !== "superadmin") {
+        redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has admin access.", "/support");
+        return null;
+      }
+
+      const currentSession = sessionRef.current;
+      if (currentSession && !isSameAdminSession(currentSession, admin)) {
+        if (isSameAdminIdentity(currentSession, admin)) {
+          persistAdminSessionState(admin);
+          return admin;
+        }
+
+        redirectForEndedAdminSession(
+          options?.mismatchMessage || "Your admin session changed. Please sign in again.",
+        );
+        return null;
+      }
+
+      persistAdminSessionState(admin);
+      return admin;
+    } catch {
+      if (!options?.silent) {
+        toast.error("We could not verify your admin session right now.");
+      }
+
+      return null;
+    }
+  }
+
+  async function reconcileAdminAuthorizationFailure(options?: {
+    mismatchMessage?: string;
+    expiredMessage?: string;
+  }) {
+    const nextSession = await revalidateAdminSession({
+      silent: true,
+      mismatchMessage: options?.mismatchMessage,
+      expiredMessage: options?.expiredMessage,
+    });
+    return !nextSession;
+  }
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -538,6 +611,10 @@ const AgentDashboard = () => {
     mediaQuery.addListener(handleChange);
     return () => mediaQuery.removeListener(handleChange);
   }, []);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   useEffect(() => {
     if (!session?.username || !browserDesktopNotificationsSupported()) {
@@ -609,7 +686,7 @@ const AgentDashboard = () => {
       return false;
     }
 
-    return ticket.assignedAgentId === session?.id;
+    return ticket.assignedAgentId === resolvedSessionAgentId;
   });
   const myOpenChatCount = myOpenConsoleQueueTickets.length;
   // Keep admin availability tied to the signed-in admin's own live queue.
@@ -650,10 +727,6 @@ const AgentDashboard = () => {
     }
   }
 
-  const signedInAgent = agents.find((agent) => (
-    (session?.id && agent.id === session.id)
-    || (session?.username && agent.username === session.username)
-  ));
   const myActualConsoleStatus = signedInAgent
     ? normalizeAdminConsoleStatus(signedInAgent.consoleStatus)
     : normalizeAdminConsoleStatus(hasCurrentAdminOpenConsoleQueue ? "Busy" : (consoleStatus || "Off"));
@@ -675,8 +748,8 @@ const AgentDashboard = () => {
   const busyAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
   const offAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
   const dashboardAgentFilterOptions = [
-    ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "all" as DashboardAssignedFilter, label: "All Tickets" },
+    ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "unassigned" as DashboardAssignedFilter, label: "Unassigned" },
     ...sortedAgents
       .filter((agent) => agent.id !== dashboardSessionAgentId)
@@ -686,11 +759,10 @@ const AgentDashboard = () => {
       })),
   ];
   const normalizedUserSearch = normalizeConsoleSearchValue(userSearch);
-  const normalizedRequesterSearch = normalizeConsoleSearchValue(requesterSearch);
-  const managedAdminUsers = agents.filter((agent) => adminDirectoryRoles.has((agent.role || "").toLowerCase()));
-  const managedRequesterUsers = agents.filter((agent) => requesterDirectoryRoles.has((agent.role || "").toLowerCase()));
+  const managedAdminUsers = agents.filter((agent) => (
+    adminDirectoryRoles.has((agent.role || "").toLowerCase()) && agent.legacySupportAccess
+  ));
   const activeManagedAdminUsers = managedAdminUsers.filter((agent) => agent.isActive !== false);
-  const activeManagedRequesterUsers = managedRequesterUsers.filter((agent) => agent.isActive !== false);
   const assignableAdminAgents = sortedAgents.filter((agent) => (agent.role || "").toLowerCase() === "admin");
   const filteredUsers = managedAdminUsers.filter((agent) => {
     const matchesStatus = userStatusFilter === "all"
@@ -708,26 +780,6 @@ const AgentDashboard = () => {
     ];
     const matchesSearch = !normalizedUserSearch || searchableFields.some((fieldValue) => (
       normalizeConsoleSearchValue(fieldValue).includes(normalizedUserSearch)
-    ));
-
-    return matchesStatus && matchesRole && matchesSearch;
-  });
-  const filteredRequesters = managedRequesterUsers.filter((agent) => {
-    const matchesStatus = requesterStatusFilter === "all"
-      ? true
-      : requesterStatusFilter === "active"
-        ? agent.isActive !== false
-        : agent.isActive === false;
-    const matchesRole = requesterRoleFilter === "all" ? true : agent.role === requesterRoleFilter;
-    const searchableFields = [
-      agent.fullName,
-      agent.username,
-      agent.email || "",
-      formatAccountScopeLabel(agent.accountScope || agent.role),
-      formatRequesterRoleLabel(agent.role),
-    ];
-    const matchesSearch = !normalizedRequesterSearch || searchableFields.some((fieldValue) => (
-      normalizeConsoleSearchValue(fieldValue).includes(normalizedRequesterSearch)
     ));
 
     return matchesStatus && matchesRole && matchesSearch;
@@ -819,7 +871,11 @@ const AgentDashboard = () => {
     : dashboardAssignedFilter !== "all"
       ? getDashboardAssignedFilterEmptyMessage(dashboardTicketFilter, dashboardAssignedFilterEmptyTarget)
       : getDashboardEmptyMessage(dashboardTicketFilter);
-  const isConsoleOwnedBySignedInAgent = Boolean(consoleDetail && session?.id && consoleDetail.ticket.assignedAgentId === session.id);
+  const isConsoleOwnedBySignedInAgent = Boolean(
+    consoleDetail
+    && resolvedSessionAgentId
+    && consoleDetail.ticket.assignedAgentId === resolvedSessionAgentId
+  );
   const canAssignActiveTicket = Boolean(
     isSuperadminSession
     && activeDetail
@@ -837,8 +893,8 @@ const AgentDashboard = () => {
         return false;
       }
 
-      if (session?.id) {
-        return pendingTransferRequest.toAgentId === session.id;
+      if (resolvedSessionAgentId) {
+        return pendingTransferRequest.toAgentId === resolvedSessionAgentId;
       }
 
       return sanitizeAssignedAgentName(pendingTransferRequest.toAgentUsername) === sanitizeAssignedAgentName(session?.username || "");
@@ -855,8 +911,8 @@ const AgentDashboard = () => {
         return false;
       }
 
-      if (session?.id) {
-        return pendingEscalationNotification.toAgentId === session.id;
+      if (resolvedSessionAgentId) {
+        return pendingEscalationNotification.toAgentId === resolvedSessionAgentId;
       }
 
       return sanitizeAssignedAgentName(pendingEscalationNotification.toAgentUsername) === sanitizeAssignedAgentName(session?.username || "");
@@ -873,8 +929,8 @@ const AgentDashboard = () => {
         return false;
       }
 
-      if (session?.id) {
-        return pendingTeamsCallNotification.toAgentId === session.id;
+      if (resolvedSessionAgentId) {
+        return pendingTeamsCallNotification.toAgentId === resolvedSessionAgentId;
       }
 
       return sanitizeAssignedAgentName(pendingTeamsCallNotification.toAgentUsername) === sanitizeAssignedAgentName(session?.username || "");
@@ -905,8 +961,8 @@ const AgentDashboard = () => {
         return false;
       }
 
-      if (session?.id) {
-        return latestTransferDecision.fromAgentId === session.id;
+      if (resolvedSessionAgentId) {
+        return latestTransferDecision.fromAgentId === resolvedSessionAgentId;
       }
 
       return sanitizeAssignedAgentName(latestTransferDecision.fromAgentUsername) === sanitizeAssignedAgentName(session?.username || "");
@@ -923,8 +979,8 @@ const AgentDashboard = () => {
         return false;
       }
 
-      if (session?.id) {
-        return latestEscalationClosure.fromAgentId === session.id;
+      if (resolvedSessionAgentId) {
+        return latestEscalationClosure.fromAgentId === resolvedSessionAgentId;
       }
 
       return sanitizeAssignedAgentName(latestEscalationClosure.fromAgentUsername) === sanitizeAssignedAgentName(session?.username || "");
@@ -963,8 +1019,8 @@ const AgentDashboard = () => {
           ? "This case is closed, so the workspace is now view-only."
           : "";
   const consoleTransferHandoffNotice = consoleDetail
-    && session?.id
-    && consoleDetail.ticket.assignedAgentId === session.id
+    && resolvedSessionAgentId
+    && consoleDetail.ticket.assignedAgentId === resolvedSessionAgentId
     ? getLatestTransferHandoffNotice(consoleDetail.history, consoleDetail.ticket.assignedAgentName)
     : null;
   const hasConsoleWorkspaceBanner = Boolean(consoleWorkspaceReadOnlyMessage || consoleTransferHandoffNotice);
@@ -1040,37 +1096,22 @@ const AgentDashboard = () => {
     };
   }, []);
 
-  function isCurrentDashboardSession() {
+  function isCurrentDashboardSession(expectedSession: AdminSession | null = sessionRef.current) {
     if (!isMountedRef.current) {
       return false;
     }
 
-    if (!session?.username || !session.instanceId) {
+    if (!expectedSession?.username || !expectedSession.instanceId) {
       return true;
     }
 
-    const currentSession = getAdminSession();
-    return Boolean(
-      currentSession
-      && currentSession.username === session.username
-      && currentSession.instanceId === session.instanceId
-    );
+    const currentSession = sessionRef.current;
+    return Boolean(currentSession && isSameAdminSession(currentSession, expectedSession));
   }
 
   useEffect(() => {
     void loadDashboard();
   }, []);
-
-  useEffect(() => {
-    if (!session?.username || !session.instanceId || !consoleStatus) {
-      return;
-    }
-
-    setAdminSession({
-      ...session,
-      consoleStatus,
-    });
-  }, [consoleStatus, session?.email, session?.fullName, session?.id, session?.instanceId, session?.role, session?.username]);
 
   useEffect(() => {
     if (!session?.username || !session.instanceId) {
@@ -1206,7 +1247,7 @@ const AgentDashboard = () => {
   }, [adminView]);
 
   useEffect(() => {
-    if (adminView !== "users" && adminView !== "requesters") {
+    if (adminView !== "users") {
       return;
     }
 
@@ -1218,7 +1259,7 @@ const AgentDashboard = () => {
   }, [adminView]);
 
   useEffect(() => {
-    if (!canManageUsers && (adminView === "users" || adminView === "requesters")) {
+    if (!canManageUsers && (adminView === "users" || adminView === "management")) {
       setAdminView("dashboard");
     }
   }, [adminView, canManageUsers]);
@@ -1517,28 +1558,23 @@ const AgentDashboard = () => {
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
 
     if (!response.ok) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
       throw new Error(payload?.message || "We could not load tickets right now.");
     }
 
     return payload?.tickets || [];
   }
 
-  function buildAdminSessionQuery() {
-    if (!session?.username || !session.instanceId) {
-      throw new Error("Admin session is required.");
-    }
-
-    const searchParams = new URLSearchParams();
-    searchParams.set("actorUsername", session.username);
-    searchParams.set("instanceId", session.instanceId);
-    return searchParams.toString();
-  }
-
   async function fetchAgentsList() {
-    const response = await fetch(`/api/admin/accounts?${buildAdminSessionQuery()}`);
+    const response = await fetch("/api/admin/accounts");
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
 
     if (!response.ok) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
       throw new Error(payload?.message || "We could not load support accounts right now.");
     }
 
@@ -1546,110 +1582,21 @@ const AgentDashboard = () => {
   }
 
   async function fetchNotificationLog() {
-    if (!session?.username || !session.instanceId) {
+    if (!sessionRef.current?.username || !sessionRef.current.instanceId) {
       return [];
     }
 
-    const response = await fetch(`/api/admin/notifications?${buildAdminSessionQuery()}&limit=20`);
+    const response = await fetch("/api/admin/notifications?limit=20");
     const payload = (await response.json().catch(() => null)) as NotificationLogResponse | null;
 
     if (!response.ok) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
       throw new Error(payload?.message || "We could not load the notification log right now.");
     }
 
     return payload?.notifications || [];
-  }
-
-  function openCreateUserEditor(scope: ManagedAccountScope) {
-    setUserEditorScope(scope);
-    setUserEditor(createEmptyUserEditorState(scope));
-    setIsUserEditorOpen(true);
-  }
-
-  function openEditUserEditor(agent: AdminAgent) {
-    const nextScope = deriveAccountScopeFromRole(agent.accountScope || agent.role);
-    setUserEditorScope(nextScope);
-    setUserEditor({
-      id: agent.id,
-      username: agent.username,
-      fullName: agent.fullName,
-      email: agent.email || "",
-      role: agent.role || "user",
-      password: "",
-      isActive: agent.isActive !== false,
-    });
-    setIsUserEditorOpen(true);
-  }
-
-  function syncSessionFromManagedUser(agent: AdminAgent) {
-    if (!session || session.id !== agent.id) {
-      return;
-    }
-
-    setAdminSession({
-      ...session,
-      username: agent.username,
-      fullName: agent.fullName,
-      email: agent.email,
-      role: agent.role,
-    });
-  }
-
-  async function saveManagedUser() {
-    if (!session?.username || !session.instanceId) {
-      toast.error("Admin session is required.");
-      return;
-    }
-
-    setIsSavingUser(true);
-
-    try {
-      const payload = {
-        actorUsername: session.username,
-        instanceId: session.instanceId,
-        username: userEditor.username,
-        fullName: userEditor.fullName,
-        email: userEditor.email,
-        role: userEditor.role,
-        password: userEditor.password,
-        isActive: userEditor.isActive,
-      };
-      const isEditingUser = Boolean(userEditor.id);
-      const response = await fetch(
-        isEditingUser
-          ? `/api/admin/accounts/${encodeURIComponent(String(userEditor.id))}`
-          : "/api/admin/accounts",
-        {
-          method: isEditingUser ? "PATCH" : "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
-        },
-      );
-      const responsePayload = (await response.json().catch(() => null)) as ListResponse | null;
-      const savedAccount = responsePayload?.account || responsePayload?.agent;
-
-      if (!response.ok || !savedAccount) {
-        throw new Error(responsePayload?.message || "We could not save this account right now.");
-      }
-
-      setAgents((currentAgents) => sortAgentsForDirectory([
-        ...currentAgents.filter((agent) => agent.id !== savedAccount.id),
-        savedAccount,
-      ]));
-      syncSessionFromManagedUser(savedAccount);
-      setIsUserEditorOpen(false);
-      setUserEditor(createEmptyUserEditorState(userEditorScope));
-      toast.success(responsePayload.message || (isEditingUser ? "Account updated." : "Account created."));
-      if (!userManagementRoles.has((savedAccount.role || "").toLowerCase()) && session.id === savedAccount.id) {
-        setAdminView("dashboard");
-      }
-    } catch (saveError) {
-      toast.error(saveError instanceof Error ? saveError.message : "We could not save this account right now.");
-    } finally {
-      setIsSavingUser(false);
-    }
   }
 
   function syncConsoleStatusFromAgents(nextAgents: AdminAgent[]) {
@@ -1680,16 +1627,20 @@ const AgentDashboard = () => {
     }
 
     setConsoleStatus((currentStatus) => currentStatus === nextStatus ? currentStatus : nextStatus);
-    setAdminSession({
-      ...(session || {}),
-      id: session?.id || signedInAgent.id,
-      username: session?.username || signedInAgent.username,
-      fullName: session?.fullName || signedInAgent.fullName,
-      email: session?.email ?? signedInAgent.email,
-      role: session?.role || signedInAgent.role,
-      instanceId: session?.instanceId || "",
-      consoleStatus: nextStatus,
-    });
+    if (sessionRef.current) {
+      persistAdminSessionState({
+        ...sessionRef.current,
+        id: sessionRef.current.id || signedInAgent.id,
+        username: sessionRef.current.username || signedInAgent.username,
+        fullName: sessionRef.current.fullName || signedInAgent.fullName,
+        email: sessionRef.current.email ?? signedInAgent.email,
+        role: sessionRef.current.role || signedInAgent.role,
+        instanceId: sessionRef.current.instanceId || "",
+        sessionActive: signedInAgent.sessionActive,
+        consoleStatus: normalizeAdminConsoleStatus(signedInAgent.consoleStatus),
+        selectedConsoleStatus: nextStatus,
+      });
+    }
   }
 
   async function loadDashboard() {
@@ -1697,6 +1648,12 @@ const AgentDashboard = () => {
     setError("");
 
     try {
+      const requestSession = sessionRef.current;
+      const verifiedSession = await revalidateAdminSession({ silent: true });
+      if (!verifiedSession || !isCurrentDashboardSession(requestSession)) {
+        return;
+      }
+
       const [tickets, nextAgents, migrationStatusResponse, nextNotificationLog] = await Promise.all([
         fetchTicketsList(),
         fetchAgentsList(),
@@ -1740,8 +1697,9 @@ const AgentDashboard = () => {
 
   async function refreshAgentsOnly(silent = false) {
     try {
+      const requestSession = sessionRef.current;
       const nextAgents = await fetchAgentsList();
-      if (!isCurrentDashboardSession()) {
+      if (!isCurrentDashboardSession(requestSession)) {
         return;
       }
       setAgents(nextAgents);
@@ -1761,46 +1719,44 @@ const AgentDashboard = () => {
     try {
       const response = await fetch("/api/admin/session-heartbeat", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
-          actorUsername: session.username,
-          instanceId: session.instanceId,
           consoleStatus: statusOverride || consoleStatus,
         }),
       });
 
       const payload = (await response.json().catch(() => null)) as AdminSessionHeartbeatResponse | null;
-      const currentSession = getAdminSession();
-
-      if (
-        !currentSession
-        || currentSession.instanceId !== session.instanceId
-        || currentSession.username !== session.username
-      ) {
-        return false;
+      const responseAdmin = payload?.admin || null;
+      if (responseAdmin && !isSameAdminSession(sessionRef.current, responseAdmin)) {
+        if (isSameAdminIdentity(sessionRef.current, responseAdmin)) {
+          persistAdminSessionState(responseAdmin);
+        } else {
+          redirectForEndedAdminSession("Your admin session changed. Please sign in again.");
+          return false;
+        }
       }
 
       if (payload?.sessionReplaced) {
-        clearAdminSession();
-        toast.error("This support session was replaced by another sign-in. Please sign in again.");
-        navigate("/admin/login");
+        redirectForEndedAdminSession("This support session was replaced by another sign-in. Please sign in again.");
         return false;
       }
 
       if (payload?.sessionActive === false) {
-        clearAdminSession();
-        toast.error("Your admin session ended. Please sign in again.");
-        navigate("/admin/login");
+        redirectForEndedAdminSession("Your admin session ended. Please sign in again.");
         return false;
       }
 
       if (!response.ok && !silent) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return false;
+        }
         toast.error(payload?.message || "We could not refresh the agent session right now.");
       }
 
       if (response.ok) {
+        if (responseAdmin) {
+          persistAdminSessionState(responseAdmin);
+        }
         void refreshAgentsOnly(true);
       }
 
@@ -1814,11 +1770,43 @@ const AgentDashboard = () => {
     }
   }
 
+  async function toggleSupportAccess(agent: AdminAgent, nextValue: boolean) {
+    setTogglingAccessIds((prev) => new Set(prev).add(agent.id));
+    try {
+      const response = await fetch(`/api/admin/accounts/${agent.id}`, {
+        method: "PATCH",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({ supportAccess: nextValue }),
+      });
+      const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
+      if (!response.ok) {
+        toast.error(payload?.message || "Could not update support access.");
+        return;
+      }
+      const updatedAgent = payload?.agent;
+      if (updatedAgent) {
+        setAgents((prev) => prev.map((a) => (a.id === updatedAgent.id ? { ...a, ...updatedAgent } : a)));
+      }
+      toast.success(`Support access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
+    } catch {
+      toast.error("Could not update support access.");
+    } finally {
+      setTogglingAccessIds((prev) => {
+        const next = new Set(prev);
+        next.delete(agent.id);
+        return next;
+      });
+    }
+  }
+
   async function fetchTicketDetail(ticketId: string) {
     const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticketId)}`);
     const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
     if (!response.ok || !payload?.ticket) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
       throw new Error(payload?.message || "We could not load this ticket right now.");
     }
 
@@ -1861,7 +1849,7 @@ const AgentDashboard = () => {
         currentScope: consoleCaseScope,
         currentQueueTab: consoleQueueTab,
         ticket: payload.ticket,
-        sessionAgentId: session?.id,
+        sessionAgentId: resolvedSessionAgentId,
       })) {
         setConsoleCaseScope("my");
         setConsoleQueueTab("open");
@@ -1932,14 +1920,6 @@ const AgentDashboard = () => {
       if (canManageUsers) {
         processedConsoleDeepLinkRef.current = location.search;
         setAdminView("users");
-      }
-      return;
-    }
-
-    if (nextConsoleDeepLink.view === "requesters") {
-      if (canManageUsers) {
-        processedConsoleDeepLinkRef.current = location.search;
-        setAdminView("requesters");
       }
       return;
     }
@@ -2054,18 +2034,18 @@ const AgentDashboard = () => {
     try {
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(consoleDetail.ticket.id)}`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
           documentation: documentationDraft,
-          actorUsername: session?.username || "admin",
         }),
       });
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not save the documentation right now.");
         return;
       }
@@ -2137,9 +2117,7 @@ const AgentDashboard = () => {
 
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(consoleDetail.ticket.id)}`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
           status: documentationTicketStatus,
           statusReason: documentationResolvedStatusReason,
@@ -2154,13 +2132,15 @@ const AgentDashboard = () => {
           } : {}),
           documentation: workflowDocumentation,
           note: workflowNote,
-          actorUsername: session?.username || "admin",
         }),
       });
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not save the documentation workflow right now.");
         return;
       }
@@ -2226,15 +2206,12 @@ const AgentDashboard = () => {
     setConsoleDetail(optimisticDetail);
 
     try {
-      const response = await fetch(`/api/tickets/${encodeURIComponent(consoleDetail.ticket.id)}/chat-history`, {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(consoleDetail.ticket.id)}/chat-history`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
           status: consoleDetail.ticket.status,
           statusReason: consoleDetail.ticket.statusReason,
-          actorUsername: session?.username || "",
           messages: serializeConsoleChatHistory(optimisticDetail.chatHistory),
         }),
       });
@@ -2242,6 +2219,9 @@ const AgentDashboard = () => {
       const payload = (await response.json().catch(() => null)) as { message?: string } | null;
 
       if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         setConsoleDetail(consoleDetail);
         setConsoleChatInput(messageText);
         toast.error(payload?.message || "We could not send the chat message right now.");
@@ -2269,18 +2249,18 @@ const AgentDashboard = () => {
     try {
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(consoleDetail.ticket.id)}`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
           chatState: "closed",
-          actorUsername: session?.username || "admin",
         }),
       });
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not force-close the chat right now.");
         return;
       }
@@ -2315,19 +2295,19 @@ const AgentDashboard = () => {
     try {
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(consoleDetail.ticket.id)}/transfer-request`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
           targetAgentId: agent.id,
           reason: trimmedTransferReason,
-          actorUsername: session?.username || "admin",
         }),
       });
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not transfer the ticket right now.");
         return;
       }
@@ -2348,6 +2328,10 @@ const AgentDashboard = () => {
       return;
     }
 
+    if (action === "accept" && myActualConsoleStatus === "Off") {
+      void updateConsoleStatus("Available");
+    }
+
     setActiveTransferRequestTicketId(ticket.id);
 
     try {
@@ -2355,18 +2339,19 @@ const AgentDashboard = () => {
         `/api/admin/tickets/${encodeURIComponent(ticket.id)}/transfer-request/${action}`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            actorUsername: session.username,
-          }),
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
         },
       );
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure({
+          mismatchMessage: "Your admin session changed before this transfer decision could be completed. Please sign in again.",
+        })) {
+          return;
+        }
         toast.error(payload?.message || `We could not ${action} this transfer request right now.`);
         return;
       }
@@ -2376,6 +2361,12 @@ const AgentDashboard = () => {
         syncDrafts(payload);
       }
       await refreshTicketsOnly(true);
+      if (action === "accept") {
+        await refreshAgentsOnly(true);
+        setConsoleCaseScope("my");
+        setConsoleQueueTab("open");
+        setIsTransferNotificationsOpen(false);
+      }
 
       if (action === "accept") {
         toast.success(`Transfer accepted for ${ticket.id}.`);
@@ -2401,18 +2392,17 @@ const AgentDashboard = () => {
         `/api/admin/tickets/${encodeURIComponent(ticket.id)}/transfer-decision/acknowledge`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            actorUsername: session.username,
-          }),
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
         },
       );
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not clear this transfer update right now.");
         return;
       }
@@ -2441,18 +2431,17 @@ const AgentDashboard = () => {
         `/api/admin/tickets/${encodeURIComponent(ticket.id)}/escalation-closure/acknowledge`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            actorUsername: session.username,
-          }),
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
         },
       );
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not clear this escalation update right now.");
         return;
       }
@@ -2481,12 +2470,8 @@ const AgentDashboard = () => {
         `/api/admin/tickets/${encodeURIComponent(ticket.id)}/teams-call-notification/acknowledge`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            actorUsername: session.username,
-          }),
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
         },
       );
 
@@ -2496,6 +2481,9 @@ const AgentDashboard = () => {
         if (response.status === 409) {
           setIsTransferNotificationsOpen(false);
           await openTicket(ticket.id, "documentation");
+          return;
+        }
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
           return;
         }
 
@@ -2529,18 +2517,17 @@ const AgentDashboard = () => {
         `/api/admin/tickets/${encodeURIComponent(ticket.id)}/escalation-notification/acknowledge`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            actorUsername: session.username,
-          }),
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
         },
       );
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not clear this escalation notification right now.");
         return;
       }
@@ -2581,11 +2568,8 @@ const AgentDashboard = () => {
     try {
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticketId)}/ai-agent-message`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
-          actorUsername: session?.username || "admin",
           message: messageText,
           messages: nextThread.map((message) => ({
             role: message.role,
@@ -2598,6 +2582,9 @@ const AgentDashboard = () => {
       const payload = (await response.json().catch(() => null)) as AdminAiMessageResponse | null;
 
       if (!response.ok || !payload?.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         setAiThreads((currentThreads) => ({
           ...currentThreads,
           [ticketId]: activeAiThread,
@@ -2688,7 +2675,7 @@ const AgentDashboard = () => {
       return;
     }
 
-    setAdminSession({
+    persistAdminSessionState({
       ...session,
       consoleStatus: nextStatus,
     });
@@ -2704,7 +2691,7 @@ const AgentDashboard = () => {
     setIsUpdatingConsoleStatus(false);
     setConsoleStatus(previousStatus);
     void refreshAgentsOnly(true);
-    setAdminSession({
+    persistAdminSessionState({
       ...session,
       consoleStatus: previousStatus,
     });
@@ -2737,7 +2724,6 @@ const AgentDashboard = () => {
         ...(overrides?.statusReason ? { statusReason: overrides.statusReason } : {}),
         slaStatus: overrides?.slaStatus ?? effectiveDraftSlaStatus,
         note: nextNote,
-        actorUsername: session?.username || "admin",
       };
 
       if (canAssignActiveTicket) {
@@ -2746,15 +2732,16 @@ const AgentDashboard = () => {
 
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: buildAdminJsonHeaders(),
         body: JSON.stringify(requestBody),
       });
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
         toast.error(payload?.message || "We could not update the ticket right now.");
         return;
       }
@@ -2779,18 +2766,6 @@ const AgentDashboard = () => {
       right={!isConsoleView && canManageUsers ? (
         <>
           <Link
-            to="/admin?view=requesters"
-            className={cn(
-              "inline-flex items-center gap-2 whitespace-nowrap rounded-full border px-3.5 py-2 text-[13px] font-medium shadow-soft transition-all sm:text-sm",
-              adminView === "requesters"
-                ? "border-primary/18 bg-primary/6 text-primary hover:border-primary/30 hover:bg-primary/10"
-                : "border-primary/12 bg-white text-foreground hover:border-primary/25 hover:bg-primary/5 hover:text-primary",
-            )}
-          >
-            <UserRound className="h-4 w-4 text-primary" />
-            Requesters
-          </Link>
-          <Link
             to="/admin?view=users"
             className={cn(
               "inline-flex items-center gap-2 whitespace-nowrap rounded-full border px-3.5 py-2 text-[13px] font-medium shadow-soft transition-all sm:text-sm",
@@ -2801,7 +2776,7 @@ const AgentDashboard = () => {
           >
             <Users className="h-4 w-4 text-primary" />
             <span className="sm:hidden">Admins</span>
-            <span className="hidden sm:inline">Admin Management</span>
+            <span className="hidden sm:inline">Support Directory</span>
           </Link>
         </>
       ) : undefined}
@@ -3062,6 +3037,18 @@ const AgentDashboard = () => {
                   <MessageSquareText className="h-4 w-4 shrink-0" />
                   {!useCompactAdminSidebar ? <span>Chat Console</span> : null}
                 </TabsTrigger>
+                {canManageUsers ? (
+                  <TabsTrigger
+                    value="management"
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <Settings2 className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span>Manage Agents</span> : null}
+                  </TabsTrigger>
+                ) : null}
               </TabsList>
 
               {!useCompactAdminSidebar && adminView === "console" ? (
@@ -3393,7 +3380,7 @@ const AgentDashboard = () => {
                   <table className="w-full text-sm">
                     <thead className="bg-secondary/50 text-muted-foreground">
                       <tr className="text-left">
-                        {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Action"].map((heading) => (
+                        {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA"].map((heading) => (
                           <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
                         ))}
                       </tr>
@@ -3402,8 +3389,19 @@ const AgentDashboard = () => {
                       {visibleDashboardTickets.map((ticket) => (
                         <tr
                           key={ticket.id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => void openTicket(ticket.id)}
+                          onKeyDown={(event) => {
+                            if (event.key !== "Enter" && event.key !== " ") {
+                              return;
+                            }
+
+                            event.preventDefault();
+                            void openTicket(ticket.id);
+                          }}
                           className={cn(
-                            "transition-colors",
+                            "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-secondary/20",
                             getTicketTransferRowClassName(ticket),
                           )}
                         >
@@ -3436,11 +3434,6 @@ const AgentDashboard = () => {
                               {ticket.slaStatus}
                             </span>
                           </td>
-                          <td className="px-4 py-3">
-                            <Button size="sm" variant="outline" onClick={() => void openTicket(ticket.id)}>
-                              <Eye className="h-3.5 w-3.5 mr-1.5" /> View
-                            </Button>
-                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -3454,19 +3447,19 @@ const AgentDashboard = () => {
             <div className="space-y-6">
               <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
                 <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Total Admins</div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Support Access Profiles</div>
                   <div className="mt-3 text-3xl font-bold text-foreground">{managedAdminUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Admin and superadmin accounts visible in this directory.</div>
+                  <div className="mt-2 text-sm text-muted-foreground">Synced runtime profiles for people currently in the support access group.</div>
                 </div>
                 <div className="rounded-2xl border bg-card p-5 shadow-soft">
                   <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Active</div>
                   <div className="mt-3 text-3xl font-bold text-emerald-700">{activeManagedAdminUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Admin accounts that can still sign in.</div>
+                  <div className="mt-2 text-sm text-muted-foreground">Support access profiles currently active in the support runtime.</div>
                 </div>
                 <div className="rounded-2xl border bg-card p-5 shadow-soft">
                   <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Inactive</div>
                   <div className="mt-3 text-3xl font-bold text-slate-600">{managedAdminUsers.length - activeManagedAdminUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Admin accounts disabled from the admin login.</div>
+                  <div className="mt-2 text-sm text-muted-foreground">Support access profiles currently inactive in the support runtime.</div>
                 </div>
               </div>
 
@@ -3474,9 +3467,12 @@ const AgentDashboard = () => {
                 <div className="border-b px-4 py-4 sm:px-5">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
                     <div>
-                      <h2 className="text-lg font-semibold text-foreground">Admin Management</h2>
+                      <h2 className="text-lg font-semibold text-foreground">Support Access Directory</h2>
                       <p className="mt-1 text-sm text-muted-foreground">
-                        Review admin and superadmin accounts, reset passwords, and control dashboard access from one place.
+                        Review the synced runtime profiles for people currently granted support access.
+                      </p>
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Login access is managed from KBC auth users and Django admin access groups, not from this directory.
                       </p>
                     </div>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -3514,10 +3510,6 @@ const AgentDashboard = () => {
                           </SelectContent>
                         </Select>
                       </div>
-                      <Button onClick={() => openCreateUserEditor("staff")} className="w-full gap-2 gradient-primary sm:w-auto">
-                        <UserPlus className="h-4 w-4" />
-                        Add Admin
-                      </Button>
                     </div>
                   </div>
                 </div>
@@ -3532,11 +3524,11 @@ const AgentDashboard = () => {
                   {isLoading ? (
                     <div className="flex items-center justify-center gap-2 rounded-2xl border border-dashed p-10 text-sm text-muted-foreground">
                       <LoaderCircle className="h-4 w-4 animate-spin" />
-                      Loading admin accounts...
+                      Loading support access profiles...
                     </div>
                   ) : filteredUsers.length === 0 ? (
                     <div className="rounded-2xl border border-dashed p-10 text-center text-sm text-muted-foreground">
-                      No admin accounts matched the current search and filters.
+                      No support access profiles matched the current search and filters.
                     </div>
                   ) : (
                     <div className="grid gap-4 xl:grid-cols-2">
@@ -3562,6 +3554,9 @@ const AgentDashboard = () => {
                                   </div>
                                 </div>
                                 <div className="mt-4 flex flex-wrap gap-2">
+                                  <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-medium text-sky-700">
+                                    Support Access
+                                  </span>
                                   <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-700">
                                     {formatAccountScopeLabel(agent.accountScope || agent.role)}
                                   </span>
@@ -3583,25 +3578,6 @@ const AgentDashboard = () => {
                                     Console: {normalizeAdminConsoleStatus(agent.consoleStatus)}
                                   </span>
                                 </div>
-                              </div>
-                              <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:shrink-0">
-                                <Button variant="outline" size="sm" className="w-full sm:w-auto" onClick={() => openEditUserEditor(agent)}>
-                                  Edit
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="w-full sm:w-auto"
-                                  onClick={() => {
-                                    openEditUserEditor(agent);
-                                    setUserEditor((currentState) => ({
-                                      ...currentState,
-                                      isActive: !(agent.isActive !== false),
-                                    }));
-                                  }}
-                                >
-                                  {agent.isActive !== false ? "Deactivate" : "Activate"}
-                                </Button>
                               </div>
                             </div>
                             <div className="mt-4 grid gap-3 rounded-2xl border bg-card/60 p-3 text-sm sm:grid-cols-2">
@@ -3637,168 +3613,81 @@ const AgentDashboard = () => {
             </div>
           </TabsContent>
 
-          <TabsContent value="requesters" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
+          <TabsContent value="management" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
             <div className="space-y-6">
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Total Requesters</div>
-                  <div className="mt-3 text-3xl font-bold text-foreground">{managedRequesterUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Portal accounts for users, coaches, and employers.</div>
-                </div>
-                <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Active</div>
-                  <div className="mt-3 text-3xl font-bold text-emerald-700">{activeManagedRequesterUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Requester accounts that can submit support tickets.</div>
-                </div>
-                <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Inactive</div>
-                  <div className="mt-3 text-3xl font-bold text-slate-600">{managedRequesterUsers.length - activeManagedRequesterUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Requester accounts currently blocked from the public portal.</div>
-                </div>
-              </div>
-
               <div className="rounded-3xl border bg-card shadow-card">
                 <div className="border-b px-4 py-4 sm:px-5">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
                     <div>
-                      <h2 className="text-lg font-semibold text-foreground">Requester Accounts</h2>
+                      <h2 className="text-lg font-semibold text-foreground">Agent Management</h2>
                       <p className="mt-1 text-sm text-muted-foreground">
-                        Manage the people who can enter the public portal and create tickets as users, coaches, or employers.
+                        Control which agents receive ticket assignments via the Support Access toggle.
                       </p>
                     </div>
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-                      <div className="relative w-full sm:w-[280px]">
-                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                        <Input
-                          value={requesterSearch}
-                          onChange={(event) => setRequesterSearch(event.target.value)}
-                          placeholder="Search by name, username, or email"
-                          className="pl-10"
-                        />
-                      </div>
-                      <div className="w-full sm:w-[170px]">
-                        <Select value={requesterRoleFilter} onValueChange={setRequesterRoleFilter}>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Role" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="all">All Roles</SelectItem>
-                            {requesterAccountRoleOptions.map((roleOption) => (
-                              <SelectItem key={roleOption.value} value={roleOption.value}>{roleOption.label}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="w-full sm:w-[170px]">
-                        <Select value={requesterStatusFilter} onValueChange={(value) => setRequesterStatusFilter(value as UserStatusFilter)}>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Status" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="all">All Statuses</SelectItem>
-                            <SelectItem value="active">Active</SelectItem>
-                            <SelectItem value="inactive">Inactive</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <Button onClick={() => openCreateUserEditor("requester")} className="w-full gap-2 gradient-primary sm:w-auto">
-                        <UserPlus className="h-4 w-4" />
-                        Add Requester
-                      </Button>
+                    <div className="relative w-full lg:w-[280px]">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={managementSearch}
+                        onChange={(e) => setManagementSearch(e.target.value)}
+                        placeholder="Search by name, username, or email"
+                        className="pl-10"
+                      />
                     </div>
                   </div>
                 </div>
 
-                {error && adminView === "requesters" ? (
-                  <div className="border-b border-destructive/10 bg-destructive/5 px-5 py-3 text-sm text-destructive">
-                    {error}
-                  </div>
-                ) : null}
-
-                <div className="p-4 sm:p-5">
-                  {isLoading ? (
-                    <div className="flex items-center justify-center gap-2 rounded-2xl border border-dashed p-10 text-sm text-muted-foreground">
-                      <LoaderCircle className="h-4 w-4 animate-spin" />
-                      Loading requester accounts...
-                    </div>
-                  ) : filteredRequesters.length === 0 ? (
-                    <div className="rounded-2xl border border-dashed p-10 text-center text-sm text-muted-foreground">
-                      No requester accounts matched the current search and filters.
-                    </div>
-                  ) : (
-                    <div className="grid gap-4 xl:grid-cols-2">
-                      {filteredRequesters.map((agent) => (
-                        <div key={agent.id} className="overflow-hidden rounded-2xl border bg-background/70 p-4 shadow-soft">
-                          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                            <div className="min-w-0">
-                              <div className="flex items-start gap-2 sm:items-center">
-                                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                                  <UserRound className="h-4 w-4" />
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="truncate font-semibold text-foreground">
-                                    {agent.fullName || agent.username}
-                                  </div>
-                                  <div className="truncate text-xs text-muted-foreground">
-                                    @{agent.username}
-                                  </div>
-                                </div>
-                              </div>
-                              <div className="mt-4 flex flex-wrap gap-2">
-                                <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-700">
-                                  {formatAccountScopeLabel(agent.accountScope || agent.role)}
-                                </span>
-                                <RequesterRoleBadge role={agent.role} />
-                                <span className={cn(
-                                  "inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium",
-                                  agent.isActive !== false
-                                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                    : "border-slate-200 bg-slate-100 text-slate-600",
-                                )}>
-                                  {agent.isActive !== false ? "Active" : "Inactive"}
-                                </span>
-                              </div>
+                <div className="divide-y">
+                  {agents
+                    .filter((agent) => {
+                      if (!managementSearch.trim()) return true;
+                      const q = managementSearch.toLowerCase();
+                      return (
+                        (agent.fullName || "").toLowerCase().includes(q) ||
+                        agent.username.toLowerCase().includes(q) ||
+                        (agent.email || "").toLowerCase().includes(q)
+                      );
+                    })
+                    .map((agent) => {
+                      const isToggling = togglingAccessIds.has(agent.id);
+                      const hasAccess = agent.legacySupportAccess === true;
+                      const isCurrentUser = session?.id === agent.id;
+                      return (
+                        <div key={agent.id} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
+                          <div className="flex min-w-0 items-center gap-3">
+                            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                              <Users className="h-4 w-4" />
                             </div>
-                            <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:shrink-0">
-                              <Button variant="outline" size="sm" className="w-full sm:w-auto" onClick={() => openEditUserEditor(agent)}>
-                                Edit
-                              </Button>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="w-full sm:w-auto"
-                                onClick={() => {
-                                  openEditUserEditor(agent);
-                                  setUserEditor((currentState) => ({
-                                    ...currentState,
-                                    isActive: !(agent.isActive !== false),
-                                  }));
-                                }}
-                              >
-                                {agent.isActive !== false ? "Deactivate" : "Activate"}
-                              </Button>
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-medium text-foreground">
+                                {agent.fullName || agent.username}
+                                {isCurrentUser ? <span className="ml-1.5 text-xs text-muted-foreground">(You)</span> : null}
+                              </div>
+                              <div className="truncate text-xs text-muted-foreground">
+                                @{agent.username}
+                                {agent.email ? ` · ${agent.email}` : ""}
+                              </div>
                             </div>
                           </div>
-                          <div className="mt-4 grid gap-3 rounded-2xl border bg-card/60 p-3 text-sm sm:grid-cols-2">
-                            <div>
-                              <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Email</div>
-                              <div className="mt-1 break-all text-foreground">{agent.email || "No email saved"}</div>
-                            </div>
-                            <div>
-                              <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Portal Access</div>
-                              <div className="mt-1 text-foreground">{agent.isActive !== false ? "Enabled" : "Disabled"}</div>
-                            </div>
-                            <div>
-                              <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Role</div>
-                              <div className="mt-1 text-foreground">{formatRequesterRoleLabel(agent.role)}</div>
-                            </div>
-                            <div>
-                              <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Access Scope</div>
-                              <div className="mt-1 text-foreground">{formatAccountScopeLabel(agent.accountScope || agent.role)}</div>
-                            </div>
+                          <div className="flex shrink-0 items-center gap-3">
+                            <span className={cn(
+                              "hidden text-xs font-medium sm:block",
+                              hasAccess ? "text-emerald-600" : "text-muted-foreground",
+                            )}>
+                              {hasAccess ? "Receives tickets" : "No ticket access"}
+                            </span>
+                            <Switch
+                              checked={hasAccess}
+                              disabled={isToggling}
+                              onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
+                              aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
+                            />
                           </div>
                         </div>
-                      ))}
+                      );
+                    })}
+                  {agents.length === 0 && !isLoading && (
+                    <div className="p-10 text-center text-sm text-muted-foreground">
+                      No agents found.
                     </div>
                   )}
                 </div>
@@ -4446,140 +4335,6 @@ const AgentDashboard = () => {
         </SheetContent>
       </Sheet>
 
-      <Sheet
-        open={isUserEditorOpen}
-        onOpenChange={(open) => {
-          setIsUserEditorOpen(open);
-          if (!open) {
-            setUserEditor(createEmptyUserEditorState(userEditorScope));
-          }
-        }}
-      >
-        <SheetContent className="w-full sm:max-w-xl overflow-y-auto">
-          <SheetHeader>
-            <SheetTitle className="flex items-center gap-2">
-              <Users className="h-5 w-5 text-primary" />
-              {userEditor.id ? `Edit ${userEditorEntityLabel}` : `Add ${userEditorEntityLabel}`}
-            </SheetTitle>
-            <SheetDescription>
-              {userEditor.id
-                ? userEditorScope === "requester"
-                  ? "Update requester account details, reset the password if needed, or change who can access the portal."
-                  : "Update admin account details, reset the password if needed, or change access."
-                : userEditorScope === "requester"
-                  ? "Create a portal requester account and choose whether this person is a user, coach, or employer."
-                  : "Create a new admin account and choose the access level that fits this user."}
-            </SheetDescription>
-          </SheetHeader>
-
-          <div className="space-y-5 py-5">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <Label htmlFor="managed-user-full-name" className="mb-1.5 block">Full Name</Label>
-                <Input
-                  id="managed-user-full-name"
-                  value={userEditor.fullName}
-                  onChange={(event) => setUserEditor((currentState) => ({ ...currentState, fullName: event.target.value }))}
-                  placeholder="Full name"
-                />
-              </div>
-              <div>
-                <Label htmlFor="managed-user-username" className="mb-1.5 block">Username</Label>
-                <Input
-                  id="managed-user-username"
-                  value={userEditor.username}
-                  onChange={(event) => setUserEditor((currentState) => ({ ...currentState, username: event.target.value }))}
-                  placeholder="username"
-                  autoComplete="username"
-                />
-              </div>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <Label htmlFor="managed-user-email" className="mb-1.5 block">Email</Label>
-                <Input
-                  id="managed-user-email"
-                  value={userEditor.email}
-                  onChange={(event) => setUserEditor((currentState) => ({ ...currentState, email: event.target.value }))}
-                  placeholder="name@example.com"
-                  autoComplete="email"
-                />
-              </div>
-              <div>
-                <Label htmlFor="managed-user-role" className="mb-1.5 block">Role</Label>
-                <Select
-                  value={userEditor.role}
-                  onValueChange={(value) => setUserEditor((currentState) => ({ ...currentState, role: value }))}
-                >
-                  <SelectTrigger id="managed-user-role">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {userEditorRoleOptions.map((roleOption) => (
-                      <SelectItem key={roleOption.value} value={roleOption.value}>{roleOption.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <p className="mt-2 text-xs text-muted-foreground">
-                  Access scope: {formatAccountScopeLabel(deriveAccountScopeFromRole(userEditor.role))}
-                </p>
-              </div>
-            </div>
-
-            <div>
-              <Label htmlFor="managed-user-password" className="mb-1.5 block">
-                {userEditor.id ? "New Password" : "Password"}
-              </Label>
-              <Input
-                id="managed-user-password"
-                type="password"
-                value={userEditor.password}
-                onChange={(event) => setUserEditor((currentState) => ({ ...currentState, password: event.target.value }))}
-                placeholder={userEditor.id ? "Leave blank to keep the current password" : "Set a password"}
-                autoComplete={userEditor.id ? "new-password" : "current-password"}
-              />
-              <p className="mt-1 text-xs text-muted-foreground">
-                {userEditor.id
-                  ? "Only fill this field when you want to reset the password."
-                  : userEditorScope === "requester"
-                    ? "This password is stored with the requester account for future portal access flows."
-                    : "The user will use this password to sign in to the admin area."}
-              </p>
-            </div>
-
-            <div className="rounded-2xl border bg-secondary/35 p-4">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <div className="font-medium text-foreground">Account Status</div>
-                  <div className="mt-1 text-sm text-muted-foreground">
-                    {userEditorScope === "requester"
-                      ? "Inactive requester accounts stay in the directory but cannot use the public portal until reactivated."
-                      : "Inactive admin accounts stay in the system but cannot log in until reactivated."}
-                  </div>
-                </div>
-                <Button
-                  type="button"
-                  variant={userEditor.isActive ? "outline" : "default"}
-                  onClick={() => setUserEditor((currentState) => ({ ...currentState, isActive: !currentState.isActive }))}
-                >
-                  {userEditor.isActive ? "Active" : "Inactive"}
-                </Button>
-              </div>
-            </div>
-          </div>
-
-          <SheetFooter className="flex-col gap-2 sm:flex-col">
-            <Button className="w-full gradient-primary border-0" onClick={() => void saveManagedUser()} disabled={isSavingUser}>
-              {isSavingUser ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
-              {userEditor.id ? `Save ${userEditorEntityLabel} Changes` : `Create ${userEditorEntityLabel}`}
-            </Button>
-            <Button variant="outline" className="w-full" onClick={() => setIsUserEditorOpen(false)} disabled={isSavingUser}>
-              Cancel
-            </Button>
-          </SheetFooter>
-        </SheetContent>
-      </Sheet>
     </SupportLayout>
   );
 };
@@ -6377,14 +6132,14 @@ function parseAdminDeepLink(search: string) {
   const requestedScope = searchParams.get("scope");
   const requestedQueueTab = searchParams.get("tab");
   const shouldOpenUsers = requestedView === "users";
-  const shouldOpenRequesters = requestedView === "requesters";
+  const shouldOpenManagement = requestedView === "management";
   const shouldOpenConsole = requestedView === "console" || Boolean(requestedTicketId);
 
   return {
     view: shouldOpenUsers
       ? "users" as const
-      : shouldOpenRequesters
-        ? "requesters" as const
+      : shouldOpenManagement
+        ? "management" as const
         : shouldOpenConsole
           ? "console" as const
           : "dashboard" as const,
@@ -7052,13 +6807,8 @@ const LogoutButton = ({ collapsed = false }: { collapsed?: boolean }) => {
       if (session?.username && session.instanceId) {
         await fetch("/api/admin/logout", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            actorUsername: session.username,
-            instanceId: session.instanceId,
-          }),
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
         });
       }
     } catch {

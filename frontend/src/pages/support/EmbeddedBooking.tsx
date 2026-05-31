@@ -1,210 +1,437 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { ArrowLeft, ExternalLink, LoaderCircle } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { ArrowLeft, CalendarClock, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { useSupport } from "@/context/SupportContext";
+import { type ChatMessage, useSupport } from "@/context/SupportContext";
+import {
+  awaitingMeetingReason,
+  canReturnToChat,
+  getSupportResumePath,
+  shouldShowStatusStep,
+  type SupportBookingLocationState,
+} from "@/lib/supportFlow";
+import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 
-interface BookingContextResponse {
-  bookingUrl: string;
-  learner: {
-    id: number;
-    fullName: string;
-    email: string;
-    phone: string;
+const ukSupportTimeZone = "Europe/London";
+const ukSupportSessionStartMinutes = 8 * 60;
+const ukSupportSessionEndMinutes = 16 * 60;
+const supportSessionSlotIntervalMinutes = 30;
+const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
+
+function buildTimestamp() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function buildBotMessage(text: string): ChatMessage {
+  return {
+    id: crypto.randomUUID(),
+    sender: "bot",
+    text,
+    timestamp: buildTimestamp(),
   };
-  ticket: {
-    id: string;
-    category: string;
-    technicalSubcategory: string;
-    inquiry: string;
-    status: string;
-  };
-  prefill: {
-    fullName: string;
-    email: string;
-    phone: string;
-    specialRequests: string;
+}
+
+function formatDateInputValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function parseLocalDateTime(dateValue: string, timeValue: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || !/^\d{2}:\d{2}$/.test(timeValue)) {
+    return null;
+  }
+
+  const [year, month, day] = dateValue.split("-").map(Number);
+  const [hours, minutes] = timeValue.split(":").map(Number);
+  const parsed = new Date(year, month - 1, day, hours, minutes, 0, 0);
+
+  if (
+    Number.isNaN(parsed.getTime())
+    || parsed.getFullYear() !== year
+    || parsed.getMonth() !== month - 1
+    || parsed.getDate() !== day
+    || parsed.getHours() !== hours
+    || parsed.getMinutes() !== minutes
+  ) {
+    return null;
+  }
+
+  return parsed;
+}
+
+function getTimeInTimeZoneMinutes(date: Date, timeZone: string) {
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const hours = Number(parts.find((part) => part.type === "hour")?.value ?? Number.NaN);
+  const minutes = Number(parts.find((part) => part.type === "minute")?.value ?? Number.NaN);
+
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) {
+    return Number.NaN;
+  }
+
+  return (hours * 60) + minutes;
+}
+
+function isMinutesWithinRange(minutes: number, startMinutes: number, endMinutes: number) {
+  return minutes >= startMinutes && minutes <= endMinutes;
+}
+
+function isWithinSupportSessionWindow(requestedDateTime: Date) {
+  const ukMinutes = getTimeInTimeZoneMinutes(requestedDateTime, ukSupportTimeZone);
+  return isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes);
+}
+
+function isSupportSessionTimeAligned(requestedDateTime: Date) {
+  const localMinutes = (requestedDateTime.getHours() * 60) + requestedDateTime.getMinutes();
+  return localMinutes % supportSessionSlotIntervalMinutes === 0;
+}
+
+function getSupportSessionValidationMessage(dateValue: string, timeValue: string, now = new Date()) {
+  if (!dateValue || !timeValue) {
+    return "";
+  }
+
+  const requestedDateTime = parseLocalDateTime(dateValue, timeValue);
+  if (!requestedDateTime) {
+    return "Please choose a valid session date and time.";
+  }
+
+  if ((requestedDateTime.getTime() - now.getTime()) <= supportSessionLeadTimeMs) {
+    return "Support sessions must be booked more than 24 hours in advance.";
+  }
+
+  if (!isSupportSessionTimeAligned(requestedDateTime)) {
+    return "Support sessions must start on 30-minute intervals.";
+  }
+
+  if (!isWithinSupportSessionWindow(requestedDateTime)) {
+    return "Support sessions must be between 8:00 AM and 4:00 PM UK time.";
+  }
+
+  return "";
+}
+
+function buildSupportSessionTimeOptions(dateValue: string, now = new Date()) {
+  if (!dateValue) {
+    return [];
+  }
+
+  const options: Array<{ value: string; label: string }> = [];
+
+  for (let minutes = 0; minutes < 24 * 60; minutes += supportSessionSlotIntervalMinutes) {
+    const hours = String(Math.floor(minutes / 60)).padStart(2, "0");
+    const mins = String(minutes % 60).padStart(2, "0");
+    const value = `${hours}:${mins}`;
+    const requestedDateTime = parseLocalDateTime(dateValue, value);
+
+    if (!requestedDateTime) {
+      continue;
+    }
+
+    if ((requestedDateTime.getTime() - now.getTime()) <= supportSessionLeadTimeMs) {
+      continue;
+    }
+
+    if (!isWithinSupportSessionWindow(requestedDateTime)) {
+      continue;
+    }
+
+    options.push({
+      value,
+      label: new Intl.DateTimeFormat("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+      }).format(requestedDateTime),
+    });
+  }
+
+  return options;
+}
+
+function formatSupportSessionDetails(dateValue: string, timeValue: string) {
+  const requestedDateTime = parseLocalDateTime(dateValue, timeValue);
+
+  if (!requestedDateTime) {
+    return {
+      dateLabel: dateValue,
+      timeLabel: timeValue,
+    };
+  }
+
+  return {
+    dateLabel: new Intl.DateTimeFormat("en-US", {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    }).format(requestedDateTime),
+    timeLabel: new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).format(requestedDateTime),
   };
 }
 
 const EmbeddedBooking = () => {
+  const location = useLocation();
   const navigate = useNavigate();
-  const { ticket } = useSupport();
-  const [bookingContext, setBookingContext] = useState<BookingContextResponse | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [errorMessage, setErrorMessage] = useState("");
+  const { ticket, bookingSummary, updateTicket, setBookingSummary } = useSupport();
+  const [bookingDate, setBookingDate] = useState("");
+  const [bookingTime, setBookingTime] = useState("");
+  const [isBooking, setIsBooking] = useState(false);
+  const requestedReturnPath = (location.state as SupportBookingLocationState | null)?.returnPath;
+  const returnPath = requestedReturnPath || (canReturnToChat(ticket) ? "/support/chat" : "/support/options");
 
   useEffect(() => {
     if (!ticket.id) {
-      navigate("/support/chat");
+      navigate(ticket.email ? "/support/options" : "/support");
       return;
     }
 
-    const abortController = new AbortController();
+    if (!ticket.email) {
+      navigate("/support");
+      return;
+    }
 
-    const loadBookingContext = async () => {
-      setIsLoading(true);
-      setErrorMessage("");
+    if (shouldShowStatusStep(ticket, bookingSummary)) {
+      navigate(getSupportResumePath(ticket, bookingSummary));
+    }
+  }, [bookingSummary, navigate, ticket]);
 
-      try {
-        const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/booking-context`, {
-          signal: abortController.signal,
-        });
+  const minBookingDate = formatDateInputValue(new Date());
+  const bookingValidationMessage = getSupportSessionValidationMessage(bookingDate, bookingTime);
+  const bookingTimeOptions = buildSupportSessionTimeOptions(bookingDate);
 
-        const payload = (await response.json().catch(() => null)) as
-          | (BookingContextResponse & { message?: string })
-          | { message?: string }
-          | null;
+  const handleBooking = async () => {
+    if (!ticket.id || !bookingDate || !bookingTime) {
+      return;
+    }
 
-        if (!response.ok || !payload || !("bookingUrl" in payload)) {
-          setErrorMessage(payload?.message || "We could not prepare the booking page right now.");
-          return;
-        }
+    const requestedDateTime = parseLocalDateTime(bookingDate, bookingTime);
 
-        setBookingContext(payload);
-      } catch (error) {
-        if ((error as Error).name !== "AbortError") {
-          setErrorMessage("We could not connect to the booking service right now.");
-        }
-      } finally {
-        setIsLoading(false);
+    if (bookingValidationMessage) {
+      toast.error(bookingValidationMessage);
+      return;
+    }
+
+    if (!requestedDateTime) {
+      toast.error("Please choose a valid session date and time.");
+      return;
+    }
+
+    setIsBooking(true);
+
+    try {
+      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/session-requests`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          date: bookingDate,
+          time: bookingTime,
+          scheduledAt: requestedDateTime.toISOString(),
+          clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as {
+        message?: string;
+        webhookConfigured?: boolean;
+        webhookDelivered?: boolean;
+        reservationConfirmed?: boolean;
+        meetingJoinUrl?: string | null;
+        ticket?: {
+          status?: string;
+          statusReason?: string;
+          assignedTeam?: string;
+        };
+      } | null;
+
+      if (!response.ok) {
+        toast.error(payload?.message || "We could not save the support session request.");
+        return;
       }
-    };
 
-    void loadBookingContext();
+      const bookingDetails = formatSupportSessionDetails(bookingDate, bookingTime);
+      const bookingConfirmationMessage = payload?.reservationConfirmed
+        ? `Your support session has been booked for ${bookingDetails.dateLabel} at ${bookingDetails.timeLabel}. The Teams slot is now reserved for you.`
+        : `Thank you. Your support session request has been submitted for ${bookingDetails.dateLabel} at ${bookingDetails.timeLabel}. Our team will review it and confirm the next steps with you shortly.`;
 
-    return () => abortController.abort();
-  }, [navigate, ticket.id]);
+      updateTicket({
+        status: (payload?.ticket?.status as typeof ticket.status | undefined) || "Pending",
+        statusReason: payload?.ticket?.statusReason || awaitingMeetingReason,
+        assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
+        chatHistory: [...ticket.chatHistory, buildBotMessage(bookingConfirmationMessage)],
+      });
+      setBookingSummary({
+        ...bookingDetails,
+        reservationConfirmed: Boolean(payload?.reservationConfirmed),
+        meetingJoinUrl: payload?.meetingJoinUrl || null,
+      });
+      setBookingDate("");
+      setBookingTime("");
+
+      if (payload?.reservationConfirmed) {
+        toast.success("Your Teams support session has been reserved successfully.");
+      } else if (payload?.webhookConfigured === false) {
+        toast.success("Your request has been submitted successfully. Our team will review it shortly.");
+      } else if (payload?.webhookDelivered === false) {
+        toast.success("Your request has been submitted successfully. Confirmation may take a little longer than usual.");
+      } else {
+        toast.success("Your support session request has been submitted successfully.");
+      }
+
+      navigate("/support/status");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsBooking(false);
+    }
+  };
 
   return (
     <SupportLayout>
       <StepIndicator current={3} />
-      <div className="mx-auto max-w-7xl space-y-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="text-2xl font-bold">Booking Stage</h1>
-            <p className="text-sm text-muted-foreground">
-              Review the learner details below, then continue to the official booking page to complete the session request.
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => navigate("/support/chat")}>
-              <ArrowLeft className="mr-2 h-4 w-4" /> Back to Chat
-            </Button>
-            {bookingContext?.bookingUrl && (
-              <Button
-                className="border-0 gradient-primary"
-                onClick={() => window.open(bookingContext.bookingUrl, "_blank", "noopener,noreferrer")}
-              >
-                Open Booking Page
-                <ExternalLink className="ml-2 h-4 w-4" />
-              </Button>
-            )}
-          </div>
-        </div>
-
-        {isLoading && (
-          <div className="flex min-h-64 items-center justify-center rounded-2xl border bg-card shadow-card">
-            <div className="flex items-center gap-3 text-sm text-muted-foreground">
-              <LoaderCircle className="h-5 w-5 animate-spin" />
-              Preparing booking details...
+      <div className="mx-auto max-w-6xl">
+        <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.04] p-6 shadow-card md:p-8">
+          <div className="flex items-start justify-between gap-4">
+            <div className="inline-flex items-center gap-2 rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80">
+              <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
+              Booking Session
             </div>
+            <Button variant="ghost" onClick={() => navigate(returnPath)} className="shrink-0">
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              {returnPath === "/support/chat" ? "Back to Chat" : "Back"}
+            </Button>
           </div>
-        )}
 
-        {!isLoading && errorMessage && (
-          <div className="rounded-2xl border border-destructive/30 bg-destructive/5 p-5 shadow-card">
-            <div className="font-semibold text-foreground">Booking page unavailable</div>
-            <p className="mt-1 text-sm text-muted-foreground">{errorMessage}</p>
-          </div>
-        )}
-
-        {!isLoading && bookingContext && (
-          <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
-            <aside className="space-y-4 rounded-2xl border bg-card p-5 shadow-card">
-              <div>
-                <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Booking Guidance
+          <div className="mt-4 grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+            <section className="rounded-[26px] border border-primary/12 bg-card/90 p-5 shadow-soft md:p-6">
+              <div className="flex items-start gap-3">
+                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-soft">
+                  <CalendarClock className="h-5 w-5" />
                 </div>
-                <p className="mt-2 text-sm leading-6 text-foreground">
-                  Use the official booking page to choose the session slot that suits you. The learner and ticket details
-                  shown here are provided for reference while you complete the booking.
-                </p>
-                <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                  If the external page asks for the same information again, use the details listed in this panel.
-                </p>
+                <div>
+                  <h1 className="text-2xl font-bold text-primary">Book a Support Session</h1>
+                  <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                    Choose a date and time that works for you on a dedicated booking page, without showing the chat in the background.
+                  </p>
+                </div>
               </div>
 
-              <section className="rounded-xl border bg-secondary/20 p-4">
-                <div className="text-sm font-semibold">Learner Details</div>
-                <dl className="mt-3 space-y-2 text-sm">
-                  <div>
-                    <dt className="text-muted-foreground">Name</dt>
-                    <dd className="font-medium">{bookingContext.learner.fullName || "-"}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">Email</dt>
-                    <dd className="font-medium break-all">{bookingContext.learner.email}</dd>
-                  </div>
-                  <div>
-                    <dt className="text-muted-foreground">Phone</dt>
-                    <dd className="font-medium">{bookingContext.learner.phone || "-"}</dd>
-                  </div>
-                </dl>
-              </section>
+              <div className="mt-6 space-y-5">
+                <div className="rounded-2xl border border-primary/15 bg-primary/[0.04] p-4">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-primary">Aptem Email</div>
+                  <div className="mt-2 text-lg font-semibold text-foreground break-all">{ticket.email}</div>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    This is the email address that will be used for your booking and follow-up.
+                  </p>
+                </div>
 
-              <section className="rounded-xl border bg-secondary/20 p-4">
-                <div className="text-sm font-semibold">Ticket Context</div>
-                <dl className="mt-3 space-y-2 text-sm">
-                  <div>
-                    <dt className="text-muted-foreground">Ticket</dt>
-                    <dd className="font-medium">{bookingContext.ticket.id}</dd>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label htmlFor="booking-date">Date</Label>
+                    <Input
+                      id="booking-date"
+                      type="date"
+                      min={minBookingDate}
+                      value={bookingDate}
+                      onChange={(event) => {
+                        setBookingDate(event.target.value);
+                        setBookingTime("");
+                      }}
+                    />
                   </div>
-                  <div>
-                    <dt className="text-muted-foreground">Category</dt>
-                    <dd className="font-medium">{bookingContext.ticket.category}</dd>
-                  </div>
-                  {bookingContext.ticket.technicalSubcategory && (
-                    <div>
-                      <dt className="text-muted-foreground">Technical Subcategory</dt>
-                      <dd className="font-medium">{bookingContext.ticket.technicalSubcategory}</dd>
-                    </div>
-                  )}
-                  <div>
-                    <dt className="text-muted-foreground">Special Requests</dt>
-                    <dd className="font-medium whitespace-pre-wrap">{bookingContext.prefill.specialRequests || "-"}</dd>
-                  </div>
-                </dl>
-              </section>
-            </aside>
 
-            <section className="rounded-2xl border bg-card p-6 shadow-card">
-              <div className="text-lg font-semibold text-foreground">Continue to Outlook Bookings</div>
-              <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                The booking page opens directly on the official Outlook Bookings site so you can complete the request
-                without relying on an embedded frame.
-              </p>
-              <div className="mt-6 rounded-xl border bg-secondary/20 p-4">
-                <div className="text-sm font-medium text-foreground">Booking URL</div>
-                <div className="mt-2 break-all text-sm text-muted-foreground">{bookingContext.bookingUrl}</div>
-              </div>
-              <div className="mt-6 flex flex-wrap gap-3">
-                <Button
-                  className="border-0 gradient-primary"
-                  onClick={() => window.open(bookingContext.bookingUrl, "_blank", "noopener,noreferrer")}
-                >
-                  Open Booking Page
-                  <ExternalLink className="ml-2 h-4 w-4" />
-                </Button>
-                <Button variant="outline" onClick={() => navigate("/support/chat")}>
-                  <ArrowLeft className="mr-2 h-4 w-4" /> Return to Chat
-                </Button>
+                  <div className="space-y-2">
+                    <Label htmlFor="booking-time">Time</Label>
+                    <Select value={bookingTime} onValueChange={setBookingTime} disabled={!bookingDate || bookingTimeOptions.length === 0}>
+                      <SelectTrigger id="booking-time">
+                        <SelectValue placeholder={bookingDate ? "Select a time slot" : "Choose a date first"} />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {bookingTimeOptions.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                {bookingDate && bookingTimeOptions.length === 0 ? (
+                  <p className="text-xs text-destructive">
+                    No available session times match the 24-hour notice and UK support hours for this date.
+                  </p>
+                ) : null}
+
+                <p className={cn("text-xs", bookingValidationMessage ? "text-destructive" : "text-muted-foreground")}>
+                  {bookingValidationMessage || "Allowed meeting hours are 8:00 AM to 4:00 PM UK time, with more than 24 hours notice required, and sessions start on 30-minute intervals."}
+                </p>
+
+                <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
+                  <Button variant="outline" onClick={() => navigate(returnPath)}>
+                    <ArrowLeft className="mr-2 h-4 w-4" />
+                    {returnPath === "/support/chat" ? "Return to Chat" : "Back"}
+                  </Button>
+                  <Button
+                    className="border-0 gradient-primary"
+                    disabled={!bookingDate || !bookingTime || Boolean(bookingValidationMessage) || isBooking}
+                    onClick={() => void handleBooking()}
+                  >
+                    <Check className="mr-2 h-4 w-4" />
+                    {isBooking ? "Saving..." : "Confirm Booking"}
+                  </Button>
+                </div>
               </div>
             </section>
+
+            <aside className="rounded-[26px] border border-primary/12 bg-card/90 p-5 shadow-soft md:p-6">
+              <div className="text-sm font-semibold uppercase tracking-wide text-primary/80">Summary</div>
+              <div className="mt-5 space-y-4 text-sm">
+                <div>
+                  <div className="text-muted-foreground">Ticket</div>
+                  <div className="mt-1 font-medium text-foreground">{ticket.id || "-"}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Learner</div>
+                  <div className="mt-1 font-medium text-foreground">{ticket.learnerName || ticket.email || "-"}</div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Category</div>
+                  <div className="mt-1 font-medium text-foreground">
+                    {ticket.category}{ticket.technicalSubcategory ? ` - ${ticket.technicalSubcategory}` : ""}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">Inquiry</div>
+                  <div className="mt-1 whitespace-pre-wrap font-medium text-foreground">{ticket.inquiry || "-"}</div>
+                </div>
+              </div>
+            </aside>
           </div>
-        )}
+        </div>
       </div>
     </SupportLayout>
   );
