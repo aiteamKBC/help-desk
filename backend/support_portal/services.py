@@ -1513,10 +1513,6 @@ def is_kbc_learner_record(learner: dict[str, Any] | None) -> bool:
 
 
 def find_kbc_learner_by_email(email: str) -> dict[str, Any] | None:
-    learner = fetch_local_learner_by_email(email)
-    if is_kbc_learner_record(learner):
-        return learner
-
     legacy_learner = fetch_legacy_learner_by_email(email)
     if not legacy_learner:
         return None

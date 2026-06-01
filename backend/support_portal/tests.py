@@ -98,6 +98,25 @@ class LearnerLookupTests(SimpleTestCase):
         self.assertIsNone(result)
         fetch_legacy.assert_called_once_with("manual@example.com")
 
+    def test_find_kbc_learner_by_email_does_not_authorize_cached_kbc_records_without_legacy_match(self):
+        cached_kbc_learner = {
+            "id": 12,
+            "full_name": "Cached Learner",
+            "email": "cached@example.com",
+            "source": "legacy_kbc_users_data",
+            "metadata": {"legacy_source": "kbc_users_data"},
+        }
+
+        with (
+            patch.object(services, "fetch_local_learner_by_email", return_value=cached_kbc_learner) as fetch_local,
+            patch.object(services, "fetch_legacy_learner_by_email", return_value=None) as fetch_legacy,
+        ):
+            result = services.find_kbc_learner_by_email("cached@example.com")
+
+        self.assertIsNone(result)
+        fetch_local.assert_not_called()
+        fetch_legacy.assert_called_once_with("cached@example.com")
+
     def test_verify_email_response_uses_synced_learner(self):
         learner = {"id": 9, "full_name": "Synced Learner", "email": "synced@example.com"}
         requester = {
