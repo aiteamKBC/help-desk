@@ -3239,7 +3239,6 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
         "legacy_auth_email": normalized_email,
         "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
         "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
-        "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
     }
 
     existing_account = (
@@ -3295,6 +3294,7 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
     initial_metadata = {
         **metadata_patch,
         "session_active": False,
+        "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
         "created_via": "microsoft_legacy_auth_sync",
     }
 
@@ -3402,7 +3402,6 @@ def sync_support_staff_account_from_entra_directory_user(
         "entra_email": normalized_email,
         "entra_directory_admin_access": True,
         "entra_directory_roles": normalized_directory_roles,
-        "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
     }
 
     existing_account = (
@@ -3461,6 +3460,7 @@ def sync_support_staff_account_from_entra_directory_user(
     initial_metadata = {
         **metadata_patch,
         "session_active": False,
+        "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
         "created_via": "microsoft_entra_directory_role_sync",
     }
 

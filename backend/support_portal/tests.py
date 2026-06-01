@@ -2324,6 +2324,112 @@ class SupportDirectoryTests(SimpleTestCase):
 
 
 class SupportStaffSyncTests(SimpleTestCase):
+    def test_sync_support_staff_account_preserves_existing_console_session_metadata(self):
+        legacy_user = {
+            "id": 368,
+            "username": "Rewan.yasser",
+            "first_name": "Rewan",
+            "last_name": "Yasser",
+            "full_name": "Rewan Yasser",
+            "email": "rewan.yasser@kentbusinesscollege.com",
+            "is_staff": True,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": True,
+            "has_admin_access": True,
+        }
+        existing_account = {
+            "id": 601,
+            "username": "rewan.yasser",
+            "full_name": "Rewan Yasser",
+            "email": "rewan.yasser@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 368,
+                "session_active": True,
+                "session_instance_id": "instance-123",
+                "session_last_seen_at": "2026-05-31T10:00:00+00:00",
+                "console_status": "Available",
+            },
+        }
+        refreshed_account = {**existing_account, "metadata": existing_account["metadata"]}
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "fetch_staff_support_account_by_legacy_auth_user_id", return_value=existing_account),
+            patch.object(services, "find_agent_account_by_email", return_value=None),
+            patch.object(services, "resolve_unique_support_staff_username", return_value="rewan.yasser"),
+            patch.object(services, "fetch_agent_account_by_id", return_value=refreshed_account),
+        ):
+            response = services.sync_support_staff_account_from_legacy_auth_user(legacy_user)
+
+        self.assertEqual(response, refreshed_account)
+        update_params = cursor.execute.call_args.args[1]
+        updated_metadata = json.loads(update_params[5])
+        self.assertTrue(updated_metadata["session_active"])
+        self.assertEqual(updated_metadata["session_instance_id"], "instance-123")
+        self.assertEqual(updated_metadata["console_status"], "Available")
+        self.assertTrue(updated_metadata["legacy_support_access"])
+        self.assertTrue(updated_metadata["legacy_admin_access"])
+
+    def test_sync_entra_support_staff_account_preserves_existing_console_session_metadata(self):
+        profile = {
+            "id": "entra-object-123",
+            "displayName": "Omar One",
+            "mail": "omar1@kentbusinesscollege.com",
+            "userPrincipalName": "omar1@kentbusinesscollege.com",
+        }
+        directory_roles = [{"id": "role-1", "displayName": "User Administrator", "roleTemplateId": "template-1"}]
+        existing_account = {
+            "id": 602,
+            "username": "omar1",
+            "full_name": "Omar One",
+            "email": "omar1@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {
+                "entra_object_id": "entra-object-123",
+                "session_active": True,
+                "session_instance_id": "instance-456",
+                "session_last_seen_at": "2026-05-31T10:00:00+00:00",
+                "console_status": "Available",
+            },
+        }
+        refreshed_account = {**existing_account, "metadata": existing_account["metadata"]}
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "fetch_staff_support_account_by_entra_object_id", return_value=existing_account),
+            patch.object(services, "find_agent_account_by_email", return_value=None),
+            patch.object(services, "fetch_agent_account_by_id", return_value=refreshed_account),
+        ):
+            response = services.sync_support_staff_account_from_entra_directory_user(profile, directory_roles, "admin")
+
+        self.assertEqual(response, refreshed_account)
+        update_params = cursor.execute.call_args.args[1]
+        updated_metadata = json.loads(update_params[5])
+        self.assertTrue(updated_metadata["session_active"])
+        self.assertEqual(updated_metadata["session_instance_id"], "instance-456")
+        self.assertEqual(updated_metadata["console_status"], "Available")
+        self.assertTrue(updated_metadata["entra_directory_admin_access"])
+
     def test_sync_support_staff_account_creates_runtime_profile_without_colliding_requester_email(self):
         legacy_user = {
             "id": 368,
