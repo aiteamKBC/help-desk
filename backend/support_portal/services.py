@@ -30,6 +30,7 @@ from .roles import (
     PUBLIC_SUPPORT_ACCOUNT_ROLE_SET,
     PUBLIC_SUPPORT_ACCOUNT_ROLES,
     ROLE_ADMIN,
+    ROLE_AGENT,
     ROLE_COACH,
     derive_account_scope_from_role,
     ROLE_EMPLOYER,
@@ -1199,6 +1200,7 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
     }
 
 
+
 def fetch_legacy_support_user_by_email(email: str) -> dict[str, Any] | None:
     normalized_email = normalize_account_email(email)
     if not normalized_email or not settings.LEGACY_DATABASE_URL:
@@ -1331,6 +1333,7 @@ def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | Non
     }
 
 
+
 def fetch_legacy_support_directory_users() -> list[dict[str, Any]]:
     if not settings.LEGACY_DATABASE_URL:
         return []
@@ -1416,6 +1419,8 @@ def fetch_legacy_support_directory_users() -> list[dict[str, Any]]:
     return legacy_users
 
 
+
+
 def upsert_learner_record(learner: dict[str, Any], source: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1453,35 +1458,6 @@ def upsert_learner_record(learner: dict[str, Any], source: str, metadata: dict[s
         )
         return dictfetchone(cursor)
 
-
-def link_support_account_to_learner(*, support_account_id: int, email: str | None) -> None:
-    normalized_email = normalize_account_email(email)
-    if not normalized_email:
-        return
-
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            UPDATE learners
-            SET support_account_id = %s,
-                updated_at = NOW()
-            WHERE LOWER(TRIM(email)) = %s
-            """,
-            [support_account_id, normalized_email],
-        )
-
-
-def unlink_support_account_from_learners(*, support_account_id: int) -> None:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            UPDATE learners
-            SET support_account_id = NULL,
-                updated_at = NOW()
-            WHERE support_account_id = %s
-            """,
-            [support_account_id],
-        )
 
 
 def find_learner_by_email(email: str) -> dict[str, Any] | None:
@@ -1525,6 +1501,8 @@ def find_kbc_learner_by_email(email: str) -> dict[str, Any] | None:
             "synced_on_demand": True,
         },
     )
+
+
 
 
 def normalize_entra_public_requester_user(profile: dict[str, Any]) -> dict[str, Any] | None:
@@ -3721,11 +3699,16 @@ def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[
     persist_agent_metadata(agent_id, metadata)
 
     legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
+    User = get_user_model()
+    django_user = None
     if legacy_auth_user_id > 0:
-        User = get_user_model()
         django_user = User.objects.filter(pk=legacy_auth_user_id).first()
-        if django_user:
-            sync_support_access_group_membership(django_user, support_access)
+    if not django_user:
+        agent_email = normalize_email(agent.get("email") or "")
+        if agent_email:
+            django_user = User.objects.filter(email__iexact=agent_email).first()
+    if django_user:
+        sync_support_access_group_membership(django_user, support_access)
 
     agent["metadata"] = metadata
     return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
@@ -4908,6 +4891,55 @@ def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[st
     return list(dict.fromkeys(candidates))
 
 
+def _login_manually_added_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
+    """Login path for agents added via Manage Agents (not Entra directory admins)."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT u.id FROM auth_user u
+            INNER JOIN auth_user_groups ug ON ug.user_id = u.id
+            INNER JOIN auth_group g ON g.id = ug.group_id
+            WHERE LOWER(TRIM(u.email)) = %s
+              AND u.is_active = TRUE
+              AND LOWER(TRIM(g.name)) IN (%s, %s)
+            LIMIT 1
+            """,
+            [normalized_email, SUPPORT_ACCESS_GROUP_NAME, ADMIN_ACCESS_GROUP_NAME],
+        )
+        if not cursor.fetchone():
+            raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+
+    agent = fetch_staff_support_account_by_email(normalized_email)
+    if not agent:
+        raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+
+    if not normalize_bool(agent.get("is_active")):
+        raise ApiError(403, "Your account has been disabled. Please contact an administrator.")
+
+    entra_object_id = sanitize_text(profile.get("id") or profile.get("oid") or profile.get("sub"))
+    full_name = (
+        sanitize_text(profile.get("displayName"))
+        or sanitize_text(profile.get("name"))
+        or normalized_email.split("@", 1)[0]
+    )
+    metadata = normalize_json_object(agent.get("metadata"))
+    metadata["entra_object_id"] = entra_object_id or metadata.get("entra_object_id", "")
+    metadata["entra_synced_at"] = datetime.now(timezone.utc).isoformat()
+    metadata["entra_email"] = normalized_email
+    persist_agent_metadata(int(agent["id"]), metadata)
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE support_accounts SET full_name = %s, updated_at = NOW() WHERE id = %s",
+            [full_name, int(agent["id"])],
+        )
+
+    refreshed = fetch_agent_account_by_id(int(agent["id"]))
+    if not refreshed:
+        raise ApiError(500, "We could not complete Microsoft sign-in right now.")
+    return refreshed
+
+
 def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any]:
     code = sanitize_text(payload.get("code"))
     redirect_uri = sanitize_text(payload.get("redirectUri"))
@@ -5030,10 +5062,12 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         metadata = normalize_json_object(account.get("metadata"))
         legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
         has_entra_admin_access = normalize_bool(metadata.get("entra_directory_admin_access"))
+        manually_added_agent = normalize_bool(metadata.get("manually_added_agent"))
         if (
             int(account.get("id") or 0) in synced_staff_account_ids
             or (legacy_auth_user_id and legacy_auth_user_id in current_legacy_staff_ids)
             or has_entra_admin_access
+            or manually_added_agent
         ):
             filtered_accounts.append(account)
 
@@ -5047,6 +5081,260 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         "accounts": serialized_accounts,
         "agents": serialized_accounts,
     }
+
+
+def search_entra_agents(q: str) -> dict[str, Any]:
+    normalized_q = sanitize_text(q)
+    if not normalized_q or len(normalized_q) < 2:
+        raise ApiError(400, "Search query must be at least 2 characters.")
+
+    if not is_microsoft_admin_login_configured():
+        raise ApiError(503, "Microsoft Entra is not configured on the server.")
+
+    _, token_delivered, token_status, token_payload = request_microsoft_login_graph_access_token()
+    if not token_delivered or token_status is None or not (200 <= token_status < 300) or not isinstance(token_payload, dict):
+        raise ApiError(502, "We could not reach Microsoft Entra right now.")
+
+    access_token = sanitize_text(token_payload.get("access_token"))
+    if not access_token:
+        raise ApiError(502, "We could not authenticate with Microsoft Entra right now.")
+
+    escaped_q = normalized_q.replace("'", "''")
+    query_string = urllib_parse.urlencode(
+        {
+            "$select": "id,displayName,mail,userPrincipalName,accountEnabled",
+            "$filter": (
+                f"accountEnabled eq true and ("
+                f"startswith(displayName,'{escaped_q}') or "
+                f"startswith(mail,'{escaped_q}') or "
+                f"startswith(userPrincipalName,'{escaped_q}')"
+                f")"
+            ),
+            "$top": "10",
+        },
+        quote_via=urllib_parse.quote,
+    )
+    _, delivered, status, payload = get_json_request(
+        f"{MICROSOFT_GRAPH_USERS_URL}?{query_string}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    if not delivered or status is None or not (200 <= status < 300) or not isinstance(payload, dict):
+        raise ApiError(502, extract_external_service_message(payload) or "We could not search Microsoft Entra right now.")
+
+    values = payload.get("value")
+    if not isinstance(values, list):
+        return {"results": []}
+
+    existing_usernames: set[str] = set()
+    existing_emails: set[str] = set()
+    for account in run_query(
+        "SELECT username, email FROM support_accounts WHERE account_scope = %s AND (metadata->>'manually_added_agent')::boolean = TRUE",
+        [ACCOUNT_SCOPE_STAFF],
+    ):
+        if account.get("username"):
+            existing_usernames.add(sanitize_text(account["username"]).lower())
+        if account.get("email"):
+            existing_emails.add(normalize_email(account["email"]))
+
+    results = []
+    for user in values:
+        if not isinstance(user, dict):
+            continue
+        if user.get("accountEnabled") is False:
+            continue
+        mail = normalize_email(sanitize_text(user.get("mail") or user.get("userPrincipalName") or ""))
+        upn = sanitize_text(user.get("userPrincipalName") or "").lower()
+        display_name = sanitize_text(user.get("displayName") or "")
+        entra_id = sanitize_text(user.get("id") or "")
+        if not mail and not upn:
+            continue
+        username = (upn.split("@")[0] if upn else mail.split("@")[0]).lower()
+        already_added = username in existing_usernames or (mail and mail in existing_emails)
+        results.append({
+            "entraId": entra_id,
+            "displayName": display_name,
+            "email": mail or upn,
+            "username": username,
+            "alreadyAdded": already_added,
+        })
+
+    return {"results": results}
+
+
+def _ensure_django_support_access(email: str, full_name: str) -> int | None:
+    """Ensure the person has a Django user in the Support Access group. Returns the Django user id."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT id FROM auth_user WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+            [email],
+        )
+        row = cursor.fetchone()
+        if row:
+            django_user_id = row[0]
+        else:
+            name_parts = full_name.split(" ", 1)
+            first_name = name_parts[0] if name_parts else ""
+            last_name = name_parts[1] if len(name_parts) > 1 else ""
+            django_username = email.split("@")[0].lower()
+            cursor.execute(
+                "SELECT id FROM auth_user WHERE username = %s LIMIT 1",
+                [django_username],
+            )
+            if cursor.fetchone():
+                django_username = email.lower()
+            cursor.execute(
+                """
+                INSERT INTO auth_user
+                  (username, email, first_name, last_name, password,
+                   is_staff, is_active, is_superuser, date_joined)
+                VALUES (%s, %s, %s, %s, '', FALSE, TRUE, FALSE, NOW())
+                RETURNING id
+                """,
+                [django_username, email, first_name, last_name],
+            )
+            django_user_id = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
+            [SUPPORT_ACCESS_GROUP_NAME],
+        )
+        group_row = cursor.fetchone()
+        if not group_row:
+            return django_user_id
+        group_id = group_row[0]
+
+        cursor.execute(
+            "SELECT 1 FROM auth_user_groups WHERE user_id = %s AND group_id = %s LIMIT 1",
+            [django_user_id, group_id],
+        )
+        if not cursor.fetchone():
+            cursor.execute(
+                "INSERT INTO auth_user_groups (user_id, group_id) VALUES (%s, %s)",
+                [django_user_id, group_id],
+            )
+
+    return django_user_id
+
+
+def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
+    entra_id = sanitize_text(payload.get("entraId"))
+    display_name = sanitize_text(payload.get("displayName"))
+    email = normalize_email(sanitize_text(payload.get("email") or ""))
+    username = sanitize_text(payload.get("username") or "").lower()
+
+    if not entra_id or not email:
+        raise ApiError(400, "Entra ID and email are required.")
+
+    if not is_valid_email(email):
+        raise ApiError(400, "Invalid email address.")
+
+    existing = run_query_one(
+        "SELECT id, metadata FROM support_accounts WHERE email = %s AND account_scope = %s LIMIT 1",
+        [email, ACCOUNT_SCOPE_STAFF],
+    )
+    if existing:
+        existing_metadata = normalize_json_object(existing.get("metadata"))
+        if normalize_bool(existing_metadata.get("manually_added_agent")):
+            raise ApiError(409, "This person is already added as an agent.")
+        existing_metadata["manually_added_agent"] = True
+        existing_metadata["legacy_support_access"] = True
+        django_user_id = _ensure_django_support_access(email, display_name or email)
+        if django_user_id and not existing_metadata.get("legacy_auth_user_id"):
+            existing_metadata["legacy_auth_user_id"] = django_user_id
+        persist_agent_metadata(int(existing["id"]), existing_metadata)
+        updated = run_query_one(
+            "SELECT id, username, full_name, email, account_scope, role, is_active, metadata FROM support_accounts WHERE id = %s LIMIT 1",
+            [int(existing["id"])],
+        )
+        return {"agent": serialize_agent(updated, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())}
+
+    if not username:
+        username = email.split("@")[0].lower()
+
+    username_taken = run_query_one(
+        "SELECT id FROM support_accounts WHERE username = %s LIMIT 1",
+        [username],
+    )
+    if username_taken:
+        username = f"{username}.{entra_id[:6].lower()}"
+
+    full_name = display_name or email
+    django_user_id = _ensure_django_support_access(email, full_name)
+
+    new_account = run_query_one(
+        """
+        INSERT INTO support_accounts (username, full_name, email, account_scope, role, is_active, metadata)
+        VALUES (%s, %s, %s, %s, %s, TRUE, %s::jsonb)
+        RETURNING id, username, full_name, email, account_scope, role, is_active, metadata
+        """,
+        [
+            username,
+            full_name,
+            email,
+            ACCOUNT_SCOPE_STAFF,
+            ROLE_AGENT,
+            json.dumps({
+                "entra_object_id": entra_id,
+                "entra_user_principal_name": sanitize_text(payload.get("email") or ""),
+                "entra_directory_admin_access": False,
+                "legacy_support_access": True,
+                "manually_added_agent": True,
+                **({"legacy_auth_user_id": django_user_id} if django_user_id else {}),
+            }),
+        ],
+    )
+    if not new_account:
+        raise ApiError(500, "We could not add this agent right now.")
+
+    return {"agent": serialize_agent(new_account, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())}
+
+
+def _remove_django_support_access(email: str) -> None:
+    """Remove user from Django Support Access group (does not delete the user)."""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM auth_user WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+                [email],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return
+            django_user_id = row[0]
+            cursor.execute(
+                "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
+                [SUPPORT_ACCESS_GROUP_NAME],
+            )
+            group_row = cursor.fetchone()
+            if not group_row:
+                return
+            cursor.execute(
+                "DELETE FROM auth_user_groups WHERE user_id = %s AND group_id = %s",
+                [django_user_id, group_row[0]],
+            )
+    except Exception as exc:
+        log_unexpected_api_error("Failed to remove Django support access group membership.", exc)
+
+
+def remove_agent(account_id: int) -> None:
+    agent = run_query_one(
+        "SELECT id, email, metadata FROM support_accounts WHERE id = %s AND account_scope = %s LIMIT 1",
+        [account_id, ACCOUNT_SCOPE_STAFF],
+    )
+    if not agent:
+        raise ApiError(404, "Agent not found.")
+
+    metadata = normalize_json_object(agent.get("metadata"))
+    if not normalize_bool(metadata.get("manually_added_agent")):
+        raise ApiError(403, "Only manually added agents can be removed from here.")
+
+    email = normalize_email(agent.get("email") or "")
+    run_query(
+        "DELETE FROM support_accounts WHERE id = %s AND account_scope = %s",
+        [account_id, ACCOUNT_SCOPE_STAFF],
+    )
+    if email:
+        _remove_django_support_access(email)
 
 
 def list_admin_tickets() -> dict[str, Any]:

@@ -16,6 +16,7 @@ urlpatterns = [
     path("admin/session-heartbeat", views.admin_session_heartbeat, name="admin-session-heartbeat"),
     path("admin/accounts", views.admin_accounts, name="admin-accounts"),
     path("admin/agents", views.admin_accounts, name="admin-agents"),
+    path("admin/agents/search", views.admin_agents_search, name="admin-agents-search"),
     path("admin/accounts/<int:account_id>", views.admin_account_detail, name="admin-account-detail"),
     path("admin/tickets", views.admin_tickets, name="admin-tickets"),
     path("admin/notifications", views.admin_notifications, name="admin-notifications"),

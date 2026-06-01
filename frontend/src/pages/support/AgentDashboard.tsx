@@ -43,6 +43,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Sheet,
   SheetContent,
   SheetDescription,
@@ -302,6 +310,14 @@ interface ListResponse {
   agent?: AdminAgent;
 }
 
+interface EntraSearchResult {
+  entraId: string;
+  displayName: string;
+  email: string;
+  username: string;
+  alreadyAdded: boolean;
+}
+
 interface DetailResponse extends TicketDetailResponse {
   message?: string;
 }
@@ -346,18 +362,12 @@ const adminSelectableConsoleStatuses = ["Available", "Off"] as const;
 const consolePollIntervalMs = 2500;
 const dashboardTicketPollIntervalMs = 5000;
 const dashboardAgentPollIntervalMs = 15000;
-const accountDirectoryPollIntervalMs = 15000;
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const documentationStatusReasons = {
   Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed via Agent"],
   Pending: [defaultPendingDocumentationStatusReason, "Awaiting support meeting", "Escalation", "Quick Ticket"],
 } as const;
-const adminAccountRoleOptions = [
-  { value: "superadmin", label: "Super Admin" },
-  { value: "admin", label: "Admin" },
-] as const;
-const adminDirectoryRoles = new Set<string>(["admin", "superadmin"]);
 const userManagementRoles = new Set<string>(["admin", "superadmin"]);
 type AdminConsoleStatus = (typeof adminConsoleStatuses)[number];
 type AdminSelectableConsoleStatus = (typeof adminSelectableConsoleStatuses)[number];
@@ -366,9 +376,8 @@ type DocumentationIssuesAddressed = "yes" | "no" | "";
 type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreached" | "quickResolution" | "escalation";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
-type AdminView = "dashboard" | "console" | "users" | "management";
+type AdminView = "dashboard" | "console" | "management";
 type TicketDetailTab = "conversation" | "documentation" | "details";
-type UserStatusFilter = "all" | "active" | "inactive";
 
 function buildAdminJsonHeaders() {
   return buildCsrfHeaders({
@@ -438,11 +447,15 @@ const AgentDashboard = () => {
   const [isSavingDocumentation, setIsSavingDocumentation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
-  const [userStatusFilter, setUserStatusFilter] = useState<UserStatusFilter>("all");
-  const [userRoleFilter, setUserRoleFilter] = useState<string>("all");
   const [managementSearch, setManagementSearch] = useState("");
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
-  const [userSearch, setUserSearch] = useState("");
+  const [showAddAgentSheet, setShowAddAgentSheet] = useState(false);
+  const [agentSearchQuery, setAgentSearchQuery] = useState("");
+  const [agentSearchResults, setAgentSearchResults] = useState<EntraSearchResult[]>([]);
+  const [isSearchingAgents, setIsSearchingAgents] = useState(false);
+  const [isAddingAgentId, setIsAddingAgentId] = useState<string | null>(null);
+  const [removingAgentIds, setRemovingAgentIds] = useState<Set<number>>(new Set());
+  const [confirmRemoveAgent, setConfirmRemoveAgent] = useState<AdminAgent | null>(null);
   const [error, setError] = useState("");
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
   const [consoleTimerNow, setConsoleTimerNow] = useState(() => Date.now());
@@ -758,32 +771,7 @@ const AgentDashboard = () => {
         label: getAgentDisplayName(agent),
       })),
   ];
-  const normalizedUserSearch = normalizeConsoleSearchValue(userSearch);
-  const managedAdminUsers = agents.filter((agent) => (
-    adminDirectoryRoles.has((agent.role || "").toLowerCase()) && agent.legacySupportAccess
-  ));
-  const activeManagedAdminUsers = managedAdminUsers.filter((agent) => agent.isActive !== false);
   const assignableAdminAgents = sortedAgents.filter((agent) => (agent.role || "").toLowerCase() === "admin");
-  const filteredUsers = managedAdminUsers.filter((agent) => {
-    const matchesStatus = userStatusFilter === "all"
-      ? true
-      : userStatusFilter === "active"
-        ? agent.isActive !== false
-        : agent.isActive === false;
-    const matchesRole = userRoleFilter === "all" ? true : agent.role === userRoleFilter;
-    const searchableFields = [
-      agent.fullName,
-      agent.username,
-      agent.email || "",
-      formatAccountScopeLabel(agent.accountScope || agent.role),
-      formatAdminRoleLabel(agent.role),
-    ];
-    const matchesSearch = !normalizedUserSearch || searchableFields.some((fieldValue) => (
-      normalizeConsoleSearchValue(fieldValue).includes(normalizedUserSearch)
-    ));
-
-    return matchesStatus && matchesRole && matchesSearch;
-  });
   const dashboardAssignmentScopedTickets = filterDashboardTicketsByAssignee(
     tickets,
     dashboardAssignedFilter,
@@ -1247,19 +1235,7 @@ const AgentDashboard = () => {
   }, [adminView]);
 
   useEffect(() => {
-    if (adminView !== "users") {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      void refreshAgentsOnly(true);
-    }, accountDirectoryPollIntervalMs);
-
-    return () => window.clearInterval(intervalId);
-  }, [adminView]);
-
-  useEffect(() => {
-    if (!canManageUsers && (adminView === "users" || adminView === "management")) {
+    if (!canManageUsers && adminView === "management") {
       setAdminView("dashboard");
     }
   }, [adminView, canManageUsers]);
@@ -1799,6 +1775,80 @@ const AgentDashboard = () => {
     }
   }
 
+  async function searchEntraAgents(q: string) {
+    if (q.trim().length < 2) {
+      setAgentSearchResults([]);
+      return;
+    }
+    setIsSearchingAgents(true);
+    try {
+      const response = await fetch(`/api/admin/agents/search?q=${encodeURIComponent(q.trim())}`, {
+        headers: buildAdminJsonHeaders(),
+      });
+      const payload = (await response.json().catch(() => null)) as { results?: EntraSearchResult[]; message?: string } | null;
+      if (!response.ok) {
+        toast.error(payload?.message || "Could not search agents.");
+        return;
+      }
+      setAgentSearchResults(payload?.results || []);
+    } catch {
+      toast.error("Could not search agents.");
+    } finally {
+      setIsSearchingAgents(false);
+    }
+  }
+
+  async function addEntraAgent(result: EntraSearchResult) {
+    setIsAddingAgentId(result.entraId);
+    try {
+      const response = await fetch("/api/admin/accounts", {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify(result),
+      });
+      const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
+      if (!response.ok) {
+        toast.error(payload?.message || "Could not add agent.");
+        return;
+      }
+      const newAgent = payload?.agent;
+      if (newAgent) {
+        setAgents((prev) => [...prev, newAgent]);
+      }
+      setAgentSearchResults((prev) => prev.map((r) => r.entraId === result.entraId ? { ...r, alreadyAdded: true } : r));
+      toast.success(`${result.displayName || result.email} added as an agent.`);
+    } catch {
+      toast.error("Could not add agent.");
+    } finally {
+      setIsAddingAgentId(null);
+    }
+  }
+
+  async function removeAgentById(agent: AdminAgent) {
+    setRemovingAgentIds((prev) => new Set(prev).add(agent.id));
+    try {
+      const response = await fetch(`/api/admin/accounts/${agent.id}`, {
+        method: "DELETE",
+        headers: buildAdminJsonHeaders(),
+      });
+      const payload = (await response.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
+      if (!response.ok) {
+        toast.error(payload?.message || "Could not remove agent.");
+        return;
+      }
+      setAgents((prev) => prev.filter((a) => a.id !== agent.id));
+      toast.success(`${agent.fullName || agent.username} removed.`);
+    } catch {
+      toast.error("Could not remove agent.");
+    } finally {
+      setRemovingAgentIds((prev) => {
+        const next = new Set(prev);
+        next.delete(agent.id);
+        return next;
+      });
+    }
+  }
+
   async function fetchTicketDetail(ticketId: string) {
     const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticketId)}`);
     const payload = (await response.json().catch(() => null)) as DetailResponse | null;
@@ -1916,14 +1966,6 @@ const AgentDashboard = () => {
 
     const nextConsoleDeepLink = parseAdminDeepLink(location.search);
 
-    if (nextConsoleDeepLink.view === "users") {
-      if (canManageUsers) {
-        processedConsoleDeepLinkRef.current = location.search;
-        setAdminView("users");
-      }
-      return;
-    }
-
     if (nextConsoleDeepLink.view !== "console" && !nextConsoleDeepLink.ticketId) {
       return;
     }
@@ -1940,7 +1982,7 @@ const AgentDashboard = () => {
     if (nextConsoleDeepLink.ticketId) {
       void openConsoleChat(nextConsoleDeepLink.ticketId);
     }
-  }, [canManageUsers, isLoading, location.search]);
+  }, [isLoading, location.search]);
 
   async function refreshConsoleTicketDetail(ticketId: string) {
     try {
@@ -2763,23 +2805,7 @@ const AgentDashboard = () => {
     <SupportLayout
       fullWidth
       showHeader={!isConsoleView}
-      right={!isConsoleView && canManageUsers ? (
-        <>
-          <Link
-            to="/admin?view=users"
-            className={cn(
-              "inline-flex items-center gap-2 whitespace-nowrap rounded-full border px-3.5 py-2 text-[13px] font-medium shadow-soft transition-all sm:text-sm",
-              adminView === "users"
-                ? "border-primary/18 bg-primary/6 text-primary hover:border-primary/30 hover:bg-primary/10"
-                : "border-primary/12 bg-white text-foreground hover:border-primary/25 hover:bg-primary/5 hover:text-primary",
-            )}
-          >
-            <Users className="h-4 w-4 text-primary" />
-            <span className="sm:hidden">Admins</span>
-            <span className="hidden sm:inline">Support Directory</span>
-          </Link>
-        </>
-      ) : undefined}
+      right={undefined}
       mainClassName={isConsoleView ? "h-[100dvh] px-0 py-0 md:px-0 md:py-0" : undefined}
     >
       <Tabs
@@ -3443,256 +3469,220 @@ const AgentDashboard = () => {
             </div>
           </TabsContent>
 
-          <TabsContent value="users" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
-            <div className="space-y-6">
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Support Access Profiles</div>
-                  <div className="mt-3 text-3xl font-bold text-foreground">{managedAdminUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Synced runtime profiles for people currently in the support access group.</div>
-                </div>
-                <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Active</div>
-                  <div className="mt-3 text-3xl font-bold text-emerald-700">{activeManagedAdminUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Support access profiles currently active in the support runtime.</div>
-                </div>
-                <div className="rounded-2xl border bg-card p-5 shadow-soft">
-                  <div className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Inactive</div>
-                  <div className="mt-3 text-3xl font-bold text-slate-600">{managedAdminUsers.length - activeManagedAdminUsers.length}</div>
-                  <div className="mt-2 text-sm text-muted-foreground">Support access profiles currently inactive in the support runtime.</div>
-                </div>
-              </div>
-
-              <div className="rounded-3xl border bg-card shadow-card">
-                <div className="border-b px-4 py-4 sm:px-5">
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-                    <div>
-                      <h2 className="text-lg font-semibold text-foreground">Support Access Directory</h2>
-                      <p className="mt-1 text-sm text-muted-foreground">
-                        Review the synced runtime profiles for people currently granted support access.
-                      </p>
-                      <p className="mt-2 text-xs text-muted-foreground">
-                        Login access is managed from KBC auth users and Django admin access groups, not from this directory.
-                      </p>
-                    </div>
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-                      <div className="relative w-full sm:w-[280px]">
-                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                        <Input
-                          value={userSearch}
-                          onChange={(event) => setUserSearch(event.target.value)}
-                          placeholder="Search by name, username, or email"
-                          className="pl-10"
-                        />
-                      </div>
-                      <div className="w-full sm:w-[170px]">
-                        <Select value={userRoleFilter} onValueChange={setUserRoleFilter}>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Role" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="all">All Roles</SelectItem>
-                            {adminAccountRoleOptions.map((roleOption) => (
-                              <SelectItem key={roleOption.value} value={roleOption.value}>{roleOption.label}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="w-full sm:w-[170px]">
-                        <Select value={userStatusFilter} onValueChange={(value) => setUserStatusFilter(value as UserStatusFilter)}>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Status" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="all">All Statuses</SelectItem>
-                            <SelectItem value="active">Active</SelectItem>
-                            <SelectItem value="inactive">Inactive</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                {error && adminView === "users" ? (
-                  <div className="border-b border-destructive/10 bg-destructive/5 px-5 py-3 text-sm text-destructive">
-                    {error}
-                  </div>
-                ) : null}
-
-                <div className="p-4 sm:p-5">
-                  {isLoading ? (
-                    <div className="flex items-center justify-center gap-2 rounded-2xl border border-dashed p-10 text-sm text-muted-foreground">
-                      <LoaderCircle className="h-4 w-4 animate-spin" />
-                      Loading support access profiles...
-                    </div>
-                  ) : filteredUsers.length === 0 ? (
-                    <div className="rounded-2xl border border-dashed p-10 text-center text-sm text-muted-foreground">
-                      No support access profiles matched the current search and filters.
-                    </div>
-                  ) : (
-                    <div className="grid gap-4 xl:grid-cols-2">
-                      {filteredUsers.map((agent) => {
-                        const isCurrentSessionUser = session?.id === agent.id;
-
-                        return (
-                          <div key={agent.id} className="overflow-hidden rounded-2xl border bg-background/70 p-4 shadow-soft">
-                            <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                              <div className="min-w-0">
-                                <div className="flex items-start gap-2 sm:items-center">
-                                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-                                    <Users className="h-4 w-4" />
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="truncate font-semibold text-foreground">
-                                      {agent.fullName || agent.username}
-                                      {isCurrentSessionUser ? " (You)" : ""}
-                                    </div>
-                                    <div className="truncate text-xs text-muted-foreground">
-                                      @{agent.username}
-                                    </div>
-                                  </div>
-                                </div>
-                                <div className="mt-4 flex flex-wrap gap-2">
-                                  <span className="inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-[11px] font-medium text-sky-700">
-                                    Support Access
-                                  </span>
-                                  <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-700">
-                                    {formatAccountScopeLabel(agent.accountScope || agent.role)}
-                                  </span>
-                                  <span className="inline-flex items-center rounded-full border border-primary/15 bg-primary/5 px-2.5 py-1 text-[11px] font-medium text-primary">
-                                    {formatAdminRoleLabel(agent.role)}
-                                  </span>
-                                  <span className={cn(
-                                    "inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium",
-                                    agent.isActive !== false
-                                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                                      : "border-slate-200 bg-slate-100 text-slate-600",
-                                  )}>
-                                    {agent.isActive !== false ? "Active" : "Inactive"}
-                                  </span>
-                                  <span className={cn(
-                                    "inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-medium",
-                                    consoleStatusBadgeClassName(normalizeAdminConsoleStatus(agent.consoleStatus)),
-                                  )}>
-                                    Console: {normalizeAdminConsoleStatus(agent.consoleStatus)}
-                                  </span>
-                                </div>
-                              </div>
-                            </div>
-                            <div className="mt-4 grid gap-3 rounded-2xl border bg-card/60 p-3 text-sm sm:grid-cols-2">
-                              <div>
-                                <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Email</div>
-                                <div className="mt-1 break-all text-foreground">{agent.email || "No email saved"}</div>
-                              </div>
-                              <div>
-                                <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Availability</div>
-                                <div className={cn(
-                                  "mt-1",
-                                  agent.isActive !== false
-                                    ? consoleStatusTextClassName(normalizeAdminConsoleStatus(agent.consoleStatus))
-                                    : "text-foreground",
-                                )}>
-                                  {agent.isActive !== false
-                                    ? `${normalizeAdminConsoleStatus(agent.consoleStatus)}${agent.sessionActive ? " session" : ""}`
-                                    : "Disabled"}
-                                </div>
-                              </div>
-                              <div>
-                                <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Access Scope</div>
-                                <div className="mt-1 text-foreground">{formatAccountScopeLabel(agent.accountScope || agent.role)}</div>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </TabsContent>
 
           <TabsContent value="management" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
             <div className="space-y-6">
               <div className="rounded-3xl border bg-card shadow-card">
                 <div className="border-b px-4 py-4 sm:px-5">
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                     <div>
                       <h2 className="text-lg font-semibold text-foreground">Agent Management</h2>
                       <p className="mt-1 text-sm text-muted-foreground">
-                        Control which agents receive ticket assignments via the Support Access toggle.
+                        Agents added here receive ticket assignments.
                       </p>
                     </div>
-                    <div className="relative w-full lg:w-[280px]">
-                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                      <Input
-                        value={managementSearch}
-                        onChange={(e) => setManagementSearch(e.target.value)}
-                        placeholder="Search by name, username, or email"
-                        className="pl-10"
-                      />
+                    <div className="flex items-center gap-3">
+                      <div className="relative w-full sm:w-[240px]">
+                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                        <Input
+                          value={managementSearch}
+                          onChange={(e) => setManagementSearch(e.target.value)}
+                          placeholder="Search agents..."
+                          className="pl-10"
+                        />
+                      </div>
+                      <Button
+                        className="shrink-0 border-0 gradient-primary"
+                        onClick={() => {
+                          setShowAddAgentSheet(true);
+                          setAgentSearchQuery("");
+                          setAgentSearchResults([]);
+                        }}
+                      >
+                        <UserPlus className="mr-2 h-4 w-4" />
+                        Add Agent
+                      </Button>
                     </div>
                   </div>
                 </div>
 
                 <div className="divide-y">
-                  {agents
-                    .filter((agent) => {
-                      if (!managementSearch.trim()) return true;
-                      const q = managementSearch.toLowerCase();
-                      return (
-                        (agent.fullName || "").toLowerCase().includes(q) ||
-                        agent.username.toLowerCase().includes(q) ||
-                        (agent.email || "").toLowerCase().includes(q)
-                      );
-                    })
-                    .map((agent) => {
-                      const isToggling = togglingAccessIds.has(agent.id);
-                      const hasAccess = agent.legacySupportAccess === true;
-                      const isCurrentUser = session?.id === agent.id;
-                      return (
-                        <div key={agent.id} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
-                          <div className="flex min-w-0 items-center gap-3">
-                            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-                              <Users className="h-4 w-4" />
-                            </div>
-                            <div className="min-w-0">
-                              <div className="truncate text-sm font-medium text-foreground">
-                                {agent.fullName || agent.username}
-                                {isCurrentUser ? <span className="ml-1.5 text-xs text-muted-foreground">(You)</span> : null}
-                              </div>
-                              <div className="truncate text-xs text-muted-foreground">
-                                @{agent.username}
-                                {agent.email ? ` · ${agent.email}` : ""}
-                              </div>
-                            </div>
-                          </div>
-                          <div className="flex shrink-0 items-center gap-3">
-                            <span className={cn(
-                              "hidden text-xs font-medium sm:block",
-                              hasAccess ? "text-emerald-600" : "text-muted-foreground",
-                            )}>
-                              {hasAccess ? "Receives tickets" : "No ticket access"}
-                            </span>
-                            <Switch
-                              checked={hasAccess}
-                              disabled={isToggling}
-                              onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
-                              aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
-                            />
-                          </div>
-                        </div>
-                      );
-                    })}
-                  {agents.length === 0 && !isLoading && (
-                    <div className="p-10 text-center text-sm text-muted-foreground">
-                      No agents found.
+                  {isLoading ? (
+                    <div className="flex items-center justify-center gap-2 p-10 text-sm text-muted-foreground">
+                      <LoaderCircle className="h-4 w-4 animate-spin" />
+                      Loading agents...
                     </div>
+                  ) : agents.filter((agent) => {
+                    if (!managementSearch.trim()) return true;
+                    const q = managementSearch.toLowerCase();
+                    return (
+                      (agent.fullName || "").toLowerCase().includes(q) ||
+                      agent.username.toLowerCase().includes(q) ||
+                      (agent.email || "").toLowerCase().includes(q)
+                    );
+                  }).length === 0 ? (
+                    <div className="p-10 text-center text-sm text-muted-foreground">
+                      No agents added yet. Use "Add Agent" to add someone from Microsoft Entra.
+                    </div>
+                  ) : (
+                    agents
+                      .filter((agent) => {
+                        if (!managementSearch.trim()) return true;
+                        const q = managementSearch.toLowerCase();
+                        return (
+                          (agent.fullName || "").toLowerCase().includes(q) ||
+                          agent.username.toLowerCase().includes(q) ||
+                          (agent.email || "").toLowerCase().includes(q)
+                        );
+                      })
+                      .map((agent) => {
+                        const isToggling = togglingAccessIds.has(agent.id);
+                        const hasAccess = agent.legacySupportAccess === true;
+                        const isCurrentUser = session?.id === agent.id;
+                        return (
+                          <div key={agent.id} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
+                            <div className="flex min-w-0 items-center gap-3">
+                              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+                                <Users className="h-4 w-4" />
+                              </div>
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium text-foreground">
+                                  {agent.fullName || agent.username}
+                                  {isCurrentUser ? <span className="ml-1.5 text-xs text-muted-foreground">(You)</span> : null}
+                                </div>
+                                <div className="truncate text-xs text-muted-foreground">
+                                  @{agent.username}{agent.email ? ` · ${agent.email}` : ""}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-3">
+                              <span className={cn(
+                                "hidden text-xs font-medium sm:block",
+                                hasAccess ? "text-emerald-600" : "text-muted-foreground",
+                              )}>
+                                {hasAccess ? "Receives tickets" : "No ticket access"}
+                              </span>
+                              <Switch
+                                checked={hasAccess}
+                                disabled={isToggling}
+                                onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
+                                aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
+                              />
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                disabled={removingAgentIds.has(agent.id) || isCurrentUser}
+                                onClick={() => setConfirmRemoveAgent(agent)}
+                                className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                                aria-label={`Remove ${agent.fullName || agent.username}`}
+                              >
+                                {removingAgentIds.has(agent.id) ? (
+                                  <LoaderCircle className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <X className="h-4 w-4" />
+                                )}
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })
                   )}
                 </div>
               </div>
             </div>
+
+            <Sheet open={showAddAgentSheet} onOpenChange={setShowAddAgentSheet}>
+              <SheetContent className="w-full sm:max-w-md">
+                <SheetHeader>
+                  <SheetTitle>Add Agent</SheetTitle>
+                  <SheetDescription>Search for a person in Microsoft Entra and add them as an agent.</SheetDescription>
+                </SheetHeader>
+                <div className="mt-6 space-y-4">
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      placeholder="Search by name or email..."
+                      className="pl-10"
+                      value={agentSearchQuery}
+                      onChange={(e) => {
+                        setAgentSearchQuery(e.target.value);
+                        void searchEntraAgents(e.target.value);
+                      }}
+                      autoFocus
+                    />
+                  </div>
+
+                  {isSearchingAgents ? (
+                    <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+                      <LoaderCircle className="h-4 w-4 animate-spin" />
+                      Searching...
+                    </div>
+                  ) : agentSearchQuery.trim().length >= 2 && agentSearchResults.length === 0 ? (
+                    <div className="py-8 text-center text-sm text-muted-foreground">
+                      No results found in Microsoft Entra.
+                    </div>
+                  ) : (
+                    <div className="divide-y rounded-2xl border">
+                      {agentSearchResults.map((result) => (
+                        <div key={result.entraId} className="flex items-center justify-between gap-3 px-4 py-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-medium text-foreground">{result.displayName}</div>
+                            <div className="truncate text-xs text-muted-foreground">{result.email}</div>
+                          </div>
+                          <Button
+                            size="sm"
+                            disabled={result.alreadyAdded || isAddingAgentId === result.entraId}
+                            onClick={() => void addEntraAgent(result)}
+                            className="shrink-0 border-0 gradient-primary"
+                          >
+                            {isAddingAgentId === result.entraId ? (
+                              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                            ) : result.alreadyAdded ? (
+                              "Added"
+                            ) : (
+                              "Add"
+                            )}
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <SheetFooter className="mt-6">
+                  <Button variant="outline" className="w-full" onClick={() => setShowAddAgentSheet(false)}>
+                    Close
+                  </Button>
+                </SheetFooter>
+              </SheetContent>
+            </Sheet>
+
+            <Dialog open={!!confirmRemoveAgent} onOpenChange={(open) => { if (!open) setConfirmRemoveAgent(null); }}>
+              <DialogContent className="max-w-sm">
+                <DialogHeader>
+                  <DialogTitle>Remove Agent</DialogTitle>
+                  <DialogDescription>
+                    Are you sure you want to remove <span className="font-medium text-foreground">{confirmRemoveAgent?.fullName || confirmRemoveAgent?.username}</span> as an agent? They will lose support portal access.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter className="flex-col gap-2 sm:flex-row">
+                  <Button variant="outline" className="w-full" onClick={() => setConfirmRemoveAgent(null)}>
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    className="w-full"
+                    disabled={confirmRemoveAgent ? removingAgentIds.has(confirmRemoveAgent.id) : false}
+                    onClick={() => {
+                      if (!confirmRemoveAgent) return;
+                      void removeAgentById(confirmRemoveAgent);
+                      setConfirmRemoveAgent(null);
+                    }}
+                  >
+                    Remove
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </TabsContent>
 
           <TabsContent value="console" className="mt-0 min-h-0 flex-1">
@@ -6131,18 +6121,15 @@ function parseAdminDeepLink(search: string) {
   const requestedTicketId = searchParams.get("ticket") || "";
   const requestedScope = searchParams.get("scope");
   const requestedQueueTab = searchParams.get("tab");
-  const shouldOpenUsers = requestedView === "users";
   const shouldOpenManagement = requestedView === "management";
   const shouldOpenConsole = requestedView === "console" || Boolean(requestedTicketId);
 
   return {
-    view: shouldOpenUsers
-      ? "users" as const
-      : shouldOpenManagement
-        ? "management" as const
-        : shouldOpenConsole
-          ? "console" as const
-          : "dashboard" as const,
+    view: shouldOpenManagement
+      ? "management" as const
+      : shouldOpenConsole
+        ? "console" as const
+        : "dashboard" as const,
     ticketId: requestedTicketId,
     scope: requestedScope === "all" ? "all" as const : "my" as const,
     queueTab: requestedQueueTab === "closed" ? "closed" as const : "open" as const,
@@ -6307,13 +6294,7 @@ function normalizeQuickTicketStatusReason(statusReason: string) {
 
 function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">) {
   const normalizedScope = (agent.accountScope || "").trim().toLowerCase();
-  const normalizedRole = (agent.role || "").trim().toLowerCase();
-
-  if (normalizedScope) {
-    return normalizedScope === "staff";
-  }
-
-  return adminDirectoryRoles.has(normalizedRole);
+  return normalizedScope === "staff";
 }
 
 function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicketFilter) {

@@ -45,9 +45,12 @@ from .services import (
     get_ticket_chat_history_response,
     get_ticket_chat_context_response,
     get_verify_email_response,
+    add_entra_agent,
     list_admin_tickets,
     list_agents,
+    remove_agent,
     require_agent_session_actor,
+    search_entra_agents,
     request_live_chat,
     save_chat_history,
     sanitize_text,
@@ -428,11 +431,24 @@ def admin_logout(request):
         return handle_api_error(error)
 
 
-@require_http_methods(["GET"])
+@require_http_methods(["GET", "POST"])
 def admin_accounts(request):
     try:
         require_request_admin_session(request)
+        if request.method == "POST":
+            agent = add_entra_agent(parse_json_body(request))
+            return JsonResponse(agent, status=201)
         return JsonResponse(list_agents(include_inactive=True))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_GET
+def admin_agents_search(request):
+    try:
+        require_request_admin_session(request)
+        q = sanitize_text(request.GET.get("q", ""))
+        return JsonResponse(search_entra_agents(q))
     except Exception as error:
         return handle_api_error(error)
 
@@ -440,10 +456,13 @@ def admin_accounts(request):
 admin_agents = admin_accounts
 
 
-@require_http_methods(["PATCH"])
+@require_http_methods(["PATCH", "DELETE"])
 def admin_account_detail(request, account_id: int):
     try:
         require_request_admin_session(request)
+        if request.method == "DELETE":
+            remove_agent(account_id)
+            return JsonResponse({"ok": True})
         payload = parse_json_body(request)
         if "supportAccess" not in payload:
             raise ApiError(400, "supportAccess field is required.")
