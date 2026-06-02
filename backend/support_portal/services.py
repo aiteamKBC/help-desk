@@ -1131,7 +1131,9 @@ def parse_int(value: Any, default: int = 0) -> int:
 
 
 def dictfetchall(cursor) -> list[dict[str, Any]]:
-    columns = [column[0] for column in cursor.description or []]
+    if not cursor.description:
+        return []
+    columns = [column[0] for column in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
