@@ -5077,59 +5077,84 @@ def search_entra_agents(q: str) -> dict[str, Any]:
     return {"results": results}
 
 
+def _get_kbc_auth_db_connection():
+    """Get a connection to the KBC auth database if configured, else use the default connection."""
+    kbc_url = sanitize_text(settings.KBC_AUTH_DATABASE_URL) if hasattr(settings, "KBC_AUTH_DATABASE_URL") else ""
+    if kbc_url:
+        return psycopg.connect(kbc_url)
+    return None
+
+
 def _ensure_django_support_access(email: str, full_name: str) -> int | None:
-    """Ensure the person has a Django user in the Support Access group. Returns the Django user id."""
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT id FROM auth_user WHERE LOWER(TRIM(email)) = %s LIMIT 1",
-            [email],
-        )
-        row = cursor.fetchone()
-        if row:
-            django_user_id = row[0]
+    """Ensure the person has a Django user in the KBC auth database Support Access group. Returns the Django user id."""
+    kbc_conn = _get_kbc_auth_db_connection()
+    try:
+        if kbc_conn:
+            ctx = kbc_conn
+            cursor_ctx = kbc_conn.cursor()
         else:
-            name_parts = full_name.split(" ", 1)
-            first_name = name_parts[0] if name_parts else ""
-            last_name = name_parts[1] if len(name_parts) > 1 else ""
-            django_username = email.split("@")[0].lower()
-            cursor.execute(
-                "SELECT id FROM auth_user WHERE username = %s LIMIT 1",
-                [django_username],
-            )
-            if cursor.fetchone():
-                django_username = email.lower()
-            cursor.execute(
-                """
-                INSERT INTO auth_user
-                  (username, email, first_name, last_name, password,
-                   is_staff, is_active, is_superuser, date_joined)
-                VALUES (%s, %s, %s, %s, '', FALSE, TRUE, FALSE, NOW())
-                RETURNING id
-                """,
-                [django_username, email, first_name, last_name],
-            )
-            django_user_id = cursor.fetchone()[0]
+            ctx = None
+            cursor_ctx = connection.cursor()
 
-        cursor.execute(
-            "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
-            [SUPPORT_ACCESS_GROUP_NAME],
-        )
-        group_row = cursor.fetchone()
-        if not group_row:
-            return django_user_id
-        group_id = group_row[0]
-
-        cursor.execute(
-            "SELECT 1 FROM auth_user_groups WHERE user_id = %s AND group_id = %s LIMIT 1",
-            [django_user_id, group_id],
-        )
-        if not cursor.fetchone():
+        with cursor_ctx as cursor:
             cursor.execute(
-                "INSERT INTO auth_user_groups (user_id, group_id) VALUES (%s, %s)",
+                "SELECT id FROM auth_user WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+                [email],
+            )
+            row = cursor.fetchone()
+            if row:
+                django_user_id = row[0]
+            else:
+                name_parts = full_name.split(" ", 1)
+                first_name = name_parts[0] if name_parts else ""
+                last_name = name_parts[1] if len(name_parts) > 1 else ""
+                django_username = email.split("@")[0].lower()
+                cursor.execute(
+                    "SELECT id FROM auth_user WHERE username = %s LIMIT 1",
+                    [django_username],
+                )
+                if cursor.fetchone():
+                    django_username = email.lower()
+                cursor.execute(
+                    """
+                    INSERT INTO auth_user
+                      (username, email, first_name, last_name, password,
+                       is_staff, is_active, is_superuser, date_joined)
+                    VALUES (%s, %s, %s, %s, '', FALSE, TRUE, FALSE, NOW())
+                    RETURNING id
+                    """,
+                    [django_username, email, first_name, last_name],
+                )
+                django_user_id = cursor.fetchone()[0]
+
+            cursor.execute(
+                "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
+                [SUPPORT_ACCESS_GROUP_NAME],
+            )
+            group_row = cursor.fetchone()
+            if not group_row:
+                if kbc_conn:
+                    kbc_conn.commit()
+                return django_user_id
+            group_id = group_row[0]
+
+            cursor.execute(
+                "SELECT 1 FROM auth_user_groups WHERE user_id = %s AND group_id = %s LIMIT 1",
                 [django_user_id, group_id],
             )
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO auth_user_groups (user_id, group_id) VALUES (%s, %s)",
+                    [django_user_id, group_id],
+                )
 
-    return django_user_id
+            if kbc_conn:
+                kbc_conn.commit()
+
+        return django_user_id
+    finally:
+        if kbc_conn:
+            kbc_conn.close()
 
 
 def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5218,9 +5243,11 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _remove_django_support_access(email: str) -> None:
-    """Remove user from Django Support Access group (does not delete the user)."""
+    """Remove user from KBC auth database Support Access group (does not delete the user)."""
+    kbc_conn = _get_kbc_auth_db_connection()
     try:
-        with connection.cursor() as cursor:
+        cursor_ctx = kbc_conn.cursor() if kbc_conn else connection.cursor()
+        with cursor_ctx as cursor:
             cursor.execute(
                 "SELECT id FROM auth_user WHERE LOWER(TRIM(email)) = %s LIMIT 1",
                 [email],
@@ -5240,8 +5267,13 @@ def _remove_django_support_access(email: str) -> None:
                 "DELETE FROM auth_user_groups WHERE user_id = %s AND group_id = %s",
                 [django_user_id, group_row[0]],
             )
+            if kbc_conn:
+                kbc_conn.commit()
     except Exception as exc:
         log_unexpected_api_error("Failed to remove Django support access group membership.", exc)
+    finally:
+        if kbc_conn:
+            kbc_conn.close()
 
 
 def remove_agent(account_id: int) -> None:
