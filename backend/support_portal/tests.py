@@ -2257,6 +2257,36 @@ class SupportDirectoryTests(SimpleTestCase):
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(response["legacySupportAccess"])
 
+    def test_remove_agent_soft_removes_manually_added_agent(self):
+        agent = {
+            "id": 31,
+            "email": "omar.badr@kentbusinesscollege.com",
+            "metadata": {
+                "manually_added_agent": True,
+                "legacy_support_access": True,
+                "session_active": True,
+                "console_status": "Available",
+            },
+        }
+
+        with (
+            patch.object(services, "run_query_one", return_value=agent),
+            patch.object(services, "run_query") as run_query,
+            patch.object(services, "_remove_django_support_access") as remove_django_support_access,
+        ):
+            services.remove_agent(31)
+
+        update_sql = run_query.call_args.args[0]
+        update_params = run_query.call_args.args[1]
+        self.assertIn("UPDATE support_accounts", update_sql)
+        self.assertNotIn("DELETE FROM support_accounts", update_sql)
+        saved_metadata = json.loads(update_params[0])
+        self.assertFalse(saved_metadata["manually_added_agent"])
+        self.assertFalse(saved_metadata["legacy_support_access"])
+        self.assertFalse(saved_metadata["session_active"])
+        self.assertEqual(saved_metadata["console_status"], "Off")
+        remove_django_support_access.assert_called_once_with("omar.badr@kentbusinesscollege.com")
+
     def test_list_agents_returns_only_current_support_access_staff_profiles(self):
         with (
             patch.object(

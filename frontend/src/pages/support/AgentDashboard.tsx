@@ -1833,6 +1833,8 @@ const AgentDashboard = () => {
       return;
     }
 
+    const previousAgents = agents;
+    setAgents((prev) => prev.filter((a) => a.id !== agent.id));
     setRemovingAgentIds((prev) => new Set(prev).add(agent.id));
     try {
       const response = await fetch(`/api/admin/accounts/${agent.id}`, {
@@ -1841,12 +1843,13 @@ const AgentDashboard = () => {
       });
       const payload = (await response.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
       if (!response.ok) {
+        setAgents(previousAgents);
         toast.error(payload?.message || "Could not remove agent.");
         return;
       }
-      setAgents((prev) => prev.filter((a) => a.id !== agent.id));
       toast.success(`${agent.fullName || agent.username} removed.`);
     } catch {
+      setAgents(previousAgents);
       toast.error("Could not remove agent.");
     } finally {
       setRemovingAgentIds((prev) => {

@@ -5299,10 +5299,22 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
             raise ApiError(409, "This person is already added as an agent.")
         existing_metadata["manually_added_agent"] = True
         existing_metadata["legacy_support_access"] = True
+        existing_metadata["agent_removed_at"] = ""
         django_user_id = _ensure_django_support_access(email, display_name or email)
         if django_user_id and not existing_metadata.get("legacy_auth_user_id"):
             existing_metadata["legacy_auth_user_id"] = django_user_id
         persist_agent_metadata(int(existing["id"]), existing_metadata)
+        run_query(
+            """
+            UPDATE support_accounts
+            SET full_name = COALESCE(NULLIF(%s, ''), full_name),
+                role = %s,
+                is_active = TRUE,
+                updated_at = NOW()
+            WHERE id = %s AND account_scope = %s
+            """,
+            [display_name, ROLE_AGENT, int(existing["id"]), ACCOUNT_SCOPE_STAFF],
+        )
         updated = run_query_one(
             "SELECT id, username, full_name, email, account_scope, role, is_active, metadata FROM support_accounts WHERE id = %s LIMIT 1",
             [int(existing["id"])],
@@ -5390,9 +5402,20 @@ def remove_agent(account_id: int) -> None:
         raise ApiError(403, "Only manually added agents can be removed from here.")
 
     email = normalize_email(agent.get("email") or "")
+    metadata["manually_added_agent"] = False
+    metadata["legacy_support_access"] = False
+    metadata["session_active"] = False
+    metadata["console_status"] = DEFAULT_AGENT_CONSOLE_STATUS
+    metadata["agent_removed_at"] = datetime.now(timezone.utc).isoformat()
     run_query(
-        "DELETE FROM support_accounts WHERE id = %s AND account_scope = %s",
-        [account_id, ACCOUNT_SCOPE_STAFF],
+        """
+        UPDATE support_accounts
+        SET is_active = FALSE,
+            metadata = %s::jsonb,
+            updated_at = NOW()
+        WHERE id = %s AND account_scope = %s
+        """,
+        [json.dumps(metadata), account_id, ACCOUNT_SCOPE_STAFF],
     )
     if email:
         _remove_django_support_access(email)
