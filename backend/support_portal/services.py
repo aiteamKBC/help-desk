@@ -1201,70 +1201,6 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
 
 
 
-def fetch_legacy_support_user_by_email(email: str) -> dict[str, Any] | None:
-    normalized_email = normalize_account_email(email)
-    if not normalized_email or not settings.LEGACY_DATABASE_URL:
-        return None
-
-    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
-        with source_connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                  u.id,
-                  u.username,
-                  u.first_name,
-                  u.last_name,
-                  LOWER(TRIM(u.email)) AS email,
-                  u.is_staff,
-                  u.is_superuser,
-                  u.is_active,
-                  EXISTS(
-                    SELECT 1
-                    FROM auth_user_groups ug
-                    INNER JOIN auth_group g ON g.id = ug.group_id
-                    WHERE ug.user_id = u.id
-                      AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_support_access,
-                  EXISTS(
-                    SELECT 1
-                    FROM auth_user_groups ug
-                    INNER JOIN auth_group g ON g.id = ug.group_id
-                    WHERE ug.user_id = u.id
-                      AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_admin_access
-                FROM auth_user u
-                WHERE LOWER(TRIM(u.email)) = %s
-                  AND u.is_active = TRUE
-                LIMIT 1
-                """,
-                [SUPPORT_ACCESS_GROUP_NAME, ADMIN_ACCESS_GROUP_NAME, normalized_email],
-            )
-            row = cursor.fetchone()
-
-    if not row:
-        return None
-
-    user_id, username, first_name, last_name, returned_email, is_staff, is_superuser, is_active, has_support_access, has_admin_access = row
-    if not (bool(has_support_access) or bool(has_admin_access)):
-        return None
-
-    full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
-
-    return {
-        "id": int(user_id),
-        "username": sanitize_text(username),
-        "first_name": sanitize_text(first_name),
-        "last_name": sanitize_text(last_name),
-        "full_name": full_name,
-        "email": sanitize_text(returned_email).lower(),
-        "is_staff": bool(is_staff),
-        "is_superuser": bool(is_superuser),
-        "is_active": bool(is_active),
-        "has_support_access": bool(has_support_access),
-        "has_admin_access": bool(has_admin_access),
-    }
-
 
 def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | None:
     normalized_username = sanitize_text(username).lower()
@@ -1334,89 +1270,6 @@ def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | Non
 
 
 
-def fetch_legacy_support_directory_users() -> list[dict[str, Any]]:
-    if not settings.LEGACY_DATABASE_URL:
-        return []
-
-    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
-        with source_connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                  u.id,
-                  u.username,
-                  u.first_name,
-                  u.last_name,
-                  LOWER(TRIM(u.email)) AS email,
-                  u.is_staff,
-                  u.is_superuser,
-                  u.is_active,
-                  EXISTS(
-                    SELECT 1
-                    FROM auth_user_groups ug
-                    INNER JOIN auth_group g ON g.id = ug.group_id
-                    WHERE ug.user_id = u.id
-                      AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_support_access,
-                  EXISTS(
-                    SELECT 1
-                    FROM auth_user_groups ug
-                    INNER JOIN auth_group g ON g.id = ug.group_id
-                    WHERE ug.user_id = u.id
-                      AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_admin_access
-                FROM auth_user u
-                WHERE u.is_active = TRUE
-                  AND (
-                    EXISTS(
-                      SELECT 1
-                      FROM auth_user_groups ug
-                      INNER JOIN auth_group g ON g.id = ug.group_id
-                      WHERE ug.user_id = u.id
-                        AND LOWER(TRIM(g.name)) = %s
-                    )
-                    OR EXISTS(
-                      SELECT 1
-                      FROM auth_user_groups ug
-                      INNER JOIN auth_group g ON g.id = ug.group_id
-                      WHERE ug.user_id = u.id
-                        AND LOWER(TRIM(g.name)) = %s
-                    )
-                  )
-                ORDER BY
-                  COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), NULLIF(TRIM(u.username), '')) ASC,
-                  u.id ASC
-                """,
-                [
-                    SUPPORT_ACCESS_GROUP_NAME,
-                    ADMIN_ACCESS_GROUP_NAME,
-                    SUPPORT_ACCESS_GROUP_NAME,
-                    ADMIN_ACCESS_GROUP_NAME,
-                ],
-            )
-            rows = cursor.fetchall()
-
-    legacy_users: list[dict[str, Any]] = []
-    for row in rows:
-        user_id, username, first_name, last_name, returned_email, is_staff, is_superuser, is_active, has_support_access, has_admin_access = row
-        full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
-        legacy_users.append(
-            {
-                "id": int(user_id),
-                "username": sanitize_text(username),
-                "first_name": sanitize_text(first_name),
-                "last_name": sanitize_text(last_name),
-                "full_name": full_name,
-                "email": sanitize_text(returned_email).lower(),
-                "is_staff": bool(is_staff),
-                "is_superuser": bool(is_superuser),
-                "is_active": bool(is_active),
-                "has_support_access": bool(has_support_access),
-                "has_admin_access": bool(has_admin_access),
-            }
-        )
-
-    return legacy_users
 
 
 
@@ -4740,6 +4593,40 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not username or not password:
         raise ApiError(400, "Username and password are required.")
 
+    # Try manually added agent first (by username or email)
+    manually_added_agent = (
+        fetch_agent_account_by_username(username, active_only=True)
+        or run_query_one(
+            """
+            SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+            FROM support_accounts
+            WHERE LOWER(TRIM(email)) = %s
+              AND account_scope = %s
+              AND (metadata->>'manually_added_agent')::boolean = TRUE
+              AND is_active = TRUE
+            LIMIT 1
+            """,
+            [normalize_email(username), ACCOUNT_SCOPE_STAFF],
+        )
+    )
+    if manually_added_agent and normalize_bool(
+        normalize_json_object(manually_added_agent.get("metadata")).get("manually_added_agent")
+    ):
+        agent_metadata = normalize_json_object(manually_added_agent.get("metadata"))
+        if not get_agent_password_hash(agent_metadata):
+            raise ApiError(401, "This account does not have a password set. Please sign in with Microsoft.")
+        if not verify_agent_password(manually_added_agent, password):
+            raise ApiError(401, "Invalid username or password.")
+        return {
+            "admin": register_agent_session(
+                sanitize_text(manually_added_agent.get("username")).lower(),
+                instance_id,
+                console_status,
+            ),
+            "message": "Login successful.",
+        }
+
+    # Fallback: legacy database login
     legacy_user = fetch_legacy_support_user_by_username(username)
     if not legacy_user:
         raise ApiError(401, "Invalid username or password.")
@@ -5059,9 +4946,13 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
     }
     support_role = derive_support_role_from_entra_directory_roles(roles_payload)
     if not support_role:
-        raise ApiError(403, "Your Microsoft account does not have Entra admin center access.")
-
-    matched_agent = sync_support_staff_account_from_entra_directory_user(merged_profile, roles_payload, support_role)
+        candidate_emails = extract_microsoft_login_email_candidates(merged_profile)
+        normalized_email = candidate_emails[0] if candidate_emails else ""
+        if not normalized_email:
+            raise ApiError(403, "Your Microsoft account must provide a valid email address.")
+        matched_agent = _login_manually_added_agent_from_entra(merged_profile, normalized_email)
+    else:
+        matched_agent = sync_support_staff_account_from_entra_directory_user(merged_profile, roles_payload, support_role)
 
     instance_id = sanitize_text(payload.get("instanceId")) or uuid4().hex
     console_status = normalize_selectable_console_status(payload.get("consoleStatus"))
@@ -5078,17 +4969,7 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
 
 
 def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
-    current_legacy_staff_accounts: list[dict[str, Any]] = []
-    current_legacy_staff_ids: set[int] = set()
-
-    for legacy_user in fetch_legacy_support_directory_users():
-        current_legacy_staff_ids.add(int(legacy_user["id"]))
-        try:
-            current_legacy_staff_accounts.append(sync_support_staff_account_from_legacy_auth_user(legacy_user))
-        except ApiError:
-            continue
-
-    where_clause = "WHERE account_scope = %s"
+    where_clause = "WHERE account_scope = %s AND (metadata->>'manually_added_agent')::boolean = TRUE"
     query_params: list[Any] = [ACCOUNT_SCOPE_STAFF]
     if not include_inactive:
         where_clause += " AND is_active = TRUE"
@@ -5099,43 +4980,15 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         {where_clause}
         ORDER BY
           CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
-          CASE role
-            WHEN 'superadmin' THEN 0
-            WHEN 'admin' THEN 1
-            WHEN 'coach' THEN 2
-            WHEN 'employer' THEN 3
-            WHEN 'agent' THEN 4
-            WHEN 'user' THEN 5
-            ELSE 6
-          END,
           full_name ASC NULLS LAST,
           username ASC
         """,
         query_params,
     )
-    synced_staff_account_ids = {int(account["id"]) for account in current_legacy_staff_accounts if account.get("id")}
-    filtered_accounts: list[dict[str, Any]] = []
-    for account in accounts:
-        account_scope = normalize_account_scope(account.get("account_scope"), fallback_role=account.get("role"))
-        if account_scope != ACCOUNT_SCOPE_STAFF:
-            continue
-
-        metadata = normalize_json_object(account.get("metadata"))
-        legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
-        has_entra_admin_access = normalize_bool(metadata.get("entra_directory_admin_access"))
-        manually_added_agent = normalize_bool(metadata.get("manually_added_agent"))
-        if (
-            int(account.get("id") or 0) in synced_staff_account_ids
-            or (legacy_auth_user_id and legacy_auth_user_id in current_legacy_staff_ids)
-            or has_entra_admin_access
-            or manually_added_agent
-        ):
-            filtered_accounts.append(account)
-
     open_assigned_chat_agent_ids = get_open_assigned_live_chat_agent_ids()
     serialized_accounts = [
         serialize_agent(account, open_assigned_chat_agent_ids=open_assigned_chat_agent_ids)
-        for account in filtered_accounts
+        for account in accounts
     ]
 
     return {
