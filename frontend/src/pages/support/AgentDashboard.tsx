@@ -464,6 +464,7 @@ const AgentDashboard = () => {
   const [notificationLog, setNotificationLog] = useState<AdminNotificationLogItem[]>([]);
   const seenTransferNotificationKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedTransferNotificationsRef = useRef(false);
+  const pendingRemovedAgentIdsRef = useRef<Set<number>>(new Set());
   const canManageUsers = userManagementRoles.has((session?.role || "").toLowerCase())
     && !!(session?.legacyAdminAccess || session?.entraDirectoryAdmin);
   const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
@@ -1621,6 +1622,15 @@ const AgentDashboard = () => {
     }
   }
 
+  function filterPendingRemovedAgents(nextAgents: AdminAgent[]) {
+    const pendingRemovedAgentIds = pendingRemovedAgentIdsRef.current;
+    if (pendingRemovedAgentIds.size === 0) {
+      return nextAgents;
+    }
+
+    return nextAgents.filter((agent) => !pendingRemovedAgentIds.has(agent.id));
+  }
+
   async function loadDashboard() {
     setIsLoading(true);
     setError("");
@@ -1643,9 +1653,10 @@ const AgentDashboard = () => {
         return;
       }
       setTickets(tickets);
-      setAgents(nextAgents);
+      const visibleAgents = filterPendingRemovedAgents(nextAgents);
+      setAgents(visibleAgents);
       setNotificationLog(nextNotificationLog);
-      syncConsoleStatusFromAgents(nextAgents);
+      syncConsoleStatusFromAgents(visibleAgents);
       setChatbotWorkflowConfigured(
         Boolean(migrationStatusPayload?.adminAiWebhookConfigured ?? migrationStatusPayload?.chatbotWebhookConfigured),
       );
@@ -1680,8 +1691,9 @@ const AgentDashboard = () => {
       if (!isCurrentDashboardSession(requestSession)) {
         return;
       }
-      setAgents(nextAgents);
-      syncConsoleStatusFromAgents(nextAgents);
+      const visibleAgents = filterPendingRemovedAgents(nextAgents);
+      setAgents(visibleAgents);
+      syncConsoleStatusFromAgents(visibleAgents);
     } catch (fetchError) {
       if (!silent) {
         setError(fetchError instanceof Error ? fetchError.message : "We could not load support accounts right now.");
@@ -1816,6 +1828,7 @@ const AgentDashboard = () => {
       }
       const newAgent = payload?.agent;
       if (newAgent) {
+        pendingRemovedAgentIdsRef.current.delete(newAgent.id);
         setAgents((prev) => [...prev, newAgent]);
       }
       setAgentSearchResults((prev) => prev.map((r) => r.entraId === result.entraId ? { ...r, alreadyAdded: true } : r));
@@ -1834,6 +1847,7 @@ const AgentDashboard = () => {
     }
 
     const previousAgents = agents;
+    pendingRemovedAgentIdsRef.current.add(agent.id);
     setAgents((prev) => prev.filter((a) => a.id !== agent.id));
     setRemovingAgentIds((prev) => new Set(prev).add(agent.id));
     try {
@@ -1843,12 +1857,14 @@ const AgentDashboard = () => {
       });
       const payload = (await response.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
       if (!response.ok) {
+        pendingRemovedAgentIdsRef.current.delete(agent.id);
         setAgents(previousAgents);
         toast.error(payload?.message || "Could not remove agent.");
         return;
       }
       toast.success(`${agent.fullName || agent.username} removed.`);
     } catch {
+      pendingRemovedAgentIdsRef.current.delete(agent.id);
       setAgents(previousAgents);
       toast.error("Could not remove agent.");
     } finally {
