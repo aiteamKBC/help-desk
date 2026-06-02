@@ -1693,6 +1693,7 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         or sanitize_text(metadata.get("legacy_auth_email"))
         or None
     )
+    manually_added_agent = normalize_bool(metadata.get("manually_added_agent"))
     return {
         "id": agent_id,
         "username": row["username"],
@@ -1705,6 +1706,8 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         "legacySupportAccess": normalize_bool(metadata.get("legacy_support_access")),
         "legacyAdminAccess": normalize_bool(metadata.get("legacy_admin_access")),
         "entraDirectoryAdmin": normalize_bool(metadata.get("entra_directory_admin_access")),
+        "manuallyAddedAgent": manually_added_agent,
+        "canRemoveFromAgentManagement": manually_added_agent,
         "consoleStatus": resolve_agent_console_status(
             metadata,
             session_active=session_active,
@@ -3678,6 +3681,64 @@ def persist_agent_metadata(agent_id: int, metadata: dict[str, Any]) -> None:
         )
 
 
+def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+    normalized_user_id = int(legacy_auth_user_id or 0)
+    if normalized_user_id <= 0:
+        raise ApiError(400, "A linked KBC auth user is required.")
+    if not settings.LEGACY_DATABASE_URL:
+        raise ApiError(503, "KBC auth database is not configured.")
+
+    try:
+        with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM auth_user WHERE id = %s AND is_active = TRUE LIMIT 1",
+                    [normalized_user_id],
+                )
+                if not cursor.fetchone():
+                    raise ApiError(404, "Linked KBC auth user was not found.")
+
+                cursor.execute(
+                    "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
+                    [SUPPORT_ACCESS_GROUP_NAME],
+                )
+                group_row = cursor.fetchone()
+                if group_row:
+                    group_id = int(group_row[0])
+                elif enabled:
+                    cursor.execute(
+                        "INSERT INTO auth_group (name) VALUES (%s) RETURNING id",
+                        [SUPPORT_ACCESS_GROUP_NAME],
+                    )
+                    group_id = int(cursor.fetchone()[0])
+                else:
+                    return
+
+                if enabled:
+                    cursor.execute(
+                        """
+                        INSERT INTO auth_user_groups (user_id, group_id)
+                        SELECT %s, %s
+                        WHERE NOT EXISTS (
+                          SELECT 1
+                          FROM auth_user_groups
+                          WHERE user_id = %s AND group_id = %s
+                        )
+                        """,
+                        [normalized_user_id, group_id, normalized_user_id, group_id],
+                    )
+                else:
+                    cursor.execute(
+                        "DELETE FROM auth_user_groups WHERE user_id = %s AND group_id = %s",
+                        [normalized_user_id, group_id],
+                    )
+    except ApiError:
+        raise
+    except Exception as exc:
+        log_unexpected_api_error("Failed to sync KBC support access group membership.", exc)
+        raise ApiError(502, "We could not update this agent in the KBC auth database right now.") from exc
+
+
 def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
     from django.contrib.auth import get_user_model
     from .admin import sync_support_access_group_membership
@@ -3695,20 +3756,20 @@ def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[
         raise ApiError(404, "Agent not found.")
 
     metadata = normalize_json_object(agent.get("metadata"))
-    metadata["legacy_support_access"] = support_access
-    persist_agent_metadata(agent_id, metadata)
-
     legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
-    User = get_user_model()
-    django_user = None
     if legacy_auth_user_id > 0:
-        django_user = User.objects.filter(pk=legacy_auth_user_id).first()
-    if not django_user:
+        sync_legacy_support_access_group_membership(legacy_auth_user_id, support_access)
+    else:
+        User = get_user_model()
+        django_user = None
         agent_email = normalize_email(agent.get("email") or "")
         if agent_email:
             django_user = User.objects.filter(email__iexact=agent_email).first()
-    if django_user:
-        sync_support_access_group_membership(django_user, support_access)
+        if django_user:
+            sync_support_access_group_membership(django_user, support_access)
+
+    metadata["legacy_support_access"] = support_access
+    persist_agent_metadata(agent_id, metadata)
 
     agent["metadata"] = metadata
     return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())

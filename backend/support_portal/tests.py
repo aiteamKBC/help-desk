@@ -2228,6 +2228,35 @@ class AdminLoginTests(SimpleTestCase):
 
 
 class SupportDirectoryTests(SimpleTestCase):
+    def test_update_agent_support_access_syncs_linked_kbc_auth_group(self):
+        agent = {
+            "id": 23,
+            "username": "omar1",
+            "full_name": "Omar One",
+            "email": "omar1@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 77,
+                "legacy_support_access": True,
+                "legacy_admin_access": True,
+            },
+        }
+
+        with (
+            patch.object(services, "run_query_one", return_value=agent),
+            patch.object(services, "sync_legacy_support_access_group_membership") as sync_legacy_support_access_group_membership,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = services.update_agent_support_access(23, support_access=False)
+
+        sync_legacy_support_access_group_membership.assert_called_once_with(77, False)
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertFalse(saved_metadata["legacy_support_access"])
+        self.assertFalse(response["legacySupportAccess"])
+
     def test_list_agents_returns_only_current_support_access_staff_profiles(self):
         with (
             patch.object(

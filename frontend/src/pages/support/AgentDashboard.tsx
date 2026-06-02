@@ -95,6 +95,8 @@ interface AdminAgent {
   selectedConsoleStatus?: string;
   legacySupportAccess?: boolean;
   legacyAdminAccess?: boolean;
+  manuallyAddedAgent?: boolean;
+  canRemoveFromAgentManagement?: boolean;
 }
 
 interface PendingTransferRequest {
@@ -1763,6 +1765,7 @@ const AgentDashboard = () => {
       if (updatedAgent) {
         setAgents((prev) => prev.map((a) => (a.id === updatedAgent.id ? { ...a, ...updatedAgent } : a)));
       }
+      void refreshAgentsOnly(true);
       toast.success(`Support access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
     } catch {
       toast.error("Could not update support access.");
@@ -1825,6 +1828,11 @@ const AgentDashboard = () => {
   }
 
   async function removeAgentById(agent: AdminAgent) {
+    if (agent.canRemoveFromAgentManagement !== true) {
+      toast.info("This agent is managed from KBC permissions. Turn ticket access off or update KBC auth.");
+      return;
+    }
+
     setRemovingAgentIds((prev) => new Set(prev).add(agent.id));
     try {
       const response = await fetch(`/api/admin/accounts/${agent.id}`, {
@@ -3539,6 +3547,7 @@ const AgentDashboard = () => {
                         const isToggling = togglingAccessIds.has(agent.id);
                         const hasAccess = agent.legacySupportAccess === true;
                         const isCurrentUser = session?.id === agent.id;
+                        const canRemoveAgent = agent.canRemoveFromAgentManagement === true && !isCurrentUser;
                         return (
                           <div key={agent.id} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
                             <div className="flex min-w-0 items-center gap-3">
@@ -3568,20 +3577,26 @@ const AgentDashboard = () => {
                                 onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
                                 aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
                               />
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                disabled={removingAgentIds.has(agent.id) || isCurrentUser}
-                                onClick={() => setConfirmRemoveAgent(agent)}
-                                className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
-                                aria-label={`Remove ${agent.fullName || agent.username}`}
-                              >
-                                {removingAgentIds.has(agent.id) ? (
-                                  <LoaderCircle className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <X className="h-4 w-4" />
-                                )}
-                              </Button>
+                              {canRemoveAgent ? (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  disabled={removingAgentIds.has(agent.id)}
+                                  onClick={() => setConfirmRemoveAgent(agent)}
+                                  className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
+                                  aria-label={`Remove ${agent.fullName || agent.username}`}
+                                >
+                                  {removingAgentIds.has(agent.id) ? (
+                                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <X className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              ) : (
+                                <span className="hidden w-8 text-center text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:inline">
+                                  KBC
+                                </span>
+                              )}
                             </div>
                           </div>
                         );
