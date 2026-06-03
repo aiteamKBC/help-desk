@@ -5088,18 +5088,17 @@ def _get_kbc_auth_db_connection():
 def _ensure_django_support_access(email: str, full_name: str) -> int | None:
     """Ensure the person has a Django user in the KBC auth database Support Access group. Returns the Django user id."""
     kbc_conn = _get_kbc_auth_db_connection()
+    normalized_email = email.strip().lower()
     try:
         if kbc_conn:
-            ctx = kbc_conn
             cursor_ctx = kbc_conn.cursor()
         else:
-            ctx = None
             cursor_ctx = connection.cursor()
 
         with cursor_ctx as cursor:
             cursor.execute(
                 "SELECT id FROM auth_user WHERE LOWER(TRIM(email)) = %s LIMIT 1",
-                [email],
+                [normalized_email],
             )
             row = cursor.fetchone()
             if row:
@@ -5108,13 +5107,13 @@ def _ensure_django_support_access(email: str, full_name: str) -> int | None:
                 name_parts = full_name.split(" ", 1)
                 first_name = name_parts[0] if name_parts else ""
                 last_name = name_parts[1] if len(name_parts) > 1 else ""
-                django_username = email.split("@")[0].lower()
+                django_username = normalized_email.split("@")[0]
                 cursor.execute(
-                    "SELECT id FROM auth_user WHERE username = %s LIMIT 1",
+                    "SELECT id FROM auth_user WHERE LOWER(TRIM(username)) = %s LIMIT 1",
                     [django_username],
                 )
                 if cursor.fetchone():
-                    django_username = email.lower()
+                    django_username = normalized_email
                 cursor.execute(
                     """
                     INSERT INTO auth_user
@@ -5123,7 +5122,7 @@ def _ensure_django_support_access(email: str, full_name: str) -> int | None:
                     VALUES (%s, %s, %s, %s, '', FALSE, TRUE, FALSE, NOW())
                     RETURNING id
                     """,
-                    [django_username, email, first_name, last_name],
+                    [django_username, normalized_email, first_name, last_name],
                 )
                 django_user_id = cursor.fetchone()[0]
 
@@ -5170,7 +5169,7 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
         raise ApiError(400, "Invalid email address.")
 
     existing = run_query_one(
-        "SELECT id, metadata FROM support_accounts WHERE email = %s AND account_scope = %s LIMIT 1",
+        "SELECT id, metadata FROM support_accounts WHERE LOWER(TRIM(email)) = %s AND account_scope = %s LIMIT 1",
         [email, ACCOUNT_SCOPE_STAFF],
     )
     if existing:
