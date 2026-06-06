@@ -3,6 +3,10 @@ import { type BookingSummary, type RequesterRole, type Ticket } from "@/context/
 export const awaitingMeetingReason = "Awaiting support meeting";
 export const quickTicketReason = "Quick Ticket";
 export const awaitingSupportReviewReason = quickTicketReason;
+export const coverageTutorRequestedReason = "Tutor Requested";
+export const coverageTutorAcceptedReason = "Tutor Accepted";
+export const coverageTutorRejectedReason = "Tutor Rejected";
+export const coverageRerequestingReason = "Rerequesting";
 export type SupportChatEntryAction = "live-chat" | "booking";
 export interface SupportChatLocationState {
   entryAction?: SupportChatEntryAction;
@@ -11,6 +15,12 @@ export interface SupportBookingLocationState {
   returnPath?: "/support/chat" | "/support/options";
 }
 const legacyQuickTicketReasons = ["Awaiting resolution", "Awaiting Resolution", "Awaiting support review"] as const;
+const coveragePendingReasons = [
+  coverageTutorRequestedReason,
+  coverageTutorAcceptedReason,
+  coverageTutorRejectedReason,
+  coverageRerequestingReason,
+] as const;
 
 type TicketFlowState = Pick<Ticket, "id" | "status" | "statusReason" | "requesterRole">;
 
@@ -22,7 +32,7 @@ export const isAwaitingMeetingTicket = (ticket: TicketFlowState) =>
 
 export const isAwaitingSupportReviewTicket = (ticket: TicketFlowState) =>
   ticket.status === "Pending"
-  && [quickTicketReason, ...legacyQuickTicketReasons].includes(ticket.statusReason);
+  && [quickTicketReason, ...legacyQuickTicketReasons, ...coveragePendingReasons].includes(ticket.statusReason);
 
 export const canReturnToChat = (ticket: TicketFlowState) =>
   !isQuickTicketOnlyRequesterRole(ticket.requesterRole)

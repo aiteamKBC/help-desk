@@ -1,6 +1,7 @@
 LEGACY_ENDPOINTS = [
     {"method": "GET", "path": "/api/booking-link"},
     {"method": "GET", "path": "/api/teams-call-context"},
+    {"method": "GET", "path": "/api/coverage-options"},
     {"method": "POST", "path": "/api/verify-email"},
     {"method": "POST", "path": "/api/admin/login"},
     {"method": "GET", "path": "/api/admin/microsoft/login"},

@@ -18,6 +18,7 @@ import psycopg
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
 from django.db import connection, transaction
+from django.utils import timezone as django_timezone
 
 from .roles import (
     ACCOUNT_ROLES,
@@ -43,7 +44,7 @@ EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
-ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "LMS", "Teams", "Others"}
+ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "Coverage", "LMS", "Teams", "Others"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
 ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
@@ -62,6 +63,11 @@ STATUS_REASON_CLOSED_BY_AGENT = "Closed via Agent"
 STATUS_REASON_AWAITING_MEETING = "Awaiting support meeting"
 STATUS_REASON_ESCALATION = "Escalation"
 STATUS_REASON_QUICK_TICKET = "Quick Ticket"
+STATUS_REASON_TUTOR_REQUESTED = "Tutor Requested"
+STATUS_REASON_TUTOR_ACCEPTED = "Tutor Accepted"
+STATUS_REASON_TUTOR_REJECTED = "Tutor Rejected"
+STATUS_REASON_TUTOR_REFUSED = "Tutor Refused"
+STATUS_REASON_REREQUESTING = "Rerequesting"
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION = "Awaiting Resolution"
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND = "Awaiting resolution"
 STATUS_REASON_AWAITING_RESOLUTION = LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND
@@ -71,6 +77,13 @@ QUICK_TICKET_STATUS_REASONS = {
     LEGACY_STATUS_REASON_AWAITING_RESOLUTION,
     LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND,
     LEGACY_STATUS_REASON_AWAITING_SUPPORT_REVIEW,
+}
+COVERAGE_TUTOR_STATUS_REASONS = {
+    STATUS_REASON_TUTOR_REQUESTED,
+    STATUS_REASON_TUTOR_ACCEPTED,
+    STATUS_REASON_TUTOR_REJECTED,
+    STATUS_REASON_TUTOR_REFUSED,
+    STATUS_REASON_REREQUESTING,
 }
 ALLOWED_CHAT_STATES = {"open", "closed"}
 ALLOWED_STATUS_REASONS_BY_STATUS = {
@@ -83,6 +96,7 @@ ALLOWED_STATUS_REASONS_BY_STATUS = {
         STATUS_REASON_AWAITING_MEETING,
         STATUS_REASON_ESCALATION,
         *QUICK_TICKET_STATUS_REASONS,
+        *COVERAGE_TUTOR_STATUS_REASONS,
     },
 }
 AUTO_MANAGED_SLA_STATUSES = {"Open", "Pending", "Closed"}
@@ -107,8 +121,10 @@ LATEST_TRANSFER_DECISION_METADATA_KEY = "latest_transfer_decision"
 PENDING_ESCALATION_NOTIFICATION_METADATA_KEY = "pending_escalation_notification"
 LATEST_ESCALATION_CLOSURE_METADATA_KEY = "latest_escalation_closure"
 PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY = "pending_teams_call_notification"
+PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY = "pending_coverage_ticket_notification"
 TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
 LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
+LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY = "latest_coverage_tutor_response"
 MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0"
 MICROSOFT_GRAPH_BETA_BASE_URL = "https://graph.microsoft.com/beta"
 MICROSOFT_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
@@ -566,6 +582,35 @@ def get_pending_teams_call_notification(metadata: Any) -> dict[str, Any] | None:
     return normalize_pending_teams_call_notification(normalize_json_object(metadata).get(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY))
 
 
+def normalize_pending_coverage_ticket_notification(value: Any) -> dict[str, Any] | None:
+    payload = normalize_json_object(value)
+    if not payload:
+        return None
+
+    ticket_id = sanitize_text(payload.get("ticketId")) or sanitize_text(payload.get("chatId"))
+    requester_name = sanitize_text(payload.get("requesterName"))
+    requester_email = sanitize_text(payload.get("requesterEmail"))
+    requester_role = normalize_public_requester_role(payload.get("requesterRole"))
+    created_at = serialize_datetime_value(coerce_datetime(payload.get("createdAt")))
+
+    if not ticket_id or not requester_email or not created_at:
+        return None
+
+    return {
+        "ticketId": ticket_id,
+        "requesterName": requester_name,
+        "requesterEmail": requester_email,
+        "requesterRole": requester_role,
+        "createdAt": created_at,
+    }
+
+
+def get_pending_coverage_ticket_notification(metadata: Any) -> dict[str, Any] | None:
+    return normalize_pending_coverage_ticket_notification(
+        normalize_json_object(metadata).get(PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY)
+    )
+
+
 def is_teams_call_requested(metadata: Any) -> bool:
     return normalize_bool(normalize_json_object(metadata).get(TEAMS_CALL_REQUESTED_METADATA_KEY))
 
@@ -688,6 +733,63 @@ def normalize_latest_transfer_decision(value: Any) -> dict[str, Any] | None:
 
 def get_latest_transfer_decision(metadata: Any) -> dict[str, Any] | None:
     return normalize_latest_transfer_decision(normalize_json_object(metadata).get(LATEST_TRANSFER_DECISION_METADATA_KEY))
+
+
+def normalize_latest_coverage_tutor_response(value: Any) -> dict[str, Any] | None:
+    payload = normalize_json_object(value)
+    if not payload:
+        return None
+
+    outcome = sanitize_text(payload.get("outcome")).lower()
+    if outcome == "refused":
+        outcome = "rejected"
+    to_agent_id = parse_assigned_agent_id(payload.get("toAgentId"))
+    ticket_id = sanitize_text(payload.get("ticketId")) or sanitize_text(payload.get("chatId"))
+    tutor = sanitize_text(payload.get("tutor"))
+    tutor_email = sanitize_text(payload.get("tutorEmail"))
+    card_id = sanitize_text(payload.get("cardId"))
+    related_tutor_choice_card_id = sanitize_text(payload.get("relatedTutorChoiceCardId"))
+    responded_at = serialize_datetime_value(coerce_datetime(payload.get("respondedAt")))
+    request_submitted_at = serialize_datetime_value(coerce_datetime(payload.get("requestedAt")))
+    session_details = sanitize_text(payload.get("sessionDetails"))
+    reply_text = sanitize_text(payload.get("replyText"))
+    session_start_at = serialize_datetime_value(coerce_datetime(payload.get("sessionStartAt")))
+    session_end_at = serialize_datetime_value(coerce_datetime(payload.get("sessionEndAt")))
+    requester_acknowledged = normalize_bool(payload.get("requesterAcknowledged"))
+
+    if (
+        outcome not in {"accepted", "rejected"}
+        or not to_agent_id
+        or not ticket_id
+        or not tutor
+        or not card_id
+        or not related_tutor_choice_card_id
+        or not responded_at
+    ):
+        return None
+
+    return {
+        "outcome": outcome,
+        "toAgentId": to_agent_id,
+        "toAgentName": sanitize_text(payload.get("toAgentName")),
+        "toAgentUsername": sanitize_text(payload.get("toAgentUsername")),
+        "ticketId": ticket_id,
+        "tutor": tutor,
+        "tutorEmail": tutor_email,
+        "cardId": card_id,
+        "relatedTutorChoiceCardId": related_tutor_choice_card_id,
+        "requestedAt": request_submitted_at,
+        "respondedAt": responded_at,
+        "sessionDetails": session_details,
+        "replyText": reply_text,
+        "sessionStartAt": session_start_at,
+        "sessionEndAt": session_end_at,
+        "requesterAcknowledged": requester_acknowledged,
+    }
+
+
+def get_latest_coverage_tutor_response(metadata: Any) -> dict[str, Any] | None:
+    return normalize_latest_coverage_tutor_response(normalize_json_object(metadata).get(LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY))
 
 
 def normalize_console_status(value: Any) -> str:
@@ -845,6 +947,86 @@ def is_live_chat_requested(ticket_metadata: Any, conversation_metadata: Any = No
     )
 
 
+def normalize_coverage_card_attachment(value: Any) -> dict[str, Any] | None:
+    source = normalize_json_object(value)
+    data_url = sanitize_text(source.get("dataUrl"))
+    if not data_url.startswith("data:"):
+        return None
+
+    return {
+        "id": sanitize_text(source.get("id")),
+        "name": sanitize_text(source.get("name")) or "attachment",
+        "mimeType": sanitize_text(source.get("mimeType")) or "application/octet-stream",
+        "size": int(source.get("size") or 0),
+        "dataUrl": data_url,
+    }
+
+
+def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
+    raw_cards = value if isinstance(value, list) else []
+    normalized_cards: list[dict[str, Any]] = []
+    allowed_types = {"tutor_choice", "tutor_reply", "note"}
+    allowed_request_statuses = {"draft", "requested", "pending", "accepted", "refused"}
+    allowed_reply_outcomes = {"accepted", "refused"}
+
+    for item in raw_cards:
+        source = normalize_json_object(item)
+        card_type = sanitize_text(source.get("type")).lower()
+        if card_type not in allowed_types:
+            continue
+
+        attachments = []
+        raw_attachments = source.get("presentationFiles") if isinstance(source.get("presentationFiles"), list) else []
+        for attachment in raw_attachments:
+            normalized_attachment = normalize_coverage_card_attachment(attachment)
+            if normalized_attachment:
+                attachments.append(normalized_attachment)
+
+        request_status = sanitize_text(source.get("requestStatus")).lower()
+        if request_status not in allowed_request_statuses:
+            request_status = "draft"
+        elif request_status == "pending":
+            request_status = "requested"
+
+        reply_outcome = sanitize_text(source.get("replyOutcome")).lower()
+        if reply_outcome not in allowed_reply_outcomes:
+            reply_outcome = ""
+
+        normalized_cards.append(
+            {
+                "id": sanitize_text(source.get("id")),
+                "type": card_type,
+                "title": sanitize_text(source.get("title")),
+                "note": sanitize_text(source.get("note")),
+                "tutor": sanitize_text(source.get("tutor")),
+                "tutorEmail": sanitize_text(source.get("tutorEmail")),
+                "sessionDetails": sanitize_text(source.get("sessionDetails")),
+                "replyText": sanitize_text(source.get("replyText")),
+                "requestStatus": request_status,
+                "replyOutcome": reply_outcome,
+                "locked": normalize_bool(source.get("locked")),
+                "createdAt": sanitize_text(source.get("createdAt")),
+                "updatedAt": sanitize_text(source.get("updatedAt")),
+                "submittedAt": sanitize_text(source.get("submittedAt")),
+                "respondedAt": sanitize_text(source.get("respondedAt")),
+                "relatedTutorChoiceCardId": sanitize_text(source.get("relatedTutorChoiceCardId")),
+                "requestSubmittedByAgentId": parse_assigned_agent_id(source.get("requestSubmittedByAgentId")),
+                "requestSubmittedByAgentName": sanitize_text(source.get("requestSubmittedByAgentName")),
+                "requestSubmittedByAgentUsername": sanitize_text(source.get("requestSubmittedByAgentUsername")),
+                "responseToken": sanitize_text(source.get("responseToken")),
+                "sessionStartAt": serialize_datetime_value(coerce_datetime(source.get("sessionStartAt"))),
+                "sessionEndAt": serialize_datetime_value(coerce_datetime(source.get("sessionEndAt"))),
+                "confirmedAt": serialize_datetime_value(coerce_datetime(source.get("confirmedAt"))),
+                "confirmedByAgentId": parse_assigned_agent_id(source.get("confirmedByAgentId")),
+                "confirmedByAgentName": sanitize_text(source.get("confirmedByAgentName")),
+                "confirmedByAgentUsername": sanitize_text(source.get("confirmedByAgentUsername")),
+                "presentationFiles": attachments,
+            }
+        )
+
+    return normalized_cards
+
+
 def normalize_admin_documentation(
     value: Any,
     *,
@@ -892,7 +1074,49 @@ def normalize_admin_documentation(
         "escalationAgentId": parse_assigned_agent_id(source.get("escalationAgentId")),
         "escalationAgentName": sanitize_text(source.get("escalationAgentName")),
         "escalationNote": sanitize_text(source.get("escalationNote")),
+        "coverageNotes": sanitize_text(source.get("coverageNotes")),
+        "coverageCards": normalize_coverage_cards(source.get("coverageCards")),
         "errorImages": error_images,
+    }
+
+
+def freeze_coverage_documentation_snapshot(
+    existing_documentation: Any,
+    requested_documentation: Any,
+) -> dict[str, Any]:
+    existing = normalize_admin_documentation(existing_documentation)
+    requested = normalize_admin_documentation(requested_documentation)
+
+    existing_cards = list(existing.get("coverageCards") or [])
+    existing_card_ids = {
+        sanitize_text(card.get("id"))
+        for card in existing_cards
+        if sanitize_text(card.get("id"))
+    }
+    has_existing_saved_snapshot = bool(existing_cards) or bool(existing.get("coverageNotes"))
+
+    frozen_cards: list[dict[str, Any]] = [normalize_json_object(card) for card in existing_cards]
+    for card in requested.get("coverageCards") or []:
+        normalized_card = normalize_json_object(card)
+        card_id = sanitize_text(normalized_card.get("id"))
+        if card_id and card_id in existing_card_ids:
+            continue
+
+        created_at = sanitize_text(normalized_card.get("createdAt"))
+        updated_at = sanitize_text(normalized_card.get("updatedAt")) or created_at
+        frozen_cards.append(
+            {
+                **normalized_card,
+                "locked": True,
+                "updatedAt": updated_at,
+            }
+        )
+
+    return {
+        **requested,
+        "inquiry": existing.get("inquiry") if has_existing_saved_snapshot else requested.get("inquiry") or "",
+        "coverageNotes": existing.get("coverageNotes") if has_existing_saved_snapshot else requested.get("coverageNotes") or "",
+        "coverageCards": frozen_cards,
     }
 
 
@@ -1202,6 +1426,1410 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
     }
 
 
+def run_communication_centre_query(
+    sql: str,
+    params: list[Any] | tuple[Any, ...] | None = None,
+) -> list[dict[str, Any]]:
+    communication_centre_url = sanitize_text(getattr(settings, "COMMUNICATION_CENTRE_DATABASE_URL", ""))
+    if not communication_centre_url:
+        raise ApiError(503, "Coverage options are not configured on the server.")
+
+    with psycopg.connect(communication_centre_url) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(sql, params or [])
+            return dictfetchall(cursor)
+
+
+def format_coverage_time_option_label(
+    week_day: Any,
+    start_time: Any,
+    end_time: Any,
+    group_name: Any,
+    cohort_name: Any,
+) -> str:
+    normalized_week_day = sanitize_text(week_day).title()
+    normalized_start_time = sanitize_text(start_time)
+    normalized_end_time = sanitize_text(end_time)
+    normalized_group_name = sanitize_text(group_name)
+    normalized_cohort_name = sanitize_text(cohort_name)
+
+    day_and_time_parts = [part for part in [normalized_week_day, normalized_start_time] if part]
+    if normalized_end_time:
+        if normalized_start_time:
+            day_and_time_parts[-1] = f"{normalized_start_time} - {normalized_end_time}"
+        else:
+            day_and_time_parts.append(normalized_end_time)
+
+    label_parts = []
+    if day_and_time_parts:
+        label_parts.append(" ".join(day_and_time_parts))
+    if normalized_group_name:
+        label_parts.append(normalized_group_name)
+    if normalized_cohort_name:
+        label_parts.append(normalized_cohort_name)
+
+    return " | ".join(label_parts)
+
+
+def parse_coverage_plan_date(value: Any):
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return None
+
+    try:
+        return datetime.strptime(normalized_value, "%Y-%m-%d").date()
+    except ValueError:
+        try:
+            return datetime.fromisoformat(normalized_value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+
+
+def get_coverage_weekday_index(value: Any) -> int | None:
+    normalized_value = re.sub(r"[^a-z]", "", sanitize_text(value).lower())
+    if not normalized_value:
+        return None
+
+    weekday_indexes = {
+        "monday": 0,
+        "mon": 0,
+        "tuesday": 1,
+        "tue": 1,
+        "tues": 1,
+        "wednesday": 2,
+        "wed": 2,
+        "thursday": 3,
+        "thu": 3,
+        "thur": 3,
+        "thurs": 3,
+        "friday": 4,
+        "fri": 4,
+        "saturday": 5,
+        "sat": 5,
+        "sunday": 6,
+        "sun": 6,
+    }
+    return weekday_indexes.get(normalized_value)
+
+
+def format_coverage_session_date_option_label(value) -> str:
+    return value.strftime("%A %d %b %Y")
+
+
+def list_coverage_time_rows(tutor: Any, module: Any) -> list[dict[str, Any]]:
+    normalized_tutor = sanitize_text(tutor).lower()
+    normalized_module = sanitize_text(module).lower()
+    if not normalized_tutor or not normalized_module:
+        return []
+
+    return run_communication_centre_query(
+        """
+        SELECT DISTINCT
+          NULLIF(TRIM("session_week_day"), '') AS session_week_day,
+          NULLIF(TRIM("session_start_time"), '') AS session_start_time,
+          NULLIF(TRIM("session_end_time"), '') AS session_end_time,
+          NULLIF(TRIM("group_name"), '') AS group_name,
+          NULLIF(TRIM("Cohort_name"), '') AS cohort_name,
+          NULLIF(TRIM("start_date"), '') AS start_date,
+          NULLIF(TRIM("end_date"), '') AS end_date
+        FROM public."Training_plan"
+        WHERE (
+          LOWER(TRIM("Tutor_name")) = %s
+          OR EXISTS (
+            SELECT 1
+            FROM regexp_split_to_table(COALESCE("Tutor_name", ''), '\\+') AS tutor_part
+            WHERE LOWER(TRIM(tutor_part)) = %s
+          )
+        )
+          AND LOWER(TRIM("module_name")) = %s
+        ORDER BY session_week_day, session_start_time, session_end_time, group_name, cohort_name, start_date, end_date
+        """,
+        [normalized_tutor, normalized_tutor, normalized_module],
+    )
+
+
+def list_coverage_tutor_options(module: Any = None) -> list[str]:
+    normalized_module = sanitize_text(module).lower()
+    if normalized_module:
+        rows = run_communication_centre_query(
+            """
+            SELECT tutor_name
+            FROM (
+              SELECT DISTINCT NULLIF(TRIM("Tutor_name"), '') AS tutor_name
+              FROM public."Training_plan"
+              WHERE LOWER(TRIM("module_name")) = %s
+            ) coverage_tutors
+            WHERE tutor_name IS NOT NULL
+            ORDER BY LOWER(tutor_name), tutor_name
+            """,
+            [normalized_module],
+        )
+    else:
+        rows = run_communication_centre_query(
+            """
+            SELECT tutor_name
+            FROM (
+              SELECT DISTINCT NULLIF(TRIM("Tutor_name"), '') AS tutor_name
+              FROM public."Training_plan"
+            ) coverage_tutors
+            WHERE tutor_name IS NOT NULL
+            ORDER BY LOWER(tutor_name), tutor_name
+            """
+        )
+    tutor_names_by_key: dict[str, str] = {}
+
+    for row in rows:
+        raw_tutor_name = sanitize_text(row.get("tutor_name"))
+        if not raw_tutor_name:
+            continue
+
+        for tutor_name_part in raw_tutor_name.split("+"):
+            tutor_name = sanitize_text(tutor_name_part)
+            if not tutor_name:
+                continue
+            tutor_names_by_key.setdefault(tutor_name.lower(), tutor_name)
+
+    return [tutor_names_by_key[key] for key in sorted(tutor_names_by_key)]
+
+
+def list_coverage_module_options(tutor: Any) -> list[str]:
+    normalized_tutor = sanitize_text(tutor).lower()
+    if not normalized_tutor:
+        return []
+
+    rows = run_communication_centre_query(
+        """
+        SELECT module_name
+        FROM (
+          SELECT DISTINCT NULLIF(TRIM("module_name"), '') AS module_name
+          FROM public."Training_plan"
+          WHERE (
+            LOWER(TRIM("Tutor_name")) = %s
+            OR EXISTS (
+              SELECT 1
+              FROM regexp_split_to_table(COALESCE("Tutor_name", ''), '\\+') AS tutor_part
+              WHERE LOWER(TRIM(tutor_part)) = %s
+            )
+          )
+        ) coverage_modules
+        WHERE module_name IS NOT NULL
+        ORDER BY LOWER(module_name), module_name
+        """,
+        [normalized_tutor, normalized_tutor],
+    )
+    return [sanitize_text(row.get("module_name")) for row in rows if sanitize_text(row.get("module_name"))]
+
+
+def list_coverage_time_options(tutor: Any, module: Any) -> list[str]:
+    rows = list_coverage_time_rows(tutor, module)
+
+    labels: list[str] = []
+    seen_labels: set[str] = set()
+    for row in rows:
+        label = format_coverage_time_option_label(
+            row.get("session_week_day"),
+            row.get("session_start_time"),
+            row.get("session_end_time"),
+            row.get("group_name"),
+            row.get("cohort_name"),
+        )
+        if not label or label in seen_labels:
+            continue
+        seen_labels.add(label)
+        labels.append(label)
+
+    return labels
+
+
+def list_coverage_session_date_options(tutor: Any, module: Any, time_label: Any) -> list[str]:
+    normalized_time_label = sanitize_text(time_label)
+    if not normalized_time_label:
+        return []
+
+    rows = list_coverage_time_rows(tutor, module)
+    labels: list[str] = []
+    seen_labels: set[str] = set()
+
+    for row in rows:
+        row_time_label = format_coverage_time_option_label(
+            row.get("session_week_day"),
+            row.get("session_start_time"),
+            row.get("session_end_time"),
+            row.get("group_name"),
+            row.get("cohort_name"),
+        )
+        if row_time_label != normalized_time_label:
+            continue
+
+        start_date = parse_coverage_plan_date(row.get("start_date"))
+        end_date = parse_coverage_plan_date(row.get("end_date"))
+        weekday_index = get_coverage_weekday_index(row.get("session_week_day"))
+        if not start_date or not end_date or weekday_index is None or end_date < start_date:
+            continue
+
+        days_until_weekday = (weekday_index - start_date.weekday()) % 7
+        candidate_date = start_date + timedelta(days=days_until_weekday)
+
+        while candidate_date <= end_date:
+            label = format_coverage_session_date_option_label(candidate_date)
+            if label not in seen_labels:
+                seen_labels.add(label)
+                labels.append(label)
+            candidate_date += timedelta(days=7)
+
+    return labels
+
+
+def get_coverage_tutor_email(tutor: Any) -> str:
+    normalized_tutor = sanitize_text(tutor).lower()
+    if not normalized_tutor:
+        return ""
+
+    rows = run_communication_centre_query(
+        """
+        SELECT NULLIF(TRIM("Tutor_email"), '') AS tutor_email
+        FROM public."Tutors_Modules"
+        WHERE (
+          LOWER(TRIM("Tutor_name")) = %s
+          OR EXISTS (
+            SELECT 1
+            FROM regexp_split_to_table(COALESCE("Tutor_name", ''), '\\+') AS tutor_part
+            WHERE LOWER(TRIM(tutor_part)) = %s
+          )
+        )
+        ORDER BY
+          CASE WHEN LOWER(TRIM("Tutor_name")) = %s THEN 0 ELSE 1 END,
+          NULLIF(TRIM("Tutor_email"), '') DESC NULLS LAST
+        """,
+        [normalized_tutor, normalized_tutor, normalized_tutor],
+    )
+
+    for row in rows:
+        email = normalize_email(row.get("tutor_email"))
+        if is_valid_email(email):
+            return email
+
+    return ""
+
+
+def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
+    option_type = sanitize_text(payload.get("type")).lower()
+    tutor = payload.get("tutor")
+    module = payload.get("module")
+    time_label = payload.get("time")
+
+    if option_type == "tutors":
+        options = list_coverage_tutor_options(module)
+    elif option_type == "modules":
+        options = list_coverage_module_options(tutor)
+    elif option_type == "times":
+        options = list_coverage_time_options(tutor, module)
+    elif option_type == "session-dates":
+        options = list_coverage_session_date_options(tutor, module, time_label)
+    elif option_type == "tutor-email":
+        return {
+            "type": option_type,
+            "value": get_coverage_tutor_email(tutor),
+        }
+    else:
+        raise ApiError(400, "Please choose a valid coverage option type.")
+
+    return {
+        "type": option_type,
+        "options": options,
+    }
+
+
+def get_coverage_tutor_request_webhook_url() -> str:
+    return sanitize_text(getattr(settings, "MAIL_WEBHOOK_URL", ""))
+
+
+def normalize_support_portal_public_base_url(value: Any) -> str:
+    normalized_value = sanitize_text(value).rstrip("/")
+    if not normalized_value:
+        return ""
+
+    parsed = urllib_parse.urlparse(normalized_value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
+        return ""
+
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def get_support_portal_public_base_url(fallback_origin: Any = "") -> str:
+    configured_base_url = normalize_support_portal_public_base_url(
+        getattr(settings, "SUPPORT_PORTAL_PUBLIC_BASE_URL", ""),
+    )
+    if configured_base_url:
+        return configured_base_url
+
+    return normalize_support_portal_public_base_url(fallback_origin)
+
+
+def build_coverage_tutor_public_response_base_url(fallback_origin: Any = "") -> str:
+    public_base_url = get_support_portal_public_base_url(fallback_origin)
+    if not public_base_url:
+        return ""
+
+    return f"{public_base_url}/coverage/tutor-response"
+
+
+def build_coverage_tutor_public_response_action_url(
+    public_response_base_url: Any,
+    *,
+    action: str,
+    ticket_public_id: Any,
+    card_id: Any,
+    response_token: Any,
+    tutor_email: Any = "",
+) -> str:
+    normalized_base_url = sanitize_text(public_response_base_url).rstrip("/")
+    if not normalized_base_url:
+        return ""
+
+    query_payload = {
+        "action": sanitize_text(action).lower(),
+        "ticketId": sanitize_text(ticket_public_id),
+        "cardId": sanitize_text(card_id),
+        "responseToken": sanitize_text(response_token),
+    }
+    normalized_tutor_email = normalize_email(tutor_email)
+    if normalized_tutor_email:
+        query_payload["tutorEmail"] = normalized_tutor_email
+
+    query_string = urllib_parse.urlencode({key: value for key, value in query_payload.items() if value})
+    return f"{normalized_base_url}?{query_string}" if query_string else normalized_base_url
+
+
+def build_coverage_tutor_request_webhook_payload(
+    ticket: dict[str, Any],
+    documentation: dict[str, Any],
+    card: dict[str, Any],
+    actor_row: dict[str, Any],
+    *,
+    callback_url: str = "",
+) -> dict[str, Any]:
+    accept_url = build_coverage_tutor_public_response_action_url(
+        callback_url,
+        action="accept",
+        ticket_public_id=ticket["public_id"],
+        card_id=card["id"],
+        response_token=card.get("responseToken"),
+        tutor_email=card.get("tutorEmail"),
+    )
+    refuse_url = build_coverage_tutor_public_response_action_url(
+        callback_url,
+        action="refuse",
+        ticket_public_id=ticket["public_id"],
+        card_id=card["id"],
+        response_token=card.get("responseToken"),
+        tutor_email=card.get("tutorEmail"),
+    )
+
+    return {
+        "event": "coverage_tutor_requested",
+        "source": "support_portal",
+        "ticketId": ticket["public_id"],
+        "cardId": card["id"],
+        "responseToken": card.get("responseToken"),
+        "acceptUrl": accept_url,
+        "refuseUrl": refuse_url,
+        "tutor": {
+            "name": card.get("tutor"),
+            "email": card.get("tutorEmail"),
+        },
+        "learner": {
+            "name": ticket.get("learner_name"),
+            "email": ticket.get("learner_email"),
+        },
+        "request": {
+            "category": ticket.get("category"),
+            "technicalSubcategory": ticket.get("technical_subcategory"),
+            "inquiry": ticket.get("inquiry"),
+            "sessionDetails": card.get("sessionDetails"),
+            "notes": documentation.get("coverageNotes") or "",
+            "presentationFiles": card.get("presentationFiles") or [],
+        },
+        "requestedBy": {
+            "agentId": int(actor_row["id"]),
+            "agentName": actor_row.get("full_name") or actor_row["username"],
+            "agentUsername": actor_row["username"],
+            "agentEmail": actor_row.get("email") or "",
+        },
+        "callback": {
+            "ticketId": ticket["public_id"],
+            "cardId": card["id"],
+            "responseToken": card.get("responseToken"),
+            "url": callback_url or "",
+            "path": "/coverage/tutor-response",
+            "acceptUrl": accept_url,
+            "refuseUrl": refuse_url,
+        },
+    }
+
+
+def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    configured, delivered, status, response_payload = post_json_webhook(get_coverage_tutor_request_webhook_url(), payload)
+    return {
+        "configured": configured,
+        "delivered": delivered,
+        "status": status,
+        "response": response_payload,
+    }
+
+
+def find_coverage_card_index(
+    cards: list[dict[str, Any]],
+    *,
+    card_id: Any = None,
+    response_token: Any = None,
+) -> int | None:
+    normalized_card_id = sanitize_text(card_id)
+    normalized_response_token = sanitize_text(response_token)
+
+    for index, card in enumerate(cards):
+        if normalized_card_id and sanitize_text(card.get("id")) == normalized_card_id:
+            return index
+        if normalized_response_token and sanitize_text(card.get("responseToken")) == normalized_response_token:
+            return index
+
+    return None
+
+
+def extract_coverage_tutor_response_outcome(payload: dict[str, Any]) -> str:
+    normalized_outcome = sanitize_text(
+        payload.get("outcome")
+        or payload.get("status")
+        or payload.get("decision")
+        or payload.get("replyOutcome")
+    ).lower()
+
+    if normalized_outcome in {"accepted", "accept", "approved", "confirmed"}:
+        return "accepted"
+    if normalized_outcome in {"rejected", "reject", "refused", "declined", "decline"}:
+        return "rejected"
+
+    accepted_flag = payload.get("accepted")
+    if accepted_flag is True:
+        return "accepted"
+    if accepted_flag is False:
+        return "rejected"
+
+    return ""
+
+
+def extract_coverage_tutor_response_session_details(payload: dict[str, Any]) -> str:
+    explicit_value = sanitize_text(payload.get("sessionDetails"))
+    if explicit_value:
+        return explicit_value
+
+    parts = [
+        sanitize_text(payload.get("summary")),
+        sanitize_text(payload.get("module")),
+        sanitize_text(payload.get("preferredTime")),
+        sanitize_text(payload.get("sessionSubject")),
+        sanitize_text(payload.get("sessionWindow")),
+        sanitize_text(payload.get("sessionJoinUrl")),
+    ]
+    filtered_parts = [part for part in parts if part]
+    if filtered_parts:
+        return "\n".join(filtered_parts)
+
+    return ""
+
+
+def build_coverage_tutor_response_payload(
+    *,
+    ticket_public_id: str,
+    tutor_choice_card: dict[str, Any],
+    response_payload: dict[str, Any],
+    outcome: str,
+    responded_at: str,
+) -> dict[str, Any]:
+    return {
+        "outcome": outcome,
+        "toAgentId": tutor_choice_card.get("requestSubmittedByAgentId"),
+        "toAgentName": tutor_choice_card.get("requestSubmittedByAgentName"),
+        "toAgentUsername": tutor_choice_card.get("requestSubmittedByAgentUsername"),
+        "ticketId": ticket_public_id,
+        "tutor": sanitize_text(response_payload.get("tutor")) or tutor_choice_card.get("tutor"),
+        "tutorEmail": sanitize_text(response_payload.get("tutorEmail")) or tutor_choice_card.get("tutorEmail"),
+        "cardId": sanitize_text(response_payload.get("cardId")),
+        "relatedTutorChoiceCardId": tutor_choice_card.get("id"),
+        "requestedAt": tutor_choice_card.get("submittedAt"),
+        "respondedAt": responded_at,
+        "sessionDetails": extract_coverage_tutor_response_session_details(response_payload),
+        "replyText": sanitize_text(response_payload.get("replyText") or response_payload.get("message") or response_payload.get("note")),
+        "sessionStartAt": serialize_datetime_value(
+            coerce_datetime(
+                response_payload.get("sessionStartAt")
+                or response_payload.get("sessionAt")
+                or response_payload.get("startAt")
+            )
+        ),
+        "sessionEndAt": serialize_datetime_value(
+            coerce_datetime(
+                response_payload.get("sessionEndAt")
+                or response_payload.get("endAt")
+            )
+        ),
+        "requesterAcknowledged": False,
+    }
+
+
+def build_coverage_tutor_reply_card(
+    *,
+    tutor_choice_card: dict[str, Any],
+    response_payload: dict[str, Any],
+    outcome: str,
+    responded_at: str,
+) -> dict[str, Any]:
+    reply_text = sanitize_text(response_payload.get("replyText") or response_payload.get("message") or response_payload.get("note"))
+    session_details = extract_coverage_tutor_response_session_details(response_payload)
+
+    return {
+        "id": sanitize_text(response_payload.get("responseCardId")) or uuid4().hex,
+        "type": "tutor_reply",
+        "title": "Tutor Accepted" if outcome == "accepted" else "Tutor Rejected",
+        "note": reply_text,
+        "tutor": sanitize_text(response_payload.get("tutor")) or tutor_choice_card.get("tutor") or "",
+        "tutorEmail": sanitize_text(response_payload.get("tutorEmail")) or tutor_choice_card.get("tutorEmail") or "",
+        "sessionDetails": session_details,
+        "replyText": reply_text,
+        "requestStatus": "accepted" if outcome == "accepted" else "refused",
+        "replyOutcome": "accepted" if outcome == "accepted" else "refused",
+        "locked": True,
+        "createdAt": responded_at,
+        "updatedAt": responded_at,
+        "submittedAt": "",
+        "respondedAt": responded_at,
+        "relatedTutorChoiceCardId": tutor_choice_card.get("id") or "",
+        "requestSubmittedByAgentId": tutor_choice_card.get("requestSubmittedByAgentId"),
+        "requestSubmittedByAgentName": tutor_choice_card.get("requestSubmittedByAgentName") or "",
+        "requestSubmittedByAgentUsername": tutor_choice_card.get("requestSubmittedByAgentUsername") or "",
+        "responseToken": "",
+        "sessionStartAt": serialize_datetime_value(
+            coerce_datetime(
+                response_payload.get("sessionStartAt")
+                or response_payload.get("sessionAt")
+                or response_payload.get("startAt")
+            )
+        ),
+        "sessionEndAt": serialize_datetime_value(
+            coerce_datetime(
+                response_payload.get("sessionEndAt")
+                or response_payload.get("endAt")
+            )
+        ),
+        "confirmedAt": "",
+        "confirmedByAgentId": None,
+        "confirmedByAgentName": "",
+        "confirmedByAgentUsername": "",
+        "presentationFiles": [],
+    }
+
+
+coverage_inquiry_line_patterns = {
+    "tutor": re.compile(r"^Tutor:\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    "module": re.compile(r"^Module:\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    "time": re.compile(r"^Preferred Time:\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    "session_dates": re.compile(r"^Session Date:\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    "session_numbers": re.compile(r"^Session Number:\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+    "session_subject": re.compile(r"^Session Subject:\s*(.+)$", re.IGNORECASE | re.MULTILINE),
+}
+
+
+def parse_coverage_inquiry_details(inquiry: Any) -> dict[str, Any] | None:
+    normalized_inquiry = sanitize_text(inquiry)
+    if not normalized_inquiry:
+        return None
+
+    tutor_match = coverage_inquiry_line_patterns["tutor"].search(normalized_inquiry)
+    module_match = coverage_inquiry_line_patterns["module"].search(normalized_inquiry)
+    time_match = coverage_inquiry_line_patterns["time"].search(normalized_inquiry)
+    session_dates_match = coverage_inquiry_line_patterns["session_dates"].search(normalized_inquiry)
+    session_numbers_match = coverage_inquiry_line_patterns["session_numbers"].search(normalized_inquiry)
+    session_subject_match = coverage_inquiry_line_patterns["session_subject"].search(normalized_inquiry)
+
+    tutor = sanitize_text(tutor_match.group(1) if tutor_match else "")
+    module = sanitize_text(module_match.group(1) if module_match else "")
+    time_label = sanitize_text(time_match.group(1) if time_match else "")
+    session_dates = [
+        sanitize_text(value)
+        for value in sanitize_text(session_dates_match.group(1) if session_dates_match else "").split(";")
+        if sanitize_text(value)
+    ]
+    session_numbers = [
+        sanitize_text(value)
+        for value in sanitize_text(session_numbers_match.group(1) if session_numbers_match else "").split(";")
+        if sanitize_text(value)
+    ]
+    session_subjects = [
+        sanitize_text(value)
+        for value in sanitize_text(session_subject_match.group(1) if session_subject_match else "").split(";")
+        if sanitize_text(value)
+    ]
+    session_subject = "; ".join(session_subjects) if len(session_subjects) > 1 else (session_subjects[0] if session_subjects else "")
+
+    if not tutor and not module and not time_label and not session_dates and not session_numbers and not session_subjects:
+        return None
+
+    return {
+        "tutor": tutor,
+        "module": module,
+        "time": time_label,
+        "sessionDates": session_dates,
+        "sessionNumbers": session_numbers,
+        "sessionSubjects": session_subjects,
+        "sessionSubject": session_subject,
+    }
+
+
+def build_coverage_session_details_from_inquiry(inquiry: Any) -> str:
+    parsed_inquiry = parse_coverage_inquiry_details(inquiry)
+    if not parsed_inquiry:
+        return ""
+
+    session_dates = parsed_inquiry.get("sessionDates") or []
+    session_numbers = parsed_inquiry.get("sessionNumbers") or []
+    session_subjects = parsed_inquiry.get("sessionSubjects") or []
+    session_detail_lines = []
+    max_session_count = max(len(session_dates), len(session_numbers), len(session_subjects))
+    if max_session_count > 0:
+        for index in range(max_session_count):
+            session_parts = []
+            session_date = sanitize_text(session_dates[index] if index < len(session_dates) else "")
+            session_number = sanitize_text(session_numbers[index] if index < len(session_numbers) else "")
+            session_subject = sanitize_text(session_subjects[index] if index < len(session_subjects) else "")
+            if session_date:
+                session_parts.append(session_date)
+            if session_number:
+                session_parts.append(f"No. {session_number}")
+            if session_subject:
+                session_parts.append(session_subject)
+            if session_parts:
+                session_detail_lines.append(f"{index + 1}. {' | '.join(session_parts)}")
+
+    return "\n".join(
+        [
+            f"Module: {parsed_inquiry['module']}" if parsed_inquiry.get("module") else "",
+            f"Preferred Time: {parsed_inquiry['time']}" if parsed_inquiry.get("time") else "",
+            "Sessions:" if session_detail_lines else "",
+            *session_detail_lines,
+        ]
+    ).strip()
+
+
+def build_derived_coverage_tutor_choice_card(
+    *,
+    ticket_public_id: str,
+    inquiry: Any,
+    created_at: Any,
+    updated_at: Any,
+    request_submitted_by_agent_id: Any = None,
+    request_submitted_by_agent_name: Any = "",
+    request_submitted_by_agent_username: Any = "",
+) -> dict[str, Any] | None:
+    parsed_inquiry = parse_coverage_inquiry_details(inquiry)
+    if not parsed_inquiry:
+        return None
+
+    created_at_value = serialize_datetime_value(coerce_datetime(created_at)) or datetime.now(timezone.utc).isoformat()
+    updated_at_value = serialize_datetime_value(coerce_datetime(updated_at)) or created_at_value
+
+    return {
+        "id": f"{sanitize_text(ticket_public_id).lower() or 'coverage-ticket'}-tutor-choice",
+        "type": "tutor_choice",
+        "title": "",
+        "note": "",
+        "tutor": parsed_inquiry.get("tutor") or "",
+        "tutorEmail": "",
+        "sessionDetails": build_coverage_session_details_from_inquiry(inquiry),
+        "replyText": "",
+        "requestStatus": "requested",
+        "replyOutcome": "",
+        "locked": True,
+        "createdAt": created_at_value,
+        "updatedAt": updated_at_value,
+        "submittedAt": created_at_value,
+        "respondedAt": "",
+        "relatedTutorChoiceCardId": "",
+        "requestSubmittedByAgentId": parse_assigned_agent_id(request_submitted_by_agent_id),
+        "requestSubmittedByAgentName": sanitize_text(request_submitted_by_agent_name),
+        "requestSubmittedByAgentUsername": sanitize_text(request_submitted_by_agent_username),
+        "responseToken": "",
+        "sessionStartAt": "",
+        "sessionEndAt": "",
+        "confirmedAt": "",
+        "confirmedByAgentId": None,
+        "confirmedByAgentName": "",
+        "confirmedByAgentUsername": "",
+        "presentationFiles": [],
+    }
+
+
+def get_coverage_tutor_response_outcome_for_status_reason(status_reason: Any) -> str:
+    normalized_status_reason = sanitize_text(status_reason).lower()
+    if normalized_status_reason == sanitize_text(STATUS_REASON_TUTOR_ACCEPTED).lower():
+        return "accepted"
+    if normalized_status_reason in {
+        sanitize_text(STATUS_REASON_TUTOR_REJECTED).lower(),
+        sanitize_text(STATUS_REASON_TUTOR_REFUSED).lower(),
+        "rejected",
+        "refused",
+    }:
+        return "rejected"
+    return ""
+
+
+def get_coverage_workflow_card_sort_timestamp(card: dict[str, Any]) -> float:
+    normalized_card = normalize_json_object(card)
+    for field_name in ("respondedAt", "submittedAt", "updatedAt", "createdAt"):
+        field_value = coerce_datetime(normalized_card.get(field_name))
+        if field_value:
+            return field_value.timestamp()
+    return 0.0
+
+
+def build_derived_coverage_tutor_reply_card_id(related_tutor_choice_card_id: Any, outcome: Any) -> str:
+    normalized_related_id = sanitize_text(related_tutor_choice_card_id) or "coverage-card"
+    normalized_outcome = sanitize_text(outcome).lower() or "response"
+    return f"{normalized_related_id}-reply-{normalized_outcome}"
+
+
+def does_coverage_reply_card_match_outcome(card: dict[str, Any], outcome: str) -> bool:
+    normalized_card = normalize_json_object(card)
+    normalized_reply_outcome = sanitize_text(normalized_card.get("replyOutcome")).lower()
+    normalized_request_status = sanitize_text(normalized_card.get("requestStatus")).lower()
+    normalized_title = sanitize_text(normalized_card.get("title")).lower()
+
+    if outcome == "accepted":
+        return (
+            normalized_reply_outcome == "accepted"
+            or normalized_request_status == "accepted"
+            or normalized_title == "tutor accepted"
+        )
+
+    if outcome == "rejected":
+        return (
+            normalized_reply_outcome == "refused"
+            or normalized_request_status == "refused"
+            or normalized_title == "tutor rejected"
+        )
+
+    return False
+
+
+def get_coverage_reply_card_outcome(card: dict[str, Any]) -> str:
+    if does_coverage_reply_card_match_outcome(card, "accepted"):
+        return "accepted"
+    if does_coverage_reply_card_match_outcome(card, "rejected"):
+        return "rejected"
+    return ""
+
+
+def find_latest_submitted_coverage_tutor_choice_card(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    tutor_choice_cards = [
+        normalize_json_object(card)
+        for card in cards
+        if sanitize_text(normalize_json_object(card).get("type")) == "tutor_choice"
+    ]
+    if not tutor_choice_cards:
+        return None
+
+    submitted_cards = [
+        card for card in tutor_choice_cards
+        if (
+            sanitize_text(card.get("submittedAt"))
+            or sanitize_text(card.get("requestStatus")).lower() in {"requested", "accepted", "refused"}
+            or parse_assigned_agent_id(card.get("requestSubmittedByAgentId"))
+        )
+    ]
+    candidate_cards = submitted_cards or tutor_choice_cards
+    return max(
+        candidate_cards,
+        key=lambda card: (
+            get_coverage_workflow_card_sort_timestamp(card),
+            sanitize_text(card.get("id")),
+        ),
+    )
+
+
+def find_coverage_reply_card_for_tutor_choice(
+    cards: list[dict[str, Any]],
+    related_tutor_choice_card_id: Any,
+    outcome: str,
+) -> dict[str, Any] | None:
+    normalized_related_id = sanitize_text(related_tutor_choice_card_id)
+    reply_cards = [
+        normalize_json_object(card)
+        for card in cards
+        if (
+            sanitize_text(normalize_json_object(card).get("type")) == "tutor_reply"
+            and sanitize_text(normalize_json_object(card).get("relatedTutorChoiceCardId")) == normalized_related_id
+            and does_coverage_reply_card_match_outcome(normalize_json_object(card), outcome)
+        )
+    ]
+    if not reply_cards:
+        return None
+
+    return max(
+        reply_cards,
+        key=lambda card: (
+            get_coverage_workflow_card_sort_timestamp(card),
+            sanitize_text(card.get("id")),
+        ),
+    )
+
+
+def find_latest_coverage_reply_card_for_tutor_choice(cards: list[dict[str, Any]], related_tutor_choice_card_id: Any) -> dict[str, Any] | None:
+    normalized_related_id = sanitize_text(related_tutor_choice_card_id)
+    reply_cards = [
+        normalize_json_object(card)
+        for card in cards
+        if (
+            sanitize_text(normalize_json_object(card).get("type")) == "tutor_reply"
+            and sanitize_text(normalize_json_object(card).get("relatedTutorChoiceCardId")) == normalized_related_id
+        )
+    ]
+    if not reply_cards:
+        return None
+
+    return max(
+        reply_cards,
+        key=lambda card: (
+            get_coverage_workflow_card_sort_timestamp(card),
+            sanitize_text(card.get("id")),
+        ),
+    )
+
+
+def get_canonical_coverage_reply_outcome_for_tutor_choice(cards: list[dict[str, Any]], related_tutor_choice_card_id: Any) -> str:
+    normalized_related_id = sanitize_text(related_tutor_choice_card_id)
+    has_accepted_reply = False
+    has_rejected_reply = False
+
+    for card in cards:
+        normalized_card = normalize_json_object(card)
+        if (
+            sanitize_text(normalized_card.get("type")) != "tutor_reply"
+            or sanitize_text(normalized_card.get("relatedTutorChoiceCardId")) != normalized_related_id
+        ):
+            continue
+        if does_coverage_reply_card_match_outcome(normalized_card, "accepted"):
+            has_accepted_reply = True
+        elif does_coverage_reply_card_match_outcome(normalized_card, "rejected"):
+            has_rejected_reply = True
+
+    if has_accepted_reply:
+        return "accepted"
+    if has_rejected_reply:
+        return "rejected"
+    return ""
+
+
+def get_coverage_status_reason_for_outcome(outcome: str, current_status_reason: Any = "") -> str:
+    if outcome == "accepted":
+        return STATUS_REASON_TUTOR_ACCEPTED
+    if outcome == "rejected":
+        normalized_current_status_reason = sanitize_text(current_status_reason).lower()
+        if normalized_current_status_reason in {
+            sanitize_text(STATUS_REASON_TUTOR_REFUSED).lower(),
+            "refused",
+        }:
+            return STATUS_REASON_TUTOR_REFUSED
+        return STATUS_REASON_TUTOR_REJECTED
+    return sanitize_text(current_status_reason)
+
+
+def derive_coverage_tutor_response_state(
+    *,
+    ticket_public_id: str,
+    inquiry: Any = "",
+    status_reason: Any,
+    updated_at: Any,
+    created_at: Any = None,
+    assigned_agent_id: Any = None,
+    assigned_agent_name: Any = "",
+    assigned_agent_username: Any = "",
+    documentation: dict[str, Any],
+    metadata: Any,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    normalized_documentation = normalize_admin_documentation(
+        documentation,
+        fallback_ticket_id=ticket_public_id,
+    )
+    normalized_metadata = normalize_json_object(metadata)
+    latest_response = get_latest_coverage_tutor_response(normalized_metadata)
+    outcome = get_coverage_tutor_response_outcome_for_status_reason(status_reason)
+    if outcome not in {"accepted", "rejected"}:
+        return normalized_documentation, latest_response
+
+    coverage_cards = list(normalized_documentation.get("coverageCards") or [])
+    tutor_choice_card = find_latest_submitted_coverage_tutor_choice_card(coverage_cards)
+    if not tutor_choice_card:
+        fallback_tutor_choice_card = build_derived_coverage_tutor_choice_card(
+            ticket_public_id=ticket_public_id,
+            inquiry=inquiry or normalized_documentation.get("inquiry"),
+            created_at=created_at or updated_at,
+            updated_at=updated_at or created_at,
+            request_submitted_by_agent_id=(
+                latest_response.get("toAgentId") if latest_response else assigned_agent_id
+            ),
+            request_submitted_by_agent_name=(
+                latest_response.get("toAgentName") if latest_response else assigned_agent_name
+            ),
+            request_submitted_by_agent_username=(
+                latest_response.get("toAgentUsername") if latest_response else assigned_agent_username
+            ),
+        )
+        if not fallback_tutor_choice_card:
+            return normalized_documentation, latest_response
+        coverage_cards.append(fallback_tutor_choice_card)
+        normalized_documentation["coverageCards"] = coverage_cards
+        tutor_choice_card = fallback_tutor_choice_card
+
+    related_tutor_choice_card_id = sanitize_text(tutor_choice_card.get("id"))
+    if not related_tutor_choice_card_id:
+        return normalized_documentation, latest_response
+
+    existing_terminal_outcome = get_canonical_coverage_reply_outcome_for_tutor_choice(
+        coverage_cards,
+        related_tutor_choice_card_id,
+    )
+    if existing_terminal_outcome in {"accepted", "rejected"} and existing_terminal_outcome != outcome:
+        outcome = existing_terminal_outcome
+
+    latest_response_matches_current = bool(
+        latest_response
+        and sanitize_text(latest_response.get("outcome")).lower() == outcome
+        and sanitize_text(latest_response.get("relatedTutorChoiceCardId")) == related_tutor_choice_card_id
+    )
+    existing_reply_card = find_coverage_reply_card_for_tutor_choice(
+        coverage_cards,
+        related_tutor_choice_card_id,
+        outcome,
+    )
+
+    responded_at = (
+        serialize_datetime_value(coerce_datetime(latest_response.get("respondedAt")) if latest_response_matches_current else None)
+        or serialize_datetime_value(coerce_datetime(existing_reply_card.get("respondedAt")) if existing_reply_card else None)
+        or serialize_datetime_value(coerce_datetime(updated_at))
+        or datetime.now(timezone.utc).isoformat()
+    )
+    session_details = (
+        sanitize_text(latest_response.get("sessionDetails")) if latest_response_matches_current and latest_response else ""
+    ) or sanitize_text(existing_reply_card.get("sessionDetails") if existing_reply_card else "") or sanitize_text(tutor_choice_card.get("sessionDetails"))
+    reply_text = (
+        sanitize_text(latest_response.get("replyText")) if latest_response_matches_current and latest_response else ""
+    ) or sanitize_text(existing_reply_card.get("replyText") if existing_reply_card else "") or sanitize_text(existing_reply_card.get("note") if existing_reply_card else "")
+    session_start_at = (
+        serialize_datetime_value(coerce_datetime(latest_response.get("sessionStartAt")) if latest_response_matches_current and latest_response else None)
+        or serialize_datetime_value(coerce_datetime(existing_reply_card.get("sessionStartAt")) if existing_reply_card else None))
+    session_start_at = session_start_at or serialize_datetime_value(coerce_datetime(tutor_choice_card.get("sessionStartAt")))
+    session_end_at = (
+        serialize_datetime_value(coerce_datetime(latest_response.get("sessionEndAt")) if latest_response_matches_current and latest_response else None)
+        or serialize_datetime_value(coerce_datetime(existing_reply_card.get("sessionEndAt")) if existing_reply_card else None))
+    session_end_at = session_end_at or serialize_datetime_value(coerce_datetime(tutor_choice_card.get("sessionEndAt")))
+    tutor = (
+        sanitize_text(latest_response.get("tutor")) if latest_response_matches_current and latest_response else ""
+    ) or sanitize_text(existing_reply_card.get("tutor") if existing_reply_card else "") or sanitize_text(tutor_choice_card.get("tutor"))
+    tutor_email = (
+        sanitize_text(latest_response.get("tutorEmail")) if latest_response_matches_current and latest_response else ""
+    ) or sanitize_text(existing_reply_card.get("tutorEmail") if existing_reply_card else "") or sanitize_text(tutor_choice_card.get("tutorEmail"))
+    effective_reply_card_id = sanitize_text(existing_reply_card.get("id") if existing_reply_card else "") or build_derived_coverage_tutor_reply_card_id(
+        related_tutor_choice_card_id,
+        outcome,
+    )
+    requester_acknowledged = bool(latest_response.get("requesterAcknowledged")) if latest_response_matches_current and latest_response else False
+
+    response_payload = {
+        "responseCardId": effective_reply_card_id,
+        "cardId": effective_reply_card_id,
+        "tutor": tutor,
+        "tutorEmail": tutor_email,
+        "sessionDetails": session_details,
+        "replyText": reply_text,
+        "sessionStartAt": session_start_at,
+        "sessionEndAt": session_end_at,
+    }
+
+    effective_reply_card = build_coverage_tutor_reply_card(
+        tutor_choice_card=tutor_choice_card,
+        response_payload=response_payload,
+        outcome=outcome,
+        responded_at=responded_at,
+    )
+    if existing_reply_card:
+        effective_reply_card = {
+            **existing_reply_card,
+            **effective_reply_card,
+            "id": sanitize_text(existing_reply_card.get("id")) or effective_reply_card["id"],
+            "createdAt": sanitize_text(existing_reply_card.get("createdAt")) or effective_reply_card["createdAt"],
+            "updatedAt": sanitize_text(existing_reply_card.get("updatedAt")) or effective_reply_card["updatedAt"],
+            "submittedAt": sanitize_text(existing_reply_card.get("submittedAt")) or effective_reply_card["submittedAt"],
+            "confirmedAt": sanitize_text(existing_reply_card.get("confirmedAt")) or effective_reply_card["confirmedAt"],
+            "confirmedByAgentId": parse_assigned_agent_id(existing_reply_card.get("confirmedByAgentId")),
+            "confirmedByAgentName": sanitize_text(existing_reply_card.get("confirmedByAgentName")),
+            "confirmedByAgentUsername": sanitize_text(existing_reply_card.get("confirmedByAgentUsername")),
+        }
+
+    effective_tutor_choice_card = {
+        **tutor_choice_card,
+        "requestStatus": "accepted" if outcome == "accepted" else "refused",
+        "locked": True,
+        "respondedAt": sanitize_text(tutor_choice_card.get("respondedAt")) or responded_at,
+        "updatedAt": responded_at,
+        "tutor": tutor,
+        "tutorEmail": tutor_email,
+        "sessionDetails": session_details or sanitize_text(tutor_choice_card.get("sessionDetails")),
+        "sessionStartAt": session_start_at or serialize_datetime_value(coerce_datetime(tutor_choice_card.get("sessionStartAt"))),
+        "sessionEndAt": session_end_at or serialize_datetime_value(coerce_datetime(tutor_choice_card.get("sessionEndAt"))),
+    }
+
+    updated_cards: list[dict[str, Any]] = []
+    reply_card_replaced = False
+    tutor_choice_replaced = False
+    for card in coverage_cards:
+        normalized_card = normalize_json_object(card)
+        if sanitize_text(normalized_card.get("id")) == related_tutor_choice_card_id:
+            updated_cards.append(effective_tutor_choice_card)
+            tutor_choice_replaced = True
+            continue
+        if (
+            sanitize_text(normalized_card.get("type")) == "tutor_reply"
+            and sanitize_text(normalized_card.get("relatedTutorChoiceCardId")) == related_tutor_choice_card_id
+            and not does_coverage_reply_card_match_outcome(normalized_card, outcome)
+        ):
+            continue
+        if sanitize_text(normalized_card.get("id")) == sanitize_text(existing_reply_card.get("id") if existing_reply_card else ""):
+            updated_cards.append(effective_reply_card)
+            reply_card_replaced = True
+            continue
+        updated_cards.append(normalized_card)
+
+    if not tutor_choice_replaced:
+        updated_cards.append(effective_tutor_choice_card)
+    if not reply_card_replaced:
+        updated_cards.append(effective_reply_card)
+
+    normalized_documentation["coverageCards"] = updated_cards
+    derived_latest_response = normalize_latest_coverage_tutor_response(
+        {
+            **build_coverage_tutor_response_payload(
+                ticket_public_id=ticket_public_id,
+                tutor_choice_card=effective_tutor_choice_card,
+                response_payload={
+                    "cardId": effective_reply_card["id"],
+                    "tutor": effective_reply_card.get("tutor"),
+                    "tutorEmail": effective_reply_card.get("tutorEmail"),
+                    "sessionDetails": effective_reply_card.get("sessionDetails"),
+                    "replyText": effective_reply_card.get("replyText") or effective_reply_card.get("note"),
+                    "sessionStartAt": effective_reply_card.get("sessionStartAt"),
+                    "sessionEndAt": effective_reply_card.get("sessionEndAt"),
+                },
+                outcome=outcome,
+                responded_at=responded_at,
+            ),
+            "requesterAcknowledged": requester_acknowledged,
+        }
+    )
+
+    return normalized_documentation, (derived_latest_response or latest_response)
+
+
+def is_coverage_session_confirmation_available(card: dict[str, Any], *, now: datetime | None = None) -> bool:
+    if sanitize_text(card.get("type")) != "tutor_reply":
+        return False
+    if sanitize_text(card.get("replyOutcome")) != "accepted":
+        return False
+    if sanitize_text(card.get("confirmedAt")):
+        return False
+
+    session_start_at = coerce_datetime(card.get("sessionStartAt"))
+    if not session_start_at:
+        return False
+
+    comparison_now = now or datetime.now(timezone.utc)
+    return comparison_now >= session_start_at
+
+
+def reconcile_coverage_tutor_requests_from_history(ticket_id: Any, documentation: dict[str, Any]) -> dict[str, Any]:
+    normalized_documentation = normalize_admin_documentation(documentation)
+    if not ticket_id:
+        return normalized_documentation
+
+    coverage_cards = list(normalized_documentation.get("coverageCards") or [])
+
+    request_history_rows = run_query(
+        """
+        SELECT payload, created_at
+        FROM ticket_history
+        WHERE ticket_id = %s
+          AND event_type = 'coverage_tutor_requested'
+        ORDER BY created_at ASC, id ASC
+        """,
+        [ticket_id],
+    )
+    if not request_history_rows:
+        return normalized_documentation
+
+    latest_request_by_card_id: dict[str, dict[str, Any]] = {}
+    for row in request_history_rows:
+        payload = normalize_json_object(row.get("payload"))
+        card_id = sanitize_text(payload.get("cardId"))
+        if not card_id:
+            continue
+        latest_request_by_card_id[card_id] = {
+            "payload": payload,
+            "createdAt": serialize_datetime_value(coerce_datetime(row.get("created_at"))),
+        }
+
+    if not latest_request_by_card_id:
+        return normalized_documentation
+
+    if not coverage_cards:
+        reconstructed_cards: list[dict[str, Any]] = []
+        for request_entry in latest_request_by_card_id.values():
+            payload = request_entry["payload"]
+            requested_at = sanitize_text(payload.get("requestedAt")) or sanitize_text(request_entry.get("createdAt"))
+            reconstructed_cards.append(
+                {
+                    "id": sanitize_text(payload.get("cardId")) or f"{normalized_documentation.get('ticketId') or 'coverage-ticket'}-tutor-choice",
+                    "type": "tutor_choice",
+                    "title": "",
+                    "note": "",
+                    "tutor": sanitize_text(payload.get("tutor")),
+                    "tutorEmail": sanitize_text(payload.get("tutorEmail")),
+                    "sessionDetails": sanitize_text(payload.get("sessionDetails")),
+                    "replyText": "",
+                    "requestStatus": "requested",
+                    "replyOutcome": "",
+                    "locked": True,
+                    "createdAt": requested_at,
+                    "updatedAt": requested_at,
+                    "submittedAt": requested_at,
+                    "respondedAt": "",
+                    "relatedTutorChoiceCardId": "",
+                    "requestSubmittedByAgentId": parse_assigned_agent_id(payload.get("toAgentId")),
+                    "requestSubmittedByAgentName": sanitize_text(payload.get("toAgentName")),
+                    "requestSubmittedByAgentUsername": sanitize_text(payload.get("toAgentUsername")),
+                    "responseToken": "",
+                    "sessionStartAt": "",
+                    "sessionEndAt": "",
+                    "confirmedAt": "",
+                    "confirmedByAgentId": None,
+                    "confirmedByAgentName": "",
+                    "confirmedByAgentUsername": "",
+                    "presentationFiles": [],
+                }
+            )
+
+        normalized_documentation["coverageCards"] = sorted(
+            reconstructed_cards,
+            key=lambda card: (
+                get_coverage_workflow_card_sort_timestamp(card),
+                sanitize_text(card.get("id")),
+            ),
+        )
+        coverage_cards = list(normalized_documentation.get("coverageCards") or [])
+
+    did_change = False
+    reconciled_cards: list[dict[str, Any]] = []
+    for card in coverage_cards:
+        normalized_card = normalize_json_object(card)
+        if sanitize_text(normalized_card.get("type")) != "tutor_choice":
+            reconciled_cards.append(normalized_card)
+            continue
+
+        card_id = sanitize_text(normalized_card.get("id"))
+        request_entry = latest_request_by_card_id.get(card_id)
+        if not request_entry:
+            reconciled_cards.append(normalized_card)
+            continue
+
+        current_request_status = sanitize_text(normalized_card.get("requestStatus")).lower()
+        if current_request_status == "pending":
+            current_request_status = "requested"
+
+        payload = request_entry["payload"]
+        requested_at = (
+            sanitize_text(normalized_card.get("submittedAt"))
+            or sanitize_text(payload.get("requestedAt"))
+            or sanitize_text(request_entry.get("createdAt"))
+        )
+        reconciled_card = {
+            **normalized_card,
+            "tutor": sanitize_text(normalized_card.get("tutor")) or sanitize_text(payload.get("tutor")),
+            "tutorEmail": sanitize_text(normalized_card.get("tutorEmail")) or sanitize_text(payload.get("tutorEmail")),
+            "sessionDetails": sanitize_text(normalized_card.get("sessionDetails")) or sanitize_text(payload.get("sessionDetails")),
+            "locked": True,
+            "requestStatus": current_request_status if current_request_status in {"accepted", "refused"} else "requested",
+            "submittedAt": requested_at,
+            "requestSubmittedByAgentId": parse_assigned_agent_id(normalized_card.get("requestSubmittedByAgentId")) or parse_assigned_agent_id(payload.get("toAgentId")),
+            "requestSubmittedByAgentName": sanitize_text(normalized_card.get("requestSubmittedByAgentName")) or sanitize_text(payload.get("toAgentName")),
+            "requestSubmittedByAgentUsername": sanitize_text(normalized_card.get("requestSubmittedByAgentUsername")) or sanitize_text(payload.get("toAgentUsername")),
+            "updatedAt": sanitize_text(normalized_card.get("updatedAt")) or requested_at,
+        }
+        if reconciled_card != normalized_card:
+            did_change = True
+        reconciled_cards.append(reconciled_card)
+
+    if not did_change:
+        return normalized_documentation
+
+    normalized_documentation["coverageCards"] = reconciled_cards
+    return normalized_documentation
+
+
+def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[str, Any]:
+    if not is_coverage_ticket_record(ticket):
+        return ticket
+
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    current_documentation = normalize_admin_documentation(
+        ticket_metadata.get("admin_documentation"),
+        fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+        fallback_chat_id=build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
+        fallback_ticket_id=ticket.get("public_id") or "",
+    )
+    recovered_documentation = reconcile_coverage_tutor_requests_from_history(ticket.get("id"), current_documentation)
+    current_latest_response = get_latest_coverage_tutor_response(ticket_metadata)
+    outcome = get_coverage_tutor_response_outcome_for_status_reason(ticket.get("status_reason"))
+    if outcome in {"accepted", "rejected"}:
+        derived_documentation, derived_latest_response = derive_coverage_tutor_response_state(
+            ticket_public_id=ticket.get("public_id") or "",
+            inquiry=ticket.get("inquiry"),
+            status_reason=ticket.get("status_reason"),
+            updated_at=ticket.get("updated_at"),
+            created_at=ticket.get("created_at"),
+            assigned_agent_id=ticket.get("assigned_agent_id"),
+            assigned_agent_name=ticket.get("assigned_agent_name"),
+            assigned_agent_username=ticket.get("assigned_agent_username"),
+            documentation=recovered_documentation,
+            metadata=ticket_metadata,
+        )
+    else:
+        derived_documentation = recovered_documentation
+        derived_latest_response = current_latest_response
+
+    effective_outcome = sanitize_text(derived_latest_response.get("outcome") if derived_latest_response else "").lower() or outcome
+    documentation_changed = derived_documentation != current_documentation
+    latest_response_changed = normalize_latest_coverage_tutor_response(current_latest_response) != normalize_latest_coverage_tutor_response(derived_latest_response)
+    next_status_reason = (
+        get_coverage_status_reason_for_outcome(effective_outcome, ticket.get("status_reason"))
+        if effective_outcome in {"accepted", "rejected"}
+        else sanitize_text(ticket.get("status_reason"))
+    )
+    status_reason_changed = next_status_reason != sanitize_text(ticket.get("status_reason"))
+    next_status = "Closed" if effective_outcome == "accepted" else sanitize_text(ticket.get("status")) or "Pending"
+    status_changed = next_status != sanitize_text(ticket.get("status"))
+
+    if not documentation_changed and not latest_response_changed and not status_changed and not status_reason_changed:
+        return ticket
+
+    next_sla_status = ticket.get("sla_status")
+    next_sla_attention_required = bool(ticket.get("sla_attention_required"))
+    next_sla_attention_reason = None
+    if status_changed:
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            next_status,
+            ticket.get("created_at"),
+            ticket.get("sla_status"),
+        )
+
+    updated_ticket_metadata = normalize_json_object(ticket_metadata)
+    updated_ticket_metadata["admin_documentation"] = derived_documentation
+    updated_ticket_metadata[LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY] = derived_latest_response
+    if status_changed:
+        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+
+    next_chat_state = sanitize_text(ticket.get("conversation_status")) or map_conversation_status(next_status)
+    if status_changed:
+        next_chat_state = map_conversation_status(next_status)
+
+    sync_timestamp = datetime.now(timezone.utc)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tickets
+            SET
+              status = %s,
+              status_reason = %s,
+              sla_status = %s,
+              metadata = %s::jsonb,
+              updated_at = NOW(),
+              closed_at = CASE
+                WHEN %s = 'Closed' THEN COALESCE(closed_at, NOW())
+                ELSE closed_at
+              END
+            WHERE id = %s
+            """,
+            [
+                next_status,
+                next_status_reason,
+                next_sla_status,
+                json.dumps(updated_ticket_metadata),
+                next_status,
+                ticket["id"],
+            ],
+        )
+
+        if ticket.get("conversation_id") and (status_changed or latest_response_changed or documentation_changed):
+            cursor.execute(
+                """
+                UPDATE conversations
+                SET
+                  status = %s,
+                  last_message_at = NOW(),
+                  metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                WHERE id = %s
+                """,
+                [
+                    next_chat_state,
+                    json.dumps(
+                        {
+                            "ticket_status": next_status,
+                            "status_reason": next_status_reason,
+                            "chat_state": next_chat_state,
+                            "assigned_agent_id": ticket.get("assigned_agent_id"),
+                            "assigned_team": ticket.get("assigned_team"),
+                        }
+                    ),
+                    ticket["conversation_id"],
+                ],
+            )
+
+    if status_changed:
+        insert_history_event(ticket["id"], "status_changed", None, {"from": ticket.get("status") or "", "to": next_status})
+        if ticket.get("conversation_id") and sanitize_text(next_chat_state).lower() == "closed":
+            persist_conversation_chat_duration(ticket["id"], ticket["conversation_id"])
+
+    if status_reason_changed:
+        insert_history_event(
+            ticket["id"],
+            "status_reason_changed",
+            None,
+            {"from": ticket.get("status_reason") or "", "to": next_status_reason},
+        )
+
+    if latest_response_changed:
+        insert_history_event(ticket["id"], "coverage_tutor_response", None, derived_latest_response)
+
+    synchronized_ticket = dict(ticket)
+    synchronized_ticket["status"] = next_status
+    synchronized_ticket["status_reason"] = next_status_reason
+    synchronized_ticket["sla_status"] = next_sla_status
+    synchronized_ticket["metadata"] = updated_ticket_metadata
+    synchronized_ticket["updated_at"] = sync_timestamp
+    if next_status == "Closed":
+        synchronized_ticket["closed_at"] = ticket.get("closed_at") or sync_timestamp
+    if ticket.get("conversation_id"):
+        synchronized_ticket["conversation_status"] = next_chat_state
+    if status_changed:
+        synchronized_ticket["sla_attention_required"] = next_sla_attention_required
+
+    return synchronized_ticket
 
 
 def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | None:
@@ -1506,6 +3134,7 @@ def is_chat_locked_for_learner(ticket_status: Any, ticket_status_reason: Any) ->
     return sanitize_text(ticket_status) == "Pending" and sanitize_text(ticket_status_reason) in {
         STATUS_REASON_AWAITING_MEETING,
         *QUICK_TICKET_STATUS_REASONS,
+        *COVERAGE_TUTOR_STATUS_REASONS,
     }
 
 
@@ -1532,6 +3161,24 @@ def is_quick_ticket_status_reason(status_reason: Any) -> bool:
     return sanitize_text(status_reason).lower() in {
         sanitize_text(reason).lower() for reason in QUICK_TICKET_STATUS_REASONS
     }
+
+
+def is_coverage_tutor_status_reason(status_reason: Any) -> bool:
+    return sanitize_text(status_reason).lower() in {
+        sanitize_text(reason).lower() for reason in COVERAGE_TUTOR_STATUS_REASONS
+    }
+
+
+def is_coverage_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    direct_value = sanitize_text(ticket.get("technical_subcategory")).lower()
+    if direct_value == "coverage":
+        return True
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return sanitize_text(metadata.get("technical_subcategory")).lower() == "coverage"
 
 
 def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[int] | None = None) -> dict[str, Any]:
@@ -1575,6 +3222,26 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
+    documentation = normalize_admin_documentation(
+        ticket_metadata.get("admin_documentation"),
+        fallback_inquiry=sanitize_text(row.get("inquiry")),
+        fallback_chat_id=build_public_chat_id(row.get("public_id"), row.get("conversation_id"), conversation_metadata),
+        fallback_ticket_id=row.get("public_id") or "",
+    )
+    latest_coverage_tutor_response = get_latest_coverage_tutor_response(ticket_metadata)
+    if is_coverage_ticket_record(row):
+        documentation, latest_coverage_tutor_response = derive_coverage_tutor_response_state(
+            ticket_public_id=row.get("public_id") or "",
+            inquiry=row.get("inquiry"),
+            status_reason=row.get("status_reason"),
+            updated_at=row.get("updated_at"),
+            created_at=row.get("created_at"),
+            assigned_agent_id=row.get("assigned_agent_id"),
+            assigned_agent_name=row.get("assigned_agent_name"),
+            assigned_agent_username=row.get("assigned_agent_username"),
+            documentation=documentation,
+            metadata=ticket_metadata,
+        )
     chat_state = sanitize_text(row.get("conversation_status")).lower()
     if not chat_state:
         chat_state = "closed" if sanitize_text(row.get("status")) == "Closed" else "open"
@@ -1608,15 +3275,12 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "pendingTransferRequest": get_pending_transfer_request(ticket_metadata),
         "pendingEscalationNotification": get_pending_escalation_notification(ticket_metadata),
         "pendingTeamsCallNotification": get_pending_teams_call_notification(ticket_metadata),
+        "pendingCoverageTicketNotification": get_pending_coverage_ticket_notification(ticket_metadata),
         "teamsCallRequested": is_teams_call_requested(ticket_metadata),
         "latestEscalationClosure": get_latest_escalation_closure(ticket_metadata),
         "latestTransferDecision": get_latest_transfer_decision(ticket_metadata),
-        "documentation": normalize_admin_documentation(
-            ticket_metadata.get("admin_documentation"),
-            fallback_inquiry=sanitize_text(row.get("inquiry")),
-            fallback_chat_id=build_public_chat_id(row.get("public_id"), row.get("conversation_id"), conversation_metadata),
-            fallback_ticket_id=row.get("public_id") or "",
-        ),
+        "latestCoverageTutorResponse": latest_coverage_tutor_response,
+        "documentation": documentation,
         "slaStatus": row["sla_status"],
         "slaAttentionRequired": bool(row.get("sla_attention_required")),
         "evidenceCount": int(row.get("evidence_count") or 0),
@@ -1627,18 +3291,12 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
 
 def serialize_ticket_detail(row: dict[str, Any]) -> dict[str, Any]:
     detail = serialize_ticket_summary(row)
-    metadata = normalize_json_object(row.get("metadata"))
     detail.update(
         {
             "inquiry": row["inquiry"],
             "priority": normalize_ticket_priority(row.get("priority")),
             "closedAt": row.get("closed_at"),
-            "documentation": normalize_admin_documentation(
-                metadata.get("admin_documentation"),
-                fallback_inquiry=sanitize_text(row.get("inquiry")),
-                fallback_chat_id=build_public_chat_id(row.get("public_id"), row.get("conversation_id"), row.get("conversation_metadata")),
-                fallback_ticket_id=row.get("public_id") or "",
-            ),
+            "documentation": detail.get("documentation"),
         }
     )
     return detail
@@ -2614,7 +4272,7 @@ def apply_ticket_chat_history_sync(
             [status, next_status_reason, next_sla_status, json.dumps(sla_metadata_patch), status, status, ticket["id"]],
         )
 
-    if status == "Pending" and is_quick_ticket_status_reason(next_status_reason):
+    if status == "Pending" and is_quick_ticket_status_reason(next_status_reason) and not is_coverage_ticket_record(ticket):
         try_auto_assign_quick_ticket(ticket, now=persisted_at)
 
     if map_conversation_status(status) == "closed":
@@ -4416,6 +6074,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
     if not ticket:
         return None
 
+    ticket = synchronize_coverage_tutor_workflow_ticket(ticket)
     apply_ticket_sla_policy(ticket, persist=True)
 
     if ticket.get("conversation_id"):
@@ -5356,6 +7015,7 @@ def list_admin_tickets() -> dict[str, Any]:
         """
     )
 
+    tickets = [synchronize_coverage_tutor_workflow_ticket(ticket) for ticket in tickets]
     tickets = [apply_ticket_sla_policy(ticket, persist=True) for ticket in tickets]
     tickets = sort_tickets_by_priority_and_recency(tickets)
     return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
@@ -5397,6 +7057,22 @@ def do_teams_call_notification_payloads_match(left: Any, right: Any) -> bool:
         int(left_payload["toAgentId"]) == int(right_payload["toAgentId"])
         and sanitize_text(left_payload["ticketId"]) == sanitize_text(right_payload["ticketId"])
         and sanitize_text(left_payload["requestedAt"]) == sanitize_text(right_payload["requestedAt"])
+    )
+
+
+def do_coverage_tutor_response_payloads_match(left: Any, right: Any) -> bool:
+    left_payload = normalize_latest_coverage_tutor_response(left)
+    right_payload = normalize_latest_coverage_tutor_response(right)
+    if not left_payload or not right_payload:
+        return False
+
+    return (
+        sanitize_text(left_payload["outcome"]) == sanitize_text(right_payload["outcome"])
+        and int(left_payload["toAgentId"]) == int(right_payload["toAgentId"])
+        and sanitize_text(left_payload["ticketId"]) == sanitize_text(right_payload["ticketId"])
+        and sanitize_text(left_payload["cardId"]) == sanitize_text(right_payload["cardId"])
+        and sanitize_text(left_payload["relatedTutorChoiceCardId"]) == sanitize_text(right_payload["relatedTutorChoiceCardId"])
+        and sanitize_text(left_payload["respondedAt"]) == sanitize_text(right_payload["respondedAt"])
     )
 
 
@@ -5452,6 +7128,14 @@ def is_current_admin_notification_history_item(event_type: Any, payload: Any, ti
             and not normalize_bool(latest_transfer_decision.get("requesterAcknowledged"))
             and sanitize_text(latest_transfer_decision.get("status")) == normalized_event_type.replace("transfer_request_", "")
             and do_transfer_request_payloads_match(payload, latest_transfer_decision)
+        )
+
+    if normalized_event_type == "coverage_tutor_response":
+        latest_coverage_tutor_response = get_latest_coverage_tutor_response(normalized_ticket_metadata)
+        return bool(
+            latest_coverage_tutor_response
+            and not normalize_bool(latest_coverage_tutor_response.get("requesterAcknowledged"))
+            and do_coverage_tutor_response_payloads_match(payload, latest_coverage_tutor_response)
         )
 
     return False
@@ -5520,10 +7204,11 @@ def list_admin_notifications(actor_username: Any, instance_id: Any, *, limit: An
           OR (h.event_type = 'escalation_closed' AND COALESCE(h.payload ->> 'fromAgentId', '') = %s)
           OR (h.event_type = 'transfer_request_accepted' AND COALESCE(h.payload ->> 'fromAgentId', '') = %s)
           OR (h.event_type = 'transfer_request_rejected' AND COALESCE(h.payload ->> 'fromAgentId', '') = %s)
+          OR (h.event_type = 'coverage_tutor_response' AND COALESCE(h.payload ->> 'toAgentId', '') = %s)
         ORDER BY h.created_at DESC, h.id DESC
         LIMIT %s
         """,
-        [actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, resolved_limit],
+        [actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, resolved_limit],
     )
 
     return {"notifications": [serialize_admin_notification_log_item(row) for row in notifications]}
@@ -5989,6 +7674,8 @@ def reject_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
             SELECT
               t.id,
               t.public_id,
+              t.status_reason,
+              t.updated_at,
               t.metadata
             FROM tickets t
             WHERE t.public_id = %s
@@ -6265,6 +7952,740 @@ def acknowledge_ticket_escalation_closure(public_id: str, payload: dict[str, Any
                 """,
                 [json.dumps(ticket_metadata), ticket["id"]],
             )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+    callback_origin = sanitize_text(payload.get("origin")).rstrip("/")
+    requested_documentation = payload.get("documentation")
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.category,
+              t.technical_subcategory,
+              t.inquiry,
+              t.status,
+              t.status_reason,
+              t.assigned_team,
+              t.assigned_agent_id,
+              t.sla_status,
+              t.metadata,
+              t.created_at,
+              t.conversation_id,
+              l.full_name AS learner_name,
+              l.email AS learner_email
+            FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not is_coverage_ticket_record(ticket):
+            raise ApiError(409, "This ticket is not a coverage ticket.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        existing_documentation = normalize_admin_documentation(
+            ticket_metadata.get("admin_documentation"),
+            fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+            fallback_ticket_id=ticket["public_id"],
+        )
+        if requested_documentation is not None:
+            documentation = freeze_coverage_documentation_snapshot(
+                existing_documentation,
+                normalize_admin_documentation(
+                    requested_documentation,
+                    fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+                    fallback_ticket_id=ticket["public_id"],
+                ),
+            )
+        else:
+            documentation = existing_documentation
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(target_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "Only tutor choice cards can be submitted.")
+        if normalize_bool(target_card.get("locked")) and sanitize_text(target_card.get("requestStatus")) in {"requested", "accepted", "refused"}:
+            raise ApiError(409, "This tutor request has already been submitted.")
+
+        tutor = sanitize_text(target_card.get("tutor"))
+        tutor_email = normalize_email(target_card.get("tutorEmail"))
+        session_details = sanitize_text(target_card.get("sessionDetails"))
+        if not tutor:
+            raise ApiError(400, "Choose a tutor before submitting the request.")
+        if (not tutor_email or not is_valid_email(tutor_email)) and tutor:
+            tutor_email = get_coverage_tutor_email(tutor)
+        if not tutor_email or not is_valid_email(tutor_email):
+            raise ApiError(400, "Please enter a valid tutor e-mail before submitting the request.")
+        if not session_details:
+            raise ApiError(400, "Add the session details before submitting the request.")
+
+        current_assigned_agent_id = parse_assigned_agent_id(ticket.get("assigned_agent_id"))
+        next_assigned_agent_id = current_assigned_agent_id or int(actor_row["id"])
+        next_assigned_team = ticket.get("assigned_team") or "Unassigned"
+        if current_assigned_agent_id is None:
+            next_assigned_team = derive_assigned_team(actor_row)
+
+        timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+        response_token = uuid4().hex
+        request_status_reason = (
+            STATUS_REASON_REREQUESTING
+            if any(
+                sanitize_text(card.get("type")) == "tutor_reply"
+                or (
+                    sanitize_text(card.get("id")) != card_id
+                    and sanitize_text(card.get("type")) == "tutor_choice"
+                    and sanitize_text(card.get("submittedAt"))
+                )
+                for card in coverage_cards
+            )
+            else STATUS_REASON_TUTOR_REQUESTED
+        )
+
+        updated_target_card = {
+            **target_card,
+            "tutorEmail": tutor_email,
+            "locked": True,
+            "requestStatus": "requested",
+            "submittedAt": sanitize_text(target_card.get("submittedAt")) or timestamp,
+            "updatedAt": timestamp,
+            "respondedAt": "",
+            "responseToken": response_token,
+            "requestSubmittedByAgentId": int(actor_row["id"]),
+            "requestSubmittedByAgentName": actor_row.get("full_name") or actor_row["username"],
+            "requestSubmittedByAgentUsername": actor_row["username"],
+        }
+        coverage_cards[card_index] = updated_target_card
+        documentation["coverageCards"] = coverage_cards
+
+        webhook_result = send_coverage_tutor_request_webhook(
+            build_coverage_tutor_request_webhook_payload(
+                ticket,
+                documentation,
+                updated_target_card,
+                actor_row,
+                callback_url=build_coverage_tutor_public_response_base_url(callback_origin),
+            )
+        )
+        if not webhook_result["configured"]:
+            raise ApiError(503, "The tutor request webhook is not configured on the server.")
+        if not webhook_result["delivered"]:
+            raise ApiError(502, "We could not send this tutor request right now.")
+
+        next_status = "Pending"
+        next_status_reason = request_status_reason
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            next_status,
+            ticket.get("created_at"),
+            ticket.get("sla_status"),
+        )
+        updated_ticket_metadata = normalize_json_object(ticket_metadata)
+        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        updated_ticket_metadata["admin_documentation"] = documentation
+        # A fresh tutor request supersedes any prior accepted/refused response.
+        updated_ticket_metadata.pop(LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY, None)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET
+                  status = %s,
+                  status_reason = %s,
+                  assigned_agent_id = %s,
+                  assigned_team = %s,
+                  sla_status = %s,
+                  metadata = %s::jsonb,
+                  updated_at = NOW()
+                WHERE id = %s
+                """,
+                [
+                    next_status,
+                    next_status_reason,
+                    next_assigned_agent_id,
+                    next_assigned_team,
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    ticket["id"],
+                ],
+            )
+
+            if ticket.get("conversation_id"):
+                cursor.execute(
+                    """
+                    UPDATE conversations
+                    SET
+                      status = %s,
+                      last_message_at = NOW(),
+                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                    WHERE id = %s
+                    """,
+                    [
+                        map_conversation_status(next_status),
+                        json.dumps(
+                            {
+                                "ticket_status": next_status,
+                                "status_reason": next_status_reason,
+                                "chat_state": map_conversation_status(next_status),
+                                "assigned_agent_id": next_assigned_agent_id,
+                                "assigned_team": next_assigned_team,
+                            }
+                        ),
+                        ticket["conversation_id"],
+                    ],
+                )
+
+        actor = {
+            "id": actor_row["id"],
+            "role": actor_row["role"],
+            "label": actor_row.get("full_name") or actor_row["username"],
+        }
+        if ticket["status"] != next_status:
+            insert_history_event(ticket["id"], "status_changed", actor, {"from": ticket["status"], "to": next_status})
+        if (ticket.get("status_reason") or "") != next_status_reason:
+            insert_history_event(
+                ticket["id"],
+                "status_reason_changed",
+                actor,
+                {"from": ticket.get("status_reason") or "", "to": next_status_reason},
+            )
+        if current_assigned_agent_id != next_assigned_agent_id:
+            insert_history_event(
+                ticket["id"],
+                "assignment_changed",
+                actor,
+                {
+                    "fromAgentId": current_assigned_agent_id,
+                    "toAgentId": next_assigned_agent_id,
+                    "toAgentName": actor_row.get("full_name") or actor_row["username"],
+                },
+            )
+        insert_history_event(
+            ticket["id"],
+            "coverage_tutor_requested",
+            actor,
+            {
+                "toAgentId": int(actor_row["id"]),
+                "toAgentName": actor_row.get("full_name") or actor_row["username"],
+                "toAgentUsername": actor_row["username"],
+                "ticketId": ticket["public_id"],
+                "cardId": updated_target_card["id"],
+                "tutor": tutor,
+                "tutorEmail": tutor_email,
+                "requestedAt": updated_target_card["submittedAt"],
+                "sessionDetails": session_details,
+            },
+        )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
+    ticket_public_id = sanitize_text(payload.get("ticketId") or payload.get("publicId"))
+    if not ticket_public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    outcome = extract_coverage_tutor_response_outcome(payload)
+    if not outcome:
+        raise ApiError(400, "Please provide a valid tutor response outcome.")
+
+    requested_card_id = sanitize_text(payload.get("cardId") or payload.get("relatedTutorChoiceCardId"))
+    response_token = sanitize_text(payload.get("responseToken"))
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.status,
+              t.status_reason,
+              t.technical_subcategory,
+              t.metadata,
+              t.assigned_team,
+              t.assigned_agent_id,
+              t.sla_status,
+              t.created_at,
+              t.conversation_id
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [ticket_public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not is_coverage_ticket_record(ticket):
+            raise ApiError(409, "This ticket is not a coverage ticket.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        latest_response = get_latest_coverage_tutor_response(ticket_metadata)
+        if latest_response and do_coverage_tutor_response_payloads_match(
+            latest_response,
+            {
+                "outcome": outcome,
+                "toAgentId": latest_response.get("toAgentId"),
+                "ticketId": ticket_public_id,
+                "cardId": requested_card_id or latest_response.get("cardId"),
+                "relatedTutorChoiceCardId": requested_card_id or latest_response.get("relatedTutorChoiceCardId"),
+                "respondedAt": latest_response.get("respondedAt"),
+            },
+        ):
+            detail = fetch_admin_ticket_detail(ticket_public_id)
+            if not detail:
+                raise ApiError(404, "Ticket not found.")
+            return detail
+
+        documentation = normalize_admin_documentation(
+            ticket_metadata.get("admin_documentation"),
+            fallback_ticket_id=ticket["public_id"],
+        )
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=requested_card_id, response_token=response_token)
+        if card_index is None:
+            raise ApiError(404, "The related tutor request was not found.")
+
+        tutor_choice_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(tutor_choice_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "The related coverage card is not a tutor choice card.")
+
+        responded_at = serialize_datetime_value(
+            coerce_datetime(payload.get("respondedAt")) or datetime.now(timezone.utc)
+        ) or datetime.now(timezone.utc).isoformat()
+        existing_reply_card = next(
+            (
+                card for card in coverage_cards
+                if sanitize_text(card.get("type")) == "tutor_reply"
+                and sanitize_text(card.get("relatedTutorChoiceCardId")) == sanitize_text(tutor_choice_card.get("id"))
+            ),
+            None,
+        )
+        if existing_reply_card:
+            detail = fetch_admin_ticket_detail(ticket_public_id)
+            if not detail:
+                raise ApiError(404, "Ticket not found.")
+            return detail
+
+        updated_tutor_choice_card = {
+            **tutor_choice_card,
+            "requestStatus": "accepted" if outcome == "accepted" else "refused",
+            "locked": True,
+            "respondedAt": responded_at,
+            "updatedAt": responded_at,
+        }
+        coverage_cards[card_index] = updated_tutor_choice_card
+        coverage_cards.append(
+            build_coverage_tutor_reply_card(
+                tutor_choice_card=updated_tutor_choice_card,
+                response_payload=payload,
+                outcome=outcome,
+                responded_at=responded_at,
+            )
+        )
+        documentation["coverageCards"] = coverage_cards
+
+        next_status = "Closed" if outcome == "accepted" else "Pending"
+        next_status_reason = STATUS_REASON_TUTOR_ACCEPTED if outcome == "accepted" else STATUS_REASON_TUTOR_REJECTED
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            next_status,
+            ticket.get("created_at"),
+            ticket.get("sla_status"),
+        )
+        updated_ticket_metadata = normalize_json_object(ticket_metadata)
+        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        updated_ticket_metadata["admin_documentation"] = documentation
+        latest_response_payload = build_coverage_tutor_response_payload(
+            ticket_public_id=ticket_public_id,
+            tutor_choice_card=updated_tutor_choice_card,
+            response_payload={
+                **payload,
+                "cardId": requested_card_id or payload.get("cardId") or payload.get("relatedTutorChoiceCardId"),
+            },
+            outcome=outcome,
+            responded_at=responded_at,
+        )
+        updated_ticket_metadata[LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY] = latest_response_payload
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET
+                  status = %s,
+                  status_reason = %s,
+                  sla_status = %s,
+                  metadata = %s::jsonb,
+                  updated_at = NOW(),
+                  closed_at = CASE
+                    WHEN %s = 'Closed' THEN COALESCE(closed_at, NOW())
+                    ELSE closed_at
+                  END
+                WHERE id = %s
+                """,
+                [next_status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), next_status, ticket["id"]],
+            )
+
+            if ticket.get("conversation_id"):
+                cursor.execute(
+                    """
+                    UPDATE conversations
+                    SET
+                      status = %s,
+                      last_message_at = NOW(),
+                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                    WHERE id = %s
+                    """,
+                    [
+                        map_conversation_status(next_status),
+                        json.dumps(
+                            {
+                                "ticket_status": next_status,
+                                "status_reason": next_status_reason,
+                                "chat_state": map_conversation_status(next_status),
+                                "assigned_agent_id": ticket.get("assigned_agent_id"),
+                                "assigned_team": ticket.get("assigned_team"),
+                            }
+                        ),
+                        ticket["conversation_id"],
+                    ],
+                )
+
+        if ticket.get("conversation_id") and sanitize_text(map_conversation_status(next_status)).lower() == "closed":
+            persist_conversation_chat_duration(ticket["id"], ticket["conversation_id"])
+
+        if ticket["status"] != next_status:
+            insert_history_event(ticket["id"], "status_changed", None, {"from": ticket["status"], "to": next_status})
+        if (ticket.get("status_reason") or "") != next_status_reason:
+            insert_history_event(
+                ticket["id"],
+                "status_reason_changed",
+                None,
+                {"from": ticket.get("status_reason") or "", "to": next_status_reason},
+            )
+        insert_history_event(ticket["id"], "coverage_tutor_response", None, latest_response_payload)
+
+    detail = fetch_admin_ticket_detail(ticket_public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def acknowledge_coverage_tutor_response(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.metadata
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation, latest_coverage_tutor_response = derive_coverage_tutor_response_state(
+            ticket_public_id=ticket["public_id"],
+            status_reason=ticket.get("status_reason"),
+            updated_at=ticket.get("updated_at"),
+            documentation=ticket_metadata.get("admin_documentation"),
+            metadata=ticket_metadata,
+        )
+        if not latest_coverage_tutor_response:
+            raise ApiError(409, "There is no coverage tutor update to acknowledge.")
+
+        actor_row = fetch_actor_by_username(actor_username)
+        if not actor_row or int(actor_row["id"]) != int(latest_coverage_tutor_response["toAgentId"]):
+            raise ApiError(403, "Only the requesting admin can acknowledge this tutor update.")
+
+        if latest_coverage_tutor_response.get("requesterAcknowledged"):
+            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
+
+        ticket_metadata["admin_documentation"] = documentation
+        ticket_metadata[LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY] = {
+            **latest_coverage_tutor_response,
+            "requesterAcknowledged": True,
+        }
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def acknowledge_coverage_ticket_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.metadata
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        if not get_pending_coverage_ticket_notification(ticket_metadata):
+            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
+
+        ticket_metadata.pop(PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY, None)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.status,
+              t.status_reason,
+              t.technical_subcategory,
+              t.metadata,
+              t.assigned_team,
+              t.assigned_agent_id,
+              t.sla_status,
+              t.created_at,
+              t.updated_at,
+              t.conversation_id
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not is_coverage_ticket_record(ticket):
+            raise ApiError(409, "This ticket is not a coverage ticket.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation, _ = derive_coverage_tutor_response_state(
+            ticket_public_id=ticket["public_id"],
+            status_reason=ticket.get("status_reason"),
+            updated_at=ticket.get("updated_at"),
+            documentation=ticket_metadata.get("admin_documentation"),
+            metadata=ticket_metadata,
+        )
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if not is_coverage_session_confirmation_available(target_card):
+            raise ApiError(409, "This session cannot be confirmed yet.")
+
+        confirmed_at = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+        updated_cards: list[dict[str, Any]] = []
+        for card in coverage_cards:
+            updated_card = {
+                **card,
+                "locked": True,
+                "updatedAt": confirmed_at,
+            }
+            if sanitize_text(card.get("id")) == card_id:
+                updated_card.update(
+                    {
+                        "confirmedAt": confirmed_at,
+                        "confirmedByAgentId": int(actor_row["id"]),
+                        "confirmedByAgentName": actor_row.get("full_name") or actor_row["username"],
+                        "confirmedByAgentUsername": actor_row["username"],
+                    }
+                )
+            updated_cards.append(updated_card)
+        documentation["coverageCards"] = updated_cards
+
+        next_status = "Closed"
+        next_status_reason = STATUS_REASON_CLOSED_BY_AGENT
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+            next_status,
+            ticket.get("created_at"),
+            ticket.get("sla_status"),
+        )
+        updated_ticket_metadata = normalize_json_object(ticket_metadata)
+        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        updated_ticket_metadata["admin_documentation"] = documentation
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET
+                  status = %s,
+                  status_reason = %s,
+                  sla_status = %s,
+                  metadata = %s::jsonb,
+                  updated_at = NOW(),
+                  closed_at = NOW()
+                WHERE id = %s
+                """,
+                [next_status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), ticket["id"]],
+            )
+
+            if ticket.get("conversation_id"):
+                cursor.execute(
+                    """
+                    UPDATE conversations
+                    SET
+                      status = %s,
+                      last_message_at = NOW(),
+                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                    WHERE id = %s
+                    """,
+                    [
+                        map_conversation_status(next_status),
+                        json.dumps(
+                            {
+                                "ticket_status": next_status,
+                                "status_reason": next_status_reason,
+                                "chat_state": map_conversation_status(next_status),
+                                "assigned_agent_id": ticket.get("assigned_agent_id"),
+                                "assigned_team": ticket.get("assigned_team"),
+                            }
+                        ),
+                        ticket["conversation_id"],
+                    ],
+                )
+
+        actor = {
+            "id": actor_row["id"],
+            "role": actor_row["role"],
+            "label": actor_row.get("full_name") or actor_row["username"],
+        }
+        if ticket["status"] != next_status:
+            insert_history_event(ticket["id"], "status_changed", actor, {"from": ticket["status"], "to": next_status})
+        if (ticket.get("status_reason") or "") != next_status_reason:
+            insert_history_event(
+                ticket["id"],
+                "status_reason_changed",
+                actor,
+                {"from": ticket.get("status_reason") or "", "to": next_status_reason},
+            )
+        insert_history_event(
+            ticket["id"],
+            "coverage_session_confirmed",
+            actor,
+            {
+                "ticketId": ticket["public_id"],
+                "cardId": card_id,
+                "tutor": sanitize_text(target_card.get("tutor")),
+                "confirmedAt": confirmed_at,
+                "confirmedById": int(actor_row["id"]),
+                "confirmedByName": actor_row.get("full_name") or actor_row["username"],
+                "confirmedByUsername": actor_row["username"],
+            },
+        )
 
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:
@@ -7316,6 +9737,16 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
         apply_ticket_sla_policy(ticket)
 
+        if (
+            requested_status_reason is not None
+            and is_coverage_ticket_record(ticket)
+            and is_coverage_tutor_status_reason(requested_status_reason)
+        ):
+            raise ApiError(
+                409,
+                "Coverage tutor status reasons are managed by the tutor workflow only.",
+            )
+
         if requested_status is not None and requested_status != ticket["status"] and not note:
             raise ApiError(400, "Add an internal note before changing the ticket status.")
 
@@ -7336,8 +9767,6 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
             if actor_role != ROLE_SUPERADMIN:
                 raise ApiError(403, "Only superadmins can assign tickets.")
-            if current_assigned_agent_id is not None:
-                raise ApiError(409, "Only unassigned tickets can be assigned from this screen.")
             if parsed_assigned_agent_id is None:
                 raise ApiError(400, "Select an admin before assigning this ticket.")
 
@@ -7379,6 +9808,22 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                 "role": "agent",
             }
 
+        auto_assigned_actor = None
+        if (
+            not has_assigned_agent_input
+            and current_assigned_agent_id is None
+            and actor_row
+            and sanitize_text(actor_row.get("role")).lower() in {ROLE_ADMIN, ROLE_SUPERADMIN}
+        ):
+            auto_assigned_actor = {
+                "id": int(actor_row["id"]),
+                "username": actor_row["username"],
+                "full_name": actor_row.get("full_name") or actor_row["username"],
+                "email": actor_row.get("email"),
+                "role": actor_row["role"],
+            }
+            assigned_agent = auto_assigned_actor
+
         next_status = requested_status or ticket["status"]
         is_escalation_notification = next_status == "Pending" and requested_status_reason == STATUS_REASON_ESCALATION
         if is_escalation_notification and parsed_escalation_agent_id is None:
@@ -7415,6 +9860,11 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                 fallback_chat_id=chat_public_id,
                 fallback_ticket_id=ticket["public_id"],
             )
+            if is_coverage_ticket_record(ticket):
+                documentation_payload = freeze_coverage_documentation_snapshot(
+                    normalize_json_object(ticket.get("metadata")).get("admin_documentation"),
+                    documentation_payload,
+                )
             updated_ticket_metadata["admin_documentation"] = documentation_payload
 
         if is_escalation_notification and escalation_target_agent:
@@ -7466,10 +9916,14 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             updated_ticket_metadata.pop(PENDING_ESCALATION_NOTIFICATION_METADATA_KEY, None)
             updated_ticket_metadata[LATEST_ESCALATION_CLOSURE_METADATA_KEY] = latest_escalation_closure
 
-        next_assigned_agent_id = parsed_assigned_agent_id if has_assigned_agent_input else ticket.get("assigned_agent_id")
+        next_assigned_agent_id = (
+            parsed_assigned_agent_id
+            if has_assigned_agent_input
+            else (auto_assigned_actor["id"] if auto_assigned_actor else ticket.get("assigned_agent_id"))
+        )
         if requested_assigned_team is not None:
             next_assigned_team = requested_assigned_team or derive_assigned_team(assigned_agent)
-        elif has_assigned_agent_input:
+        elif has_assigned_agent_input or auto_assigned_actor:
             next_assigned_team = derive_assigned_team(assigned_agent)
         else:
             next_assigned_team = ticket["assigned_team"]
@@ -7703,6 +10157,14 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     raise ApiError(500, "We could not create the ticket right now.")
 
                 public_id = build_public_ticket_id(int(ticket_row["id"]))
+                if technical_subcategory == "Coverage":
+                    ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {
+                        "ticketId": public_id,
+                        "requesterName": requester.get("display_name") or learner.get("full_name") or learner["email"],
+                        "requesterEmail": learner["email"],
+                        "requesterRole": requester_role,
+                        "createdAt": serialize_datetime_value(ticket_row.get("created_at")) or serialize_datetime_value(datetime.now(timezone.utc)),
+                    }
 
                 cursor.execute(
                     """
@@ -7749,10 +10211,10 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 cursor.execute(
                     """
                     UPDATE tickets
-                    SET public_id = %s, conversation_id = %s, updated_at = NOW()
+                    SET public_id = %s, conversation_id = %s, metadata = %s::jsonb, updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [public_id, conversation_id, ticket_row["id"]],
+                    [public_id, conversation_id, json.dumps(ticket_metadata), ticket_row["id"]],
                 )
 
                 if conversation_id:

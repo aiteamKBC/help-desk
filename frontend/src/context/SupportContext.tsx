@@ -3,7 +3,7 @@ import { createContext, useContext, useEffect, useState, ReactNode } from "react
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
-export type TechnicalSubcategory = "Aptem" | "LMS" | "Teams" | "Others" | "";
+export type TechnicalSubcategory = "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
 export type RequesterRole = "user" | "coach" | "employer";
 
 export interface ChatMessage {
@@ -89,7 +89,14 @@ function normalizeTechnicalSubcategory(
   value: unknown,
   fallback: TechnicalSubcategory = defaultTicket.technicalSubcategory,
 ): TechnicalSubcategory {
-  if (value === "Aptem" || value === "LMS" || value === "Teams" || value === "Others" || value === "") {
+  if (
+    value === "Aptem"
+    || value === "Coverage"
+    || value === "LMS"
+    || value === "Teams"
+    || value === "Others"
+    || value === ""
+  ) {
     return value;
   }
 
@@ -164,9 +171,12 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
 
   return {
     id: ticket.id,
+    learnerName: ticket.learnerName,
+    email: ticket.email,
     requesterRole: ticket.requesterRole,
     category: ticket.category,
     technicalSubcategory: ticket.technicalSubcategory,
+    inquiry: ticket.inquiry,
     status: ticket.status,
     statusReason: ticket.statusReason,
     assignedAgentId: ticket.assignedAgentId,

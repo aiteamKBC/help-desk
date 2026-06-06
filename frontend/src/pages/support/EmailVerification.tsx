@@ -83,7 +83,7 @@ interface RestoredTicketPayload {
   email: string;
   requesterRole?: RequesterRole;
   category: "" | "Learning" | "Technical" | "Others";
-  technicalSubcategory: "" | "Aptem" | "LMS" | "Teams" | "Others";
+  technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
   inquiry: string;
   status: "Open" | "Pending" | "Closed";
   statusReason?: string;
@@ -203,7 +203,7 @@ const EmailVerification = () => {
               email: string;
               requesterRole?: RequesterRole;
               category: "" | "Learning" | "Technical" | "Others";
-              technicalSubcategory: "" | "Aptem" | "LMS" | "Teams" | "Others";
+              technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
               inquiry: string;
               status: "Open" | "Pending" | "Closed";
               statusReason?: string;

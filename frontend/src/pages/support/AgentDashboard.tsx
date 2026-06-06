@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Bell,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -19,6 +20,7 @@ import {
   LogOut,
   Mail,
   MessageSquareText,
+  Paperclip,
   Phone,
   RefreshCw,
   Search,
@@ -78,6 +80,7 @@ import {
   setAdminSessionOnWindow,
   type AdminSession,
 } from "@/lib/adminSession";
+import { fetchCoverageOptions, fetchCoverageTutorEmail, parseCoverageInquiry } from "@/lib/coverageSupport";
 import { buildCsrfHeaders } from "@/lib/csrf";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -135,6 +138,14 @@ interface PendingTeamsCallNotification {
   requestedAt: string;
 }
 
+interface PendingCoverageTicketNotification {
+  ticketId: string;
+  requesterName: string;
+  requesterEmail: string;
+  requesterRole: string;
+  createdAt: string;
+}
+
 interface LatestEscalationClosure {
   fromAgentId: number;
   fromAgentName: string;
@@ -170,6 +181,25 @@ interface LatestTransferDecision {
   requesterAcknowledged: boolean;
 }
 
+interface LatestCoverageTutorResponse {
+  outcome: "accepted" | "rejected";
+  toAgentId: number;
+  toAgentName: string;
+  toAgentUsername: string;
+  ticketId: string;
+  tutor: string;
+  tutorEmail: string;
+  cardId: string;
+  relatedTutorChoiceCardId: string;
+  requestedAt: string | null;
+  respondedAt: string;
+  sessionDetails: string;
+  replyText: string;
+  sessionStartAt: string | null;
+  sessionEndAt: string | null;
+  requesterAcknowledged: boolean;
+}
+
 interface TicketSummary {
   id: string;
   learnerName: string;
@@ -197,9 +227,11 @@ interface TicketSummary {
   pendingTransferRequest?: PendingTransferRequest | null;
   pendingEscalationNotification?: PendingEscalationNotification | null;
   pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
+  pendingCoverageTicketNotification?: PendingCoverageTicketNotification | null;
   teamsCallRequested?: boolean;
   latestEscalationClosure?: LatestEscalationClosure | null;
   latestTransferDecision?: LatestTransferDecision | null;
+  latestCoverageTutorResponse?: LatestCoverageTutorResponse | null;
   documentation?: AdminDocumentation | null;
   slaStatus: "Pending Review" | "On Track" | "Breached";
   slaAttentionRequired?: boolean;
@@ -271,6 +303,48 @@ interface DocumentationImage {
   dataUrl: string;
 }
 
+interface CoverageCardAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl: string;
+}
+
+type CoverageWorkflowCardType = "tutor_choice" | "tutor_reply" | "note";
+type CoverageTutorRequestStatus = "draft" | "requested" | "accepted" | "refused";
+type CoverageTutorReplyOutcome = "" | "accepted" | "refused";
+
+interface CoverageWorkflowCard {
+  id: string;
+  type: CoverageWorkflowCardType;
+  title: string;
+  note: string;
+  tutor: string;
+  tutorEmail: string;
+  sessionDetails: string;
+  replyText: string;
+  requestStatus: CoverageTutorRequestStatus;
+  replyOutcome: CoverageTutorReplyOutcome;
+  locked: boolean;
+  createdAt: string;
+  updatedAt: string;
+  submittedAt: string;
+  respondedAt: string;
+  relatedTutorChoiceCardId: string;
+  requestSubmittedByAgentId?: number | null;
+  requestSubmittedByAgentName?: string;
+  requestSubmittedByAgentUsername?: string;
+  responseToken?: string;
+  sessionStartAt?: string;
+  sessionEndAt?: string;
+  confirmedAt?: string;
+  confirmedByAgentId?: number | null;
+  confirmedByAgentName?: string;
+  confirmedByAgentUsername?: string;
+  presentationFiles: CoverageCardAttachment[];
+}
+
 interface AdminDocumentation {
   inquiry: string;
   symptoms: string;
@@ -285,6 +359,8 @@ interface AdminDocumentation {
   escalationAgentId?: number | null;
   escalationAgentName?: string;
   escalationNote?: string;
+  coverageNotes: string;
+  coverageCards: CoverageWorkflowCard[];
   errorImages: DocumentationImage[];
 }
 
@@ -375,11 +451,12 @@ type AdminConsoleStatus = (typeof adminConsoleStatuses)[number];
 type AdminSelectableConsoleStatus = (typeof adminSelectableConsoleStatuses)[number];
 type DocumentationWorkflowStatus = (typeof documentationWorkflowStatuses)[number];
 type DocumentationIssuesAddressed = "yes" | "no" | "";
-type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreached" | "quickResolution" | "escalation";
+type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreached" | "quickResolution" | "escalation" | "coverage";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
-type AdminView = "dashboard" | "console" | "management";
+type AdminView = "dashboard" | "coverage" | "console" | "management";
 type TicketDetailTab = "conversation" | "documentation" | "details";
+type CoverageWorkspaceTab = "documentation" | "details";
 
 function buildAdminJsonHeaders() {
   return buildCsrfHeaders({
@@ -424,6 +501,7 @@ const AgentDashboard = () => {
   const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
+  const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [documentationStep, setDocumentationStep] = useState(1);
   const [documentationTicketStatus, setDocumentationTicketStatus] = useState<DocumentationWorkflowStatus | "">("");
   const [documentationStatusReason, setDocumentationStatusReason] = useState("");
@@ -447,6 +525,7 @@ const AgentDashboard = () => {
   const [transferReason, setTransferReason] = useState("");
   const [isSendingAiMessage, setIsSendingAiMessage] = useState(false);
   const [isSavingDocumentation, setIsSavingDocumentation] = useState(false);
+  const [isSavingActiveDocumentation, setIsSavingActiveDocumentation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
@@ -469,6 +548,8 @@ const AgentDashboard = () => {
     && !!(session?.legacyAdminAccess || session?.entraDirectoryAdmin);
   const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
   const isConsoleView = adminView === "console";
+  const isCoverageDashboardView = adminView === "coverage";
+  const isDashboardLikeView = adminView === "dashboard" || adminView === "coverage";
   const useCompactAdminSidebar = !isStackedAdminLayout && isAdminSidebarCollapsed;
   const trimmedNotes = notes.trim();
   const dashboardSessionAgentName = session?.fullName || session?.username || "Me";
@@ -482,6 +563,14 @@ const AgentDashboard = () => {
   const compactConsoleSearch = compactConsoleSearchValue(normalizedConsoleSearch);
   const normalizedDashboardSearch = normalizeConsoleSearchValue(dashboardSearch);
   const compactDashboardSearch = compactConsoleSearchValue(normalizedDashboardSearch);
+  const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
+  const activeCoverageDocumentationBaseline = activeDetail && isActiveCoverageTicket
+    ? buildCoverageDocumentationDraft(activeDetail.ticket)
+    : null;
+  const activeCoverageDocumentationDraft = activeDocumentationDraft || activeCoverageDocumentationBaseline;
+  const activeCoverageDocumentationReadOnly = Boolean(activeDetail) && activeDetail.ticket.status === "Closed";
+  const activeCoverageDocumentationDirty = Boolean(activeCoverageDocumentationBaseline && activeDocumentationDraft)
+    && JSON.stringify(activeDocumentationDraft) !== JSON.stringify(activeCoverageDocumentationBaseline);
   const activeAgents = agents.filter((agent) => agent.isActive !== false && isStaffSupportAccount(agent) && agent.legacySupportAccess === true);
   const signedInAgent = agents.find((agent) => (
     (session?.id && agent.id === session.id)
@@ -764,7 +853,7 @@ const AgentDashboard = () => {
   const busyAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
   const offAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
   const dashboardAgentFilterOptions = [
-    { value: "all" as DashboardAssignedFilter, label: "All Tickets" },
+    { value: "all" as DashboardAssignedFilter, label: isCoverageDashboardView ? "All Coverage Tickets" : "All Tickets" },
     ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "unassigned" as DashboardAssignedFilter, label: "Unassigned" },
     ...sortedAgents
@@ -775,12 +864,15 @@ const AgentDashboard = () => {
       })),
   ];
   const assignableAdminAgents = sortedAgents.filter((agent) => (agent.role || "").toLowerCase() === "admin");
+  const dashboardBaseTickets = isCoverageDashboardView
+    ? tickets.filter((ticket) => isCoverageTicket(ticket))
+    : tickets;
   const dashboardAssignmentScopedTickets = filterDashboardTicketsByAssignee(
-    tickets,
+    dashboardBaseTickets,
     dashboardAssignedFilter,
     dashboardSessionAgentId,
   );
-  const quickResolutionTickets = dashboardAssignmentScopedTickets.filter(isQuickResolutionTicket);
+  const quickResolutionTickets = dashboardAssignmentScopedTickets.filter(isDashboardQuickResolutionTicket);
   const scopedDashboardTickets = filterDashboardTickets(dashboardAssignmentScopedTickets, dashboardTicketFilter);
   const visibleDashboardTickets = [...scopedDashboardTickets]
     .filter((ticket) => {
@@ -836,7 +928,9 @@ const AgentDashboard = () => {
         ? leftTimestamp - rightTimestamp
         : rightTimestamp - leftTimestamp;
     });
-  const dashboardTableTitle = getDashboardTableTitle(dashboardTicketFilter);
+  const dashboardTableTitle = dashboardTicketFilter === "all" && isCoverageDashboardView
+    ? "Coverage Tickets"
+    : getDashboardTableTitle(dashboardTicketFilter);
   const dashboardAssignedFilterLabel = getDashboardAssignedFilterLabel(
     dashboardAssignedFilter,
     dashboardSessionAgentName,
@@ -852,7 +946,7 @@ const AgentDashboard = () => {
     visibleDashboardTickets.length,
     scopedDashboardTickets.length,
     dashboardAssignmentScopedTickets.length,
-    tickets.length,
+    dashboardBaseTickets.length,
     Boolean(normalizedDashboardSearch),
     dashboardAssignedFilter !== "all",
     dashboardAssignedFilterLabel,
@@ -861,7 +955,9 @@ const AgentDashboard = () => {
     ? "No matching tickets found for this search."
     : dashboardAssignedFilter !== "all"
       ? getDashboardAssignedFilterEmptyMessage(dashboardTicketFilter, dashboardAssignedFilterEmptyTarget)
-      : getDashboardEmptyMessage(dashboardTicketFilter);
+      : isCoverageDashboardView && dashboardTicketFilter === "all"
+        ? "No coverage tickets have been created yet."
+        : getDashboardEmptyMessage(dashboardTicketFilter);
   const isConsoleOwnedBySignedInAgent = Boolean(
     consoleDetail
     && resolvedSessionAgentId
@@ -869,8 +965,7 @@ const AgentDashboard = () => {
   );
   const canAssignActiveTicket = Boolean(
     isSuperadminSession
-    && activeDetail
-    && !activeDetail.ticket.assignedAgentId,
+    && activeDetail,
   );
   const isActiveTicketAlreadyAssigned = Boolean(activeDetail?.ticket.assignedAgentId);
   const canForceCloseConsoleChat = Boolean(consoleDetail)
@@ -981,12 +1076,39 @@ const AgentDashboard = () => {
       const rightClosedAt = Date.parse(rightTicket.latestEscalationClosure?.closedAt || "");
       return (Number.isNaN(rightClosedAt) ? 0 : rightClosedAt) - (Number.isNaN(leftClosedAt) ? 0 : leftClosedAt);
     });
+  const coverageTutorResponseNotifications = tickets
+    .filter((ticket) => {
+      const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
+      if (!latestCoverageTutorResponse || latestCoverageTutorResponse.requesterAcknowledged) {
+        return false;
+      }
+
+      if (resolvedSessionAgentId) {
+        return latestCoverageTutorResponse.toAgentId === resolvedSessionAgentId;
+      }
+
+      return sanitizeAssignedAgentName(latestCoverageTutorResponse.toAgentUsername) === sanitizeAssignedAgentName(session?.username || "");
+    })
+    .sort((leftTicket, rightTicket) => {
+      const leftRespondedAt = Date.parse(leftTicket.latestCoverageTutorResponse?.respondedAt || "");
+      const rightRespondedAt = Date.parse(rightTicket.latestCoverageTutorResponse?.respondedAt || "");
+      return (Number.isNaN(rightRespondedAt) ? 0 : rightRespondedAt) - (Number.isNaN(leftRespondedAt) ? 0 : leftRespondedAt);
+    });
+  const coverageTicketNotifications = tickets
+    .filter((ticket) => Boolean(ticket.pendingCoverageTicketNotification))
+    .sort((leftTicket, rightTicket) => {
+      const leftCreatedAt = Date.parse(leftTicket.pendingCoverageTicketNotification?.createdAt || leftTicket.createdAt || "");
+      const rightCreatedAt = Date.parse(rightTicket.pendingCoverageTicketNotification?.createdAt || rightTicket.createdAt || "");
+      return (Number.isNaN(rightCreatedAt) ? 0 : rightCreatedAt) - (Number.isNaN(leftCreatedAt) ? 0 : leftCreatedAt);
+    });
   const totalAdminNotificationCount = pendingTransferRequests.length
     + pendingEscalationNotifications.length
     + pendingTeamsCallNotifications.length
     + waitingLiveChatNotifications.length
     + transferDecisionNotifications.length
-    + escalationClosureNotifications.length;
+    + escalationClosureNotifications.length
+    + coverageTicketNotifications.length
+    + coverageTutorResponseNotifications.length;
   const archivedNotificationLog = notificationLog
     .filter((item) => !item.isCurrent)
     .slice(0, 12);
@@ -1172,6 +1294,15 @@ const AgentDashboard = () => {
   }, [consoleDetail?.ticket.id, chatbotWorkflowConfigured]);
 
   useEffect(() => {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      setActiveDocumentationDraft(null);
+      return;
+    }
+
+    setActiveDocumentationDraft(buildCoverageDocumentationDraft(activeDetail.ticket));
+  }, [activeDetail?.ticket.id, activeDetail?.ticket.updatedAt, activeDetail?.ticket.technicalSubcategory]);
+
+  useEffect(() => {
     if (adminView !== "console" || !consoleDetail) {
       previousConsoleChatStateRef.current = null;
       return;
@@ -1219,7 +1350,7 @@ const AgentDashboard = () => {
   }, [adminView, consoleTicketId, isConsoleOpening, isSendingConsoleChat]);
 
   useEffect(() => {
-    if (adminView !== "dashboard") {
+    if (!isDashboardLikeView) {
       return;
     }
 
@@ -1235,7 +1366,7 @@ const AgentDashboard = () => {
       window.clearInterval(ticketsIntervalId);
       window.clearInterval(agentsIntervalId);
     };
-  }, [adminView]);
+  }, [isDashboardLikeView]);
 
   useEffect(() => {
     if (!canManageUsers && adminView === "management") {
@@ -1245,12 +1376,27 @@ const AgentDashboard = () => {
 
   useEffect(() => {
     const nextNotificationKeys = new Set<string>();
+    const newCoverageTickets: TicketSummary[] = [];
     const newTransferRequests: TicketSummary[] = [];
     const newEscalationNotifications: TicketSummary[] = [];
     const newTeamsCallNotifications: TicketSummary[] = [];
     const newWaitingLiveChatNotifications: TicketSummary[] = [];
     const newTransferDecisions: TicketSummary[] = [];
     const newEscalationClosures: TicketSummary[] = [];
+    const newCoverageTutorResponses: TicketSummary[] = [];
+
+    for (const ticket of coverageTicketNotifications) {
+      const pendingCoverageTicketNotification = ticket.pendingCoverageTicketNotification;
+      if (!pendingCoverageTicketNotification) {
+        continue;
+      }
+
+      const notificationKey = `coverage-ticket:${ticket.id}:${pendingCoverageTicketNotification.createdAt}`;
+      nextNotificationKeys.add(notificationKey);
+      if (!seenTransferNotificationKeysRef.current.has(notificationKey)) {
+        newCoverageTickets.push(ticket);
+      }
+    }
 
     for (const ticket of pendingTransferRequests) {
       const pendingTransferRequest = ticket.pendingTransferRequest;
@@ -1325,10 +1471,39 @@ const AgentDashboard = () => {
       }
     }
 
+    for (const ticket of coverageTutorResponseNotifications) {
+      const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
+      if (!latestCoverageTutorResponse) {
+        continue;
+      }
+
+      const notificationKey = `coverage-response:${ticket.id}:${latestCoverageTutorResponse.cardId}:${latestCoverageTutorResponse.respondedAt}`;
+      nextNotificationKeys.add(notificationKey);
+      if (!seenTransferNotificationKeysRef.current.has(notificationKey)) {
+        newCoverageTutorResponses.push(ticket);
+      }
+    }
+
     if (!hasHydratedTransferNotificationsRef.current) {
       seenTransferNotificationKeysRef.current = nextNotificationKeys;
       hasHydratedTransferNotificationsRef.current = true;
       return;
+    }
+
+    for (const ticket of newCoverageTickets) {
+      const pendingCoverageTicketNotification = ticket.pendingCoverageTicketNotification;
+      if (!pendingCoverageTicketNotification) {
+        continue;
+      }
+
+      toast.info(
+        `New coverage ticket ${ticket.id} created for ${pendingCoverageTicketNotification.requesterName || ticket.learnerName || ticket.email || "requester"}.`,
+      );
+      showAdminDesktopNotification(
+        `coverage-ticket:${ticket.id}:${pendingCoverageTicketNotification.createdAt}`,
+        "New Coverage Ticket",
+        `${ticket.id} • ${pendingCoverageTicketNotification.requesterName || ticket.learnerName || ticket.email || "Requester"}`,
+      );
     }
 
     for (const ticket of newTransferRequests) {
@@ -1418,19 +1593,40 @@ const AgentDashboard = () => {
       );
     }
 
+    for (const ticket of newCoverageTutorResponses) {
+      const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
+      if (!latestCoverageTutorResponse) {
+        continue;
+      }
+
+      const wasAccepted = latestCoverageTutorResponse.outcome === "accepted";
+      toast.info(
+        wasAccepted
+          ? `Tutor accepted coverage session for ${ticket.id}. The ticket was closed automatically.`
+          : `Tutor refused coverage session for ${ticket.id}.`,
+      );
+      showAdminDesktopNotification(
+        `coverage-response:${ticket.id}:${latestCoverageTutorResponse.cardId}:${latestCoverageTutorResponse.respondedAt}`,
+        wasAccepted ? "Tutor Accepted • Ticket Closed" : "Tutor Refused",
+        `${ticket.id} • ${latestCoverageTutorResponse.tutor}`,
+      );
+    }
+
     if (
-      newTransferRequests.length > 0
+      newCoverageTickets.length > 0
+      || newTransferRequests.length > 0
       || newEscalationNotifications.length > 0
       || newTeamsCallNotifications.length > 0
       || newWaitingLiveChatNotifications.length > 0
       || newTransferDecisions.length > 0
       || newEscalationClosures.length > 0
+      || newCoverageTutorResponses.length > 0
     ) {
       playTransferNotificationSound();
     }
 
     seenTransferNotificationKeysRef.current = nextNotificationKeys;
-  }, [escalationClosureNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications, waitingLiveChatNotifications]);
+  }, [coverageTicketNotifications, coverageTutorResponseNotifications, escalationClosureNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications, waitingLiveChatNotifications]);
 
   useEffect(() => {
     if (!documentationTicketStatus) {
@@ -1530,10 +1726,17 @@ const AgentDashboard = () => {
       color: "bg-rose-100 text-rose-700",
       filter: "slaBreached" as const,
     },
+    {
+      label: "Coverage Tickets",
+      value: dashboardAssignmentScopedTickets.filter((ticket) => isCoverageTicket(ticket)).length,
+      icon: FileText,
+      color: "bg-primary/10 text-primary",
+      filter: "coverage" as const,
+    },
   ];
 
   async function fetchTicketsList() {
-    const response = await fetch("/api/admin/tickets");
+    const response = await fetch("/api/admin/tickets", { cache: "no-store" });
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
 
     if (!response.ok) {
@@ -1565,7 +1768,7 @@ const AgentDashboard = () => {
       return [];
     }
 
-    const response = await fetch("/api/admin/notifications?limit=20");
+    const response = await fetch("/api/admin/notifications?limit=20", { cache: "no-store" });
     const payload = (await response.json().catch(() => null)) as NotificationLogResponse | null;
 
     if (!response.ok) {
@@ -1676,6 +1879,40 @@ const AgentDashboard = () => {
       setTickets(nextTickets);
       if (nextNotificationLog !== null) {
         setNotificationLog(nextNotificationLog);
+      }
+
+      const currentActiveTicketId = activeDetail?.ticket.id || "";
+      if (currentActiveTicketId) {
+        const previousActiveTicket = activeDetail?.ticket;
+        const nextActiveTicket = nextTickets.find((ticket) => ticket.id === currentActiveTicketId);
+        const shouldForceCoverageDetailRefresh = Boolean(previousActiveTicket && isCoverageTicket(previousActiveTicket));
+        const coverageResponseChanged = (
+          (previousActiveTicket?.latestCoverageTutorResponse?.cardId || "") !== (nextActiveTicket?.latestCoverageTutorResponse?.cardId || "")
+          || (previousActiveTicket?.latestCoverageTutorResponse?.respondedAt || "") !== (nextActiveTicket?.latestCoverageTutorResponse?.respondedAt || "")
+          || (previousActiveTicket?.latestCoverageTutorResponse?.outcome || "") !== (nextActiveTicket?.latestCoverageTutorResponse?.outcome || "")
+        );
+        const activeTicketChanged = Boolean(
+          nextActiveTicket
+          && previousActiveTicket
+          && (
+            shouldForceCoverageDetailRefresh
+            || (
+            nextActiveTicket.updatedAt !== previousActiveTicket.updatedAt
+            || nextActiveTicket.status !== previousActiveTicket.status
+            || nextActiveTicket.statusReason !== previousActiveTicket.statusReason
+            || coverageResponseChanged
+            )
+          )
+        );
+
+        if (activeTicketChanged) {
+          try {
+            const refreshedDetail = await fetchTicketDetail(currentActiveTicketId);
+            syncDetailAcrossViews(refreshedDetail);
+          } catch {
+            // Keep the visible detail stable; the next successful poll will recover.
+          }
+        }
       }
     } catch (fetchError) {
       if (!silent) {
@@ -1877,7 +2114,7 @@ const AgentDashboard = () => {
   }
 
   async function fetchTicketDetail(ticketId: string) {
-    const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticketId)}`);
+    const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticketId)}`, { cache: "no-store" });
     const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
     if (!response.ok || !payload?.ticket) {
@@ -1885,6 +2122,73 @@ const AgentDashboard = () => {
         throw new Error("Admin session is required.");
       }
       throw new Error(payload?.message || "We could not load this ticket right now.");
+    }
+
+    return payload;
+  }
+
+  function shouldAutoAcknowledgeCoverageTutorResponse(ticket: TicketSummary) {
+    const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
+    if (!latestCoverageTutorResponse || latestCoverageTutorResponse.requesterAcknowledged || !session?.username) {
+      return false;
+    }
+
+    if (resolvedSessionAgentId) {
+      return latestCoverageTutorResponse.toAgentId === resolvedSessionAgentId;
+    }
+
+    return sanitizeAssignedAgentName(latestCoverageTutorResponse.toAgentUsername) === sanitizeAssignedAgentName(session.username);
+  }
+
+  function shouldAutoAcknowledgeCoverageTicketNotification(ticket: TicketSummary) {
+    return Boolean(ticket.pendingCoverageTicketNotification && session?.username);
+  }
+
+  async function acknowledgeCoverageTutorResponseSilently(ticket: TicketSummary) {
+    if (!shouldAutoAcknowledgeCoverageTutorResponse(ticket)) {
+      return null;
+    }
+
+    const response = await fetch(
+      `/api/admin/tickets/${encodeURIComponent(ticket.id)}/coverage-tutor-response/acknowledge`,
+      {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({}),
+      },
+    );
+
+    const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+    if (!response.ok || !payload?.ticket) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        return null;
+      }
+      return null;
+    }
+
+    return payload;
+  }
+
+  async function acknowledgeCoverageTicketNotificationSilently(ticket: TicketSummary) {
+    if (!shouldAutoAcknowledgeCoverageTicketNotification(ticket)) {
+      return null;
+    }
+
+    const response = await fetch(
+      `/api/admin/tickets/${encodeURIComponent(ticket.id)}/coverage-ticket-notification/acknowledge`,
+      {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({}),
+      },
+    );
+
+    const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+    if (!response.ok || !payload?.ticket) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        return null;
+      }
+      return null;
     }
 
     return payload;
@@ -1898,8 +2202,23 @@ const AgentDashboard = () => {
     setIsOpening(true);
 
     try {
-      const payload = await fetchTicketDetail(ticketId);
+      let payload = await fetchTicketDetail(ticketId);
+      const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
+      if (acknowledgedCoverageTicketPayload?.ticket) {
+        payload = acknowledgedCoverageTicketPayload;
+      }
+      const acknowledgedPayload = await acknowledgeCoverageTutorResponseSilently(payload.ticket);
+      if (acknowledgedPayload?.ticket) {
+        payload = acknowledgedPayload;
+      }
+
       setActiveDetail(payload);
+      setTickets((currentTickets) => currentTickets.map((ticket) => (
+        ticket.id === payload.ticket.id ? payload.ticket : ticket
+      )));
+      setConsoleDetail((currentDetail) => (
+        currentDetail?.ticket.id === payload.ticket.id ? payload : currentDetail
+      ));
       syncDrafts(payload);
     } catch (fetchError) {
       closePanel();
@@ -1921,7 +2240,16 @@ const AgentDashboard = () => {
     setIsConsoleOpening(true);
 
     try {
-      const payload = await fetchTicketDetail(ticketId);
+      let payload = await fetchTicketDetail(ticketId);
+      const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
+      if (acknowledgedCoverageTicketPayload?.ticket) {
+        payload = acknowledgedCoverageTicketPayload;
+      }
+      const acknowledgedPayload = await acknowledgeCoverageTutorResponseSilently(payload.ticket);
+      if (acknowledgedPayload?.ticket) {
+        payload = acknowledgedPayload;
+      }
+
       if (shouldRouteConsoleChatToMyOpenQueue({
         currentScope: consoleCaseScope,
         currentQueueTab: consoleQueueTab,
@@ -2045,6 +2373,30 @@ const AgentDashboard = () => {
     });
   }
 
+  function updateActiveDocumentationField(field: keyof AdminDocumentation, value: string) {
+    setActiveDocumentationDraft((currentDraft) => {
+      if (!currentDraft) {
+        return currentDraft;
+      }
+
+      return {
+        ...currentDraft,
+        [field]: value,
+      };
+    });
+  }
+
+  function updateActiveCoverageDocumentation(updater: (draft: AdminDocumentation) => AdminDocumentation) {
+    setActiveDocumentationDraft((currentDraft) => {
+      const baseDraft = currentDraft || activeCoverageDocumentationBaseline;
+      if (!baseDraft) {
+        return currentDraft;
+      }
+
+      return updater(baseDraft);
+    });
+  }
+
   async function handleDocumentationImagesAdded(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
@@ -2091,6 +2443,174 @@ const AgentDashboard = () => {
         errorImages: currentDraft.errorImages.filter((_, imageIndex) => imageIndex !== index),
       };
     });
+  }
+
+  async function persistActiveCoverageDocumentation(options?: {
+    documentation?: AdminDocumentation;
+    status?: TicketSummary["status"];
+    statusReason?: string;
+    note?: string;
+    successMessage?: string;
+    errorMessage?: string;
+    showSuccessToast?: boolean;
+  }) {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return null;
+    }
+
+    const documentationToSave = options?.documentation || activeDocumentationDraft || buildCoverageDocumentationDraft(activeDetail.ticket);
+
+    setIsSavingActiveDocumentation(true);
+
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
+        method: "PATCH",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({
+          documentation: documentationToSave,
+          ...(options?.status ? { status: options.status } : {}),
+          ...(options?.statusReason ? { statusReason: options.statusReason } : {}),
+          ...(options?.note ? { note: options.note } : {}),
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return null;
+        }
+        toast.error(payload?.message || options?.errorMessage || "We could not save the coverage ticket right now.");
+        return null;
+      }
+
+      syncDetailAcrossViews(payload);
+      syncDrafts(payload);
+      setActiveDocumentationDraft(buildCoverageDocumentationDraft(payload.ticket));
+      if (options?.showSuccessToast !== false) {
+        toast.success(options?.successMessage || "Coverage ticket saved.");
+      }
+      return payload;
+    } catch {
+      toast.error(options?.errorMessage || "We could not connect to the server. Please try again.");
+      return null;
+    } finally {
+      setIsSavingActiveDocumentation(false);
+    }
+  }
+
+  async function saveActiveCoverageDocumentation() {
+    await persistActiveCoverageDocumentation({
+      successMessage: "Coverage ticket saved.",
+      errorMessage: "We could not save the coverage ticket right now.",
+    });
+  }
+
+  async function submitActiveCoverageTutorChoiceCard(cardId: string) {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return;
+    }
+
+    const currentDraft = activeDocumentationDraft || buildCoverageDocumentationDraft(activeDetail.ticket);
+    const targetCard = currentDraft.coverageCards.find((card) => card.id === cardId && card.type === "tutor_choice");
+
+    if (!targetCard) {
+      return;
+    }
+
+    if (!targetCard.tutor.trim()) {
+      toast.error("Choose a tutor before submitting the request.");
+      return;
+    }
+
+    if (!targetCard.sessionDetails.trim()) {
+      toast.error("Add the session details before submitting the request.");
+      return;
+    }
+
+    if (!targetCard.tutorEmail.trim()) {
+      toast.error("Add the tutor e-mail before submitting the request.");
+      return;
+    }
+
+    if (!isValidCoverageTutorEmail(targetCard.tutorEmail)) {
+      toast.error("Please enter a valid tutor e-mail before submitting the request.");
+      return;
+    }
+
+    setIsSavingActiveDocumentation(true);
+
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-request`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({
+            cardId,
+            origin: window.location.origin,
+            documentation: currentDraft,
+          }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not submit this tutor request right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      syncDrafts(payload);
+      setActiveDocumentationDraft(buildCoverageDocumentationDraft(payload.ticket));
+      toast.success("Tutor request sent.");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsSavingActiveDocumentation(false);
+    }
+  }
+
+  async function confirmActiveCoverageTutorSession(cardId: string) {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return;
+    }
+
+    setIsSavingActiveDocumentation(true);
+
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-confirm-session`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({ cardId }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not confirm this tutor session right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      syncDrafts(payload);
+      setActiveDocumentationDraft(buildCoverageDocumentationDraft(payload.ticket));
+      toast.success("Session confirmed and ticket closed.");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsSavingActiveDocumentation(false);
+    }
   }
 
   async function saveDocumentation() {
@@ -2527,6 +3047,84 @@ const AgentDashboard = () => {
     }
   }
 
+  async function handleCoverageTutorResponseAcknowledge(ticket: TicketSummary) {
+    if (!ticket.latestCoverageTutorResponse || !session?.username || activeTransferRequestTicketId) {
+      return;
+    }
+
+    setActiveTransferRequestTicketId(ticket.id);
+
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/coverage-tutor-response/acknowledge`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not clear this tutor update right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      if (activeDetail?.ticket.id === ticket.id) {
+        syncDrafts(payload);
+      }
+      await refreshTicketsOnly(true);
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setActiveTransferRequestTicketId("");
+    }
+  }
+
+  async function handleCoverageTicketNotificationAcknowledge(ticket: TicketSummary) {
+    if (!ticket.pendingCoverageTicketNotification || !session?.username || activeTransferRequestTicketId) {
+      return;
+    }
+
+    setActiveTransferRequestTicketId(ticket.id);
+
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/coverage-ticket-notification/acknowledge`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not clear this coverage ticket alert right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      if (activeDetail?.ticket.id === ticket.id) {
+        syncDrafts(payload);
+      }
+      await refreshTicketsOnly(true);
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setActiveTransferRequestTicketId("");
+    }
+  }
+
   async function handleTeamsCallNotificationOpen(ticket: TicketSummary) {
     if (!ticket.pendingTeamsCallNotification || !session?.username || activeTransferRequestTicketId) {
       return;
@@ -2694,6 +3292,7 @@ const AgentDashboard = () => {
     setActiveTicketId("");
     setActiveTicketTab("conversation");
     setActiveDetail(null);
+    setActiveDocumentationDraft(null);
     setNotes("");
   }
 
@@ -2796,7 +3395,10 @@ const AgentDashboard = () => {
       };
 
       if (canAssignActiveTicket) {
-        requestBody.assignedAgentId = draftAgentId === "unassigned" ? null : Number(draftAgentId);
+        const currentAssignedAgentId = activeDetail.ticket.assignedAgentId ? String(activeDetail.ticket.assignedAgentId) : "unassigned";
+        if (draftAgentId !== currentAssignedAgentId) {
+          requestBody.assignedAgentId = draftAgentId === "unassigned" ? null : Number(draftAgentId);
+        }
       }
 
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
@@ -2828,6 +3430,325 @@ const AgentDashboard = () => {
     }
   }
 
+  function renderDashboardWorkspace() {
+    const coverageDashboardKpiFilters: DashboardTicketFilter[] = ["coverage", "pending", "closed", "slaBreached"];
+    const visibleKpis = isCoverageDashboardView
+      ? kpis.filter((kpi) => coverageDashboardKpiFilters.includes(kpi.filter))
+      : kpis;
+
+    return (
+      <div className="space-y-5">
+        <div className={cn(
+          "grid grid-cols-1 gap-4",
+          isCoverageDashboardView ? "sm:grid-cols-2 xl:grid-cols-4" : "sm:grid-cols-2 xl:grid-cols-7",
+        )}>
+          {visibleKpis.map((kpi) => (
+            <button
+              key={kpi.label}
+              type="button"
+              onClick={() => setDashboardTicketFilter((currentFilter) => (
+                currentFilter === kpi.filter ? "all" : kpi.filter
+              ))}
+              className={cn(
+                "bg-card rounded-2xl border shadow-soft p-5 text-left transition-colors",
+                dashboardTicketFilter === kpi.filter
+                  ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                  : "hover:border-primary/40 hover:bg-secondary/20",
+              )}
+            >
+              <div className={cn("h-9 w-9 rounded-lg flex items-center justify-center mb-3", kpi.color)}>
+                <kpi.icon className="h-5 w-5" />
+              </div>
+              <div className="text-2xl font-bold">{kpi.value}</div>
+              <div className="text-xs text-muted-foreground">{kpi.label}</div>
+              <div className="mt-2 text-[11px] font-medium text-primary">
+                {dashboardTicketFilter === kpi.filter ? `Showing ${kpi.label.toLowerCase()}` : `Click to view ${kpi.label.toLowerCase()}`}
+              </div>
+            </button>
+          ))}
+          {!isCoverageDashboardView ? (
+            <button
+              type="button"
+              onClick={() => setDashboardTicketFilter((currentFilter) => (
+                currentFilter === "quickResolution" ? "all" : "quickResolution"
+              ))}
+              className={cn(
+                "bg-card rounded-2xl border shadow-soft p-5 text-left transition-colors",
+                dashboardTicketFilter === "quickResolution"
+                  ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                  : "hover:border-primary/40 hover:bg-secondary/20",
+              )}
+            >
+              <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <FileText className="h-5 w-5" />
+              </div>
+              <div className="text-2xl font-bold">{quickResolutionTickets.length}</div>
+              <div className="text-xs text-muted-foreground">Quick Tickets</div>
+              <div className="mt-2 text-[11px] font-medium text-primary">
+                {dashboardTicketFilter === "quickResolution" ? "Showing only quick tickets" : "Click to view quick tickets"}
+              </div>
+            </button>
+          ) : null}
+        </div>
+
+        <div className="bg-card overflow-hidden rounded-2xl border shadow-card">
+          <div className="border-b px-4 py-4 sm:px-5">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <h2 className="font-semibold">{dashboardTableTitle}</h2>
+                {dashboardTicketFilter === "quickResolution" ? (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    These tickets skip the chat console and stay available from the dashboard only.
+                  </p>
+                ) : null}
+              </div>
+              <div className="flex flex-col gap-3 lg:items-end">
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-muted-foreground">{dashboardTableCountLabel}</span>
+                  {dashboardTicketFilter !== "all" || dashboardSortOrder !== "newest" ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setDashboardTicketFilter("all");
+                        setDashboardSortOrder("newest");
+                      }}
+                    >
+                      Reset View
+                    </Button>
+                  ) : null}
+                </div>
+                <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+                  {!isCoverageDashboardView ? (
+                    <div className="w-full sm:w-[170px]">
+                      <Select
+                        value={consoleStatus || "Off"}
+                        onValueChange={(value) => void updateConsoleStatus(value as AdminSelectableConsoleStatus)}
+                        disabled={isUpdatingConsoleStatus}
+                      >
+                        <SelectTrigger
+                          aria-label="Set your console status"
+                          className={cn(
+                            (consoleStatus || "Off") === "Available"
+                              ? "border-emerald-200 bg-emerald-50/80 text-emerald-700"
+                              : "border-slate-200 bg-slate-50/80 text-slate-600",
+                          )}
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {adminSelectableConsoleStatuses.map((status) => (
+                            <SelectItem key={status} value={status}>{status}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  ) : null}
+                  <div className="w-full sm:w-[200px]">
+                    <Select
+                      value={dashboardAssignedFilter}
+                      onValueChange={(value) => setDashboardAssignedFilter(value as DashboardAssignedFilter)}
+                    >
+                      <SelectTrigger aria-label="Filter tickets by assigned agent">
+                        <SelectValue placeholder="Assigned To" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {dashboardAgentFilterOptions.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="w-full sm:w-[170px]">
+                    <Select
+                      value={dashboardSortOrder}
+                      onValueChange={(value) => setDashboardSortOrder(value as DashboardSortOrder)}
+                    >
+                      <SelectTrigger aria-label="Sort tickets">
+                        <SelectValue placeholder="Sort by" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="newest">Newest First</SelectItem>
+                        <SelectItem value="oldest">Oldest First</SelectItem>
+                        <SelectItem value="priorityDesc">Highest Priority</SelectItem>
+                        <SelectItem value="priorityAsc">Lowest Priority</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" className="w-full max-w-full justify-between gap-3 sm:w-[300px]">
+                        <span className="inline-flex items-center gap-2">
+                          <UserRound className="h-4 w-4 text-primary" />
+                          Team Status
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          {availableAgentCount} available
+                        </span>
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-[min(92vw,340px)] p-0">
+                      <div className="border-b px-4 py-3">
+                        <div className="text-sm font-semibold">Agent Status</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          Live availability from the support accounts table.
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {([
+                            { label: "Available", count: availableAgentCount },
+                            { label: "Busy", count: busyAgentCount },
+                            { label: "Off", count: offAgentCount },
+                          ] as const).map((item) => (
+                            <div
+                              key={item.label}
+                              className="inline-flex items-center gap-2 rounded-full border bg-background/80 px-2.5 py-1 text-[11px] text-muted-foreground"
+                            >
+                              <span className={cn("h-2 w-2 rounded-full", presenceDotClassName(item.label))} />
+                              <span>{item.label}</span>
+                              <span className="font-semibold text-foreground">{item.count}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="max-h-[320px] overflow-y-auto p-2">
+                        {sortedAgents.length === 0 ? (
+                          <div className="rounded-xl border border-dashed px-3 py-4 text-sm text-muted-foreground">
+                            No active agents found.
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            {sortedAgents.map((agent) => {
+                              const agentStatus = normalizeAdminConsoleStatus(agent.consoleStatus);
+
+                              return (
+                                <div
+                                  key={agent.id}
+                                  className="rounded-xl border bg-background/80 px-3 py-3 shadow-soft"
+                                >
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <div className="truncate font-medium text-foreground">
+                                        {getAgentDisplayName(agent)}
+                                      </div>
+                                      <div className="mt-1 truncate text-xs text-muted-foreground">
+                                        @{agent.username}
+                                        {agent.role ? ` - ${formatAdminRoleLabel(agent.role)}` : ""}
+                                      </div>
+                                    </div>
+                                    <span className="inline-flex shrink-0 items-center gap-2 rounded-full border bg-background px-2.5 py-1 text-[11px] text-muted-foreground">
+                                      <span className={cn("h-2 w-2 rounded-full", presenceDotClassName(agentStatus))} />
+                                      {agentStatus}
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <div className="relative w-full lg:w-[360px]">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={dashboardSearch}
+                      onChange={(event) => setDashboardSearch(event.target.value)}
+                      placeholder="Search by learner name, chat ID, or ticket ID"
+                      className="pl-10"
+                      aria-label="Search tickets by learner name, chat ID, or ticket ID"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {error ? (
+            <div className="p-5 text-sm text-destructive bg-destructive/5 border-b border-destructive/10">
+              {error}
+            </div>
+          ) : null}
+
+          {isLoading ? (
+            <div className="p-10 text-sm text-muted-foreground flex items-center justify-center gap-2">
+              <LoaderCircle className="h-4 w-4 animate-spin" /> Loading dashboard...
+            </div>
+          ) : visibleDashboardTickets.length === 0 ? (
+            <div className="p-10 text-sm text-muted-foreground text-center">
+              {dashboardEmptyMessage}
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-secondary/50 text-muted-foreground">
+                  <tr className="text-left">
+                    {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA"].map((heading) => (
+                      <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {visibleDashboardTickets.map((ticket) => (
+                    <tr
+                      key={ticket.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => void openTicket(ticket.id)}
+                      onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") {
+                          return;
+                        }
+
+                        event.preventDefault();
+                        void openTicket(ticket.id);
+                      }}
+                      className={cn(
+                        "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-secondary/20",
+                        getTicketTransferRowClassName(ticket),
+                      )}
+                    >
+                      <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
+                      <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
+                      <td className="px-4 py-3 min-w-[240px]">
+                        <div className="font-medium">{ticket.learnerName || "Learner"}</div>
+                        <div className="text-xs text-muted-foreground">{ticket.email}</div>
+                        <div className="mt-2">
+                          <RequesterRoleBadge role={ticket.requesterRole} />
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</td>
+                      <td className="px-4 py-3"><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
+                      <td className="px-4 py-3 text-muted-foreground">{getDisplayedTicketStatusReason(ticket)}</td>
+                      <td className="px-4 py-3">
+                        <AssignedAgentBadge
+                          assignedAgentId={ticket.assignedAgentId}
+                          assignedAgentName={ticket.assignedAgentName}
+                          statusReason={ticket.statusReason}
+                          documentation={ticket.documentation}
+                          pendingEscalationNotification={ticket.pendingEscalationNotification}
+                          latestEscalationClosure={ticket.latestEscalationClosure}
+                          latestTransferDecision={ticket.latestTransferDecision}
+                        />
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap">{formatDateTime(ticket.createdAt)}</td>
+                      <td className="px-4 py-3">
+                        <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
+                          {ticket.slaStatus}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <SupportLayout
       fullWidth
@@ -2839,10 +3760,10 @@ const AgentDashboard = () => {
         value={adminView}
         onValueChange={(value) => {
           const nextView = value as AdminView;
-          setAdminView(nextView);
-          if (nextView !== "dashboard") {
+          if (nextView !== adminView) {
             closePanel();
           }
+          setAdminView(nextView);
         }}
         className={cn(
           "min-h-0",
@@ -2895,20 +3816,24 @@ const AgentDashboard = () => {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
                       <AdminNotificationsPanel
+                        coverageTickets={coverageTicketNotifications}
                         requests={pendingTransferRequests}
                         escalations={pendingEscalationNotifications}
                         teamsCalls={pendingTeamsCallNotifications}
                         waitingLiveChats={waitingLiveChatNotifications}
                         currentConsoleStatus={myActualConsoleStatus}
                         isUpdatingConsoleStatus={isUpdatingConsoleStatus}
+                        coverageResponses={coverageTutorResponseNotifications}
                         escalationUpdates={escalationClosureNotifications}
                         decisionUpdates={transferDecisionNotifications}
                         notificationLog={archivedNotificationLog}
                         activeTicketId={activeTransferRequestTicketId}
                         onDecision={handleTransferRequestDecision}
                         onOpenTeamsCall={handleTeamsCallNotificationOpen}
+                        onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
                         onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
                         onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
+                        onAcknowledgeCoverageResponse={handleCoverageTutorResponseAcknowledge}
                         onAcknowledgeDecision={handleTransferDecisionAcknowledge}
                         onOpenTicket={openNotificationLogTicket}
                         onSetAvailable={() => void updateConsoleStatus("Available")}
@@ -2951,20 +3876,24 @@ const AgentDashboard = () => {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
                       <AdminNotificationsPanel
+                        coverageTickets={coverageTicketNotifications}
                         requests={pendingTransferRequests}
                         escalations={pendingEscalationNotifications}
                         teamsCalls={pendingTeamsCallNotifications}
                         waitingLiveChats={waitingLiveChatNotifications}
                         currentConsoleStatus={myActualConsoleStatus}
                         isUpdatingConsoleStatus={isUpdatingConsoleStatus}
+                        coverageResponses={coverageTutorResponseNotifications}
                         escalationUpdates={escalationClosureNotifications}
                         decisionUpdates={transferDecisionNotifications}
                         notificationLog={archivedNotificationLog}
                         activeTicketId={activeTransferRequestTicketId}
                         onDecision={handleTransferRequestDecision}
                         onOpenTeamsCall={handleTeamsCallNotificationOpen}
+                        onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
                         onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
                         onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
+                        onAcknowledgeCoverageResponse={handleCoverageTutorResponseAcknowledge}
                         onAcknowledgeDecision={handleTransferDecisionAcknowledge}
                         onOpenTicket={openNotificationLogTicket}
                         onSetAvailable={() => void updateConsoleStatus("Available")}
@@ -3081,6 +4010,16 @@ const AgentDashboard = () => {
                   {!useCompactAdminSidebar ? <span>Admin Dashboard</span> : null}
                 </TabsTrigger>
                 <TabsTrigger
+                  value="coverage"
+                  className={cn(
+                    "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                    useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                  )}
+                >
+                  <FileText className="h-4 w-4 shrink-0" />
+                  {!useCompactAdminSidebar ? <span>Coverage Dashboard</span> : null}
+                </TabsTrigger>
+                <TabsTrigger
                   value="console"
                   className={cn(
                     "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
@@ -3194,306 +4133,11 @@ const AgentDashboard = () => {
           <div className={cn("flex min-w-0 w-full flex-1 flex-col", isStackedAdminLayout ? "overflow-visible" : "overflow-hidden")}>
 
           <TabsContent value="dashboard" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-6">
-              {kpis.map((kpi) => (
-                <button
-                  key={kpi.label}
-                  type="button"
-                  onClick={() => setDashboardTicketFilter((currentFilter) => (
-                    currentFilter === kpi.filter ? "all" : kpi.filter
-                  ))}
-                  className={cn(
-                    "bg-card rounded-2xl border shadow-soft p-5 text-left transition-colors",
-                    dashboardTicketFilter === kpi.filter
-                      ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                      : "hover:border-primary/40 hover:bg-secondary/20",
-                  )}
-                >
-                  <div className={cn("h-9 w-9 rounded-lg flex items-center justify-center mb-3", kpi.color)}>
-                    <kpi.icon className="h-5 w-5" />
-                  </div>
-                  <div className="text-2xl font-bold">{kpi.value}</div>
-                  <div className="text-xs text-muted-foreground">{kpi.label}</div>
-                  <div className="mt-2 text-[11px] font-medium text-primary">
-                    {dashboardTicketFilter === kpi.filter ? `Showing ${kpi.label.toLowerCase()}` : `Click to view ${kpi.label.toLowerCase()}`}
-                  </div>
-                </button>
-              ))}
-              <button
-                type="button"
-                onClick={() => setDashboardTicketFilter((currentFilter) => (
-                  currentFilter === "quickResolution" ? "all" : "quickResolution"
-                ))}
-                className={cn(
-                  "bg-card rounded-2xl border shadow-soft p-5 text-left transition-colors",
-                  dashboardTicketFilter === "quickResolution"
-                    ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                    : "hover:border-primary/40 hover:bg-secondary/20",
-                )}
-              >
-                <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                  <FileText className="h-5 w-5" />
-                </div>
-                <div className="text-2xl font-bold">{quickResolutionTickets.length}</div>
-                <div className="text-xs text-muted-foreground">Quick Tickets</div>
-                <div className="mt-2 text-[11px] font-medium text-primary">
-                  {dashboardTicketFilter === "quickResolution" ? "Showing only quick tickets" : "Click to view quick tickets"}
-                </div>
-              </button>
-            </div>
+            {renderDashboardWorkspace()}
+          </TabsContent>
 
-            <div className="bg-card overflow-hidden rounded-2xl border shadow-card">
-              <div className="border-b px-4 py-4 sm:px-5">
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-                  <div>
-                    <h2 className="font-semibold">{dashboardTableTitle}</h2>
-                    {dashboardTicketFilter === "quickResolution" ? (
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        These tickets skip the chat console and stay available from the dashboard only.
-                      </p>
-                    ) : null}
-                  </div>
-                  <div className="flex flex-col gap-3 lg:items-end">
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs text-muted-foreground">{dashboardTableCountLabel}</span>
-                      {dashboardTicketFilter !== "all" || dashboardSortOrder !== "newest" ? (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => {
-                            setDashboardTicketFilter("all");
-                            setDashboardSortOrder("newest");
-                          }}
-                        >
-                          Reset View
-                        </Button>
-                      ) : null}
-                    </div>
-                    <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
-                      <div className="w-full sm:w-[170px]">
-                        <Select
-                          value={consoleStatus || "Off"}
-                          onValueChange={(value) => void updateConsoleStatus(value as AdminSelectableConsoleStatus)}
-                          disabled={isUpdatingConsoleStatus}
-                        >
-                          <SelectTrigger
-                            aria-label="Set your console status"
-                            className={cn(
-                              (consoleStatus || "Off") === "Available"
-                                ? "border-emerald-200 bg-emerald-50/80 text-emerald-700"
-                                : "border-slate-200 bg-slate-50/80 text-slate-600",
-                            )}
-                          >
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {adminSelectableConsoleStatuses.map((status) => (
-                              <SelectItem key={status} value={status}>{status}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="w-full sm:w-[200px]">
-                        <Select
-                          value={dashboardAssignedFilter}
-                          onValueChange={(value) => setDashboardAssignedFilter(value as DashboardAssignedFilter)}
-                        >
-                          <SelectTrigger aria-label="Filter tickets by assigned agent">
-                            <SelectValue placeholder="Assigned To" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {dashboardAgentFilterOptions.map((option) => (
-                              <SelectItem key={option.value} value={option.value}>
-                                {option.label}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="w-full sm:w-[170px]">
-                        <Select
-                          value={dashboardSortOrder}
-                          onValueChange={(value) => setDashboardSortOrder(value as DashboardSortOrder)}
-                        >
-                          <SelectTrigger aria-label="Sort tickets">
-                            <SelectValue placeholder="Sort by" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="newest">Newest First</SelectItem>
-                            <SelectItem value="oldest">Oldest First</SelectItem>
-                            <SelectItem value="priorityDesc">Highest Priority</SelectItem>
-                            <SelectItem value="priorityAsc">Lowest Priority</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="outline" className="w-full max-w-full justify-between gap-3 sm:w-[300px]">
-                            <span className="inline-flex items-center gap-2">
-                              <UserRound className="h-4 w-4 text-primary" />
-                              Team Status
-                            </span>
-                            <span className="text-xs text-muted-foreground">
-                              {availableAgentCount} available
-                            </span>
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end" className="w-[min(92vw,340px)] p-0">
-                          <div className="border-b px-4 py-3">
-                            <div className="text-sm font-semibold">Agent Status</div>
-                            <div className="mt-1 text-xs text-muted-foreground">
-                              Live availability from the support accounts table.
-                            </div>
-                            <div className="mt-3 flex flex-wrap gap-2">
-                              {([
-                                { label: "Available", count: availableAgentCount },
-                                { label: "Busy", count: busyAgentCount },
-                                { label: "Off", count: offAgentCount },
-                              ] as const).map((item) => (
-                                <div
-                                  key={item.label}
-                                  className="inline-flex items-center gap-2 rounded-full border bg-background/80 px-2.5 py-1 text-[11px] text-muted-foreground"
-                                >
-                                  <span className={cn("h-2 w-2 rounded-full", presenceDotClassName(item.label))} />
-                                  <span>{item.label}</span>
-                                  <span className="font-semibold text-foreground">{item.count}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                          <div className="max-h-[320px] overflow-y-auto p-2">
-                            {sortedAgents.length === 0 ? (
-                              <div className="rounded-xl border border-dashed px-3 py-4 text-sm text-muted-foreground">
-                                No active agents found.
-                              </div>
-                            ) : (
-                              <div className="space-y-2">
-                                {sortedAgents.map((agent) => {
-                                  const agentStatus = normalizeAdminConsoleStatus(agent.consoleStatus);
-
-                                  return (
-                                    <div
-                                      key={agent.id}
-                                      className="rounded-xl border bg-background/80 px-3 py-3 shadow-soft"
-                                    >
-                                      <div className="flex items-start justify-between gap-3">
-                                        <div className="min-w-0">
-                                          <div className="truncate font-medium text-foreground">
-                                            {getAgentDisplayName(agent)}
-                                          </div>
-                                          <div className="mt-1 truncate text-xs text-muted-foreground">
-                                            @{agent.username}
-                                            {agent.role ? ` - ${formatAdminRoleLabel(agent.role)}` : ""}
-                                          </div>
-                                        </div>
-                                        <span className="inline-flex shrink-0 items-center gap-2 rounded-full border bg-background px-2.5 py-1 text-[11px] text-muted-foreground">
-                                          <span className={cn("h-2 w-2 rounded-full", presenceDotClassName(agentStatus))} />
-                                          {agentStatus}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                      <div className="relative w-full lg:w-[360px]">
-                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                        <Input
-                          value={dashboardSearch}
-                          onChange={(event) => setDashboardSearch(event.target.value)}
-                          placeholder="Search by learner name, chat ID, or ticket ID"
-                          className="pl-10"
-                          aria-label="Search tickets by learner name, chat ID, or ticket ID"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {error ? (
-                <div className="p-5 text-sm text-destructive bg-destructive/5 border-b border-destructive/10">
-                  {error}
-                </div>
-              ) : null}
-
-              {isLoading ? (
-                <div className="p-10 text-sm text-muted-foreground flex items-center justify-center gap-2">
-                  <LoaderCircle className="h-4 w-4 animate-spin" /> Loading dashboard...
-                </div>
-              ) : visibleDashboardTickets.length === 0 ? (
-                <div className="p-10 text-sm text-muted-foreground text-center">
-                  {dashboardEmptyMessage}
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-secondary/50 text-muted-foreground">
-                      <tr className="text-left">
-                        {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA"].map((heading) => (
-                          <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {visibleDashboardTickets.map((ticket) => (
-                        <tr
-                          key={ticket.id}
-                          role="button"
-                          tabIndex={0}
-                          onClick={() => void openTicket(ticket.id)}
-                          onKeyDown={(event) => {
-                            if (event.key !== "Enter" && event.key !== " ") {
-                              return;
-                            }
-
-                            event.preventDefault();
-                            void openTicket(ticket.id);
-                          }}
-                          className={cn(
-                            "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-secondary/20",
-                            getTicketTransferRowClassName(ticket),
-                          )}
-                        >
-                          <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
-                          <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
-                          <td className="px-4 py-3 min-w-[240px]">
-                            <div className="font-medium">{ticket.learnerName || "Learner"}</div>
-                            <div className="text-xs text-muted-foreground">{ticket.email}</div>
-                            <div className="mt-2">
-                              <RequesterRoleBadge role={ticket.requesterRole} />
-                            </div>
-                          </td>
-                          <td className="px-4 py-3">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</td>
-                          <td className="px-4 py-3"><StatusBadge status={ticket.status} /></td>
-                          <td className="px-4 py-3 text-muted-foreground">{ticket.statusReason || "-"}</td>
-                          <td className="px-4 py-3">
-                            <AssignedAgentBadge
-                              assignedAgentId={ticket.assignedAgentId}
-                              assignedAgentName={ticket.assignedAgentName}
-                              statusReason={ticket.statusReason}
-                              documentation={ticket.documentation}
-                              pendingEscalationNotification={ticket.pendingEscalationNotification}
-                              latestEscalationClosure={ticket.latestEscalationClosure}
-                              latestTransferDecision={ticket.latestTransferDecision}
-                            />
-                          </td>
-                          <td className="px-4 py-3 whitespace-nowrap">{formatDateTime(ticket.createdAt)}</td>
-                          <td className="px-4 py-3">
-                            <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
-                              {ticket.slaStatus}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+          <TabsContent value="coverage" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+            {renderDashboardWorkspace()}
           </TabsContent>
 
 
@@ -4105,7 +4749,7 @@ const AgentDashboard = () => {
       </Tabs>
 
       <Sheet open={!!activeTicketId} onOpenChange={(open) => !open && closePanel()}>
-        <SheetContent className="w-full sm:max-w-3xl overflow-y-auto">
+        <SheetContent className={cn("w-full overflow-y-auto", isActiveCoverageTicket ? "sm:max-w-6xl" : "sm:max-w-3xl")}>
           {isOpening ? (
             <div className="h-full min-h-[300px] flex items-center justify-center gap-2 text-sm text-muted-foreground">
               <LoaderCircle className="h-4 w-4 animate-spin" /> Loading ticket...
@@ -4117,16 +4761,52 @@ const AgentDashboard = () => {
                   Ticket <span className="font-mono">{activeDetail.ticket.id}</span>
                 </SheetTitle>
                 <SheetDescription>
-                  {activeDetail.ticket.learnerName || activeDetail.ticket.email} - {formatCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)}
+                  {activeDetail.ticket.learnerName || activeDetail.ticket.email} - {formatTicketHeaderCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)}
                 </SheetDescription>
               </SheetHeader>
 
-              <div className="space-y-5 py-5">
-                <Tabs
-                  value={activeTicketTab}
-                  onValueChange={(value) => setActiveTicketTab(value as TicketDetailTab)}
-                  className="space-y-4"
-                >
+              {isActiveCoverageTicket && activeCoverageDocumentationDraft ? (
+                <CoverageTicketWorkspace
+                  ticket={activeDetail.ticket}
+                  history={activeDetail.history}
+                  draft={activeCoverageDocumentationDraft}
+                  readOnly={activeCoverageDocumentationReadOnly}
+                  isSaving={isSavingActiveDocumentation}
+                  isSavingDetails={isSaving}
+                  isDirty={activeCoverageDocumentationDirty}
+                  notes={notes}
+                  onNotesChange={setNotes}
+                  draftStatus={draftStatus}
+                  onDraftStatusChange={setDraftStatus}
+                  statusOptions={activeDetail.ticket.status === "Closed" ? statuses : statuses.filter((status) => status !== "Closed")}
+                  canAssignActiveTicket={canAssignActiveTicket}
+                  draftAgentId={draftAgentId}
+                  onDraftAgentChange={setDraftAgentId}
+                  selectedDraftAgent={selectedDraftAgent}
+                  assignableAdminAgents={assignableAdminAgents}
+                  isActiveTicketAlreadyAssigned={isActiveTicketAlreadyAssigned}
+                  isSlaAutoManaged={isSlaAutoManaged}
+                  effectiveDraftSlaStatus={effectiveDraftSlaStatus}
+                  onDraftSlaStatusChange={setDraftSlaStatus}
+                  slaStatuses={slaStatuses}
+                  isStatusChanging={isStatusChanging}
+                  canSubmitStatusChange={canSubmitStatusChange}
+                  onFieldChange={updateActiveDocumentationField}
+                  onDraftUpdate={updateActiveCoverageDocumentation}
+                  onCancel={closePanel}
+                  onSave={() => void saveActiveCoverageDocumentation()}
+                  onSaveDetails={() => void saveTicket({ successMessage: "Changes saved" })}
+                  onSubmitTutorChoiceCard={(cardId) => void submitActiveCoverageTutorChoiceCard(cardId)}
+                  onConfirmTutorSession={(cardId) => void confirmActiveCoverageTutorSession(cardId)}
+                />
+              ) : (
+                <>
+                  <div className="space-y-5 py-5">
+                    <Tabs
+                      value={activeTicketTab}
+                      onValueChange={(value) => setActiveTicketTab(value as TicketDetailTab)}
+                      className="space-y-4"
+                    >
                   <TabsList className="grid w-full grid-cols-3">
                     <TabsTrigger value="conversation">
                       <MessageSquareText className="mr-2 h-4 w-4" /> Conversation
@@ -4245,7 +4925,7 @@ const AgentDashboard = () => {
                               </SelectContent>
                             </Select>
                             <p className="mt-1 text-xs text-muted-foreground">
-                              Only superadmins can assign unassigned tickets to admin accounts.
+                              Only superadmins can assign or reassign tickets to admin accounts.
                             </p>
                           </>
                         ) : (
@@ -4259,8 +4939,8 @@ const AgentDashboard = () => {
                             </div>
                             <p className="mt-1 text-xs text-muted-foreground">
                               {isActiveTicketAlreadyAssigned
-                                ? "This ticket is already assigned. Only unassigned tickets can be assigned by a superadmin."
-                                : "Only superadmins can assign unassigned tickets to admin accounts."}
+                                ? "Only superadmins can reassign this ticket."
+                                : "Only superadmins can assign or reassign tickets to admin accounts."}
                             </p>
                           </>
                         )}
@@ -4288,11 +4968,11 @@ const AgentDashboard = () => {
                     </div>
 
                     <div className="grid gap-4 text-sm sm:grid-cols-2">
-                      <InfoCard label="Learner Email" value={activeDetail.ticket.email} />
+                      <InfoCard label="Requester E-mail" value={activeDetail.ticket.email} />
                       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(activeDetail.ticket.requesterRole)} />
                       <InfoCard label="Assigned Team" value={activeDetail.ticket.assignedTeam} />
                       <InfoCard label="Category" value={formatCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)} />
-                      <InfoCard label="Status Reason" value={activeDetail.ticket.statusReason || "-"} />
+                      <InfoCard label="Status Reason" value={getDisplayedTicketStatusReason(activeDetail.ticket)} />
                       <InfoCard label="Created" value={formatDateTime(activeDetail.ticket.createdAt)} />
                       <InfoCard label="Updated" value={formatDateTime(activeDetail.ticket.updatedAt)} />
                       <InfoCard label="Priority" value={activeDetail.ticket.priority} />
@@ -4350,6 +5030,8 @@ const AgentDashboard = () => {
                   </Button>
                 </div>
               </SheetFooter>
+                </>
+              )}
             </>
           ) : (
             <div className="h-full min-h-[300px] flex items-center justify-center text-sm text-muted-foreground">
@@ -4595,47 +5277,57 @@ const AgentStatusLabel = ({
 };
 
 const AdminNotificationsPanel = ({
+  coverageTickets,
   requests,
   escalations,
   teamsCalls,
   waitingLiveChats,
   currentConsoleStatus,
   isUpdatingConsoleStatus,
+  coverageResponses,
   escalationUpdates,
   decisionUpdates,
   notificationLog,
   activeTicketId,
   onDecision,
   onOpenTeamsCall,
+  onAcknowledgeCoverageTicket,
   onAcknowledgeEscalation,
   onAcknowledgeEscalationUpdate,
+  onAcknowledgeCoverageResponse,
   onAcknowledgeDecision,
   onOpenTicket,
   onSetAvailable,
 }: {
+  coverageTickets: TicketSummary[];
   requests: TicketSummary[];
   escalations: TicketSummary[];
   teamsCalls: TicketSummary[];
   waitingLiveChats: TicketSummary[];
   currentConsoleStatus: AdminConsoleStatus;
   isUpdatingConsoleStatus: boolean;
+  coverageResponses: TicketSummary[];
   escalationUpdates: TicketSummary[];
   decisionUpdates: TicketSummary[];
   notificationLog: AdminNotificationLogItem[];
   activeTicketId: string;
   onDecision: (ticket: TicketSummary, action: "accept" | "reject") => Promise<void>;
   onOpenTeamsCall: (ticket: TicketSummary) => Promise<void>;
+  onAcknowledgeCoverageTicket: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeEscalation: (ticket: TicketSummary, openChat?: boolean) => Promise<void>;
   onAcknowledgeEscalationUpdate: (ticket: TicketSummary) => Promise<void>;
+  onAcknowledgeCoverageResponse: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeDecision: (ticket: TicketSummary) => Promise<void>;
   onOpenTicket: (ticketId: string) => Promise<void>;
   onSetAvailable: () => void;
 }) => {
   if (
-    requests.length === 0
+    coverageTickets.length === 0
+    && requests.length === 0
     && escalations.length === 0
     && teamsCalls.length === 0
     && waitingLiveChats.length === 0
+    && coverageResponses.length === 0
     && escalationUpdates.length === 0
     && decisionUpdates.length === 0
     && notificationLog.length === 0
@@ -4654,10 +5346,70 @@ const AdminNotificationsPanel = ({
           Admin Notifications
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
-          Review active alerts and the recent notification log for transfer, escalation, Teams call, and waiting live chat activity.
+          Review active alerts and the recent notification log for new coverage tickets, transfer, escalation, coverage tutor replies, Teams calls, and waiting live chat activity.
         </div>
       </div>
       <div className="max-h-[420px] space-y-2 overflow-y-auto p-2">
+        {coverageTickets.length > 0 ? (
+          <div className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            New Coverage Tickets
+          </div>
+        ) : null}
+        {coverageTickets.map((ticket) => {
+          const pendingCoverageTicketNotification = ticket.pendingCoverageTicketNotification;
+          if (!pendingCoverageTicketNotification) {
+            return null;
+          }
+
+          const isBusy = activeTicketId === ticket.id;
+
+          return (
+            <div key={`${ticket.id}-${pendingCoverageTicketNotification.createdAt}`} className="rounded-2xl border border-primary/20 bg-primary/5 px-3 py-3 shadow-soft">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-mono text-xs font-semibold text-primary">Ticket {pendingCoverageTicketNotification.ticketId}</div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground">
+                    {pendingCoverageTicketNotification.requesterName || ticket.learnerName || ticket.email || "Requester"}
+                  </div>
+                  <div className="mt-2">
+                    <RequesterRoleBadge
+                      role={pendingCoverageTicketNotification.requesterRole || ticket.requesterRole}
+                      className="border-primary/20 bg-white/80 text-primary"
+                    />
+                  </div>
+                  <div className="mt-1 text-xs text-primary/75">
+                    Coverage ticket created • {formatDateTime(pendingCoverageTicketNotification.createdAt)}
+                  </div>
+                </div>
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
+              </div>
+              {ticket.inquiryPreview ? (
+                <div className="mt-3 rounded-xl border border-primary/15 bg-background px-3 py-2 text-sm leading-6 text-foreground">
+                  {ticket.inquiryPreview}
+                </div>
+              ) : null}
+              <div className="mt-3 flex gap-2">
+                <Button
+                  size="sm"
+                  className="border-0 gradient-primary"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onOpenTicket(ticket.id)}
+                >
+                  {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Open Ticket
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onAcknowledgeCoverageTicket(ticket)}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          );
+        })}
         {requests.length > 0 ? (
           <div className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
             Incoming Requests
@@ -4686,7 +5438,7 @@ const AdminNotificationsPanel = ({
                     From {pendingTransferRequest.fromAgentName} • {formatDateTime(pendingTransferRequest.requestedAt)}
                   </div>
                 </div>
-                <StatusBadge status={ticket.status} />
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
               </div>
               <div className="mt-3 rounded-xl border bg-secondary/30 px-3 py-2 text-sm leading-6 text-foreground">
                 {pendingTransferRequest.reason}
@@ -4741,7 +5493,7 @@ const AdminNotificationsPanel = ({
                     From {pendingEscalationNotification.fromAgentName} to {pendingEscalationNotification.toAgentName}
                   </div>
                 </div>
-                <StatusBadge status={ticket.status} />
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
               </div>
               <div className="mt-3 rounded-xl border border-amber-200 bg-background px-3 py-2 text-sm leading-6 text-foreground">
                 {pendingEscalationNotification.note}
@@ -4788,7 +5540,7 @@ const AdminNotificationsPanel = ({
                     Direct Teams call requested for {pendingTeamsCallNotification.toAgentName} • {formatDateTime(pendingTeamsCallNotification.requestedAt)}
                   </div>
                 </div>
-                <StatusBadge status={ticket.status} />
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
               </div>
               <div className="mt-3 rounded-xl border border-primary/15 bg-background px-3 py-2 text-sm leading-6 text-foreground">
                 {pendingTeamsCallNotification.note}
@@ -4836,7 +5588,7 @@ const AdminNotificationsPanel = ({
                     Live chat requested • {formatDateTime(ticket.liveChatRequestedAt || ticket.createdAt)}
                   </div>
                 </div>
-                <StatusBadge status={ticket.status} />
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
               </div>
               <div className="mt-3 rounded-xl border border-amber-200 bg-background px-3 py-2 text-sm leading-6 text-foreground">
                 A learner is waiting for a live agent, but no admin was available at the time of the request.
@@ -4865,6 +5617,92 @@ const AdminNotificationsPanel = ({
                 >
                   {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
                   Open Ticket
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+        {coverageResponses.length > 0 ? (
+          <div className="px-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            Coverage Tutor Replies
+          </div>
+        ) : null}
+        {coverageResponses.map((ticket) => {
+          const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
+          if (!latestCoverageTutorResponse) {
+            return null;
+          }
+
+          const isBusy = activeTicketId === ticket.id;
+          const wasAccepted = latestCoverageTutorResponse.outcome === "accepted";
+
+          return (
+            <div
+              key={`${ticket.id}-${latestCoverageTutorResponse.cardId}-${latestCoverageTutorResponse.respondedAt}`}
+              className={cn(
+                "rounded-2xl border px-3 py-3 shadow-soft",
+                wasAccepted
+                  ? "border-emerald-200 bg-emerald-50/60"
+                  : "border-rose-200 bg-rose-50/60",
+              )}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className={cn(
+                    "font-mono text-xs font-semibold",
+                    wasAccepted ? "text-emerald-900" : "text-rose-900",
+                  )}>
+                    Ticket {latestCoverageTutorResponse.ticketId}
+                  </div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground">
+                    {ticket.learnerName || ticket.email || "Learner"}
+                  </div>
+                  <div className="mt-2">
+                    <RequesterRoleBadge
+                      role={ticket.requesterRole}
+                      className={cn(
+                        wasAccepted
+                          ? "border-emerald-300 bg-white/70 text-emerald-900"
+                          : "border-rose-300 bg-white/70 text-rose-900",
+                      )}
+                    />
+                  </div>
+                  <div className={cn(
+                    "mt-1 text-xs",
+                    wasAccepted ? "text-emerald-900/75" : "text-rose-900/75",
+                  )}>
+                    {wasAccepted ? "Accepted" : "Rejected"} by {latestCoverageTutorResponse.tutor} • {formatDateTime(latestCoverageTutorResponse.respondedAt)}
+                  </div>
+                </div>
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
+              </div>
+              {latestCoverageTutorResponse.sessionDetails ? (
+                <div className="mt-3 rounded-xl border bg-background px-3 py-2 text-sm leading-6 text-foreground">
+                  {latestCoverageTutorResponse.sessionDetails}
+                </div>
+              ) : null}
+              {latestCoverageTutorResponse.replyText ? (
+                <div className="mt-2 rounded-xl border bg-secondary/30 px-3 py-2 text-sm leading-6 text-foreground">
+                  {latestCoverageTutorResponse.replyText}
+                </div>
+              ) : null}
+              <div className="mt-3 flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onOpenTicket(ticket.id)}
+                >
+                  {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Open Ticket
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onAcknowledgeCoverageResponse(ticket)}
+                >
+                  Dismiss
                 </Button>
               </div>
             </div>
@@ -4901,7 +5739,7 @@ const AdminNotificationsPanel = ({
                     Closed by {latestEscalationClosure.closedByName} • {formatDateTime(latestEscalationClosure.closedAt)}
                   </div>
                 </div>
-                <StatusBadge status={ticket.status} />
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
               </div>
               <div className="mt-3 rounded-xl border border-emerald-200 bg-background px-3 py-2 text-sm leading-6 text-foreground">
                 {latestEscalationClosure.note}
@@ -5043,7 +5881,7 @@ const AdminNotificationLogCard = ({
             {formatDateTime(item.createdAt)}
           </div>
         </div>
-        <StatusBadge status={item.status} />
+        <StatusBadge status={item.status} label={getDisplayedTicketStatus(item)} />
       </div>
       <div className="mt-3 flex gap-2">
         <Button
@@ -5296,6 +6134,1197 @@ const ConsoleChatBubble = ({
           {message.text}
         </div>
       </div>
+    </div>
+  );
+};
+
+const CoverageTicketDetailsPanel = ({
+  ticket,
+  history,
+  readOnly,
+  isSaving,
+  notes,
+  onNotesChange,
+  draftStatus,
+  onDraftStatusChange,
+  statusOptions,
+  canAssignActiveTicket,
+  draftAgentId,
+  onDraftAgentChange,
+  selectedDraftAgent,
+  assignableAdminAgents,
+  isActiveTicketAlreadyAssigned,
+  isSlaAutoManaged,
+  effectiveDraftSlaStatus,
+  onDraftSlaStatusChange,
+  slaStatuses,
+  isStatusChanging,
+  canSubmitStatusChange,
+  onCancel,
+  onSaveDetails,
+}: {
+  ticket: TicketDetail;
+  history: HistoryItem[];
+  readOnly: boolean;
+  isSaving: boolean;
+  notes: string;
+  onNotesChange: (value: string) => void;
+  draftStatus: TicketSummary["status"];
+  onDraftStatusChange: (value: TicketSummary["status"]) => void;
+  statusOptions: TicketSummary["status"][];
+  canAssignActiveTicket: boolean;
+  draftAgentId: string;
+  onDraftAgentChange: (value: string) => void;
+  selectedDraftAgent: AdminAgent | null;
+  assignableAdminAgents: AdminAgent[];
+  isActiveTicketAlreadyAssigned: boolean;
+  isSlaAutoManaged: boolean;
+  effectiveDraftSlaStatus: TicketSummary["slaStatus"];
+  onDraftSlaStatusChange: (value: TicketSummary["slaStatus"]) => void;
+  slaStatuses: TicketSummary["slaStatus"][];
+  isStatusChanging: boolean;
+  canSubmitStatusChange: boolean;
+  onCancel: () => void;
+  onSaveDetails: () => void;
+}) => (
+  <div className="space-y-5">
+    <div className="grid gap-3 md:grid-cols-3">
+      <div>
+        <Label className="mb-1.5 block">Status</Label>
+        <div className="rounded-xl border bg-secondary/20 px-3 py-2.5 text-sm text-foreground">
+          {draftStatus}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Coverage ticket status is managed by the workflow.
+        </p>
+      </div>
+      <div>
+        <Label className="mb-1.5 block">Assign Agent</Label>
+        {canAssignActiveTicket && !readOnly ? (
+          <>
+            <Select value={draftAgentId} onValueChange={onDraftAgentChange}>
+              <SelectTrigger>
+                {selectedDraftAgent ? (
+                  <AgentStatusLabel agent={selectedDraftAgent} />
+                ) : (
+                  <span className="text-sm text-foreground">Select agent</span>
+                )}
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="unassigned">Unassigned</SelectItem>
+                {assignableAdminAgents.map((agent) => (
+                  <SelectItem key={agent.id} value={String(agent.id)} className="py-2">
+                    <AgentStatusLabel agent={agent} />
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Only superadmins can assign or reassign tickets to agent accounts.
+            </p>
+          </>
+        ) : (
+          <>
+            <div className="rounded-xl border bg-secondary/20 px-3 py-2.5">
+              {selectedDraftAgent ? (
+                <AgentStatusLabel agent={selectedDraftAgent} />
+              ) : (
+                <span className="text-sm text-foreground">Unassigned</span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {isActiveTicketAlreadyAssigned
+                ? "Only superadmins can reassign this ticket."
+                : "Only superadmins can assign or reassign tickets to agent accounts."}
+            </p>
+          </>
+        )}
+      </div>
+      <div>
+        <Label className="mb-1.5 block">{isSlaAutoManaged ? "SLA (Automatic)" : "SLA"}</Label>
+        <Select
+          value={effectiveDraftSlaStatus}
+          onValueChange={(value) => onDraftSlaStatusChange(value as TicketSummary["slaStatus"])}
+          disabled={readOnly || isSaving || isSlaAutoManaged}
+        >
+          <SelectTrigger><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {slaStatuses.map((status) => (
+              <SelectItem key={status} value={status}>{status}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {isSlaAutoManaged ? (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Managed automatically from the current ticket status and age.
+          </p>
+        ) : null}
+      </div>
+    </div>
+
+    <div className="grid gap-4 text-sm sm:grid-cols-2">
+      <InfoCard label="Requester E-mail" value={ticket.email} />
+      <InfoCard label="Requester Role" value={formatRequesterRoleLabel(ticket.requesterRole)} />
+      <InfoCard label="Assigned Team" value={ticket.assignedTeam} />
+      <InfoCard label="Category" value={formatCategoryLabel(ticket.category, ticket.technicalSubcategory)} />
+      <InfoCard label="Status Reason" value={getDisplayedTicketStatusReason(ticket)} />
+      <InfoCard label="Created" value={formatDateTime(ticket.createdAt)} />
+      <InfoCard label="Updated" value={formatDateTime(ticket.updatedAt)} />
+      <InfoCard label="Priority" value={ticket.priority} />
+      <InfoCard label="Evidence Count" value={String(ticket.evidenceCount)} />
+    </div>
+
+    <section>
+      <Label className="mb-1.5 block">Activity log</Label>
+      <ActivityLogTimeline history={history} />
+    </section>
+
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+      <div className="text-xs text-muted-foreground">
+        {readOnly ? "Closed tickets are view-only." : "Review ticket metadata, then save your changes. Coverage tickets close after a tutor accepts the request."}
+      </div>
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+        {!readOnly ? (
+          <Button onClick={onSaveDetails} className="border-0 gradient-primary" disabled={isSaving || !canSubmitStatusChange}>
+            {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+            Save Changes
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  </div>
+);
+
+const CoverageTicketWorkspace = ({
+  ticket,
+  history,
+  draft,
+  readOnly,
+  isSaving,
+  isSavingDetails,
+  isDirty,
+  notes,
+  onNotesChange,
+  draftStatus,
+  onDraftStatusChange,
+  statusOptions,
+  canAssignActiveTicket,
+  draftAgentId,
+  onDraftAgentChange,
+  selectedDraftAgent,
+  assignableAdminAgents,
+  isActiveTicketAlreadyAssigned,
+  isSlaAutoManaged,
+  effectiveDraftSlaStatus,
+  onDraftSlaStatusChange,
+  slaStatuses,
+  isStatusChanging,
+  canSubmitStatusChange,
+  onFieldChange,
+  onDraftUpdate,
+  onCancel,
+  onSave,
+  onSaveDetails,
+  onSubmitTutorChoiceCard,
+  onConfirmTutorSession,
+}: {
+  ticket: TicketDetail;
+  history: HistoryItem[];
+  draft: AdminDocumentation;
+  readOnly: boolean;
+  isSaving: boolean;
+  isSavingDetails: boolean;
+  isDirty: boolean;
+  notes: string;
+  onNotesChange: (value: string) => void;
+  draftStatus: TicketSummary["status"];
+  onDraftStatusChange: (value: TicketSummary["status"]) => void;
+  statusOptions: TicketSummary["status"][];
+  canAssignActiveTicket: boolean;
+  draftAgentId: string;
+  onDraftAgentChange: (value: string) => void;
+  selectedDraftAgent: AdminAgent | null;
+  assignableAdminAgents: AdminAgent[];
+  isActiveTicketAlreadyAssigned: boolean;
+  isSlaAutoManaged: boolean;
+  effectiveDraftSlaStatus: TicketSummary["slaStatus"];
+  onDraftSlaStatusChange: (value: TicketSummary["slaStatus"]) => void;
+  slaStatuses: TicketSummary["slaStatus"][];
+  isStatusChanging: boolean;
+  canSubmitStatusChange: boolean;
+  onFieldChange: (field: keyof AdminDocumentation, value: string) => void;
+  onDraftUpdate: (updater: (draft: AdminDocumentation) => AdminDocumentation) => void;
+  onCancel: () => void;
+  onSave: () => void;
+  onSaveDetails: () => void;
+  onSubmitTutorChoiceCard: (cardId: string) => void;
+  onConfirmTutorSession: (cardId: string) => void;
+}) => {
+  const [tutorOptions, setTutorOptions] = useState<string[]>([]);
+  const [coverageTutorError, setCoverageTutorError] = useState("");
+  const [isLoadingTutorOptions, setIsLoadingTutorOptions] = useState(false);
+  const [previewAttachment, setPreviewAttachment] = useState<CoverageCardAttachment | null>(null);
+  const [editingTutorEmailCardIds, setEditingTutorEmailCardIds] = useState<Set<string>>(new Set());
+  const [loadingTutorEmailCardIds, setLoadingTutorEmailCardIds] = useState<Set<string>>(new Set());
+  const [collapsedCoverageCardIds, setCollapsedCoverageCardIds] = useState<Set<string>>(new Set());
+  const [workspaceTab, setWorkspaceTab] = useState<CoverageWorkspaceTab>("documentation");
+  const hasSavedCoverageSnapshot = Boolean(ticket.documentation?.coverageCards?.length || ticket.documentation?.coverageNotes?.trim());
+  const previewAttachmentKind = getCoverageAttachmentPreviewKind(previewAttachment);
+  const parsedCoverageInquiry = parseCoverageInquiry(draft.inquiry);
+  const coverageInquiryModule = parsedCoverageInquiry?.module?.trim() || "";
+
+  useEffect(() => {
+    setWorkspaceTab("documentation");
+  }, [ticket.id]);
+
+  useEffect(() => {
+    setCollapsedCoverageCardIds(new Set());
+  }, [ticket.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setIsLoadingTutorOptions(true);
+    setCoverageTutorError("");
+
+    void fetchCoverageOptions("tutors", coverageInquiryModule ? { module: coverageInquiryModule } : undefined)
+      .then((options) => {
+        if (cancelled) {
+          return;
+        }
+
+        setTutorOptions(options);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+
+        setTutorOptions([]);
+        setCoverageTutorError(error instanceof Error ? error.message : "We could not load the tutors right now.");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoadingTutorOptions(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [coverageInquiryModule, ticket.id]);
+
+  const expandCoverageHistoryCards = () => {
+    setCollapsedCoverageCardIds(new Set());
+  };
+
+  const updateCoverageCard = (cardId: string, updates: Partial<CoverageWorkflowCard>) => {
+    const timestamp = new Date().toISOString();
+    expandCoverageHistoryCards();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => (
+        card.id === cardId
+          ? {
+              ...card,
+              ...updates,
+              updatedAt: timestamp,
+            }
+          : card
+      )),
+    }));
+  };
+
+  const addTutorChoiceCard = () => {
+    expandCoverageHistoryCards();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: [...currentDraft.coverageCards, createCoverageTutorChoiceCard(currentDraft.inquiry)],
+    }));
+  };
+
+  const addNoteCard = () => {
+    expandCoverageHistoryCards();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: [...currentDraft.coverageCards, createCoverageNoteCard()],
+    }));
+  };
+
+  const removeCoverageCard = (cardId: string) => {
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.filter((card) => card.id !== cardId),
+    }));
+    setEditingTutorEmailCardIds((currentIds) => {
+      if (!currentIds.has(cardId)) {
+        return currentIds;
+      }
+
+      const nextIds = new Set(currentIds);
+      nextIds.delete(cardId);
+      return nextIds;
+    });
+  };
+
+  const setTutorEmailEditing = (cardId: string, isEditing: boolean) => {
+    setEditingTutorEmailCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (isEditing) {
+        nextIds.add(cardId);
+      } else {
+        nextIds.delete(cardId);
+      }
+      return nextIds;
+    });
+  };
+
+  const setTutorEmailLoading = (cardId: string, isLoading: boolean) => {
+    setLoadingTutorEmailCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (isLoading) {
+        nextIds.add(cardId);
+      } else {
+        nextIds.delete(cardId);
+      }
+      return nextIds;
+    });
+  };
+
+  const handleTutorChange = (cardId: string, tutor: string) => {
+    expandCoverageHistoryCards();
+    updateCoverageCard(cardId, {
+      tutor,
+      tutorEmail: "",
+    });
+    setTutorEmailEditing(cardId, false);
+    setTutorEmailLoading(cardId, false);
+
+    if (!tutor.trim()) {
+      return;
+    }
+
+    setTutorEmailLoading(cardId, true);
+    void fetchCoverageTutorEmail(tutor)
+      .then((email) => {
+        onDraftUpdate((currentDraft) => ({
+          ...currentDraft,
+          coverageCards: currentDraft.coverageCards.map((card) => (
+            card.id === cardId && card.tutor === tutor
+              ? {
+                  ...card,
+                  tutorEmail: email,
+                  updatedAt: new Date().toISOString(),
+                }
+              : card
+          )),
+        }));
+        setTutorEmailEditing(cardId, !email);
+      })
+      .catch((error: unknown) => {
+        setTutorEmailEditing(cardId, true);
+        toast.error(error instanceof Error ? error.message : "We could not load the tutor e-mail right now.");
+      })
+      .finally(() => {
+        setTutorEmailLoading(cardId, false);
+      });
+  };
+
+  const handlePresentationFilesAdded = async (cardId: string, event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    try {
+      expandCoverageHistoryCards();
+      const nextFiles = await Promise.all(files.map(readFileAsCoverageCardAttachment));
+      onDraftUpdate((currentDraft) => ({
+        ...currentDraft,
+        coverageCards: currentDraft.coverageCards.map((card) => (
+          card.id === cardId
+            ? {
+                ...card,
+                presentationFiles: [...card.presentationFiles, ...nextFiles],
+                updatedAt: new Date().toISOString(),
+              }
+            : card
+        )),
+      }));
+    } catch {
+      toast.error("We could not read one or more presentation files right now.");
+    }
+  };
+
+  const removePresentationFile = (cardId: string, fileId: string) => {
+    expandCoverageHistoryCards();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => (
+        card.id === cardId
+          ? {
+              ...card,
+              presentationFiles: card.presentationFiles.filter((file) => file.id !== fileId),
+              updatedAt: new Date().toISOString(),
+            }
+          : card
+      )),
+    }));
+  };
+
+  const toggleCoverageCardCollapsed = (cardId: string) => {
+    setCollapsedCoverageCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (nextIds.has(cardId)) {
+        nextIds.delete(cardId);
+      } else {
+        nextIds.add(cardId);
+      }
+      return nextIds;
+    });
+  };
+  const coverageCardsForDisplay = sortCoverageWorkflowCardsForDisplay(draft.coverageCards);
+
+  return (
+    <div className="space-y-4 py-4">
+      <Tabs value={workspaceTab} onValueChange={(value) => setWorkspaceTab(value as CoverageWorkspaceTab)} className="space-y-4">
+        <TabsList className="grid w-full grid-cols-2 rounded-2xl border border-primary/10 bg-white/80 p-1 shadow-soft">
+          <TabsTrigger value="documentation" className="h-11 rounded-xl border border-transparent bg-transparent text-sm font-semibold data-[state=active]:border-primary/15 data-[state=active]:bg-primary/[0.08] data-[state=active]:text-primary">
+            <FileText className="mr-2 h-4 w-4" /> Documentation
+          </TabsTrigger>
+          <TabsTrigger value="details" className="h-11 rounded-xl border border-transparent bg-transparent text-sm font-semibold data-[state=active]:border-primary/15 data-[state=active]:bg-primary/[0.08] data-[state=active]:text-primary">
+            <TicketIcon className="mr-2 h-4 w-4" /> Ticket Details
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="documentation" className="space-y-5">
+          <div className="grid items-stretch gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.9fr)]">
+            <div className="h-full rounded-[30px] border border-primary/12 bg-gradient-to-br from-white via-primary/[0.025] to-violet-50/70 p-5 shadow-[0_22px_45px_rgba(82,54,188,0.08)]">
+              <div className="flex h-full flex-col space-y-3">
+                <div className="inline-flex items-center rounded-full border border-primary/15 bg-primary/[0.08] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
+                  Inquiry
+                </div>
+                {parseCoverageInquiry(draft.inquiry) ? (
+                  <CoverageInquirySummary inquiry={draft.inquiry} />
+                ) : (
+                  <Textarea
+                    value={draft.inquiry}
+                    onChange={(event) => onFieldChange("inquiry", event.target.value)}
+                    readOnly={readOnly || hasSavedCoverageSnapshot}
+                    placeholder="Document the learner inquiry..."
+                    className="min-h-[220px] rounded-2xl border-primary/12 bg-background"
+                  />
+                )}
+                {!readOnly && hasSavedCoverageSnapshot ? (
+                  <p className="text-xs text-muted-foreground">
+                    Saved inquiry details are frozen and kept as the original submitted request.
+                  </p>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="h-full rounded-[30px] border border-primary/12 bg-gradient-to-br from-white via-violet-50/80 to-primary/[0.06] p-5 shadow-[0_22px_45px_rgba(82,54,188,0.08)]">
+              <div className="flex h-full flex-col space-y-3">
+                <div className="inline-flex items-center rounded-full border border-primary/15 bg-white/90 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
+                  Ticket Note
+                </div>
+                <Textarea
+                  rows={7}
+                  placeholder="Add an internal note for the ticket..."
+                  value={notes}
+                  onChange={(event) => onNotesChange(event.target.value)}
+                  readOnly={readOnly}
+                  className="min-h-[230px] flex-1 rounded-2xl border-primary/12 bg-white/90 shadow-none xl:min-h-0"
+                />
+                {isStatusChanging ? (
+                  <p className={cn("text-xs", canSubmitStatusChange ? "text-muted-foreground" : "text-destructive")}>
+                    A note is required before changing this ticket status.
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    This note belongs to the ticket itself and is visible to support staff only.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-[30px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.04] p-5 shadow-[0_22px_45px_rgba(82,54,188,0.08)]">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <div className="inline-flex items-center rounded-full border border-primary/15 bg-primary/[0.08] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
+                  Coverage Cards
+                </div>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Track tutor outreach, responses, and follow-up actions in one place.
+                </p>
+              </div>
+              {!readOnly ? (
+                <div className="flex flex-wrap gap-2">
+                  <Button className="border-0 gradient-primary text-white shadow-[0_16px_30px_rgba(82,54,188,0.22)]" onClick={addTutorChoiceCard} disabled={isSaving}>
+                    Add Tutor Choice Card
+                  </Button>
+                  <Button className="border-0 bg-violet-600 text-white shadow-[0_16px_30px_rgba(109,40,217,0.18)] hover:bg-violet-700" onClick={addNoteCard} disabled={isSaving}>
+                    Add Note Card
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="mt-5 space-y-3">
+          {coverageCardsForDisplay.map((card) => {
+            const cardReadOnly = readOnly || card.locked;
+            const isTutorEmailEditable = editingTutorEmailCardIds.has(card.id) || !card.tutorEmail.trim();
+            const isTutorEmailLoading = loadingTutorEmailCardIds.has(card.id);
+            const canRemoveCard = !readOnly && !card.locked;
+            const canCollapseCard = cardReadOnly;
+            const isCardCollapsed = canCollapseCard && collapsedCoverageCardIds.has(card.id);
+
+            if (card.type === "tutor_reply") {
+              const canConfirmSession = canConfirmCoverageReplyCard(card);
+              const wasAccepted = card.replyOutcome === "accepted";
+              const relatedTutorChoiceCard = draft.coverageCards.find((candidate) => (
+                candidate.type === "tutor_choice" && candidate.id === card.relatedTutorChoiceCardId
+              ));
+              const relatedTutorRequestSummary = summarizeCoverageTutorRequestDetails(
+                relatedTutorChoiceCard?.sessionDetails || "",
+              );
+              const replyAccentClassName = wasAccepted
+                ? "border-emerald-200/70 bg-emerald-50/50"
+                : "border-rose-200/70 bg-rose-50/50";
+              const replyTextClassName = wasAccepted ? "text-emerald-900" : "text-rose-900";
+              const replyMutedTextClassName = wasAccepted ? "text-emerald-900/70" : "text-rose-900/70";
+              const replyBorderClassName = wasAccepted ? "border-emerald-200" : "border-rose-200";
+              const replySeparatorClassName = wasAccepted ? "border-emerald-200/80" : "border-rose-200/80";
+              const replyStatusLabel = getCoverageReplyOutcomeLabel(card.replyOutcome);
+              const responseSummary = card.sessionDetails.trim();
+              const requestSummary = relatedTutorChoiceCard?.sessionDetails.trim() || "";
+              const hasUpdatedSessionDetails = Boolean(responseSummary && responseSummary !== requestSummary);
+              const replyText = card.replyText.trim();
+              const tutorEmail = card.tutorEmail.trim();
+              const requestTutorEmail = relatedTutorChoiceCard?.tutorEmail.trim().toLowerCase() || "";
+              const hasUpdatedTutorEmail = Boolean(tutorEmail && tutorEmail.toLowerCase() !== requestTutorEmail);
+
+              return (
+                <div key={card.id} className={cn("rounded-[26px] border px-4 py-3.5 shadow-soft", replyAccentClassName)}>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      <div className={cn("truncate text-sm font-semibold", replyTextClassName)}>
+                        Tutor Response
+                      </div>
+                      {card.replyOutcome ? (
+                        <div className={cn("rounded-full border px-2 py-0.5 text-[11px] font-medium", replyBorderClassName, replyMutedTextClassName)}>
+                          {replyStatusLabel}
+                        </div>
+                      ) : null}
+                      {card.tutor ? (
+                        <div className={cn("truncate text-sm", replyMutedTextClassName)}>
+                          {card.tutor}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className={cn("rounded-full border bg-white px-3 py-1 text-xs font-medium", replyBorderClassName, replyMutedTextClassName)}>
+                      {buildCoverageCardTimestampLabel(card.createdAt, card.updatedAt)}
+                    </div>
+                    {canCollapseCard ? (
+                      <button
+                        type="button"
+                        onClick={() => toggleCoverageCardCollapsed(card.id)}
+                        className={cn(
+                          "inline-flex h-8 w-8 items-center justify-center rounded-full border bg-white transition",
+                          replyBorderClassName,
+                          replyMutedTextClassName,
+                        )}
+                        aria-label={isCardCollapsed ? "Expand tutor response" : "Collapse tutor response"}
+                      >
+                        <ChevronDown className={cn("h-4 w-4 transition-transform", isCardCollapsed && "-rotate-90")} />
+                      </button>
+                    ) : null}
+                  </div>
+
+                  {!isCardCollapsed ? (
+                    <div className="mt-3 space-y-2 text-sm">
+                    {hasUpdatedTutorEmail ? (
+                      <div className={cn("flex flex-wrap gap-x-2 gap-y-1", replyMutedTextClassName)}>
+                        <span className="font-medium">Tutor E-mail:</span>
+                        <span className="text-foreground break-all">{tutorEmail}</span>
+                      </div>
+                    ) : null}
+                    <div className={cn("rounded-xl bg-white/80 px-3 py-2", replyMutedTextClassName)}>
+                      <div className="font-medium">{wasAccepted ? "Tutor accepted this request." : "Tutor refused this request."}</div>
+                      {replyText ? (
+                        <div className="mt-1 whitespace-pre-wrap leading-7 text-foreground">
+                          {replyText}
+                        </div>
+                      ) : null}
+                    </div>
+                    {hasUpdatedSessionDetails ? (
+                      <div className={cn("space-y-1", replyMutedTextClassName)}>
+                        <div className="font-medium">Updated Session Details:</div>
+                        <div className="whitespace-pre-wrap rounded-xl bg-white/80 px-3 py-2 leading-7 text-foreground">
+                          {card.sessionDetails}
+                        </div>
+                        </div>
+                      ) : null}
+                      {relatedTutorChoiceCard ? (
+                        <div className="space-y-2 pt-1">
+                          <div className={cn("text-[11px] font-semibold uppercase tracking-[0.14em]", replyMutedTextClassName)}>
+                            Original Request
+                          </div>
+                          <div className="rounded-xl border border-white/70 bg-white/85 px-3 py-3">
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-foreground">
+                                  <span className="font-medium">{relatedTutorChoiceCard.tutor || "Tutor"}</span>
+                                  {relatedTutorChoiceCard.tutorEmail ? (
+                                    <span className="break-all text-muted-foreground">{relatedTutorChoiceCard.tutorEmail}</span>
+                                  ) : null}
+                                </div>
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                  {relatedTutorRequestSummary.moduleLine ? (
+                                    <div className="rounded-full border border-primary/10 bg-white px-3 py-1 text-xs font-medium text-foreground">
+                                      {relatedTutorRequestSummary.moduleLine}
+                                    </div>
+                                  ) : null}
+                                  {relatedTutorRequestSummary.sessionCount > 0 ? (
+                                    <div className="rounded-full border border-primary/10 bg-white px-3 py-1 text-xs font-medium text-foreground">
+                                      {relatedTutorRequestSummary.sessionCount} session{relatedTutorRequestSummary.sessionCount === 1 ? "" : "s"}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              </div>
+                              {relatedTutorChoiceCard.submittedAt ? (
+                                <div className="text-xs text-muted-foreground">
+                                  Submitted {formatDateTime(relatedTutorChoiceCard.submittedAt)}
+                                </div>
+                              ) : null}
+                            </div>
+                            {relatedTutorRequestSummary.preferredTimeLine ? (
+                              <div className="mt-3 rounded-xl border border-primary/10 bg-white px-3 py-2 text-sm text-foreground">
+                                {relatedTutorRequestSummary.preferredTimeLine}
+                              </div>
+                            ) : null}
+                            {relatedTutorRequestSummary.sessionLines.length > 0 ? (
+                              <div className="mt-3 space-y-2">
+                                <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                  Requested Sessions
+                                </div>
+                                <div className="space-y-2">
+                                  {relatedTutorRequestSummary.sessionLines.map((line) => (
+                                    <div
+                                      key={line}
+                                      className="rounded-xl border border-primary/10 bg-white px-3 py-2 text-sm text-foreground"
+                                    >
+                                      {line}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            ) : null}
+                            {relatedTutorChoiceCard.presentationFiles.length > 0 ? (
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {relatedTutorChoiceCard.presentationFiles.map((file) => (
+                                  <button
+                                    key={file.id}
+                                    type="button"
+                                    onClick={() => setPreviewAttachment(file)}
+                                    className="inline-flex max-w-full items-center gap-2 rounded-full border bg-white px-3 py-1.5 text-xs shadow-sm"
+                                  >
+                                    <span className="truncate font-medium text-primary">{file.name}</span>
+                                    <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {wasAccepted && !isCardCollapsed ? (
+                    <div className={cn("mt-3 flex flex-wrap items-center justify-between gap-3 border-t pt-3", replySeparatorClassName)}>
+                      <div className={cn("text-xs", wasAccepted ? "text-emerald-900/75" : "text-rose-900/75")}>
+                        {card.confirmedAt
+                          ? `Confirmed ${formatDateTime(card.confirmedAt)}`
+                          : getCoverageReplyCardTimingMessage(card)}
+                      </div>
+                      {!readOnly ? (
+                        <Button
+                          onClick={() => void onConfirmTutorSession(card.id)}
+                          disabled={isSaving || !canConfirmSession || Boolean(card.confirmedAt)}
+                          className="border-0 bg-emerald-600 text-white hover:bg-emerald-700"
+                        >
+                          {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                          Confirm Session
+                        </Button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            }
+
+            if (card.type === "note") {
+              return (
+                <div key={card.id} className="rounded-[26px] border border-primary/12 bg-gradient-to-br from-violet-50/70 via-white to-primary/[0.05] p-4 shadow-soft">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-foreground">Note</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="rounded-full border bg-background px-3 py-1 text-xs font-medium text-muted-foreground">
+                        {buildCoverageCardTimestampLabel(card.createdAt, card.updatedAt)}
+                      </div>
+                      {canCollapseCard ? (
+                        <button
+                          type="button"
+                          onClick={() => toggleCoverageCardCollapsed(card.id)}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full border bg-background text-muted-foreground transition hover:border-primary/30 hover:text-primary"
+                          aria-label={isCardCollapsed ? "Expand note card" : "Collapse note card"}
+                        >
+                          <ChevronDown className={cn("h-4 w-4 transition-transform", isCardCollapsed && "-rotate-90")} />
+                        </button>
+                      ) : null}
+                      {canRemoveCard ? (
+                        <button
+                          type="button"
+                          onClick={() => removeCoverageCard(card.id)}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full border bg-background text-muted-foreground transition hover:border-destructive/30 hover:text-destructive"
+                          aria-label="Remove note card"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  {!isCardCollapsed ? (
+                    <div className="mt-3 space-y-2">
+                    <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Note</Label>
+                    <Textarea
+                      value={card.note}
+                      onChange={(event) => updateCoverageCard(card.id, { note: event.target.value })}
+                      readOnly={cardReadOnly}
+                      placeholder="Add a support note, update, or internal reminder..."
+                      className="min-h-[120px] rounded-2xl border-primary/12 bg-white/90 shadow-none"
+                    />
+                    </div>
+                  ) : null}
+                </div>
+              );
+            }
+
+            const displayedTutorOptions = card.tutor && !tutorOptions.includes(card.tutor)
+              ? [card.tutor, ...tutorOptions]
+              : tutorOptions;
+            const tutorChoiceStatusLabel = card.requestStatus === "draft" ? "" : getCoverageTutorRequestLabel(card.requestStatus);
+            const showCompactTutorChoice = cardReadOnly;
+            const compactTutorRequestSummary = summarizeCoverageTutorRequestDetails(card.sessionDetails);
+            const linkedTutorReplyCard = draft.coverageCards.find((candidate) => (
+              candidate.type === "tutor_reply" && candidate.relatedTutorChoiceCardId === card.id
+            ));
+
+            if (showCompactTutorChoice && linkedTutorReplyCard) {
+              return null;
+            }
+
+            return (
+              <div
+                key={card.id}
+                className={cn(
+                  "rounded-[26px] border p-4 shadow-soft",
+                  showCompactTutorChoice
+                    ? "border-primary/12 bg-white/95"
+                    : "border-primary/15 bg-gradient-to-br from-primary/[0.09] via-white to-violet-50/80",
+                )}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-semibold text-foreground">
+                        {showCompactTutorChoice ? "Tutor Request" : "Tutor Choice"}
+                      </div>
+                      {tutorChoiceStatusLabel ? (
+                        <div className={cn(
+                          "rounded-full border px-2.5 py-0.5 text-[11px] font-medium",
+                          getCoverageTutorRequestBadgeClassName(card.requestStatus),
+                        )}>
+                          {tutorChoiceStatusLabel}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="rounded-full border bg-background px-3 py-1 text-xs font-medium text-muted-foreground">
+                      {buildCoverageCardTimestampLabel(card.createdAt, card.updatedAt)}
+                    </div>
+                    {canCollapseCard ? (
+                      <button
+                        type="button"
+                        onClick={() => toggleCoverageCardCollapsed(card.id)}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-full border bg-background text-muted-foreground transition hover:border-primary/30 hover:text-primary"
+                        aria-label={isCardCollapsed ? "Expand tutor choice card" : "Collapse tutor choice card"}
+                      >
+                        <ChevronDown className={cn("h-4 w-4 transition-transform", isCardCollapsed && "-rotate-90")} />
+                      </button>
+                    ) : null}
+                    {canRemoveCard ? (
+                      <button
+                        type="button"
+                        onClick={() => removeCoverageCard(card.id)}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-full border bg-background text-muted-foreground transition hover:border-destructive/30 hover:text-destructive"
+                        aria-label="Remove tutor choice card"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+
+                {showCompactTutorChoice && !isCardCollapsed ? (
+                  <>
+                    <div className="mt-3 rounded-2xl border border-primary/10 bg-gradient-to-br from-primary/[0.035] via-white to-violet-50/40 px-4 py-3.5">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-foreground">
+                            <span className="font-medium">{card.tutor || "Tutor"}</span>
+                            {card.tutorEmail ? (
+                              <span className="break-all text-muted-foreground">{card.tutorEmail}</span>
+                            ) : null}
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {compactTutorRequestSummary.moduleLine ? (
+                              <div className="rounded-full border border-primary/10 bg-white px-3 py-1 text-xs font-medium text-foreground">
+                                {compactTutorRequestSummary.moduleLine}
+                              </div>
+                            ) : null}
+                            {compactTutorRequestSummary.sessionCount > 0 ? (
+                              <div className="rounded-full border border-primary/10 bg-white px-3 py-1 text-xs font-medium text-foreground">
+                                {compactTutorRequestSummary.sessionCount} session{compactTutorRequestSummary.sessionCount === 1 ? "" : "s"}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                        {card.submittedAt ? (
+                          <div className="text-xs text-muted-foreground">
+                            Submitted {formatDateTime(card.submittedAt)}
+                          </div>
+                        ) : null}
+                      </div>
+                      {compactTutorRequestSummary.preferredTimeLine ? (
+                        <div className="mt-3 rounded-xl border border-primary/10 bg-white/90 px-3 py-2 text-sm text-foreground">
+                          {compactTutorRequestSummary.preferredTimeLine}
+                        </div>
+                      ) : null}
+                      {compactTutorRequestSummary.sessionLines.length > 0 ? (
+                        <div className="mt-3 space-y-2">
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                            Requested Sessions
+                          </div>
+                          <div className="space-y-2">
+                            {compactTutorRequestSummary.sessionLines.map((line) => (
+                              <div
+                                key={line}
+                                className="rounded-xl border border-primary/10 bg-white/85 px-3 py-2 text-sm text-foreground"
+                              >
+                                {line}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : card.sessionDetails ? (
+                        <div className="mt-3 whitespace-pre-wrap rounded-xl border border-primary/10 bg-white/85 px-3 py-2 text-sm leading-7 text-foreground">
+                          {card.sessionDetails}
+                        </div>
+                      ) : null}
+                      {card.presentationFiles.length > 0 ? (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {card.presentationFiles.map((file) => (
+                            <button
+                              key={file.id}
+                              type="button"
+                              onClick={() => setPreviewAttachment(file)}
+                              className="inline-flex max-w-full items-center gap-2 rounded-full border bg-background px-3 py-1.5 text-xs shadow-sm"
+                            >
+                              <span className="truncate font-medium text-primary">{file.name}</span>
+                              <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </>
+                ) : showCompactTutorChoice ? null : (
+                  <>
+                    <div className="mt-3 grid gap-3">
+                      <div className="grid gap-3 md:grid-cols-2 md:items-start">
+                        <div className="space-y-2">
+                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Tutor</Label>
+                          <Select
+                            value={card.tutor}
+                            onValueChange={(value) => handleTutorChange(card.id, value)}
+                            disabled={isLoadingTutorOptions || isSaving}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder={isLoadingTutorOptions ? "Loading tutors..." : "Choose tutor"} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {displayedTutorOptions.length === 0 ? (
+                                <div className="px-3 py-2 text-sm text-muted-foreground">
+                                  {isLoadingTutorOptions ? "Loading tutors..." : "No tutors available."}
+                                </div>
+                              ) : (
+                                displayedTutorOptions.map((option) => (
+                                  <SelectItem key={option} value={option}>{option}</SelectItem>
+                                ))
+                              )}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Tutor E-mail</Label>
+                          <div className="relative">
+                            <Input
+                              type="email"
+                              value={card.tutorEmail}
+                              onChange={(event) => updateCoverageCard(card.id, { tutorEmail: event.target.value })}
+                              readOnly={!isTutorEmailEditable}
+                              placeholder={card.tutor ? "Enter tutor e-mail" : "Choose tutor first"}
+                              className={cn(
+                                "bg-background",
+                                card.tutorEmail.trim() && "pr-16",
+                                !card.tutorEmail.trim() && "border-amber-300",
+                              )}
+                            />
+                            {card.tutorEmail.trim() ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setTutorEmailEditing(card.id, !isTutorEmailEditable)}
+                                className="absolute right-2 top-1/2 h-7 -translate-y-1/2 px-2 text-[11px]"
+                              >
+                                {isTutorEmailEditable ? "Done" : "Edit"}
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {card.tutor
+                          ? isTutorEmailLoading
+                            ? "Loading tutor e-mail..."
+                            : card.tutorEmail.trim()
+                            ? isTutorEmailEditable
+                              ? "Edit if the tutor e-mail needs a correction."
+                              : "Loaded from Tutors_Modules."
+                            : "No e-mail was found in Tutors_Modules. Please enter it manually."
+                          : "Choose a tutor to load the e-mail automatically."}
+                      </p>
+                    </div>
+
+                    <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                      <div className="space-y-2 lg:col-span-2">
+                        <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Presentation Upload</Label>
+                        <div className="rounded-2xl border border-primary/12 bg-gradient-to-br from-white via-primary/[0.02] to-violet-50/40 p-3 shadow-sm">
+                          <input
+                            id={`coverage-presentation-${card.id}`}
+                            type="file"
+                            multiple
+                            accept=".pdf,.ppt,.pptx,.odp,.key,image/*"
+                            disabled={isSaving}
+                            onChange={(event) => void handlePresentationFilesAdded(card.id, event)}
+                            className="sr-only"
+                          />
+                          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                            <label
+                              htmlFor={`coverage-presentation-${card.id}`}
+                              className={cn(
+                                "inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-primary/15 bg-white px-4 py-2.5 text-sm font-semibold text-primary shadow-sm transition hover:border-primary/30 hover:bg-primary/[0.04]",
+                                isSaving && "cursor-not-allowed opacity-60",
+                              )}
+                            >
+                              <Paperclip className="h-4 w-4" />
+                              {card.presentationFiles.length > 0 ? "Add More Files" : "Attach Presentation Files"}
+                            </label>
+                            <div className="text-sm text-muted-foreground xl:text-right">
+                              {card.presentationFiles.length > 0
+                                ? `${card.presentationFiles.length} file${card.presentationFiles.length === 1 ? "" : "s"} selected`
+                                : "PDF, PPT, PPTX, ODP, Keynote, or image files"}
+                            </div>
+                          </div>
+                          {card.presentationFiles.length > 0 ? (
+                            <div className="mt-3 flex min-w-0 flex-wrap gap-2">
+                              {card.presentationFiles.map((file) => (
+                                <div
+                                  key={file.id}
+                                  className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-full border border-primary/10 bg-white px-3 py-1.5 text-xs shadow-sm"
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => setPreviewAttachment(file)}
+                                    className="truncate font-medium text-primary underline-offset-4 hover:underline"
+                                  >
+                                    {file.name}
+                                  </button>
+                                  <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => removePresentationFile(card.id, file.id)}
+                                    className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+                                    aria-label={`Remove ${file.name}`}
+                                  >
+                                    <X className="h-3 w-3" />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                          </div>
+                        </div>
+
+                      <div className="space-y-2 lg:col-span-2">
+                        <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Session Details</Label>
+                        <Textarea
+                          value={card.sessionDetails}
+                          onChange={(event) => updateCoverageCard(card.id, { sessionDetails: event.target.value })}
+                          readOnly={false}
+                          placeholder="Add the session details the tutor should review..."
+                          className="min-h-[130px] bg-background"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t pt-3">
+                      <div className="text-xs text-muted-foreground">
+                        {card.submittedAt
+                          ? `Submitted ${formatDateTime(card.submittedAt)}`
+                          : "Editable until submitted"}
+                      </div>
+                      <Button
+                        onClick={() => void onSubmitTutorChoiceCard(card.id)}
+                        disabled={isSaving || isLoadingTutorOptions || isTutorEmailLoading}
+                        className="border-0 gradient-primary"
+                      >
+                        {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                        Submit to Tutor
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {coverageTutorError ? (
+          <p className="mt-3 text-sm text-destructive">{coverageTutorError}</p>
+        ) : null}
+      </div>
+
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+        <div className="text-xs text-muted-foreground">
+          {readOnly ? "Closed tickets are view-only." : "Save your work or submit a tutor request. Coverage tickets close after a tutor accepts the request."}
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+          {!readOnly ? (
+            <>
+              <Button onClick={onSave} className="border-0 gradient-primary" disabled={!isDirty || isSaving}>
+                {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+                Save Ticket
+              </Button>
+            </>
+          ) : null}
+        </div>
+      </div>
+        </TabsContent>
+
+        <TabsContent value="details" className="space-y-4">
+          <CoverageTicketDetailsPanel
+            ticket={ticket}
+            history={history}
+            readOnly={readOnly}
+            isSaving={isSavingDetails}
+            notes={notes}
+            onNotesChange={onNotesChange}
+            draftStatus={draftStatus}
+            onDraftStatusChange={onDraftStatusChange}
+            statusOptions={statusOptions}
+            canAssignActiveTicket={canAssignActiveTicket}
+            draftAgentId={draftAgentId}
+            onDraftAgentChange={onDraftAgentChange}
+            selectedDraftAgent={selectedDraftAgent}
+            assignableAdminAgents={assignableAdminAgents}
+            isActiveTicketAlreadyAssigned={isActiveTicketAlreadyAssigned}
+            isSlaAutoManaged={isSlaAutoManaged}
+            effectiveDraftSlaStatus={effectiveDraftSlaStatus}
+            onDraftSlaStatusChange={onDraftSlaStatusChange}
+            slaStatuses={slaStatuses}
+            isStatusChanging={isStatusChanging}
+            canSubmitStatusChange={canSubmitStatusChange}
+            onCancel={onCancel}
+            onSaveDetails={onSaveDetails}
+          />
+        </TabsContent>
+      </Tabs>
+
+      <Dialog open={Boolean(previewAttachment)} onOpenChange={(open) => !open && setPreviewAttachment(null)}>
+        <DialogContent className="max-h-[90vh] max-w-5xl overflow-hidden">
+          <DialogHeader>
+            <DialogTitle className="truncate pr-8">{previewAttachment?.name || "Attachment Preview"}</DialogTitle>
+            <DialogDescription>
+              {previewAttachment?.mimeType || "Attachment"} {previewAttachment ? `- ${formatBytes(previewAttachment.size)}` : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {previewAttachment ? (
+            previewAttachmentKind === "image" ? (
+              <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
+                <img
+                  src={previewAttachment.dataUrl}
+                  alt={previewAttachment.name}
+                  className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
+                />
+              </div>
+            ) : previewAttachmentKind === "pdf" ? (
+              <div className="overflow-hidden rounded-2xl border bg-secondary/10">
+                <iframe
+                  src={previewAttachment.dataUrl}
+                  title={previewAttachment.name}
+                  className="h-[70vh] w-full border-0"
+                />
+              </div>
+            ) : (
+              <div className="rounded-2xl border bg-secondary/10 p-5">
+                <div className="text-sm text-foreground">
+                  Preview is not available for this file type yet.
+                </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  You can still download the file from here if needed.
+                </div>
+                <div className="mt-4">
+                  <a
+                    href={previewAttachment.dataUrl}
+                    download={previewAttachment.name}
+                    className="inline-flex items-center rounded-full border px-4 py-2 text-sm font-medium text-primary transition hover:bg-secondary/40"
+                  >
+                    Download File
+                  </a>
+                </div>
+              </div>
+            )
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
@@ -6119,6 +8148,447 @@ const ActivityPayloadField = ({
   </div>
 );
 
+function isCoverageTicket(ticket?: Pick<TicketSummary, "technicalSubcategory"> | null) {
+  return ticket?.technicalSubcategory === "Coverage";
+}
+
+function createCoverageCardId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  return `coverage-card-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildCoverageTutorSessionDetails(inquiry: string) {
+  const parsedInquiry = parseCoverageInquiry(inquiry);
+  if (!parsedInquiry) {
+    return "";
+  }
+
+  const sessionDates = parsedInquiry.sessionDates || [];
+  const sessionNumbers = parsedInquiry.sessionNumbers || [];
+  const sessionSubjects = parsedInquiry.sessionSubjects || [];
+  const sessionDetailLines = Array.from({
+    length: Math.max(sessionDates.length, sessionNumbers.length, sessionSubjects.length),
+  })
+    .map((_, index) => {
+      const sessionParts = [
+        sessionDates[index]?.trim() || "",
+        sessionNumbers[index]?.trim() ? `No. ${sessionNumbers[index]?.trim()}` : "",
+        sessionSubjects[index]?.trim() ? `${sessionSubjects[index]?.trim()}` : "",
+      ].filter(Boolean);
+
+      return sessionParts.length > 0 ? `${index + 1}. ${sessionParts.join(" | ")}` : "";
+    })
+    .filter(Boolean);
+
+  return [
+    parsedInquiry.module ? `Module: ${parsedInquiry.module}` : "",
+    parsedInquiry.time ? `Preferred Time: ${parsedInquiry.time}` : "",
+    sessionDetailLines.length > 0 ? "Sessions:" : "",
+    ...sessionDetailLines,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function CoverageInquirySummary({ inquiry }: { inquiry: string }) {
+  const parsedInquiry = parseCoverageInquiry(inquiry);
+  if (!parsedInquiry) {
+    return null;
+  }
+
+  const sessionDates = parsedInquiry.sessionDates || [];
+  const sessionNumbers = parsedInquiry.sessionNumbers || [];
+  const sessionSubjects = parsedInquiry.sessionSubjects || [];
+  const sessionCount = Math.max(sessionDates.length, sessionNumbers.length, sessionSubjects.length, 1);
+
+  return (
+    <div className="space-y-3">
+      <div className="overflow-hidden rounded-[28px] border border-primary/15 bg-gradient-to-br from-primary/[0.08] via-white to-fuchsia-50/70 shadow-[0_18px_40px_rgba(82,54,188,0.10)]">
+        <div className="border-b border-primary/10 px-4 py-3 sm:px-5">
+          <div className="inline-flex items-center rounded-full border border-primary/15 bg-white/85 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-primary shadow-sm">
+            Coverage Session Request
+          </div>
+        </div>
+        <div className="grid gap-4 px-4 py-4 sm:grid-cols-2 sm:px-5">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Tutor</div>
+            <div className="mt-1 text-[15px] font-semibold text-foreground">{parsedInquiry.tutor || "-"}</div>
+          </div>
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Module</div>
+            <div className="mt-1 text-[15px] font-semibold text-foreground">{parsedInquiry.module || "-"}</div>
+          </div>
+          <div className="sm:col-span-2">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Preferred Time</div>
+            <div className="mt-1 text-[15px] font-semibold text-foreground">{parsedInquiry.time || "-"}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-3">
+        {Array.from({ length: sessionCount }).map((_, index) => {
+          const sessionDate = sessionDates[index]?.trim() || "";
+          const sessionNumber = sessionNumbers[index]?.trim() || "";
+          const sessionSubject = sessionSubjects[index]?.trim()
+            || (sessionSubjects.length === 1 ? sessionSubjects[0]?.trim() || "" : "");
+
+          if (!sessionDate && !sessionNumber && !sessionSubject && index > 0) {
+            return null;
+          }
+
+          return (
+            <div
+              key={`${sessionDate || "session"}-${index}`}
+              className="rounded-[26px] border border-primary/12 bg-white/92 px-4 py-3.5 shadow-[0_14px_30px_rgba(82,54,188,0.07)]"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-sm font-semibold text-foreground">Session {index + 1}</div>
+                <div className="inline-flex items-center rounded-full border border-primary/12 bg-primary/[0.06] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-primary">
+                  Planned Session
+                </div>
+              </div>
+              <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Date</div>
+                  <div className="mt-1 text-sm font-semibold text-foreground">{sessionDate || "-"}</div>
+                </div>
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Number</div>
+                  <div className="mt-1 text-sm font-semibold text-foreground">{sessionNumber || "-"}</div>
+                </div>
+                <div>
+                  <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Subject</div>
+                  <div className="mt-1 text-sm font-semibold text-foreground">{sessionSubject || "-"}</div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function createCoverageTutorChoiceCard(inquiry: string): CoverageWorkflowCard {
+  const timestamp = new Date().toISOString();
+  const parsedInquiry = parseCoverageInquiry(inquiry);
+
+  return {
+    id: createCoverageCardId(),
+    type: "tutor_choice",
+    title: "",
+    note: "",
+    tutor: parsedInquiry?.tutor || "",
+    tutorEmail: "",
+    sessionDetails: buildCoverageTutorSessionDetails(inquiry),
+    replyText: "",
+    requestStatus: "draft",
+    replyOutcome: "",
+    locked: false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    submittedAt: "",
+    respondedAt: "",
+    relatedTutorChoiceCardId: "",
+    requestSubmittedByAgentId: null,
+    requestSubmittedByAgentName: "",
+    requestSubmittedByAgentUsername: "",
+    responseToken: "",
+    sessionStartAt: "",
+    sessionEndAt: "",
+    confirmedAt: "",
+    confirmedByAgentId: null,
+    confirmedByAgentName: "",
+    confirmedByAgentUsername: "",
+    presentationFiles: [],
+  };
+}
+
+function createCoverageNoteCard(): CoverageWorkflowCard {
+  const timestamp = new Date().toISOString();
+
+  return {
+    id: createCoverageCardId(),
+    type: "note",
+    title: "",
+    note: "",
+    tutor: "",
+    tutorEmail: "",
+    sessionDetails: "",
+    replyText: "",
+    requestStatus: "draft",
+    replyOutcome: "",
+    locked: false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    submittedAt: "",
+    respondedAt: "",
+    relatedTutorChoiceCardId: "",
+    requestSubmittedByAgentId: null,
+    requestSubmittedByAgentName: "",
+    requestSubmittedByAgentUsername: "",
+    responseToken: "",
+    sessionStartAt: "",
+    sessionEndAt: "",
+    confirmedAt: "",
+    confirmedByAgentId: null,
+    confirmedByAgentName: "",
+    confirmedByAgentUsername: "",
+    presentationFiles: [],
+  };
+}
+
+function normalizeCoverageCardAttachment(attachment: CoverageCardAttachment | null | undefined): CoverageCardAttachment | null {
+  if (!attachment?.dataUrl?.startsWith("data:")) {
+    return null;
+  }
+
+  return {
+    id: attachment.id || createCoverageCardId(),
+    name: attachment.name || "attachment",
+    mimeType: attachment.mimeType || "application/octet-stream",
+    size: Number(attachment.size || 0),
+    dataUrl: attachment.dataUrl,
+  };
+}
+
+function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | undefined): CoverageWorkflowCard[] {
+  const allowedTypes: CoverageWorkflowCardType[] = ["tutor_choice", "tutor_reply", "note"];
+  const allowedRequestStatuses = new Set(["draft", "requested", "pending", "accepted", "refused", "rejected"]);
+  const allowedReplyOutcomes: CoverageTutorReplyOutcome[] = ["", "accepted", "refused"];
+
+  return Array.isArray(cards)
+    ? cards.flatMap((card) => {
+        if (!card || !allowedTypes.includes(card.type)) {
+          return [];
+        }
+
+        const rawRequestStatus = card.requestStatus || "";
+        const requestStatus = allowedRequestStatuses.has(rawRequestStatus)
+          ? ((rawRequestStatus === "pending"
+            ? "requested"
+            : rawRequestStatus === "rejected"
+              ? "refused"
+              : rawRequestStatus) as CoverageTutorRequestStatus)
+          : "draft";
+        const rawReplyOutcome = card.replyOutcome === "rejected" ? "refused" : card.replyOutcome;
+        const replyOutcome = allowedReplyOutcomes.includes(rawReplyOutcome) ? rawReplyOutcome : "";
+        const presentationFiles = Array.isArray(card.presentationFiles)
+          ? card.presentationFiles
+            .map((file) => normalizeCoverageCardAttachment(file))
+            .filter((file): file is CoverageCardAttachment => Boolean(file))
+          : [];
+
+        return [{
+          id: card.id || createCoverageCardId(),
+          type: card.type,
+          title: card.title || "",
+          note: card.note || "",
+          tutor: card.tutor || "",
+          tutorEmail: card.tutorEmail || "",
+          sessionDetails: card.sessionDetails || "",
+          replyText: card.replyText || "",
+          requestStatus,
+          replyOutcome,
+          locked: Boolean(card.locked),
+          createdAt: card.createdAt || "",
+          updatedAt: card.updatedAt || "",
+          submittedAt: card.submittedAt || "",
+          respondedAt: card.respondedAt || "",
+          relatedTutorChoiceCardId: card.relatedTutorChoiceCardId || "",
+          requestSubmittedByAgentId: card.requestSubmittedByAgentId ?? null,
+          requestSubmittedByAgentName: card.requestSubmittedByAgentName || "",
+          requestSubmittedByAgentUsername: card.requestSubmittedByAgentUsername || "",
+          responseToken: card.responseToken || "",
+          sessionStartAt: card.sessionStartAt || "",
+          sessionEndAt: card.sessionEndAt || "",
+          confirmedAt: card.confirmedAt || "",
+          confirmedByAgentId: card.confirmedByAgentId ?? null,
+          confirmedByAgentName: card.confirmedByAgentName || "",
+          confirmedByAgentUsername: card.confirmedByAgentUsername || "",
+          presentationFiles,
+        }];
+      })
+    : [];
+}
+
+function getCoverageWorkflowCardSortTimestamp(card: Pick<CoverageWorkflowCard, "createdAt" | "updatedAt">) {
+  const createdTimestamp = Date.parse(card.createdAt || "");
+  if (!Number.isNaN(createdTimestamp)) {
+    return createdTimestamp;
+  }
+
+  const updatedTimestamp = Date.parse(card.updatedAt || "");
+  if (!Number.isNaN(updatedTimestamp)) {
+    return updatedTimestamp;
+  }
+
+  return 0;
+}
+
+function sortCoverageWorkflowCardsForDisplay(cards: CoverageWorkflowCard[]): CoverageWorkflowCard[] {
+  return [...cards].sort((leftCard, rightCard) => (
+    getCoverageWorkflowCardSortTimestamp(rightCard) - getCoverageWorkflowCardSortTimestamp(leftCard)
+  ));
+}
+
+function getCoverageAttachmentPreviewKind(file: Pick<CoverageCardAttachment, "mimeType" | "dataUrl"> | null | undefined) {
+  const mimeType = (file?.mimeType || "").toLowerCase();
+  const dataUrl = (file?.dataUrl || "").toLowerCase();
+
+  if (mimeType.startsWith("image/") || dataUrl.startsWith("data:image/")) {
+    return "image";
+  }
+
+  if (mimeType === "application/pdf" || dataUrl.startsWith("data:application/pdf")) {
+    return "pdf";
+  }
+
+  return "unsupported";
+}
+
+function isValidCoverageTutorEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
+function hasCoverageTimestampUpdate(createdAt: string, updatedAt: string) {
+  return Boolean(createdAt && updatedAt && createdAt !== updatedAt);
+}
+
+function buildCoverageTimestampLabel(createdAt: string, updatedAt: string) {
+  if (!createdAt) {
+    return "Created time unavailable";
+  }
+
+  if (hasCoverageTimestampUpdate(createdAt, updatedAt)) {
+    return `Created ${formatDateTime(createdAt)} • Edited ${formatDateTime(updatedAt)}`;
+  }
+
+  return `Created ${formatDateTime(createdAt)}`;
+}
+
+function buildCoverageCardTimestampLabel(createdAt: string, updatedAt: string) {
+  if (!createdAt) {
+    return "Created time unavailable";
+  }
+
+  if (hasCoverageTimestampUpdate(createdAt, updatedAt)) {
+    return `Created ${formatDateTime(createdAt)} | Edited ${formatDateTime(updatedAt)}`;
+  }
+
+  return `Created ${formatDateTime(createdAt)}`;
+}
+
+function summarizeCoverageTutorRequestDetails(sessionDetails: string) {
+  const lines = sessionDetails
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const moduleLine = lines.find((line) => line.toLowerCase().startsWith("module:"));
+  const preferredTimeLine = lines.find((line) => line.toLowerCase().startsWith("preferred time:"));
+  const sessionLines = lines.filter((line) => /^\d+\.\s/.test(line));
+
+  return {
+    moduleLine: moduleLine || "",
+    preferredTimeLine: preferredTimeLine || "",
+    sessionLines,
+    sessionCount: sessionLines.length,
+  };
+}
+
+function canConfirmCoverageReplyCard(card: Pick<CoverageWorkflowCard, "replyOutcome" | "confirmedAt" | "sessionStartAt">) {
+  if (card.replyOutcome !== "accepted" || Boolean(card.confirmedAt)) {
+    return false;
+  }
+
+  const sessionStartMs = Date.parse(card.sessionStartAt || "");
+  if (Number.isNaN(sessionStartMs)) {
+    return false;
+  }
+
+  return Date.now() >= sessionStartMs;
+}
+
+function getCoverageReplyCardTimingMessage(card: Pick<CoverageWorkflowCard, "replyOutcome" | "sessionStartAt" | "sessionEndAt">) {
+  if (card.replyOutcome !== "accepted") {
+    return "Tutor reply saved.";
+  }
+
+  const sessionStartMs = Date.parse(card.sessionStartAt || "");
+  const sessionEndMs = Date.parse(card.sessionEndAt || "");
+  if (Number.isNaN(sessionStartMs)) {
+    return "Confirmation becomes available once the workflow provides a structured session time.";
+  }
+
+  const startLabel = formatDateTime(card.sessionStartAt || "");
+  const endLabel = Number.isNaN(sessionEndMs) ? "" : formatDateTime(card.sessionEndAt || "");
+  const sessionWindowLabel = endLabel ? `${startLabel} to ${endLabel}` : startLabel;
+
+  if (Date.now() < sessionStartMs) {
+    return `Confirmation becomes available at ${sessionWindowLabel}.`;
+  }
+
+  return `Session time reached: ${sessionWindowLabel}.`;
+}
+
+function getCoverageTutorRequestLabel(status: CoverageTutorRequestStatus) {
+  switch (status) {
+    case "requested":
+      return "Requested";
+    case "accepted":
+      return "Accepted";
+    case "refused":
+      return "Refused";
+    default:
+      return "";
+  }
+}
+
+function getCoverageTutorRequestBadgeClassName(status: CoverageTutorRequestStatus) {
+  switch (status) {
+    case "requested":
+      return "border-amber-200 bg-amber-50 text-amber-700";
+    case "accepted":
+      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    case "refused":
+      return "border-rose-200 bg-rose-50 text-rose-700";
+    default:
+      return "border-slate-200 bg-slate-50 text-slate-700";
+  }
+}
+
+function getCoverageReplyOutcomeLabel(outcome: CoverageTutorReplyOutcome) {
+  switch (outcome) {
+    case "accepted":
+      return "Accepted";
+    case "refused":
+      return "Refused";
+    default:
+      return "Reply";
+  }
+}
+
+function buildCoverageDocumentationDraft(
+  ticket: Pick<TicketDetail, "id" | "inquiry" | "chatId" | "documentation">,
+): AdminDocumentation {
+  const normalizedDocumentation = normalizeDocumentationDraft(ticket.documentation);
+  const coverageCards = normalizedDocumentation.coverageCards.length > 0
+    ? normalizedDocumentation.coverageCards
+    : [createCoverageTutorChoiceCard(ticket.inquiry || normalizedDocumentation.inquiry)];
+
+  return {
+    ...normalizedDocumentation,
+    inquiry: normalizedDocumentation.inquiry || ticket.inquiry || "",
+    chatId: normalizedDocumentation.chatId || ticket.chatId || "",
+    ticketId: normalizedDocumentation.ticketId || ticket.id || "",
+    coverageCards,
+  };
+}
+
 function normalizeDocumentationDraft(documentation?: AdminDocumentation | null): AdminDocumentation {
   return {
     inquiry: documentation?.inquiry || "",
@@ -6134,6 +8604,8 @@ function normalizeDocumentationDraft(documentation?: AdminDocumentation | null):
     escalationAgentId: documentation?.escalationAgentId ?? null,
     escalationAgentName: documentation?.escalationAgentName || "",
     escalationNote: documentation?.escalationNote || "",
+    coverageNotes: documentation?.coverageNotes || "",
+    coverageCards: normalizeCoverageWorkflowCards(documentation?.coverageCards),
     errorImages: Array.isArray(documentation?.errorImages) ? documentation.errorImages : [],
   };
 }
@@ -6326,6 +8798,28 @@ function normalizeQuickTicketStatusReason(statusReason: string) {
   return statusReason;
 }
 
+function getDisplayedTicketStatusReason(source: {
+  statusReason: string;
+  technicalSubcategory?: string | null;
+}) {
+  if (!source.statusReason) {
+    return "-";
+  }
+
+  if (normalizeQuickTicketStatusReason(source.statusReason) !== "Quick Ticket") {
+    return source.statusReason;
+  }
+
+  return source.technicalSubcategory === "Coverage" ? "Coverage Ticket" : "Quick Ticket";
+}
+
+function getDisplayedTicketStatus(source: {
+  status: string;
+  technicalSubcategory?: string | null;
+}) {
+  return source.status || "-";
+}
+
 function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">) {
   const normalizedScope = (agent.accountScope || "").trim().toLowerCase();
   return normalizedScope === "staff";
@@ -6352,8 +8846,12 @@ function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicke
     return tickets.filter((ticket) => ticket.slaStatus === "Breached");
   }
 
+  if (filter === "coverage") {
+    return tickets.filter((ticket) => isCoverageTicket(ticket));
+  }
+
   if (filter === "quickResolution") {
-    return tickets.filter(isQuickResolutionTicket);
+    return tickets.filter(isDashboardQuickResolutionTicket);
   }
 
   return tickets;
@@ -6434,6 +8932,7 @@ function getDashboardTableTitle(filter: DashboardTicketFilter) {
   if (filter === "escalation") return "Escalation Tickets";
   if (filter === "closed") return "Closed Tickets";
   if (filter === "slaBreached") return "SLA Breaches";
+  if (filter === "coverage") return "Coverage Tickets";
   if (filter === "quickResolution") return "Quick Tickets";
   return "Recent Tickets";
 }
@@ -6468,6 +8967,12 @@ function getDashboardTableCountLabel(
       : `${visibleCount} quick ticket${visibleCount === 1 ? "" : "s"}`;
   }
 
+  if (filter === "coverage") {
+    return hasAssignedFilter
+      ? `${visibleCount} coverage ticket${visibleCount === 1 ? "" : "s"} for ${assignedFilterLabel}`
+      : `${visibleCount} coverage ticket${visibleCount === 1 ? "" : "s"}`;
+  }
+
   return hasAssignedFilter
     ? `${visibleCount} matching ticket${visibleCount === 1 ? "" : "s"} for ${assignedFilterLabel}`
     : `${visibleCount} matching ticket${visibleCount === 1 ? "" : "s"}`;
@@ -6479,6 +8984,7 @@ function getDashboardEmptyMessage(filter: DashboardTicketFilter) {
   if (filter === "escalation") return "No escalation tickets are currently available.";
   if (filter === "closed") return "No closed tickets are currently available.";
   if (filter === "slaBreached") return "No SLA breaches are currently available.";
+  if (filter === "coverage") return "No coverage tickets are currently available.";
   if (filter === "quickResolution") return "No quick tickets are currently available.";
   return "No tickets have been created yet.";
 }
@@ -6536,6 +9042,7 @@ function getDashboardAssignedFilterEmptyMessage(
   if (filter === "escalation") return `No escalation tickets are currently linked to ${targetLabel}.`;
   if (filter === "closed") return `No closed tickets are currently assigned to ${targetLabel}.`;
   if (filter === "slaBreached") return `No SLA breaches are currently assigned to ${targetLabel}.`;
+  if (filter === "coverage") return `No coverage tickets are currently assigned to ${targetLabel}.`;
   if (filter === "quickResolution") return `No quick tickets are currently assigned to ${targetLabel}.`;
   return `No tickets are currently assigned to ${targetLabel}.`;
 }
@@ -6548,10 +9055,17 @@ function isQuickResolutionTicket(ticket: Pick<TicketSummary, "status" | "statusR
   return normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket";
 }
 
+function isDashboardQuickResolutionTicket(
+  ticket: Pick<TicketSummary, "status" | "statusReason" | "technicalSubcategory">,
+) {
+  return isQuickResolutionTicket(ticket) && !isCoverageTicket(ticket);
+}
+
 function getDisplayedChatReference(
   source: {
     status: "Open" | "Pending" | "Closed";
     statusReason: string;
+    technicalSubcategory?: string | null;
     chatId?: string | null;
     pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
     teamsCallRequested?: boolean;
@@ -6560,8 +9074,12 @@ function getDisplayedChatReference(
   },
   fallbackToTicketId = false,
 ) {
+  if (source.status === "Pending" && source.technicalSubcategory === "Coverage") {
+    return "Coverage Ticket";
+  }
+
   if (source.status === "Pending" && normalizeQuickTicketStatusReason(source.statusReason) === "Quick Ticket") {
-    return "Quick Ticket";
+    return getDisplayedTicketStatusReason(source);
   }
 
   if (source.pendingTeamsCallNotification) {
@@ -6788,6 +9306,31 @@ function buildInitialAiMessage(ticket: TicketDetail, workflowConfigured: boolean
   );
 }
 
+function readFileAsCoverageCardAttachment(file: File): Promise<CoverageCardAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      if (!result.startsWith("data:")) {
+        reject(new Error("Invalid file format."));
+        return;
+      }
+
+      resolve({
+        id: createCoverageCardId(),
+        name: file.name,
+        mimeType: file.type || "application/octet-stream",
+        size: file.size,
+        dataUrl: result,
+      });
+    };
+
+    reader.onerror = () => reject(new Error("Could not read file."));
+    reader.readAsDataURL(file);
+  });
+}
+
 function readImageFileAsDocumentationImage(file: File): Promise<DocumentationImage> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -6991,6 +9534,14 @@ function formatCategoryLabel(category: string, technicalSubcategory: string) {
   return category;
 }
 
+function formatTicketHeaderCategoryLabel(category: string, technicalSubcategory: string) {
+  if (category === "Technical" && technicalSubcategory) {
+    return technicalSubcategory;
+  }
+
+  return formatCategoryLabel(category, technicalSubcategory);
+}
+
 function getTicketTransferRowClassName(
   ticket: Pick<TicketSummary, "pendingTransferRequest" | "latestTransferDecision" | "status" | "statusReason" | "slaStatus">,
 ) {
@@ -7106,6 +9657,9 @@ const activityEventLabels: Record<string, string> = {
   support_session_unavailable: "Session Unavailable",
   ticket_created: "Ticket Created",
   ticket_updated: "Ticket Updated",
+  coverage_tutor_requested: "Tutor Requested",
+  coverage_tutor_response: "Tutor Reply",
+  coverage_session_confirmed: "Session Confirmed",
   escalation_closed: "Escalation Closed",
   escalation_notified: "Escalation Notified",
   teams_call_requested: "Teams Call Requested",
@@ -7118,6 +9672,7 @@ const activityPayloadLabels: Record<string, string> = {
   calendarEventId: "Calendar Event ID",
   category: "Category",
   chatId: "Chat ID",
+  cardId: "Card ID",
   closedAt: "Closed At",
   closedById: "Closed By ID",
   closedByName: "Closed By",
@@ -7151,7 +9706,12 @@ const activityPayloadLabels: Record<string, string> = {
   fromAgentName: "From Admin",
   fromAgentUsername: "From Username",
   reason: "Transfer Reason",
+  replyText: "Reply",
   requestedAt: "Requested At",
+  respondedAt: "Responded At",
+  sessionDetails: "Session Details",
+  tutor: "Tutor",
+  tutorEmail: "Tutor E-mail",
   targetLabel: "Teams Target",
   toAgentUsername: "To Username",
 };
@@ -7204,6 +9764,8 @@ function getActivityEventSummary(item: HistoryItem) {
   const requestedDate = getActivityPayloadTextValue(item.payload.requestedDate);
   const requestedTime = getActivityPayloadTextValue(item.payload.requestedTime);
   const requesterName = getActivityPayloadTextValue(item.payload.requesterName);
+  const tutor = getActivityPayloadTextValue(item.payload.tutor);
+  const sessionDetails = getActivityPayloadTextValue(item.payload.sessionDetails);
 
   switch (item.eventType) {
     case "status_changed":
@@ -7263,6 +9825,14 @@ function getActivityEventSummary(item: HistoryItem) {
       return requestedDate || requestedTime
         ? `Support session requested for ${[requestedDate, requestedTime].filter(Boolean).join(" at ")}`
         : "Support session requested";
+    case "coverage_tutor_requested":
+      return tutor ? `Tutor request sent to ${tutor}` : "Tutor request sent";
+    case "coverage_tutor_response":
+      return tutor
+        ? `${getActivityPayloadTextValue(item.payload.outcome) === "accepted" ? "Tutor accepted" : "Tutor rejected"}: ${tutor}`
+        : "Tutor reply received";
+    case "coverage_session_confirmed":
+      return tutor ? `Coverage session confirmed with ${tutor}` : "Coverage session confirmed";
     case "internal_note":
       return "Internal note recorded";
     default:
@@ -7278,6 +9848,8 @@ function getAdminNotificationLogDetail(item: AdminNotificationLogItem) {
   const closedByName = getActivityPayloadTextValue(item.payload.closedByName);
   const decidedByName = getActivityPayloadTextValue(item.payload.decidedByName);
   const targetAgentName = getActivityPayloadTextValue(item.payload.toAgentName);
+  const sessionDetails = getActivityPayloadTextValue(item.payload.sessionDetails);
+  const replyText = getActivityPayloadTextValue(item.payload.replyText);
 
   switch (item.eventType) {
     case "transfer_requested":
@@ -7298,6 +9870,14 @@ function getAdminNotificationLogDetail(item: AdminNotificationLogItem) {
       return targetAgentName ? `Transferred to ${targetAgentName}.` : "Transfer request accepted.";
     case "transfer_request_rejected":
       return decidedByName ? `${decidedByName} declined this transfer request.` : "Transfer request declined.";
+    case "coverage_tutor_requested":
+      return sessionDetails;
+    case "coverage_tutor_response":
+      return [sessionDetails, replyText].filter(Boolean).join(" ");
+    case "coverage_session_confirmed":
+      return getActivityPayloadTextValue(item.payload.confirmedByName)
+        ? `Confirmed by ${getActivityPayloadTextValue(item.payload.confirmedByName)}.`
+        : "Coverage session confirmed.";
     default:
       return "";
   }

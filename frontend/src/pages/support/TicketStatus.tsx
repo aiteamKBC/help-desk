@@ -13,7 +13,7 @@ import {
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { useSupport } from "@/context/SupportContext";
-import { canReturnToChat, getSupportResumePath, isAwaitingMeetingTicket, isAwaitingSupportReviewTicket, shouldShowStatusStep } from "@/lib/supportFlow";
+import { canReturnToChat, getSupportResumePath, isAwaitingMeetingTicket, isAwaitingSupportReviewTicket, quickTicketReason, shouldShowStatusStep } from "@/lib/supportFlow";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import { toast } from "sonner";
 
@@ -27,6 +27,9 @@ const TicketStatus = () => {
   const hasStatusStep = shouldShowStatusStep(ticket, bookingSummary);
   const showChatAction = canReturnToChat(ticket);
   const canCancelMeeting = hasBookingSummary || isAwaitingMeeting;
+  const displayedStatusReason = ticket.technicalSubcategory === "Coverage" && ticket.statusReason === quickTicketReason
+    ? "Coverage Ticket"
+    : (ticket.statusReason || ticket.status);
   const [cancelMeetingOpen, setCancelMeetingOpen] = useState(false);
   const [isCancellingMeeting, setIsCancellingMeeting] = useState(false);
 
@@ -212,7 +215,7 @@ const TicketStatus = () => {
               <div className="rounded-2xl border border-primary/10 bg-muted/20 px-4 py-4">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary/80">Status</div>
                 <div className="mt-2 text-sm font-semibold text-foreground">
-                  {ticket.statusReason || ticket.status}
+                  {displayedStatusReason}
                 </div>
               </div>
               <div className="rounded-2xl border border-primary/10 bg-muted/20 px-4 py-4">

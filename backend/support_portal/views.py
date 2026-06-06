@@ -9,7 +9,8 @@ from uuid import uuid4
 from psycopg import OperationalError as PsycopgOperationalError
 from django.conf import settings
 from django.db.utils import OperationalError as DjangoOperationalError
-from django.http import FileResponse, Http404, HttpResponseRedirect, JsonResponse
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, JsonResponse
+from django.utils.html import escape
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
@@ -21,9 +22,13 @@ from .services import (
     acknowledge_ticket_escalation_notification,
     acknowledge_ticket_teams_call_notification,
     acknowledge_ticket_transfer_decision,
+    acknowledge_coverage_ticket_notification,
+    acknowledge_coverage_tutor_response,
     accept_ticket_transfer_request,
     ApiError,
+    confirm_coverage_tutor_session,
     reject_ticket_transfer_request,
+    process_coverage_tutor_response,
     request_support_teams_call,
     request_ticket_transfer,
     cancel_support_session_request,
@@ -36,6 +41,7 @@ from .services import (
     get_admin_ticket_attachment_file,
     list_admin_notifications,
     get_admin_ticket_detail_response,
+    get_coverage_options_response,
     get_open_assigned_live_chat_agent_ids,
     heartbeat_agent_session,
     build_microsoft_admin_authorize_url,
@@ -58,6 +64,7 @@ from .services import (
     send_chatbot_message,
     serialize_agent,
     serve_frontend_asset,
+    submit_coverage_tutor_request,
     update_admin_ticket,
     update_agent_support_access,
     update_ticket,
@@ -86,6 +93,84 @@ def parse_json_body(request) -> dict:
 
 def parse_query_params(request) -> dict:
     return {key: value for key, value in request.GET.items()}
+
+
+def build_coverage_tutor_response_page(title: str, message: str, *, accent: str = "#6d28d9") -> HttpResponse:
+    safe_title = escape(title)
+    safe_message = escape(message)
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{safe_title}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --accent: {accent};
+        --accent-soft: rgba(109, 40, 217, 0.08);
+        --accent-border: rgba(109, 40, 217, 0.18);
+        --surface: #ffffff;
+        --text: #1f1648;
+        --muted: #6b7280;
+        --bg: linear-gradient(180deg, #f7f5ff 0%, #ffffff 100%);
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", Arial, sans-serif;
+      }}
+      .card {{
+        width: min(100%, 560px);
+        border-radius: 28px;
+        border: 1px solid var(--accent-border);
+        background: var(--surface);
+        box-shadow: 0 24px 60px rgba(82, 54, 188, 0.14);
+        padding: 32px 28px;
+      }}
+      .badge {{
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border-radius: 999px;
+        border: 1px solid var(--accent-border);
+        background: var(--accent-soft);
+        color: var(--accent);
+        padding: 8px 14px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }}
+      h1 {{
+        margin: 18px 0 10px;
+        font-size: 30px;
+        line-height: 1.15;
+      }}
+      p {{
+        margin: 0;
+        font-size: 16px;
+        line-height: 1.7;
+        color: var(--muted);
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div class="badge">Kent Support Portal</div>
+      <h1>{safe_title}</h1>
+      <p>{safe_message}</p>
+    </main>
+  </body>
+</html>
+"""
+    return HttpResponse(html)
 
 
 def normalize_frontend_origin(value: object) -> str:
@@ -607,6 +692,38 @@ def admin_ticket_escalation_closure_acknowledge(request, public_id: str):
         return handle_api_error(error)
 
 
+@require_http_methods(["POST"])
+def admin_ticket_coverage_tutor_request(request, public_id: str):
+    try:
+        return JsonResponse(submit_coverage_tutor_request(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_tutor_response_acknowledge(request, public_id: str):
+    try:
+        return JsonResponse(acknowledge_coverage_tutor_response(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_ticket_notification_acknowledge(request, public_id: str):
+    try:
+        return JsonResponse(acknowledge_coverage_ticket_notification(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_confirm_session(request, public_id: str):
+    try:
+        return JsonResponse(confirm_coverage_tutor_session(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def tickets_create(request):
@@ -694,6 +811,41 @@ def teams_call_context(_request):
     try:
         return JsonResponse(get_support_teams_call_context_response())
     except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def coverage_options(request):
+    try:
+        return JsonResponse(get_coverage_options_response(parse_query_params(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def coverage_tutor_response(request):
+    try:
+        if request.method == "GET":
+            payload = parse_query_params(request)
+            if not payload.get("outcome") and payload.get("action"):
+                payload["outcome"] = sanitize_text(payload.get("action"))
+            detail = process_coverage_tutor_response(payload)
+            outcome = sanitize_text(payload.get("outcome")).lower()
+            was_accepted = outcome in {"accept", "accepted", "approved", "confirmed"}
+            return build_coverage_tutor_response_page(
+                "Response Recorded",
+                "Thank you. The coverage request was accepted and the support team has been updated."
+                if was_accepted
+                else "Thank you. The coverage request was declined and the support team has been updated.",
+                accent="#16a34a" if was_accepted else "#dc2626",
+            )
+
+        return JsonResponse(process_coverage_tutor_response(parse_json_body(request)))
+    except Exception as error:
+        if request.method == "GET":
+            message = error.message if isinstance(error, ApiError) else "We could not process this tutor response right now."
+            return build_coverage_tutor_response_page("Response Could Not Be Recorded", message, accent="#dc2626")
         return handle_api_error(error)
 
 
