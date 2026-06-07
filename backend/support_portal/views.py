@@ -870,16 +870,16 @@ def coverage_tutor_response(request):
             if detail.get("coverageTutorResponseAlreadyRecorded"):
                 recorded_outcome = sanitize_text(detail.get("recordedCoverageTutorResponseOutcome")).lower()
                 if recorded_outcome == "accepted":
-                    message = "This coverage request was already accepted. The support team has already been updated."
+                    message = "Your original response was ACCEPTED. This link is now locked, so no new decision was recorded."
                     accent = "#16a34a"
                 elif recorded_outcome == "rejected":
-                    message = "This coverage request was already declined. The support team has already been updated."
+                    message = "Your original response was DECLINED. This link is now locked, so no new decision was recorded."
                     accent = "#dc2626"
                 else:
-                    message = "This coverage request has already been responded to. The support team has already been updated."
+                    message = "This request already has a recorded decision. To protect the ticket history, this new click was ignored."
                     accent = "#6d28d9"
                 return build_coverage_tutor_response_page(
-                    "Response Already Recorded",
+                    "Decision Locked",
                     message,
                     accent=accent,
                 )

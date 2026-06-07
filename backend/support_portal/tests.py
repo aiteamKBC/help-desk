@@ -781,8 +781,9 @@ class CoverageTutorResponsePageTests(SimpleTestCase):
 
         self.assertEqual(response.status_code, 200)
         content = response.content.decode("utf-8")
-        self.assertIn("Response Already Recorded", content)
-        self.assertIn("already accepted", content)
+        self.assertIn("Decision Locked", content)
+        self.assertIn("original response was ACCEPTED", content)
+        self.assertIn("no new decision was recorded", content)
 
 
 class AdminSessionViewTests(SimpleTestCase):
