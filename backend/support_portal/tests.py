@@ -5980,6 +5980,24 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         mock_connection.cursor.return_value = cursor_context
         return mock_connection, cursor
 
+    def test_send_coverage_tutor_request_webhook_uses_short_timeout(self):
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+        ):
+            response = services.send_coverage_tutor_request_webhook({"ticketId": "KBC-000001"})
+
+        self.assertTrue(response["delivered"])
+        post_json_webhook.assert_called_once_with(
+            "https://n8n.example/webhook",
+            {"ticketId": "KBC-000001"},
+            timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+
     def test_build_coverage_tutor_request_webhook_payload_includes_result_urls(self):
         payload = services.build_coverage_tutor_request_webhook_payload(
             {

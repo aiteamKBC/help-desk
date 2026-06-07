@@ -175,6 +175,7 @@ ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS = {
 ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES = {"application/pdf"}
 ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
+COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 12
 
 
 @dataclass
@@ -1909,7 +1910,11 @@ def build_coverage_tutor_request_webhook_payload(
 
 
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, response_payload = post_json_webhook(get_coverage_tutor_request_webhook_url(), payload)
+    configured, delivered, status, response_payload = post_json_webhook(
+        get_coverage_tutor_request_webhook_url(),
+        payload,
+        timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+    )
     return {
         "configured": configured,
         "delivered": delivered,
@@ -8141,6 +8146,14 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
         if not webhook_result["configured"]:
             raise ApiError(503, "The tutor request webhook is not configured on the server.")
         if not webhook_result["delivered"]:
+            response_payload = webhook_result.get("response")
+            response_message = (
+                sanitize_text(response_payload.get("message"))
+                if isinstance(response_payload, dict)
+                else sanitize_text(response_payload)
+            )
+            if response_message == "Request timed out.":
+                raise ApiError(502, "The tutor request workflow did not respond in time. Please check n8n and try again.")
             raise ApiError(502, "We could not send this tutor request right now.")
 
         next_status = "Pending"
@@ -10640,9 +10653,9 @@ def extract_chatbot_reply(response_payload: Any) -> str:
     return ""
 
 
-def execute_http_request(request: urllib_request.Request) -> tuple[bool, bool, int | None, Any]:
+def execute_http_request(request: urllib_request.Request, *, timeout_seconds: int = 20) -> tuple[bool, bool, int | None, Any]:
     try:
-        with urllib_request.urlopen(request, timeout=20) as response:
+        with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
             status = response.getcode()
             body = response.read().decode("utf-8", errors="replace")
             try:
@@ -10658,6 +10671,8 @@ def execute_http_request(request: urllib_request.Request) -> tuple[bool, bool, i
         except json.JSONDecodeError:
             parsed = body
         return True, False, error.code, parsed or sanitize_text(body)
+    except TimeoutError:
+        return True, False, None, {"message": "Request timed out."}
     except Exception:
         return True, False, None, None
 
@@ -10675,7 +10690,13 @@ def post_form_request(url: str, payload: dict[str, Any]) -> tuple[bool, bool, in
     return execute_http_request(request)
 
 
-def post_json_request(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> tuple[bool, bool, int | None, Any]:
+def post_json_request(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    *,
+    timeout_seconds: int = 20,
+) -> tuple[bool, bool, int | None, Any]:
     if not url:
         return False, False, None, None
 
@@ -10686,7 +10707,7 @@ def post_json_request(url: str, payload: dict[str, Any], headers: dict[str, str]
         headers=request_headers,
         method="POST",
     )
-    return execute_http_request(request)
+    return execute_http_request(request, timeout_seconds=timeout_seconds)
 
 
 def delete_request(url: str, headers: dict[str, str] | None = None) -> tuple[bool, bool, int | None, Any]:
@@ -10701,8 +10722,8 @@ def delete_request(url: str, headers: dict[str, str] | None = None) -> tuple[boo
     return execute_http_request(request)
 
 
-def post_json_webhook(url: str, payload: dict[str, Any]) -> tuple[bool, bool, int | None, Any]:
-    return post_json_request(url, payload)
+def post_json_webhook(url: str, payload: dict[str, Any], *, timeout_seconds: int = 20) -> tuple[bool, bool, int | None, Any]:
+    return post_json_request(url, payload, timeout_seconds=timeout_seconds)
 
 
 def send_booking_webhook(payload: dict[str, Any]) -> dict[str, Any]:
