@@ -1973,6 +1973,55 @@ def find_coverage_card_index(
     return None
 
 
+def normalize_recorded_coverage_tutor_response_outcome(value: Any) -> str:
+    normalized_value = sanitize_text(value).lower()
+    if normalized_value in {"accepted", "accept", "approved", "confirmed"}:
+        return "accepted"
+    if normalized_value in {"rejected", "reject", "refused", "refuse", "declined", "decline"}:
+        return "rejected"
+    return ""
+
+
+def get_recorded_coverage_tutor_response_outcome(
+    tutor_choice_card: dict[str, Any],
+    coverage_cards: list[dict[str, Any]],
+) -> str:
+    normalized_card_id = sanitize_text(tutor_choice_card.get("id"))
+    for card in coverage_cards:
+        if (
+            sanitize_text(card.get("type")) == "tutor_reply"
+            and sanitize_text(card.get("relatedTutorChoiceCardId")) == normalized_card_id
+        ):
+            return (
+                normalize_recorded_coverage_tutor_response_outcome(card.get("replyOutcome"))
+                or normalize_recorded_coverage_tutor_response_outcome(card.get("requestStatus"))
+                or "recorded"
+            )
+
+    return (
+        normalize_recorded_coverage_tutor_response_outcome(tutor_choice_card.get("replyOutcome"))
+        or normalize_recorded_coverage_tutor_response_outcome(tutor_choice_card.get("requestStatus"))
+        or ("recorded" if sanitize_text(tutor_choice_card.get("respondedAt")) else "")
+    )
+
+
+def build_already_recorded_coverage_tutor_response_detail(
+    ticket_public_id: str,
+    *,
+    recorded_outcome: str = "",
+    requested_outcome: str = "",
+) -> dict[str, Any]:
+    detail = fetch_admin_ticket_detail(ticket_public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    detail["coverageTutorResponseAlreadyRecorded"] = True
+    detail["recordedCoverageTutorResponseOutcome"] = normalize_recorded_coverage_tutor_response_outcome(recorded_outcome) or "recorded"
+    detail["requestedCoverageTutorResponseOutcome"] = normalize_recorded_coverage_tutor_response_outcome(requested_outcome)
+    detail["message"] = "This coverage request has already been responded to."
+    return detail
+
+
 def extract_coverage_tutor_response_outcome(payload: dict[str, Any]) -> str:
     normalized_outcome = sanitize_text(
         payload.get("outcome")
@@ -1983,7 +2032,7 @@ def extract_coverage_tutor_response_outcome(payload: dict[str, Any]) -> str:
 
     if normalized_outcome in {"accepted", "accept", "approved", "confirmed"}:
         return "accepted"
-    if normalized_outcome in {"rejected", "reject", "refused", "declined", "decline"}:
+    if normalized_outcome in {"rejected", "reject", "refused", "refuse", "declined", "decline"}:
         return "rejected"
 
     accepted_flag = payload.get("accepted")
@@ -8487,10 +8536,11 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "respondedAt": latest_response.get("respondedAt"),
             },
         ):
-            detail = fetch_admin_ticket_detail(ticket_public_id)
-            if not detail:
-                raise ApiError(404, "Ticket not found.")
-            return detail
+            return build_already_recorded_coverage_tutor_response_detail(
+                ticket_public_id,
+                recorded_outcome=latest_response.get("outcome"),
+                requested_outcome=outcome,
+            )
 
         documentation = normalize_admin_documentation(
             ticket_metadata.get("admin_documentation"),
@@ -8505,6 +8555,14 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
         if sanitize_text(tutor_choice_card.get("type")) != "tutor_choice":
             raise ApiError(409, "The related coverage card is not a tutor choice card.")
 
+        recorded_outcome = get_recorded_coverage_tutor_response_outcome(tutor_choice_card, coverage_cards)
+        if recorded_outcome:
+            return build_already_recorded_coverage_tutor_response_detail(
+                ticket_public_id,
+                recorded_outcome=recorded_outcome,
+                requested_outcome=outcome,
+            )
+
         responded_at = serialize_datetime_value(
             coerce_datetime(payload.get("respondedAt")) or datetime.now(timezone.utc)
         ) or datetime.now(timezone.utc).isoformat()
@@ -8517,10 +8575,11 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             None,
         )
         if existing_reply_card:
-            detail = fetch_admin_ticket_detail(ticket_public_id)
-            if not detail:
-                raise ApiError(404, "Ticket not found.")
-            return detail
+            return build_already_recorded_coverage_tutor_response_detail(
+                ticket_public_id,
+                recorded_outcome=get_recorded_coverage_tutor_response_outcome(tutor_choice_card, coverage_cards),
+                requested_outcome=outcome,
+            )
 
         updated_tutor_choice_card = {
             **tutor_choice_card,

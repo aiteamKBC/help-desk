@@ -762,6 +762,28 @@ class CoverageTutorResponsePageTests(SimpleTestCase):
         self.assertIn("Tutor Response", content)
         self.assertIn("workflow completes", content)
 
+    def test_coverage_tutor_response_get_shows_already_recorded_message(self):
+        request = self.factory.get(
+            "/coverage/tutor-response?action=refuse&ticketId=KBC-000052&cardId=card-1&responseToken=token-1"
+        )
+
+        with patch.object(
+            views,
+            "process_coverage_tutor_response",
+            return_value={
+                "ticket": {"id": "KBC-000052"},
+                "coverageTutorResponseAlreadyRecorded": True,
+                "recordedCoverageTutorResponseOutcome": "accepted",
+                "requestedCoverageTutorResponseOutcome": "rejected",
+            },
+        ):
+            response = views.coverage_tutor_response(request)
+
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode("utf-8")
+        self.assertIn("Response Already Recorded", content)
+        self.assertIn("already accepted", content)
+
 
 class AdminSessionViewTests(SimpleTestCase):
     def setUp(self):
@@ -7091,6 +7113,86 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_cards[1]["type"], "tutor_reply")
         self.assertEqual(persisted_cards[1]["replyOutcome"], "accepted")
         self.assertEqual(persisted_cards[1]["sessionDetails"], "Friday 09:00 - 11:00")
+
+    def test_process_coverage_tutor_response_ignores_second_response_for_same_card(self):
+        ticket = {
+            "id": 52,
+            "public_id": "KBC-000052",
+            "status": "Closed",
+            "status_reason": "Tutor Accepted",
+            "technical_subcategory": "Coverage",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "latest_coverage_tutor_response": {
+                    "ticketId": "KBC-000052",
+                    "cardId": "card-1",
+                    "responseToken": "token-1",
+                    "outcome": "accepted",
+                    "respondedAt": "2026-06-04T10:20:00Z",
+                },
+                "admin_documentation": {
+                    "ticketId": "KBC-000052",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "accepted",
+                            "replyOutcome": "accepted",
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "respondedAt": "2026-06-04T10:20:00Z",
+                            "responseToken": "token-1",
+                            "requestSubmittedByAgentId": 7,
+                            "requestSubmittedByAgentName": "Ahmed Hamamo",
+                            "requestSubmittedByAgentUsername": "ahmed",
+                            "locked": True,
+                        },
+                        {
+                            "id": "reply-1",
+                            "type": "tutor_reply",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "replyOutcome": "accepted",
+                            "requestStatus": "accepted",
+                            "relatedTutorChoiceCardId": "card-1",
+                            "respondedAt": "2026-06-04T10:20:00Z",
+                            "sessionDetails": "Friday 09:00 - 11:00",
+                            "locked": True,
+                        },
+                    ],
+                },
+            },
+        }
+        mock_connection, _cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000052"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000052",
+                    "cardId": "card-1",
+                    "responseToken": "token-1",
+                    "outcome": "refuse",
+                }
+            )
+
+        self.assertTrue(response["coverageTutorResponseAlreadyRecorded"])
+        self.assertEqual(response["recordedCoverageTutorResponseOutcome"], "accepted")
+        self.assertEqual(response["requestedCoverageTutorResponseOutcome"], "rejected")
+        mock_connection.cursor.assert_not_called()
+        insert_history_event.assert_not_called()
 
     def test_acknowledge_coverage_tutor_response_uses_database_derived_response(self):
         ticket = {

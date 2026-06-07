@@ -867,6 +867,22 @@ def coverage_tutor_response(request):
             if not payload.get("outcome") and payload.get("action"):
                 payload["outcome"] = sanitize_text(payload.get("action"))
             detail = process_coverage_tutor_response(payload)
+            if detail.get("coverageTutorResponseAlreadyRecorded"):
+                recorded_outcome = sanitize_text(detail.get("recordedCoverageTutorResponseOutcome")).lower()
+                if recorded_outcome == "accepted":
+                    message = "This coverage request was already accepted. The support team has already been updated."
+                    accent = "#16a34a"
+                elif recorded_outcome == "rejected":
+                    message = "This coverage request was already declined. The support team has already been updated."
+                    accent = "#dc2626"
+                else:
+                    message = "This coverage request has already been responded to. The support team has already been updated."
+                    accent = "#6d28d9"
+                return build_coverage_tutor_response_page(
+                    "Response Already Recorded",
+                    message,
+                    accent=accent,
+                )
             outcome = sanitize_text(payload.get("outcome")).lower()
             was_accepted = outcome in {"accept", "accepted", "approved", "confirmed"}
             return build_coverage_tutor_response_page(
