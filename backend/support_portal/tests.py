@@ -700,6 +700,31 @@ class CoverageOptionsTests(SimpleTestCase):
         get_coverage_options_response.assert_called_once_with({"type": "tutors"})
 
 
+class CoverageTutorResponsePageTests(SimpleTestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def test_coverage_tutor_response_result_shows_accepted_message_without_processing(self):
+        request = self.factory.get("/coverage/tutor-response/result?action=accept")
+
+        response = views.coverage_tutor_response_result(request)
+
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode("utf-8")
+        self.assertIn("Response Recorded", content)
+        self.assertIn("accepted", content.lower())
+
+    def test_coverage_tutor_response_result_shows_generic_preview_message(self):
+        request = self.factory.get("/coverage/tutor-response/result")
+
+        response = views.coverage_tutor_response_result(request)
+
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode("utf-8")
+        self.assertIn("Tutor Response", content)
+        self.assertIn("workflow completes", content)
+
+
 class AdminSessionViewTests(SimpleTestCase):
     def setUp(self):
         self.factory = RequestFactory()
@@ -5954,6 +5979,52 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         mock_connection = MagicMock()
         mock_connection.cursor.return_value = cursor_context
         return mock_connection, cursor
+
+    def test_build_coverage_tutor_request_webhook_payload_includes_result_urls(self):
+        payload = services.build_coverage_tutor_request_webhook_payload(
+            {
+                "public_id": "KBC-000999",
+                "learner_name": "Ayman",
+                "learner_email": "ayman@example.com",
+                "category": "Technical",
+                "technical_subcategory": "Coverage",
+                "inquiry": "Coverage request",
+            },
+            {"coverageNotes": "Internal note"},
+            {
+                "id": "choice-1",
+                "tutor": "Adey",
+                "tutorEmail": "adey@example.com",
+                "responseToken": "token-1",
+                "sessionDetails": "Module: EVM",
+                "presentationFiles": [],
+            },
+            {
+                "id": 7,
+                "username": "ahmed",
+                "full_name": "Ahmed Hamamo",
+                "email": "ahmed@example.com",
+            },
+            callback_url="https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response",
+            result_base_url="https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response/result",
+        )
+
+        self.assertEqual(
+            payload["acceptResultUrl"],
+            "https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response/result?action=accept",
+        )
+        self.assertEqual(
+            payload["refuseResultUrl"],
+            "https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response/result?action=refuse",
+        )
+        self.assertEqual(
+            payload["callback"]["result"]["acceptUrl"],
+            "https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response/result?action=accept",
+        )
+        self.assertEqual(
+            payload["callback"]["result"]["refuseUrl"],
+            "https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response/result?action=refuse",
+        )
 
     def test_freeze_coverage_documentation_snapshot_locks_saved_cards_and_preserves_previous_content(self):
         existing_documentation = {

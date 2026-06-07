@@ -9,6 +9,7 @@ urlpatterns = [
     path("teams-call-context", views.teams_call_context, name="teams-call-context"),
     path("coverage-options", views.coverage_options, name="coverage-options"),
     path("coverage/tutor-response", views.coverage_tutor_response, name="coverage-tutor-response"),
+    path("coverage/tutor-response/result", views.coverage_tutor_response_result, name="coverage-tutor-response-result"),
     path("verify-email", views.verify_email, name="verify-email"),
     path("admin/login", views.admin_login, name="admin-login"),
     path("admin/microsoft/login", views.admin_microsoft_login, name="admin-microsoft-login"),

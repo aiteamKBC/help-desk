@@ -1774,6 +1774,14 @@ def build_coverage_tutor_public_response_base_url(fallback_origin: Any = "") -> 
     return f"{public_base_url}/coverage/tutor-response"
 
 
+def build_coverage_tutor_public_result_base_url(fallback_origin: Any = "") -> str:
+    public_base_url = get_support_portal_public_base_url(fallback_origin)
+    if not public_base_url:
+        return ""
+
+    return f"{public_base_url}/coverage/tutor-response/result"
+
+
 def build_coverage_tutor_public_response_action_url(
     public_response_base_url: Any,
     *,
@@ -1801,6 +1809,22 @@ def build_coverage_tutor_public_response_action_url(
     return f"{normalized_base_url}?{query_string}" if query_string else normalized_base_url
 
 
+def build_coverage_tutor_public_result_action_url(
+    public_result_base_url: Any,
+    *,
+    action: str,
+) -> str:
+    normalized_base_url = sanitize_text(public_result_base_url).rstrip("/")
+    if not normalized_base_url:
+        return ""
+
+    normalized_action = sanitize_text(action).lower()
+    if not normalized_action:
+        return normalized_base_url
+
+    return f"{normalized_base_url}?{urllib_parse.urlencode({'action': normalized_action})}"
+
+
 def build_coverage_tutor_request_webhook_payload(
     ticket: dict[str, Any],
     documentation: dict[str, Any],
@@ -1808,6 +1832,7 @@ def build_coverage_tutor_request_webhook_payload(
     actor_row: dict[str, Any],
     *,
     callback_url: str = "",
+    result_base_url: str = "",
 ) -> dict[str, Any]:
     accept_url = build_coverage_tutor_public_response_action_url(
         callback_url,
@@ -1825,6 +1850,14 @@ def build_coverage_tutor_request_webhook_payload(
         response_token=card.get("responseToken"),
         tutor_email=card.get("tutorEmail"),
     )
+    accept_result_url = build_coverage_tutor_public_result_action_url(
+        result_base_url,
+        action="accept",
+    )
+    refuse_result_url = build_coverage_tutor_public_result_action_url(
+        result_base_url,
+        action="refuse",
+    )
 
     return {
         "event": "coverage_tutor_requested",
@@ -1834,6 +1867,8 @@ def build_coverage_tutor_request_webhook_payload(
         "responseToken": card.get("responseToken"),
         "acceptUrl": accept_url,
         "refuseUrl": refuse_url,
+        "acceptResultUrl": accept_result_url,
+        "refuseResultUrl": refuse_result_url,
         "tutor": {
             "name": card.get("tutor"),
             "email": card.get("tutorEmail"),
@@ -1864,6 +1899,11 @@ def build_coverage_tutor_request_webhook_payload(
             "path": "/coverage/tutor-response",
             "acceptUrl": accept_url,
             "refuseUrl": refuse_url,
+            "result": {
+                "path": "/coverage/tutor-response/result",
+                "acceptUrl": accept_result_url,
+                "refuseUrl": refuse_result_url,
+            },
         },
     }
 
@@ -8095,6 +8135,7 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
                 updated_target_card,
                 actor_row,
                 callback_url=build_coverage_tutor_public_response_base_url(callback_origin),
+                result_base_url=build_coverage_tutor_public_result_base_url(callback_origin),
             )
         )
         if not webhook_result["configured"]:

@@ -173,6 +173,39 @@ def build_coverage_tutor_response_page(title: str, message: str, *, accent: str 
     return HttpResponse(html)
 
 
+def build_coverage_tutor_response_result_page_from_payload(payload: dict[str, str]) -> HttpResponse:
+    status = sanitize_text(payload.get("status")).lower()
+    outcome = sanitize_text(payload.get("outcome") or payload.get("action")).lower()
+    message = sanitize_text(payload.get("message"))
+
+    if status == "error":
+        return build_coverage_tutor_response_page(
+            "Response Could Not Be Recorded",
+            message or "We could not process this tutor response right now.",
+            accent="#dc2626",
+        )
+
+    if outcome in {"accept", "accepted", "approved", "confirmed"}:
+        return build_coverage_tutor_response_page(
+            "Response Recorded",
+            "Thank you. The coverage request was accepted and the support team has been updated.",
+            accent="#16a34a",
+        )
+
+    if outcome in {"refuse", "refused", "reject", "rejected", "declined"}:
+        return build_coverage_tutor_response_page(
+            "Response Recorded",
+            "Thank you. The coverage request was declined and the support team has been updated.",
+            accent="#dc2626",
+        )
+
+    return build_coverage_tutor_response_page(
+        "Tutor Response",
+        "This page is ready to show the final tutor response result after the workflow completes.",
+        accent="#6d28d9",
+    )
+
+
 def normalize_frontend_origin(value: object) -> str:
     normalized_value = sanitize_text(value).rstrip("/")
     if not normalized_value:
@@ -847,6 +880,11 @@ def coverage_tutor_response(request):
             message = error.message if isinstance(error, ApiError) else "We could not process this tutor response right now."
             return build_coverage_tutor_response_page("Response Could Not Be Recorded", message, accent="#dc2626")
         return handle_api_error(error)
+
+
+@require_GET
+def coverage_tutor_response_result(request):
+    return build_coverage_tutor_response_result_page_from_payload(parse_query_params(request))
 
 
 @csrf_exempt
