@@ -104,6 +104,9 @@ def build_coverage_tutor_response_page(title: str, message: str, *, accent: str 
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{safe_title}</title>
+    <link rel="icon" type="image/svg+xml" href="/kent-crest.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/kent-crest.svg" />
     <style>
       :root {{
         color-scheme: light;
