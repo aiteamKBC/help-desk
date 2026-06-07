@@ -1674,6 +1674,7 @@ def list_coverage_session_date_options(tutor: Any, module: Any, time_label: Any)
     rows = list_coverage_time_rows(tutor, module)
     labels: list[str] = []
     seen_labels: set[str] = set()
+    today = django_timezone.localdate()
 
     for row in rows:
         row_time_label = format_coverage_time_option_label(
@@ -1689,11 +1690,12 @@ def list_coverage_session_date_options(tutor: Any, module: Any, time_label: Any)
         start_date = parse_coverage_plan_date(row.get("start_date"))
         end_date = parse_coverage_plan_date(row.get("end_date"))
         weekday_index = get_coverage_weekday_index(row.get("session_week_day"))
-        if not start_date or not end_date or weekday_index is None or end_date < start_date:
+        if not start_date or not end_date or weekday_index is None or end_date < start_date or end_date < today:
             continue
 
-        days_until_weekday = (weekday_index - start_date.weekday()) % 7
-        candidate_date = start_date + timedelta(days=days_until_weekday)
+        first_possible_date = max(start_date, today)
+        days_until_weekday = (weekday_index - first_possible_date.weekday()) % 7
+        candidate_date = first_possible_date + timedelta(days=days_until_weekday)
 
         while candidate_date <= end_date:
             label = format_coverage_session_date_option_label(candidate_date)

@@ -633,7 +633,7 @@ class CoverageOptionsTests(SimpleTestCase):
                     "end_date": "2026-06-30",
                 },
             ],
-        ):
+        ), patch.object(services.django_timezone, "localdate", return_value=datetime(2026, 6, 7).date()):
             response = services.list_coverage_session_date_options(
                 "Nathan",
                 "Martech",
@@ -643,12 +643,35 @@ class CoverageOptionsTests(SimpleTestCase):
         self.assertEqual(
             response,
             [
-                "Wednesday 03 Jun 2026",
                 "Wednesday 10 Jun 2026",
                 "Wednesday 17 Jun 2026",
                 "Wednesday 24 Jun 2026",
             ],
         )
+
+    def test_list_coverage_session_date_options_returns_empty_for_completed_group(self):
+        with patch.object(
+            services,
+            "list_coverage_time_rows",
+            return_value=[
+                {
+                    "session_week_day": "friday",
+                    "session_start_time": "09:00",
+                    "session_end_time": "11:00",
+                    "group_name": "G2 - Fri - 9AM",
+                    "cohort_name": "May 2025",
+                    "start_date": "2025-05-01",
+                    "end_date": "2025-05-30",
+                },
+            ],
+        ), patch.object(services.django_timezone, "localdate", return_value=datetime(2026, 6, 7).date()):
+            response = services.list_coverage_session_date_options(
+                "Karim Hatem",
+                "PMI SP 14",
+                "Friday 09:00 - 11:00 | G2 - Fri - 9AM | May 2025",
+            )
+
+        self.assertEqual(response, [])
 
     def test_get_coverage_options_response_returns_session_dates(self):
         with patch.object(
