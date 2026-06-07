@@ -176,6 +176,7 @@ ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES = {"application/pdf"}
 ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
 COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 12
+COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 
 
 @dataclass
@@ -1622,10 +1623,15 @@ def list_coverage_module_options(tutor: Any) -> list[str]:
 
 
 def list_coverage_time_options(tutor: Any, module: Any) -> list[str]:
+    return [item["label"] for item in list_coverage_time_option_items(tutor, module)]
+
+
+def list_coverage_time_option_items(tutor: Any, module: Any) -> list[dict[str, Any]]:
     rows = list_coverage_time_rows(tutor, module)
 
-    labels: list[str] = []
-    seen_labels: set[str] = set()
+    items: list[dict[str, Any]] = []
+    item_indexes_by_label: dict[str, int] = {}
+    today = django_timezone.localdate()
     for row in rows:
         label = format_coverage_time_option_label(
             row.get("session_week_day"),
@@ -1634,12 +1640,30 @@ def list_coverage_time_options(tutor: Any, module: Any) -> list[str]:
             row.get("group_name"),
             row.get("cohort_name"),
         )
-        if not label or label in seen_labels:
+        if not label:
             continue
-        seen_labels.add(label)
-        labels.append(label)
 
-    return labels
+        end_date = parse_coverage_plan_date(row.get("end_date"))
+        is_completed = bool(end_date and end_date < today)
+        if label in item_indexes_by_label:
+            existing_item = items[item_indexes_by_label[label]]
+            existing_item["completed"] = bool(existing_item.get("completed")) and is_completed
+            existing_end_date = sanitize_text(existing_item.get("endDate"))
+            next_end_date = end_date.isoformat() if end_date else ""
+            if next_end_date and (not existing_end_date or next_end_date > existing_end_date):
+                existing_item["endDate"] = next_end_date
+            continue
+
+        item_indexes_by_label[label] = len(items)
+        items.append(
+            {
+                "label": label,
+                "completed": is_completed,
+                "endDate": end_date.isoformat() if end_date else "",
+            }
+        )
+
+    return items
 
 
 def list_coverage_session_date_options(tutor: Any, module: Any, time_label: Any) -> list[str]:
@@ -1724,7 +1748,8 @@ def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
     elif option_type == "modules":
         options = list_coverage_module_options(tutor)
     elif option_type == "times":
-        options = list_coverage_time_options(tutor, module)
+        items = list_coverage_time_option_items(tutor, module)
+        options = [item["label"] for item in items]
     elif option_type == "session-dates":
         options = list_coverage_session_date_options(tutor, module, time_label)
     elif option_type == "tutor-email":
@@ -1738,11 +1763,16 @@ def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": option_type,
         "options": options,
+        **({"items": items} if option_type == "times" else {}),
     }
 
 
 def get_coverage_tutor_request_webhook_url() -> str:
     return sanitize_text(getattr(settings, "MAIL_WEBHOOK_URL", ""))
+
+
+def get_coverage_ticket_operations_webhook_url() -> str:
+    return sanitize_text(getattr(settings, "COVERAGE_TICKET_WEBHOOK_URL", ""))
 
 
 def normalize_support_portal_public_base_url(value: Any) -> str:
@@ -2163,6 +2193,141 @@ def build_coverage_session_details_from_inquiry(inquiry: Any) -> str:
             *session_detail_lines,
         ]
     ).strip()
+
+
+def build_coverage_session_items_from_inquiry_details(parsed_inquiry: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not parsed_inquiry:
+        return []
+
+    session_dates = parsed_inquiry.get("sessionDates") or []
+    session_numbers = parsed_inquiry.get("sessionNumbers") or []
+    session_subjects = parsed_inquiry.get("sessionSubjects") or []
+    max_session_count = max(len(session_dates), len(session_numbers), len(session_subjects))
+    sessions: list[dict[str, Any]] = []
+    for index in range(max_session_count):
+        session_date = sanitize_text(session_dates[index] if index < len(session_dates) else "")
+        session_number = sanitize_text(session_numbers[index] if index < len(session_numbers) else "")
+        session_subject = sanitize_text(session_subjects[index] if index < len(session_subjects) else "")
+        sessions.append(
+            {
+                "index": index + 1,
+                "date": session_date,
+                "sessionNumber": session_number,
+                "subject": session_subject,
+            }
+        )
+
+    return sessions
+
+
+def build_coverage_ticket_operations_webhook_payload(
+    *,
+    public_id: str,
+    ticket_row: dict[str, Any],
+    requester: dict[str, Any],
+    learner: dict[str, Any],
+    requester_role: str,
+    category: str,
+    technical_subcategory: str,
+    inquiry: str,
+    priority: str,
+    evidence_count: int,
+    attachment_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    parsed_inquiry = parse_coverage_inquiry_details(inquiry) or {}
+    public_base_url = get_support_portal_public_base_url("")
+    dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
+    created_at = serialize_datetime_value(ticket_row.get("created_at")) or datetime.now(timezone.utc).isoformat()
+
+    return {
+        "event": "coverage_ticket_created",
+        "source": "support_portal",
+        "ticket": {
+            "id": public_id,
+            "status": ticket_row.get("status"),
+            "statusReason": "Coverage Ticket",
+            "category": category,
+            "technicalSubcategory": technical_subcategory,
+            "priority": priority,
+            "assignedTeam": ticket_row.get("assigned_team") or "Unassigned",
+            "slaStatus": ticket_row.get("sla_status") or "",
+            "createdAt": created_at,
+            "dashboardUrl": dashboard_url,
+        },
+        "requester": {
+            "name": requester.get("display_name") or learner.get("full_name") or learner.get("email") or "",
+            "email": learner.get("email") or "",
+            "role": requester_role,
+        },
+        "coverage": {
+            "tutor": parsed_inquiry.get("tutor") or "",
+            "module": parsed_inquiry.get("module") or "",
+            "preferredTime": parsed_inquiry.get("time") or "",
+            "sessionDates": parsed_inquiry.get("sessionDates") or [],
+            "sessionNumbers": parsed_inquiry.get("sessionNumbers") or [],
+            "sessionSubjects": parsed_inquiry.get("sessionSubjects") or [],
+            "sessions": build_coverage_session_items_from_inquiry_details(parsed_inquiry),
+            "inquiry": inquiry,
+        },
+        "evidence": {
+            "count": evidence_count,
+            "files": [
+                {
+                    "name": sanitize_text(file.get("name")),
+                    "mimeType": sanitize_text(file.get("mimeType")),
+                    "size": int(file.get("size") or 0),
+                    "storageKey": sanitize_text(file.get("storageKey")),
+                }
+                for file in (attachment_rows or [])
+            ],
+        },
+    }
+
+
+def send_coverage_ticket_operations_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    configured, delivered, status, response_payload = post_json_webhook(
+        get_coverage_ticket_operations_webhook_url(),
+        payload,
+        timeout_seconds=COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS,
+    )
+    return {
+        "configured": configured,
+        "delivered": delivered,
+        "status": status,
+        "response": response_payload,
+    }
+
+
+def notify_coverage_ticket_operations_team(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    if not get_coverage_ticket_operations_webhook_url():
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    webhook_result = send_coverage_ticket_operations_webhook(payload)
+    event_type = (
+        "coverage_ticket_operations_notified"
+        if webhook_result["delivered"]
+        else "coverage_ticket_operations_notification_failed"
+    )
+    try:
+        insert_history_event(
+            ticket_id,
+            event_type,
+            None,
+            {
+                "ticketId": payload.get("ticket", {}).get("id"),
+                "requesterName": payload.get("requester", {}).get("name"),
+                "requesterEmail": payload.get("requester", {}).get("email"),
+                "module": payload.get("coverage", {}).get("module"),
+                "tutor": payload.get("coverage", {}).get("tutor"),
+                "sessionCount": len(payload.get("coverage", {}).get("sessions") or []),
+                "webhookStatus": webhook_result.get("status"),
+                "webhookDelivered": webhook_result.get("delivered"),
+            },
+        )
+    except Exception:
+        pass
+
+    return webhook_result
 
 
 def build_derived_coverage_tutor_choice_card(
@@ -10134,6 +10299,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
     uploaded_files = list(uploaded_files or [])
     evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
     stored_attachment_keys: list[str] = []
+    attachment_rows: list[dict[str, Any]] = []
 
     if not is_valid_email(email):
         raise ApiError(400, "Please enter a valid email address.")
@@ -10335,6 +10501,24 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
         for storage_key in stored_attachment_keys:
             delete_support_attachment_file(storage_key)
         raise
+
+    if technical_subcategory == "Coverage":
+        notify_coverage_ticket_operations_team(
+            int(ticket_row["id"]),
+            build_coverage_ticket_operations_webhook_payload(
+                public_id=public_id,
+                ticket_row=ticket_row,
+                requester=requester,
+                learner=learner,
+                requester_role=requester_role,
+                category=category,
+                technical_subcategory=technical_subcategory,
+                inquiry=inquiry,
+                priority=ticket_priority,
+                evidence_count=evidence_count,
+                attachment_rows=attachment_rows,
+            ),
+        )
 
     return {
         "ticket": {

@@ -31,8 +31,10 @@ import { type Category, type EvidenceFile, type TechnicalSubcategory, useSupport
 import {
   buildCoverageInquiry,
   fetchCoverageOptions,
+  fetchCoverageTimeOptions,
   isCoverageSubcategory,
   parseCoverageInquiry,
+  type CoverageTimeOption,
 } from "@/lib/coverageSupport";
 import { quickTicketReason } from "@/lib/supportFlow";
 import { toast } from "sonner";
@@ -168,7 +170,7 @@ const InquiryDetails = () => {
   );
   const [coverageTutorOptions, setCoverageTutorOptions] = useState<string[]>([]);
   const [coverageModuleOptions, setCoverageModuleOptions] = useState<string[]>([]);
-  const [coverageTimeOptions, setCoverageTimeOptions] = useState<string[]>([]);
+  const [coverageTimeOptions, setCoverageTimeOptions] = useState<CoverageTimeOption[]>([]);
   const [coverageSessionDateOptions, setCoverageSessionDateOptions] = useState<string[]>([]);
   const [coverageOptionsError, setCoverageOptionsError] = useState("");
   const [isLoadingCoverageTutors, setIsLoadingCoverageTutors] = useState(false);
@@ -366,14 +368,16 @@ const InquiryDetails = () => {
     setIsLoadingCoverageTimes(true);
     setCoverageOptionsError("");
 
-    void fetchCoverageOptions("times", { tutor: coverageTutor, module: coverageModule })
+    void fetchCoverageTimeOptions({ tutor: coverageTutor, module: coverageModule })
       .then((options) => {
         if (cancelled) {
           return;
         }
 
         setCoverageTimeOptions(options);
-        setCoverageTime((currentTime) => (currentTime && !options.includes(currentTime) ? "" : currentTime));
+        setCoverageTime((currentTime) => (
+          currentTime && !options.some((option) => option.label === currentTime) ? "" : currentTime
+        ));
       })
       .catch((error: unknown) => {
         if (cancelled) {
@@ -811,7 +815,16 @@ const InquiryDetails = () => {
                       <SelectContent>
                         {coverageTimeOptions.length > 0 ? (
                           coverageTimeOptions.map((item) => (
-                            <SelectItem key={item} value={item}>{item}</SelectItem>
+                            <SelectItem key={item.label} value={item.label}>
+                              <span className="flex w-full items-center justify-between gap-3">
+                                <span className="truncate">{item.label}</span>
+                                {item.completed ? (
+                                  <span className="shrink-0 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-700">
+                                    Completed
+                                  </span>
+                                ) : null}
+                              </span>
+                            </SelectItem>
                           ))
                         ) : (
                           <div className="px-3 py-2 text-sm text-muted-foreground">

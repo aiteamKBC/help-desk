@@ -562,6 +562,7 @@ class CoverageOptionsTests(SimpleTestCase):
                     "session_end_time": "11:00",
                     "group_name": "G3-Crispin-Fri-9",
                     "cohort_name": "May 2025",
+                    "end_date": "2025-05-30",
                 },
                 {
                     "session_week_day": "friday",
@@ -569,16 +570,18 @@ class CoverageOptionsTests(SimpleTestCase):
                     "session_end_time": "11:00",
                     "group_name": "G3-Crispin-Fri-9",
                     "cohort_name": "May 2025",
+                    "end_date": "2025-05-30",
                 },
                 {
                     "session_week_day": "wednesday",
                     "session_start_time": "09:00",
                     "session_end_time": "11:00",
                     "group_name": "G4-Nathan-Wed-9",
-                    "cohort_name": "May 2025",
+                    "cohort_name": "Jun 2026",
+                    "end_date": "2026-07-31",
                 },
             ],
-        ):
+        ), patch.object(services.django_timezone, "localdate", return_value=datetime(2026, 6, 7).date()):
             response = services.get_coverage_options_response(
                 {"type": "times", "tutor": "Nathan", "module": "Martech"}
             )
@@ -589,7 +592,19 @@ class CoverageOptionsTests(SimpleTestCase):
                 "type": "times",
                 "options": [
                     "Friday 09:00 - 11:00 | G3-Crispin-Fri-9 | May 2025",
-                    "Wednesday 09:00 - 11:00 | G4-Nathan-Wed-9 | May 2025",
+                    "Wednesday 09:00 - 11:00 | G4-Nathan-Wed-9 | Jun 2026",
+                ],
+                "items": [
+                    {
+                        "label": "Friday 09:00 - 11:00 | G3-Crispin-Fri-9 | May 2025",
+                        "completed": True,
+                        "endDate": "2025-05-30",
+                    },
+                    {
+                        "label": "Wednesday 09:00 - 11:00 | G4-Nathan-Wed-9 | Jun 2026",
+                        "completed": False,
+                        "endDate": "2026-07-31",
+                    },
                 ],
             },
         )
@@ -1325,6 +1340,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             ),
             patch.object(services, "build_public_ticket_id", return_value="KBC-000073"),
             patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_ticket_operations_team") as notify_operations_team,
             patch.object(services.connection, "cursor", return_value=cursor_manager),
         ):
             response = services.create_ticket(
@@ -1332,7 +1348,15 @@ class SupportSessionValidationTests(SimpleTestCase):
                     "email": "learner@example.com",
                     "category": "Technical",
                     "technicalSubcategory": "Coverage",
-                    "inquiry": "Coverage session request",
+                    "inquiry": (
+                        "Coverage session request\n"
+                        "Tutor: Amgad\n"
+                        "Module: PMP 3 Months\n"
+                        "Preferred Time: Friday 09:00 - 11:00 | G1-Fri-9 | Oct 2024\n"
+                        "Session Date: Friday 18 Oct 2024\n"
+                        "Session Number: 1\n"
+                        "Session Subject: test"
+                    ),
                     "evidence": [],
                 }
             )
@@ -1346,6 +1370,15 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertEqual(ticket_insert_params[3], "Coverage")
         ticket_metadata = json.loads(ticket_insert_params[7])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Coverage")
+        notify_operations_team.assert_called_once()
+        notification_ticket_id, notification_payload = notify_operations_team.call_args.args
+        self.assertEqual(notification_ticket_id, 73)
+        self.assertEqual(notification_payload["event"], "coverage_ticket_created")
+        self.assertEqual(notification_payload["ticket"]["id"], "KBC-000073")
+        self.assertEqual(notification_payload["requester"]["email"], "learner@example.com")
+        self.assertEqual(notification_payload["coverage"]["tutor"], "Amgad")
+        self.assertEqual(notification_payload["coverage"]["module"], "PMP 3 Months")
+        self.assertEqual(notification_payload["coverage"]["sessions"][0]["sessionNumber"], "1")
 
     def test_create_ticket_sets_high_priority_for_employer_requester(self):
         requester = {
@@ -1942,6 +1975,30 @@ class SupportSessionValidationTests(SimpleTestCase):
 
         self.assertEqual(result["reply"], "The learner needs a follow-up.")
         post_json_webhook.assert_called_once_with("https://example.com/chatbot", payload)
+
+    def test_send_coverage_ticket_operations_webhook_uses_short_timeout(self):
+        payload = {"event": "coverage_ticket_created", "ticket": {"id": "KBC-000073"}}
+
+        with (
+            patch.object(
+                services,
+                "get_coverage_ticket_operations_webhook_url",
+                return_value="https://n8n.example/coverage-ticket",
+            ),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+        ):
+            response = services.send_coverage_ticket_operations_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_json_webhook.assert_called_once_with(
+            "https://n8n.example/coverage-ticket",
+            payload,
+            timeout_seconds=services.COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS,
+        )
 
 
 class SlaPolicyTests(SimpleTestCase):

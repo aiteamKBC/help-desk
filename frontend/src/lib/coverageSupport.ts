@@ -10,6 +10,12 @@ export interface CoverageDetails {
 
 export type CoverageOptionType = "tutors" | "modules" | "times" | "session-dates";
 
+export interface CoverageTimeOption {
+  label: string;
+  completed: boolean;
+  endDate?: string;
+}
+
 const coverageInquiryLinePatterns = {
   tutor: /^Tutor:\s*(.+)$/im,
   module: /^Module:\s*(.+)$/im,
@@ -20,6 +26,29 @@ const coverageInquiryLinePatterns = {
 };
 
 export const isCoverageSubcategory = (value: string) => value.trim().toLowerCase() === "coverage";
+
+function normalizeCoverageTimeOption(value: unknown): CoverageTimeOption | null {
+  if (typeof value === "string") {
+    const label = value.trim();
+    return label ? { label, completed: false } : null;
+  }
+
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const payload = value as { label?: unknown; completed?: unknown; endDate?: unknown };
+  const label = typeof payload.label === "string" ? payload.label.trim() : "";
+  if (!label) {
+    return null;
+  }
+
+  return {
+    label,
+    completed: Boolean(payload.completed),
+    endDate: typeof payload.endDate === "string" ? payload.endDate : "",
+  };
+}
 
 export async function fetchCoverageOptions(
   type: CoverageOptionType,
@@ -55,6 +84,44 @@ export async function fetchCoverageOptions(
   }
 
   return Array.isArray(payload?.options) ? payload.options.filter((item): item is string => typeof item === "string") : [];
+}
+
+export async function fetchCoverageTimeOptions(params: {
+  tutor?: string;
+  module?: string;
+}) {
+  const query = new URLSearchParams({ type: "times" });
+  if (params.tutor) {
+    query.set("tutor", params.tutor);
+  }
+  if (params.module) {
+    query.set("module", params.module);
+  }
+
+  const response = await fetch(`/api/coverage-options?${query.toString()}`, {
+    cache: "no-store",
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | {
+        message?: string;
+        options?: string[];
+        items?: unknown[];
+      }
+    | null;
+
+  if (!response.ok) {
+    throw new Error(payload?.message || "We could not load the coverage times right now.");
+  }
+
+  const rawItems = Array.isArray(payload?.items) && payload.items.length > 0
+    ? payload.items
+    : Array.isArray(payload?.options)
+      ? payload.options
+      : [];
+
+  return rawItems
+    .map((item) => normalizeCoverageTimeOption(item))
+    .filter((item): item is CoverageTimeOption => Boolean(item));
 }
 
 export async function fetchCoverageTutorEmail(tutor: string) {

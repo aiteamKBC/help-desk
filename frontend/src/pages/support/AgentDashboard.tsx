@@ -8366,10 +8366,35 @@ function normalizeCoverageCardAttachment(attachment: CoverageCardAttachment | nu
   };
 }
 
+function normalizeCoverageTutorRequestStatus(status: unknown): CoverageTutorRequestStatus {
+  switch (status) {
+    case "requested":
+    case "pending":
+      return "requested";
+    case "accepted":
+      return "accepted";
+    case "refused":
+    case "rejected":
+      return "refused";
+    default:
+      return "draft";
+  }
+}
+
+function normalizeCoverageTutorReplyOutcome(outcome: unknown): CoverageTutorReplyOutcome {
+  switch (outcome) {
+    case "accepted":
+      return "accepted";
+    case "refused":
+    case "rejected":
+      return "refused";
+    default:
+      return "";
+  }
+}
+
 function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | undefined): CoverageWorkflowCard[] {
   const allowedTypes: CoverageWorkflowCardType[] = ["tutor_choice", "tutor_reply", "note"];
-  const allowedRequestStatuses = new Set(["draft", "requested", "pending", "accepted", "refused", "rejected"]);
-  const allowedReplyOutcomes: CoverageTutorReplyOutcome[] = ["", "accepted", "refused"];
 
   return Array.isArray(cards)
     ? cards.flatMap((card) => {
@@ -8377,16 +8402,8 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           return [];
         }
 
-        const rawRequestStatus = card.requestStatus || "";
-        const requestStatus = allowedRequestStatuses.has(rawRequestStatus)
-          ? ((rawRequestStatus === "pending"
-            ? "requested"
-            : rawRequestStatus === "rejected"
-              ? "refused"
-              : rawRequestStatus) as CoverageTutorRequestStatus)
-          : "draft";
-        const rawReplyOutcome = card.replyOutcome === "rejected" ? "refused" : card.replyOutcome;
-        const replyOutcome = allowedReplyOutcomes.includes(rawReplyOutcome) ? rawReplyOutcome : "";
+        const requestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
+        const replyOutcome = normalizeCoverageTutorReplyOutcome(card.replyOutcome);
         const presentationFiles = Array.isArray(card.presentationFiles)
           ? card.presentationFiles
             .map((file) => normalizeCoverageCardAttachment(file))
@@ -9081,7 +9098,7 @@ function getDisplayedChatReference(
     pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
     teamsCallRequested?: boolean;
     ticketId?: string;
-    id?: string;
+    id?: string | number;
   },
   fallbackToTicketId = false,
 ) {
@@ -9106,7 +9123,7 @@ function getDisplayedChatReference(
   }
 
   if (fallbackToTicketId) {
-    return source.ticketId || source.id || "-";
+    return source.ticketId || (source.id === undefined || source.id === null ? "-" : String(source.id));
   }
 
   return "-";
@@ -9668,6 +9685,8 @@ const activityEventLabels: Record<string, string> = {
   support_session_unavailable: "Session Unavailable",
   ticket_created: "Ticket Created",
   ticket_updated: "Ticket Updated",
+  coverage_ticket_operations_notified: "Operations Notified",
+  coverage_ticket_operations_notification_failed: "Operations Notification Failed",
   coverage_tutor_requested: "Tutor Requested",
   coverage_tutor_response: "Tutor Reply",
   coverage_session_confirmed: "Session Confirmed",
@@ -9695,6 +9714,7 @@ const activityPayloadLabels: Record<string, string> = {
   fromAgentId: "Previous Agent ID",
   liveChatRequestedAt: "Live Chat Requested",
   message: "Message",
+  module: "Module",
   message_count: "Message Count",
   meetingJoinUrl: "Teams Join Link",
   note: "Internal Note",
@@ -9721,10 +9741,13 @@ const activityPayloadLabels: Record<string, string> = {
   requestedAt: "Requested At",
   respondedAt: "Responded At",
   sessionDetails: "Session Details",
+  sessionCount: "Session Count",
   tutor: "Tutor",
   tutorEmail: "Tutor E-mail",
   targetLabel: "Teams Target",
   toAgentUsername: "To Username",
+  webhookDelivered: "Webhook Delivered",
+  webhookStatus: "Webhook Status",
 };
 
 function getActivityEventLabel(eventType: string) {
@@ -9836,6 +9859,10 @@ function getActivityEventSummary(item: HistoryItem) {
       return requestedDate || requestedTime
         ? `Support session requested for ${[requestedDate, requestedTime].filter(Boolean).join(" at ")}`
         : "Support session requested";
+    case "coverage_ticket_operations_notified":
+      return "Operations team notified about this coverage ticket";
+    case "coverage_ticket_operations_notification_failed":
+      return "Operations team notification could not be delivered";
     case "coverage_tutor_requested":
       return tutor ? `Tutor request sent to ${tutor}` : "Tutor request sent";
     case "coverage_tutor_response":
