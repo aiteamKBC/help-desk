@@ -2046,6 +2046,30 @@ class SupportSessionValidationTests(SimpleTestCase):
             timeout_seconds=services.COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS,
         )
 
+    def test_send_coverage_tutor_response_mail_webhook_uses_short_timeout(self):
+        payload = {"event": "coverage_tutor_refused", "ticket": {"id": "KBC-000073"}}
+
+        with (
+            patch.object(
+                services,
+                "get_coverage_tutor_response_mail_webhook_url",
+                return_value="https://n8n.example/coverage-response",
+            ),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+        ):
+            response = services.send_coverage_tutor_response_mail_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_json_webhook.assert_called_once_with(
+            "https://n8n.example/coverage-response",
+            payload,
+            timeout_seconds=services.COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS,
+        )
+
 
 class SlaPolicyTests(SimpleTestCase):
     def test_open_ticket_keeps_pending_review(self):
@@ -7114,6 +7138,80 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_cards[1]["type"], "tutor_reply")
         self.assertEqual(persisted_cards[1]["replyOutcome"], "accepted")
         self.assertEqual(persisted_cards[1]["sessionDetails"], "Friday 09:00 - 11:00")
+
+    def test_process_coverage_tutor_response_sends_refusal_mail_webhook_on_rejection(self):
+        ticket = {
+            "id": 53,
+            "public_id": "KBC-000053",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "technical_subcategory": "Coverage",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "ticketId": "KBC-000053",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM\nSessions:\n1. Friday 09:00 - 11:00",
+                            "presentationFiles": [{"name": "slides.pdf", "size": 77}],
+                            "requestStatus": "requested",
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "token-1",
+                            "requestSubmittedByAgentId": 7,
+                            "requestSubmittedByAgentName": "Ahmed Hamamo",
+                            "requestSubmittedByAgentUsername": "ahmed",
+                            "locked": True,
+                        }
+                    ],
+                },
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_refusal_mail_webhook") as notify_refusal_mail,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000053"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000053",
+                    "responseToken": "token-1",
+                    "outcome": "refuse",
+                    "message": "Unavailable for this slot",
+                }
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000053")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[0], "Pending")
+        self.assertEqual(update_params[1], "Tutor Rejected")
+        persisted_metadata = json.loads(update_params[3])
+        persisted_cards = persisted_metadata["admin_documentation"]["coverageCards"]
+        self.assertEqual(persisted_metadata["latest_coverage_tutor_response"]["outcome"], "rejected")
+        self.assertEqual(persisted_cards[0]["requestStatus"], "refused")
+        self.assertEqual(persisted_cards[1]["replyOutcome"], "refused")
+        notify_refusal_mail.assert_called_once()
+        self.assertEqual(notify_refusal_mail.call_args.args[0], 53)
+        webhook_payload = notify_refusal_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["event"], "coverage_tutor_refused")
+        self.assertEqual(webhook_payload["ticket"]["id"], "KBC-000053")
+        self.assertEqual(webhook_payload["ticket"]["statusReason"], "Tutor Rejected")
+        self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
+        self.assertEqual(webhook_payload["requestedBy"]["agentUsername"], "ahmed")
 
     def test_process_coverage_tutor_response_ignores_second_response_for_same_card(self):
         ticket = {
