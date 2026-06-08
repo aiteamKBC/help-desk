@@ -1178,6 +1178,8 @@ const ChatSupport = () => {
       id: "",
       learnerName: ticket.learnerName,
       email: ticket.email,
+      requesterRole: ticket.requesterRole,
+      requesterSource: ticket.requesterSource,
       category: "",
       technicalSubcategory: "",
       inquiry: "",

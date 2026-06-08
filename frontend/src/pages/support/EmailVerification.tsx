@@ -14,7 +14,13 @@ import {
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { KentCrestMark } from "@/components/support/KentCrestMark";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { type BookingSummary, type RequesterRole, type Ticket, useSupport } from "@/context/SupportContext";
+import {
+  type BookingSummary,
+  type RequesterRole,
+  type RequesterSource,
+  type Ticket,
+  useSupport,
+} from "@/context/SupportContext";
 import { getSupportResumePath, isAwaitingSupportReviewTicket } from "@/lib/supportFlow";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import { adminPortalReturnQueryParam, clearAdminPortalReturnFlag } from "@/lib/adminSession";
@@ -82,6 +88,7 @@ interface RestoredTicketPayload {
   learnerName?: string;
   email: string;
   requesterRole?: RequesterRole;
+  requesterSource?: RequesterSource;
   category: "" | "Learning" | "Technical" | "Others";
   technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
   inquiry: string;
@@ -104,6 +111,7 @@ function buildRestoredTicket(
     learnerName: restoredTicket.learnerName || learnerNameFallback,
     email: restoredTicket.email,
     requesterRole: restoredTicket.requesterRole || "user",
+    requesterSource: restoredTicket.requesterSource || "",
     category: restoredTicket.category,
     technicalSubcategory: restoredTicket.technicalSubcategory,
     inquiry: restoredTicket.inquiry,
@@ -156,12 +164,18 @@ const EmailVerification = () => {
     navigate(getSupportResumePath(restoredTicket, restoredBookingSummary));
   };
 
-  const startNewTicket = (trimmedEmail: string, learnerName: string, requesterRole: RequesterRole) => {
+  const startNewTicket = (
+    trimmedEmail: string,
+    learnerName: string,
+    requesterRole: RequesterRole,
+    requesterSource: RequesterSource,
+  ) => {
     setTicket({
       id: "",
       learnerName,
       email: trimmedEmail,
       requesterRole,
+      requesterSource,
       category: "",
       technicalSubcategory: "",
       inquiry: "",
@@ -196,12 +210,14 @@ const EmailVerification = () => {
             exists?: boolean;
             message?: string;
             requesterRole?: RequesterRole;
+            requesterSource?: RequesterSource;
             learner?: { fullName?: string; email?: string };
             ticket?: {
               id: string;
               learnerName?: string;
               email: string;
               requesterRole?: RequesterRole;
+              requesterSource?: RequesterSource;
               category: "" | "Learning" | "Technical" | "Others";
               technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
               inquiry: string;
@@ -223,6 +239,7 @@ const EmailVerification = () => {
         const restoredTicket = payload.ticket;
         const learnerName = payload?.learner?.fullName || "";
         const requesterRole = payload?.requesterRole || restoredTicket?.requesterRole || "user";
+        const requesterSource = payload?.requesterSource || restoredTicket?.requesterSource || "";
 
         if (restoredTicket?.id) {
           setExistingRequestTicket(buildRestoredTicket(restoredTicket, learnerName));
@@ -231,7 +248,7 @@ const EmailVerification = () => {
           return;
         }
 
-        startNewTicket(trimmedEmail, learnerName, requesterRole);
+        startNewTicket(trimmedEmail, learnerName, requesterRole, requesterSource);
         return;
       }
 
@@ -390,6 +407,7 @@ const EmailVerification = () => {
                 email.trim().toLowerCase(),
                 existingRequestTicket?.learnerName || "",
                 existingRequestTicket?.requesterRole || "user",
+                existingRequestTicket?.requesterSource || "",
               )}
             >
               <MessageSquarePlus className="mr-2 h-4 w-4" />

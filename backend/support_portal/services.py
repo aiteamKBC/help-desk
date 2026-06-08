@@ -157,6 +157,8 @@ MICROSOFT_GRAPH_STAFF_ROLE_PRIORITY = {
     "externalguest": 3,
 }
 MANAGED_PUBLIC_REQUESTER_SOURCE = "support_portal_requester"
+KBC_USERS_DATA_REQUESTER_SOURCE = "kbc_users_data"
+MICROSOFT_ENTRA_REQUESTER_SOURCE = "microsoft_entra"
 ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -870,6 +872,53 @@ def normalize_public_requester_role(value: Any, *, default: str = ROLE_USER) -> 
     return default
 
 
+def normalize_public_requester_source(value: Any) -> str:
+    normalized_value = sanitize_text(value).lower()
+    if normalized_value == "legacy_kbc_users_data":
+        return KBC_USERS_DATA_REQUESTER_SOURCE
+    return normalized_value
+
+
+def get_public_requester_source(requester: dict[str, Any] | None) -> str:
+    if not requester:
+        return ""
+
+    explicit_source = normalize_public_requester_source(requester.get("source"))
+    if explicit_source:
+        return explicit_source
+    if requester.get("account"):
+        return MANAGED_PUBLIC_REQUESTER_SOURCE
+    if requester.get("entra_user"):
+        return MICROSOFT_ENTRA_REQUESTER_SOURCE
+    return ""
+
+
+def get_ticket_requester_source(
+    ticket_metadata: Any,
+    *,
+    learner_source: Any = None,
+    learner_metadata: Any = None,
+    default: str = "",
+) -> str:
+    metadata = normalize_json_object(ticket_metadata)
+    explicit_source = normalize_public_requester_source(metadata.get("requester_source"))
+    if explicit_source:
+        return explicit_source
+
+    if metadata.get("requester_account_id") not in (None, "", 0):
+        return MANAGED_PUBLIC_REQUESTER_SOURCE
+
+    normalized_learner_source = normalize_public_requester_source(learner_source)
+    normalized_learner_metadata = normalize_json_object(learner_metadata)
+    if (
+        normalized_learner_source == KBC_USERS_DATA_REQUESTER_SOURCE
+        or sanitize_text(normalized_learner_metadata.get("legacy_source")).lower() == KBC_USERS_DATA_REQUESTER_SOURCE
+    ):
+        return KBC_USERS_DATA_REQUESTER_SOURCE
+
+    return normalize_public_requester_source(default)
+
+
 def normalize_ticket_priority(value: Any, *, default: str = DEFAULT_TICKET_PRIORITY) -> str:
     normalized_value = sanitize_text(value).title()
     if normalized_value in ALLOWED_TICKET_PRIORITIES:
@@ -893,13 +942,13 @@ def derive_requester_ticket_priority(requester_role: Any, current_priority: Any 
     return normalized_priority
 
 
-def can_requester_submit_coverage_ticket(requester_role: Any) -> bool:
-    return normalize_public_requester_role(requester_role) in {ROLE_COACH, ROLE_EMPLOYER}
+def can_requester_submit_coverage_ticket(requester_source: Any) -> bool:
+    return normalize_public_requester_source(requester_source) != KBC_USERS_DATA_REQUESTER_SOURCE
 
 
-def ensure_requester_can_submit_coverage_ticket(requester_role: Any) -> None:
-    if not can_requester_submit_coverage_ticket(requester_role):
-        raise ApiError(403, "Coverage requests are only available for coach and employer accounts.")
+def ensure_requester_can_submit_coverage_ticket(requester_source: Any) -> None:
+    if not can_requester_submit_coverage_ticket(requester_source):
+        raise ApiError(403, "Coverage requests are not available for standard KBC learner accounts.")
 
 
 def get_ticket_sort_timestamp(value: Any) -> float:
@@ -3623,6 +3672,11 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "email": row.get("learner_email") or "",
         "learnerPhone": row.get("learner_phone") or "",
         "requesterRole": get_ticket_requester_role(ticket_metadata),
+        "requesterSource": get_ticket_requester_source(
+            ticket_metadata,
+            learner_source=row.get("learner_source"),
+            learner_metadata=row.get("learner_metadata"),
+        ),
         "priority": normalize_ticket_priority(row.get("priority")),
         "category": row["category"],
         "technicalSubcategory": row.get("technical_subcategory") or "",
@@ -5449,6 +5503,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
                     or sanitize_text(local_learner.get("full_name") if local_learner else "")
                     or sanitize_text(managed_account.get("username"))
                 ),
+                "source": MANAGED_PUBLIC_REQUESTER_SOURCE,
             }
 
         return {
@@ -5471,7 +5526,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
         "learner": fetch_local_learner_by_email(email),
         "display_name": sanitize_text(entra_user.get("displayName")) or email,
         "entra_user": entra_user,
-        "source": "microsoft_entra",
+        "source": MICROSOFT_ENTRA_REQUESTER_SOURCE,
     }
 
 
@@ -5487,7 +5542,7 @@ def ensure_public_requester_learner(requester: dict[str, Any]) -> dict[str, Any]
         if entra_user:
             ensured_entra_learner = upsert_learner_record(
                 build_entra_public_requester_learner_payload(requester["email"], entra_user),
-                source="microsoft_entra",
+                source=MICROSOFT_ENTRA_REQUESTER_SOURCE,
                 metadata={
                     "microsoft_entra_requester": True,
                     "entra_object_id": sanitize_text(entra_user.get("id")),
@@ -6571,6 +6626,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
 
     learner = requester.get("learner")
     requester_role = requester["role"]
+    requester_source = get_public_requester_source(requester)
     response = {
         "exists": True,
         "requesterRole": requester_role,
@@ -6581,6 +6637,8 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "message": "Email verified.",
     }
+    if requester_source:
+        response["requesterSource"] = requester_source
 
     if not learner:
         return response
@@ -6590,6 +6648,10 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         return response
 
     existing_ticket_metadata = normalize_json_object(existing_ticket.get("metadata"))
+    existing_ticket_requester_source = get_ticket_requester_source(
+        existing_ticket_metadata,
+        default=requester_source,
+    )
     response["ticket"] = {
         "id": existing_ticket["public_id"],
         "learnerName": requester.get("display_name") or learner.get("full_name") or "",
@@ -6607,6 +6669,8 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         "chatState": derive_ticket_chat_state(existing_ticket.get("status"), existing_ticket.get("conversation_status")),
         "liveChatRequested": is_live_chat_requested(existing_ticket.get("metadata"), existing_ticket.get("conversation_metadata")),
     }
+    if existing_ticket_requester_source:
+        response["ticket"]["requesterSource"] = existing_ticket_requester_source
 
     booking_summary = get_latest_ticket_booking_summary(int(existing_ticket["id"]))
     if booking_summary:
@@ -10503,8 +10567,9 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 raise ApiError(404, "This email is not registered in our records.")
 
             requester_role = requester["role"]
+            requester_source = get_public_requester_source(requester)
             if technical_subcategory == "Coverage":
-                ensure_requester_can_submit_coverage_ticket(requester_role)
+                ensure_requester_can_submit_coverage_ticket(requester_source)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
             managed_account = requester.get("account")
@@ -10512,6 +10577,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 "source": "support_portal",
                 "technical_subcategory": technical_subcategory or None,
                 "requester_role": requester_role,
+                "requester_source": requester_source or None,
             }
             if managed_account:
                 ticket_metadata.update(
@@ -10524,7 +10590,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             if entra_user:
                 ticket_metadata.update(
                     {
-                        "requester_source": "microsoft_entra",
+                        "requester_source": MICROSOFT_ENTRA_REQUESTER_SOURCE,
                         "entra_object_id": sanitize_text(entra_user.get("id")),
                         "entra_user_principal_name": sanitize_text(entra_user.get("userPrincipalName")),
                     }
@@ -10605,6 +10671,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                                 "learner_id": learner["id"],
                                 "technical_subcategory": technical_subcategory or None,
                                 "requester_role": requester_role,
+                                "requester_source": requester_source or None,
                                 "requester_account_id": int(managed_account["id"]) if managed_account else None,
                                 "requester_username": sanitize_text(managed_account.get("username")) if managed_account else "",
                             }
@@ -10712,6 +10779,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             "learnerName": requester.get("display_name") or learner.get("full_name") or "",
             "email": learner["email"],
             "requesterRole": requester_role,
+            "requesterSource": requester_source,
             "category": category,
             "technicalSubcategory": technical_subcategory,
             "inquiry": inquiry,
@@ -10764,7 +10832,9 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                   t.conversation_id,
                   t.technical_subcategory,
                   l.full_name AS learner_name,
-                  l.email
+                  l.email,
+                  l.source AS learner_source,
+                  l.metadata AS learner_metadata
                 FROM tickets t
                 JOIN learners l
                   ON l.id = t.learner_id
@@ -10777,8 +10847,13 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
             if not existing_ticket:
                 raise ApiError(404, "Ticket not found.")
             requester_role = get_ticket_requester_role(existing_ticket.get("metadata"))
+            requester_source = get_ticket_requester_source(
+                existing_ticket.get("metadata"),
+                learner_source=existing_ticket.get("learner_source"),
+                learner_metadata=existing_ticket.get("learner_metadata"),
+            )
             if technical_subcategory == "Coverage":
-                ensure_requester_can_submit_coverage_ticket(requester_role)
+                ensure_requester_can_submit_coverage_ticket(requester_source)
             next_priority = derive_requester_ticket_priority(requester_role, existing_ticket.get("priority"))
             existing_attachment_storage_keys = list_ticket_attachment_storage_keys(int(existing_ticket["id"]))
 
@@ -10794,10 +10869,19 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                       inquiry = %s,
                       priority = %s,
                       evidence_count = %s,
+                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
                       updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [category, technical_subcategory or None, inquiry, next_priority, evidence_count, existing_ticket["id"]],
+                    [
+                        category,
+                        technical_subcategory or None,
+                        inquiry,
+                        next_priority,
+                        evidence_count,
+                        json.dumps({"requester_source": requester_source} if requester_source else {}),
+                        existing_ticket["id"],
+                    ],
                 )
 
                 if existing_ticket.get("conversation_id"):
@@ -10822,6 +10906,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                                     "technical_subcategory": technical_subcategory or None,
                                     "latest_inquiry": inquiry,
                                     "evidence_count": evidence_count,
+                                    "requester_source": requester_source or None,
                                 }
                             ),
                             existing_ticket["conversation_id"],
@@ -10892,6 +10977,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
             "learnerName": existing_ticket.get("learner_name") or "",
             "email": existing_ticket["email"],
             "requesterRole": requester_role,
+            "requesterSource": requester_source,
             "category": category,
             "technicalSubcategory": technical_subcategory,
             "inquiry": inquiry,

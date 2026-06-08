@@ -5,6 +5,7 @@ export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
 export type TechnicalSubcategory = "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
 export type RequesterRole = "user" | "coach" | "employer";
+export type RequesterSource = "kbc_users_data" | "microsoft_entra" | "support_portal_requester" | "";
 
 export interface ChatMessage {
   id: string;
@@ -28,6 +29,7 @@ export interface Ticket {
   learnerName: string;
   email: string;
   requesterRole: RequesterRole;
+  requesterSource: RequesterSource;
   category: Category;
   technicalSubcategory: TechnicalSubcategory;
   inquiry: string;
@@ -59,6 +61,7 @@ const defaultTicket: Ticket = {
   learnerName: "",
   email: "",
   requesterRole: "user",
+  requesterSource: "",
   category: "",
   technicalSubcategory: "",
   inquiry: "",
@@ -140,12 +143,38 @@ function normalizeRequesterRole(value: unknown, fallback: RequesterRole = defaul
   return fallback;
 }
 
+function normalizeRequesterSource(
+  value: unknown,
+  fallback: RequesterSource = defaultTicket.requesterSource,
+): RequesterSource {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const normalizedValue = value.trim().toLowerCase();
+  if (
+    normalizedValue === "kbc_users_data"
+    || normalizedValue === "legacy_kbc_users_data"
+  ) {
+    return "kbc_users_data";
+  }
+  if (normalizedValue === "microsoft_entra") {
+    return "microsoft_entra";
+  }
+  if (normalizedValue === "support_portal_requester") {
+    return "support_portal_requester";
+  }
+
+  return fallback;
+}
+
 function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
   const nextTicket = { ...defaultTicket, ...(ticket || {}) };
 
   return {
     ...nextTicket,
     requesterRole: normalizeRequesterRole(nextTicket.requesterRole),
+    requesterSource: normalizeRequesterSource(nextTicket.requesterSource),
     learnerName: normalizeString(nextTicket.learnerName),
     email: normalizeString(nextTicket.email),
     category: normalizeCategory(nextTicket.category),
@@ -174,6 +203,7 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     learnerName: ticket.learnerName,
     email: ticket.email,
     requesterRole: ticket.requesterRole,
+    requesterSource: ticket.requesterSource,
     category: ticket.category,
     technicalSubcategory: ticket.technicalSubcategory,
     inquiry: ticket.inquiry,

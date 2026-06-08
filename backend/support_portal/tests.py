@@ -341,6 +341,7 @@ class LearnerLookupTests(SimpleTestCase):
             {
                 "exists": True,
                 "requesterRole": "coach",
+                "requesterSource": "support_portal_requester",
                 "learner": {
                     "id": None,
                     "fullName": "Coach One",
@@ -1341,24 +1342,24 @@ class SupportSessionValidationTests(SimpleTestCase):
         ticket_metadata = json.loads(ticket_insert_params[7])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Others")
 
-    def test_create_ticket_accepts_coverage_technical_subcategory(self):
+    def test_create_ticket_accepts_coverage_for_entra_requester(self):
         requester = {
-            "email": "employer@example.com",
-            "role": "employer",
-            "display_name": "Employer One",
+            "email": "entra.user@kentbusinesscollege.com",
+            "role": "user",
+            "display_name": "Entra User",
             "learner": None,
-            "account": {
-                "id": 31,
-                "username": "employer1",
-                "full_name": "Employer One",
-                "email": "employer@example.com",
-                "role": "employer",
+            "account": None,
+            "entra_user": {
+                "id": "entra-user-1",
+                "displayName": "Entra User",
+                "userPrincipalName": "entra.user@kentbusinesscollege.com",
             },
+            "source": "microsoft_entra",
         }
         learner = {
             "id": 12,
-            "full_name": "Employer One",
-            "email": "employer@example.com",
+            "full_name": "Entra User",
+            "email": "entra.user@kentbusinesscollege.com",
             "phone": None,
         }
         cursor = MagicMock()
@@ -1391,7 +1392,7 @@ class SupportSessionValidationTests(SimpleTestCase):
         ):
             response = services.create_ticket(
                 {
-                    "email": "employer@example.com",
+                    "email": "entra.user@kentbusinesscollege.com",
                     "category": "Technical",
                     "technicalSubcategory": "Coverage",
                     "inquiry": (
@@ -1408,6 +1409,8 @@ class SupportSessionValidationTests(SimpleTestCase):
             )
 
         self.assertEqual(response["ticket"]["technicalSubcategory"], "Coverage")
+        self.assertEqual(response["ticket"]["requesterRole"], "user")
+        self.assertEqual(response["ticket"]["requesterSource"], "microsoft_entra")
         ticket_insert_call = next(
             call for call in cursor.execute.call_args_list
             if "INSERT INTO tickets" in call.args[0]
@@ -1416,12 +1419,13 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertEqual(ticket_insert_params[3], "Coverage")
         ticket_metadata = json.loads(ticket_insert_params[7])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Coverage")
+        self.assertEqual(ticket_metadata["requester_source"], "microsoft_entra")
         notify_operations_team.assert_called_once()
         notification_ticket_id, notification_payload = notify_operations_team.call_args.args
         self.assertEqual(notification_ticket_id, 73)
         self.assertEqual(notification_payload["event"], "coverage_ticket_created")
         self.assertEqual(notification_payload["ticket"]["id"], "KBC-000073")
-        self.assertEqual(notification_payload["requester"]["email"], "employer@example.com")
+        self.assertEqual(notification_payload["requester"]["email"], "entra.user@kentbusinesscollege.com")
         self.assertEqual(notification_payload["coverage"]["tutor"], "Amgad")
         self.assertEqual(notification_payload["coverage"]["module"], "PMP 3 Months")
         self.assertEqual(notification_payload["coverage"]["sessions"][0]["sessionNumber"], "1")
@@ -1461,7 +1465,7 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertEqual(error_context.exception.status_code, 403)
         self.assertEqual(
             error_context.exception.message,
-            "Coverage requests are only available for coach and employer accounts.",
+            "Coverage requests are not available for standard KBC learner accounts.",
         )
         ensure_learner.assert_not_called()
 

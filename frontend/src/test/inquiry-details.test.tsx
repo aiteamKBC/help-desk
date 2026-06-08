@@ -57,6 +57,7 @@ describe("InquiryDetails", () => {
                 learnerName: "Omar Two",
                 email: "omar2@gmail.com",
                 requesterRole: "user",
+                requesterSource: "microsoft_entra",
                 category: "Technical",
                 technicalSubcategory: "Coverage",
                 inquiry: buildCoverageInquiry({
@@ -161,6 +162,7 @@ describe("InquiryDetails", () => {
         ticket: {
           email: "omar2@gmail.com",
           requesterRole: "user",
+          requesterSource: "microsoft_entra",
           technicalSubcategory: "Coverage",
           inquiry: buildCoverageInquiry({
             tutor: "Ray",
@@ -190,11 +192,36 @@ describe("InquiryDetails", () => {
     expect(screen.getAllByText("Module").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Time").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Session Date").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Session Number").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Session No.").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Friday 06 Jun 2026").length).toBeGreaterThan(0);
     expect(screen.getByDisplayValue("1")).toBeInTheDocument();
     expect(screen.getByLabelText("Session Subject")).toHaveValue("Assessment review");
     expect(screen.queryByText("Generated Inquiry Preview")).not.toBeInTheDocument();
+  });
+
+  it("hides Coverage for standard KBC learner accounts", () => {
+    window.localStorage.setItem(
+      supportStorageKey,
+      JSON.stringify({
+        ticket: {
+          email: "learner@example.com",
+          requesterRole: "user",
+          requesterSource: "kbc_users_data",
+          technicalSubcategory: "Others",
+        },
+      }),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/support/inquiry"]}>
+        <SupportProvider>
+          <InquiryDetails />
+        </SupportProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("combobox"));
+    expect(screen.queryByText("Coverage")).not.toBeInTheDocument();
   });
 
   it("submits coverage directly to status after creating the ticket", async () => {
@@ -204,6 +231,7 @@ describe("InquiryDetails", () => {
         ticket: {
           email: "omar2@gmail.com",
           requesterRole: "user",
+          requesterSource: "microsoft_entra",
           technicalSubcategory: "Coverage",
           inquiry: buildCoverageInquiry({
             tutor: "Ray",

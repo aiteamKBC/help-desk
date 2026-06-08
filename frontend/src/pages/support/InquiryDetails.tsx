@@ -27,7 +27,13 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { type Category, type EvidenceFile, type TechnicalSubcategory, useSupport } from "@/context/SupportContext";
+import {
+  type Category,
+  type EvidenceFile,
+  type RequesterSource,
+  type TechnicalSubcategory,
+  useSupport,
+} from "@/context/SupportContext";
 import {
   buildCoverageInquiry,
   fetchCoverageOptions,
@@ -183,7 +189,7 @@ const InquiryDetails = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const coverageSessionDateRequestRef = useRef(0);
-  const canUseCoverage = ticket.requesterRole === "coach" || ticket.requesterRole === "employer";
+  const canUseCoverage = ticket.requesterSource !== "kbc_users_data";
   const availableInquiryPlatforms = canUseCoverage
     ? inquiryPlatforms
     : inquiryPlatforms.filter((item) => item !== "Coverage");
@@ -548,6 +554,7 @@ const InquiryDetails = () => {
               learnerName?: string;
               email: string;
               requesterRole?: "user" | "coach" | "employer";
+              requesterSource?: RequesterSource;
               category: Category;
               technicalSubcategory: TechnicalSubcategory;
               inquiry: string;
@@ -569,11 +576,13 @@ const InquiryDetails = () => {
       }
 
       const nextRequesterRole = payload.ticket.requesterRole || ticket.requesterRole;
+      const nextRequesterSource = payload.ticket.requesterSource || ticket.requesterSource;
       const nextTicketState = {
         id: payload.ticket.id,
         learnerName: payload.ticket.learnerName || ticket.learnerName,
         email: payload.ticket.email,
         requesterRole: nextRequesterRole,
+        requesterSource: nextRequesterSource,
         category: payload.ticket.category,
         technicalSubcategory: payload.ticket.technicalSubcategory,
         inquiry: payload.ticket.inquiry || submittedInquiry,
