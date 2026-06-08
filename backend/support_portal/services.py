@@ -879,6 +879,20 @@ def normalize_public_requester_source(value: Any) -> str:
     return normalized_value
 
 
+def is_auto_synced_learner_requester_account(account: dict[str, Any] | None) -> bool:
+    if not account:
+        return False
+
+    metadata = normalize_json_object(account.get("metadata"))
+    return (
+        normalize_public_requester_role(account.get("role")) == ROLE_USER
+        and (
+            normalize_bool(metadata.get("synced_from_learners"))
+            or sanitize_text(metadata.get("provisioned_by")).lower() == "sync_learners_to_support_accounts"
+        )
+    )
+
+
 def get_public_requester_source(requester: dict[str, Any] | None) -> str:
     if not requester:
         return ""
@@ -886,6 +900,8 @@ def get_public_requester_source(requester: dict[str, Any] | None) -> str:
     explicit_source = normalize_public_requester_source(requester.get("source"))
     if explicit_source:
         return explicit_source
+    if is_auto_synced_learner_requester_account(requester.get("account")):
+        return KBC_USERS_DATA_REQUESTER_SOURCE
     if requester.get("account"):
         return MANAGED_PUBLIC_REQUESTER_SOURCE
     if requester.get("entra_user"):
@@ -901,20 +917,28 @@ def get_ticket_requester_source(
     default: str = "",
 ) -> str:
     metadata = normalize_json_object(ticket_metadata)
+    normalized_learner_source = normalize_public_requester_source(learner_source)
+    normalized_learner_metadata = normalize_json_object(learner_metadata)
+    learner_is_kbc = (
+        normalized_learner_source == KBC_USERS_DATA_REQUESTER_SOURCE
+        or sanitize_text(normalized_learner_metadata.get("legacy_source")).lower() == KBC_USERS_DATA_REQUESTER_SOURCE
+    )
     explicit_source = normalize_public_requester_source(metadata.get("requester_source"))
+    requester_role = normalize_public_requester_role(metadata.get("requester_role"))
+    if learner_is_kbc and (
+        not explicit_source
+        or (
+            explicit_source == MANAGED_PUBLIC_REQUESTER_SOURCE
+            and requester_role == ROLE_USER
+        )
+    ):
+        return KBC_USERS_DATA_REQUESTER_SOURCE
+
     if explicit_source:
         return explicit_source
 
     if metadata.get("requester_account_id") not in (None, "", 0):
         return MANAGED_PUBLIC_REQUESTER_SOURCE
-
-    normalized_learner_source = normalize_public_requester_source(learner_source)
-    normalized_learner_metadata = normalize_json_object(learner_metadata)
-    if (
-        normalized_learner_source == KBC_USERS_DATA_REQUESTER_SOURCE
-        or sanitize_text(normalized_learner_metadata.get("legacy_source")).lower() == KBC_USERS_DATA_REQUESTER_SOURCE
-    ):
-        return KBC_USERS_DATA_REQUESTER_SOURCE
 
     return normalize_public_requester_source(default)
 
@@ -5492,7 +5516,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
 
     if local_learner:
         managed_account = fetch_public_requester_account_by_email(email)
-        if managed_account:
+        if managed_account and not is_auto_synced_learner_requester_account(managed_account):
             return {
                 "email": email,
                 "role": normalize_public_requester_role(managed_account.get("role")),

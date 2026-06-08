@@ -373,6 +373,37 @@ class LearnerLookupTests(SimpleTestCase):
             },
         )
 
+    def test_resolve_public_support_requester_treats_synced_support_account_as_kbc_user(self):
+        learner = {
+            "id": 22,
+            "full_name": "Legacy Learner",
+            "email": "legacy@example.com",
+            "source": "legacy_kbc_users_data",
+            "metadata": {"legacy_source": "kbc_users_data"},
+        }
+        synced_account = {
+            "id": 14,
+            "username": "legacy",
+            "full_name": "Legacy Learner",
+            "email": "legacy@example.com",
+            "role": "user",
+            "account_scope": "requester",
+            "metadata": {
+                "synced_from_learners": True,
+                "provisioned_by": "sync_learners_to_support_accounts",
+            },
+        }
+
+        with (
+            patch.object(services, "fetch_public_requester_account_by_email", return_value=synced_account),
+            patch.object(services, "find_kbc_learner_by_email", return_value=learner),
+        ):
+            result = services.resolve_public_support_requester("legacy@example.com")
+
+        self.assertEqual(result["role"], "user")
+        self.assertIsNone(result["account"])
+        self.assertEqual(result["source"], "kbc_users_data")
+
     def test_resolve_public_support_requester_rejects_email_without_kbc_or_entra_match(self):
         managed_account = {
             "id": 14,
