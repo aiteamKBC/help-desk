@@ -1343,22 +1343,22 @@ class SupportSessionValidationTests(SimpleTestCase):
 
     def test_create_ticket_accepts_coverage_technical_subcategory(self):
         requester = {
-            "email": "learner@example.com",
-            "role": "user",
-            "display_name": "Learner One",
+            "email": "employer@example.com",
+            "role": "employer",
+            "display_name": "Employer One",
             "learner": None,
             "account": {
                 "id": 31,
-                "username": "learner1",
-                "full_name": "Learner One",
-                "email": "learner@example.com",
-                "role": "user",
+                "username": "employer1",
+                "full_name": "Employer One",
+                "email": "employer@example.com",
+                "role": "employer",
             },
         }
         learner = {
             "id": 12,
-            "full_name": "Learner One",
-            "email": "learner@example.com",
+            "full_name": "Employer One",
+            "email": "employer@example.com",
             "phone": None,
         }
         cursor = MagicMock()
@@ -1391,7 +1391,7 @@ class SupportSessionValidationTests(SimpleTestCase):
         ):
             response = services.create_ticket(
                 {
-                    "email": "learner@example.com",
+                    "email": "employer@example.com",
                     "category": "Technical",
                     "technicalSubcategory": "Coverage",
                     "inquiry": (
@@ -1421,10 +1421,49 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertEqual(notification_ticket_id, 73)
         self.assertEqual(notification_payload["event"], "coverage_ticket_created")
         self.assertEqual(notification_payload["ticket"]["id"], "KBC-000073")
-        self.assertEqual(notification_payload["requester"]["email"], "learner@example.com")
+        self.assertEqual(notification_payload["requester"]["email"], "employer@example.com")
         self.assertEqual(notification_payload["coverage"]["tutor"], "Amgad")
         self.assertEqual(notification_payload["coverage"]["module"], "PMP 3 Months")
         self.assertEqual(notification_payload["coverage"]["sessions"][0]["sessionNumber"], "1")
+
+    def test_create_ticket_rejects_coverage_for_regular_kbc_user(self):
+        requester = {
+            "email": "learner@example.com",
+            "role": "user",
+            "display_name": "Learner One",
+            "learner": {
+                "id": 12,
+                "full_name": "Learner One",
+                "email": "learner@example.com",
+                "phone": None,
+                "source": "legacy_kbc_users_data",
+                "metadata": {"legacy_source": "kbc_users_data"},
+            },
+            "account": None,
+            "source": "kbc_users_data",
+        }
+
+        with (
+            patch.object(services, "resolve_public_support_requester", return_value=requester),
+            patch.object(services, "ensure_public_requester_learner") as ensure_learner,
+        ):
+            with self.assertRaises(services.ApiError) as error_context:
+                services.create_ticket(
+                    {
+                        "email": "learner@example.com",
+                        "category": "Technical",
+                        "technicalSubcategory": "Coverage",
+                        "inquiry": "Coverage session request",
+                        "evidence": [],
+                    }
+                )
+
+        self.assertEqual(error_context.exception.status_code, 403)
+        self.assertEqual(
+            error_context.exception.message,
+            "Coverage requests are only available for coach and employer accounts.",
+        )
+        ensure_learner.assert_not_called()
 
     def test_create_ticket_sets_high_priority_for_employer_requester(self):
         requester = {

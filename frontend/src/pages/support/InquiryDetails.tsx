@@ -183,6 +183,10 @@ const InquiryDetails = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const coverageSessionDateRequestRef = useRef(0);
+  const canUseCoverage = ticket.requesterRole === "coach" || ticket.requesterRole === "employer";
+  const availableInquiryPlatforms = canUseCoverage
+    ? inquiryPlatforms
+    : inquiryPlatforms.filter((item) => item !== "Coverage");
   const selectedCoverageSessionNumbers = coverageSessionDates.map(
     (sessionDate) => (coverageSessionNumberByDate[sessionDate] || getDefaultCoverageSessionNumber(sessionDate, coverageSessionDateOptions)).trim(),
   );
@@ -190,7 +194,7 @@ const InquiryDetails = () => {
     (sessionDate) => (coverageSessionSubjectByDate[sessionDate] || "").trim(),
   );
 
-  const isCoverageFlow = isCoverageSubcategory(technicalSubcategory);
+  const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
   const canSubmit = isCoverageFlow
     ? Boolean(
       coverageTutor
@@ -253,6 +257,12 @@ const InquiryDetails = () => {
       navigate("/support");
     }
   }, [navigate, ticket.email, ticket.id]);
+
+  useEffect(() => {
+    if (!canUseCoverage && technicalSubcategory === "Coverage") {
+      setTechnicalSubcategory("");
+    }
+  }, [canUseCoverage, technicalSubcategory]);
 
   useEffect(() => {
     if (!isCoverageFlow) {
@@ -726,7 +736,7 @@ const InquiryDetails = () => {
                   <SelectValue placeholder="Select a category" />
                 </SelectTrigger>
                 <SelectContent>
-                  {inquiryPlatforms.map((item) => (
+                  {availableInquiryPlatforms.map((item) => (
                     <SelectItem key={item} value={item}>{item}</SelectItem>
                   ))}
                 </SelectContent>

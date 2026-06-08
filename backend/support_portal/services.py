@@ -893,6 +893,15 @@ def derive_requester_ticket_priority(requester_role: Any, current_priority: Any 
     return normalized_priority
 
 
+def can_requester_submit_coverage_ticket(requester_role: Any) -> bool:
+    return normalize_public_requester_role(requester_role) in {ROLE_COACH, ROLE_EMPLOYER}
+
+
+def ensure_requester_can_submit_coverage_ticket(requester_role: Any) -> None:
+    if not can_requester_submit_coverage_ticket(requester_role):
+        raise ApiError(403, "Coverage requests are only available for coach and employer accounts.")
+
+
 def get_ticket_sort_timestamp(value: Any) -> float:
     normalized_value = coerce_datetime(value)
     if not normalized_value:
@@ -10494,6 +10503,8 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 raise ApiError(404, "This email is not registered in our records.")
 
             requester_role = requester["role"]
+            if technical_subcategory == "Coverage":
+                ensure_requester_can_submit_coverage_ticket(requester_role)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
             managed_account = requester.get("account")
@@ -10766,6 +10777,8 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
             if not existing_ticket:
                 raise ApiError(404, "Ticket not found.")
             requester_role = get_ticket_requester_role(existing_ticket.get("metadata"))
+            if technical_subcategory == "Coverage":
+                ensure_requester_can_submit_coverage_ticket(requester_role)
             next_priority = derive_requester_ticket_priority(requester_role, existing_ticket.get("priority"))
             existing_attachment_storage_keys = list_ticket_attachment_storage_keys(int(existing_ticket["id"]))
 
