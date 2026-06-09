@@ -4,6 +4,7 @@ import base64
 import json
 import mimetypes
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2040,6 +2041,53 @@ def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, An
         "status": status,
         "response": response_payload,
     }
+
+
+def ensure_coverage_tutor_request_webhook_configured() -> None:
+    if not get_coverage_tutor_request_webhook_url():
+        raise ApiError(503, "The tutor request webhook is not configured on the server.")
+
+
+def queue_coverage_tutor_request_webhook_delivery(
+    *,
+    ticket_id: int,
+    ticket_public_id: str,
+    card_id: str,
+    payload: dict[str, Any],
+) -> None:
+    if not get_coverage_tutor_request_webhook_url():
+        return
+
+    def deliver() -> None:
+        result = send_coverage_tutor_request_webhook(payload)
+        event_type = (
+            "coverage_tutor_request_webhook_delivered"
+            if result.get("delivered")
+            else "coverage_tutor_request_webhook_failed"
+        )
+        try:
+            insert_history_event(
+                ticket_id,
+                event_type,
+                {"role": "system", "label": "System"},
+                {
+                    "ticketId": ticket_public_id,
+                    "cardId": card_id,
+                    "webhookConfigured": bool(result.get("configured")),
+                    "webhookDelivered": bool(result.get("delivered")),
+                    "webhookStatus": result.get("status"),
+                },
+            )
+        except Exception:
+            # Webhook delivery must never break the saved tutor request.
+            return
+
+    thread = threading.Thread(
+        target=deliver,
+        name=f"coverage-tutor-request-webhook-{ticket_public_id}-{card_id}",
+        daemon=True,
+    )
+    thread.start()
 
 
 def build_coverage_tutor_refusal_mail_webhook_payload(
@@ -8423,6 +8471,7 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
     card_id = sanitize_text(payload.get("cardId"))
     callback_origin = sanitize_text(payload.get("origin")).rstrip("/")
     requested_documentation = payload.get("documentation")
+    webhook_delivery: dict[str, Any] | None = None
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -8507,6 +8556,7 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
             raise ApiError(400, "Please enter a valid tutor e-mail before submitting the request.")
         if not session_details:
             raise ApiError(400, "Add the session details before submitting the request.")
+        ensure_coverage_tutor_request_webhook_configured()
 
         current_assigned_agent_id = parse_assigned_agent_id(ticket.get("assigned_agent_id"))
         next_assigned_agent_id = current_assigned_agent_id or int(actor_row["id"])
@@ -8546,28 +8596,19 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
         coverage_cards[card_index] = updated_target_card
         documentation["coverageCards"] = coverage_cards
 
-        webhook_result = send_coverage_tutor_request_webhook(
-            build_coverage_tutor_request_webhook_payload(
+        webhook_delivery = {
+            "ticket_id": int(ticket["id"]),
+            "ticket_public_id": ticket["public_id"],
+            "card_id": updated_target_card["id"],
+            "payload": build_coverage_tutor_request_webhook_payload(
                 ticket,
                 documentation,
                 updated_target_card,
                 actor_row,
                 callback_url=build_coverage_tutor_public_response_base_url(callback_origin),
                 result_base_url=build_coverage_tutor_public_result_base_url(callback_origin),
-            )
-        )
-        if not webhook_result["configured"]:
-            raise ApiError(503, "The tutor request webhook is not configured on the server.")
-        if not webhook_result["delivered"]:
-            response_payload = webhook_result.get("response")
-            response_message = (
-                sanitize_text(response_payload.get("message"))
-                if isinstance(response_payload, dict)
-                else sanitize_text(response_payload)
-            )
-            if response_message == "Request timed out.":
-                raise ApiError(502, "The tutor request workflow did not respond in time. Please check n8n and try again.")
-            raise ApiError(502, "We could not send this tutor request right now.")
+            ),
+        }
 
         next_status = "Pending"
         next_status_reason = request_status_reason
@@ -8673,6 +8714,9 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
                 "sessionDetails": session_details,
             },
         )
+
+    if webhook_delivery:
+        queue_coverage_tutor_request_webhook_delivery(**webhook_delivery)
 
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:

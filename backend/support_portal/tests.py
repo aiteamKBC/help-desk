@@ -6199,6 +6199,24 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
 
+    def test_queue_coverage_tutor_request_webhook_delivery_starts_background_thread(self):
+        thread = MagicMock()
+
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(services.threading, "Thread", return_value=thread) as thread_class,
+        ):
+            services.queue_coverage_tutor_request_webhook_delivery(
+                ticket_id=41,
+                ticket_public_id="KBC-000041",
+                card_id="card-1",
+                payload={"ticketId": "KBC-000041"},
+            )
+
+        thread_class.assert_called_once()
+        self.assertTrue(thread_class.call_args.kwargs["daemon"])
+        thread.start.assert_called_once()
+
     def test_build_coverage_tutor_request_webhook_payload_includes_result_urls(self):
         payload = services.build_coverage_tutor_request_webhook_payload(
             {
@@ -6329,7 +6347,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(frozen["coverageCards"][0]["id"], "choice-1")
         self.assertTrue(frozen["coverageCards"][0]["locked"])
 
-    def test_submit_coverage_tutor_request_does_not_persist_when_webhook_fails(self):
+    def test_submit_coverage_tutor_request_rejects_when_webhook_is_not_configured(self):
         ticket = {
             "id": 349,
             "public_id": "KBC-000349",
@@ -6375,11 +6393,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
-            patch.object(
-                services,
-                "send_coverage_tutor_request_webhook",
-                return_value={"configured": True, "delivered": False, "status": 500, "response": {"message": "Workflow execution failed"}},
-            ),
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value=""),
             patch.object(services, "connection", mock_connection),
         ):
             with self.assertRaises(services.ApiError) as raised_error:
@@ -6393,8 +6407,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                     },
                 )
 
-        self.assertEqual(raised_error.exception.status_code, 502)
-        self.assertEqual(raised_error.exception.message, "We could not send this tutor request right now.")
+        self.assertEqual(raised_error.exception.status_code, 503)
+        self.assertEqual(raised_error.exception.message, "The tutor request webhook is not configured on the server.")
         mock_connection.cursor.assert_not_called()
 
     def test_serialize_ticket_summary_derives_coverage_reply_from_database_status(self):
@@ -6976,7 +6990,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "send_coverage_tutor_request_webhook", return_value={"configured": True, "delivered": True, "status": 200, "response": {"ok": True}}) as send_webhook,
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
@@ -6988,11 +7003,13 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             )
 
         self.assertEqual(response["ticket"]["id"], "KBC-000041")
-        send_webhook.assert_called_once()
-        webhook_payload = send_webhook.call_args.args[0]
+        queue_webhook.assert_called_once()
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
         self.assertEqual(webhook_payload["tutor"]["name"], "Nathan")
         self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
         self.assertEqual(len(webhook_payload["request"]["presentationFiles"]), 1)
+        self.assertEqual(queue_webhook.call_args.kwargs["ticket_public_id"], "KBC-000041")
+        self.assertEqual(queue_webhook.call_args.kwargs["card_id"], "card-1")
 
         update_params = cursor.execute.call_args_list[0].args[1]
         self.assertEqual(update_params[0], "Pending")
@@ -7047,7 +7064,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "get_coverage_tutor_email", return_value="andrew.millington@kentbusinesscollege.com") as get_coverage_tutor_email,
-            patch.object(services, "send_coverage_tutor_request_webhook", return_value={"configured": True, "delivered": True, "status": 200, "response": {"ok": True}}) as send_webhook,
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
@@ -7060,7 +7078,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
 
         self.assertEqual(response["ticket"]["id"], "KBC-000042")
         get_coverage_tutor_email.assert_called_once_with("Andrew")
-        webhook_payload = send_webhook.call_args.args[0]
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
         self.assertEqual(webhook_payload["tutor"]["email"], "andrew.millington@kentbusinesscollege.com")
         update_params = cursor.execute.call_args_list[0].args[1]
         self.assertEqual(update_params[2], 7)
@@ -7128,7 +7146,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "send_coverage_tutor_request_webhook", return_value={"configured": True, "delivered": True, "status": 200, "response": {"ok": True}}),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery"),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
