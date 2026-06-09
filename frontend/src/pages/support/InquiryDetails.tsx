@@ -727,8 +727,8 @@ const InquiryDetails = () => {
   return (
     <SupportLayout>
       <StepIndicator current={2} />
-      <div className="mx-auto grid max-w-5xl gap-4 sm:gap-6 lg:grid-cols-3 lg:items-stretch">
-        <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8 lg:col-span-2">
+      <div className="mx-auto max-w-4xl">
+        <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8">
           <h1 className="mb-1 text-2xl font-bold text-primary">Create Support Inquiry</h1>
           <p className="mb-6 text-sm text-muted-foreground">
             {pageDescription}
@@ -1080,83 +1080,6 @@ const InquiryDetails = () => {
           </div>
         </div>
 
-        <aside className="rounded-[28px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.04] p-5 shadow-elevated sm:p-6 lg:sticky lg:top-24 lg:self-stretch lg:min-h-full">
-          <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-primary/75">
-            Summary
-          </div>
-          <dl className="text-sm">
-            <div className="border-b border-primary/10 pb-4">
-              <dt className="text-[15px] font-bold text-foreground">Requester Type</dt>
-              <dd className="mt-1 text-[15px] font-medium capitalize">{ticket.requesterRole || "-"}</dd>
-            </div>
-            <div className="border-b border-primary/10 py-4">
-              <dt className="text-[15px] font-bold text-foreground">Email</dt>
-              <dd className="mt-1 text-[15px] font-medium truncate">{ticket.email || "-"}</dd>
-            </div>
-            <div className="border-b border-primary/10 py-4">
-              <dt className="text-[15px] font-bold text-foreground">Category</dt>
-              <dd className="mt-1 text-[15px] font-medium">{technicalSubcategory || "-"}</dd>
-            </div>
-            {isCoverageFlow && (
-              <>
-                <div className="border-b border-primary/10 py-4">
-                  <dt className="text-[15px] font-bold text-foreground">Tutor</dt>
-                  <dd className="mt-1 text-[15px] font-medium">{coverageTutor || "-"}</dd>
-                </div>
-                <div className="border-b border-primary/10 py-4">
-                  <dt className="text-[15px] font-bold text-foreground">Module</dt>
-                  <dd className="mt-1 text-[15px] font-medium">{coverageModule || "-"}</dd>
-                </div>
-                <div className="border-b border-primary/10 py-4">
-                  <dt className="text-[15px] font-bold text-foreground">Time</dt>
-                  <dd className="mt-1 text-[15px] font-medium">{coverageTime || "-"}</dd>
-                </div>
-                <div className="border-b border-primary/10 py-4">
-                  <dt className="text-[15px] font-bold text-foreground">Session Details</dt>
-                  <dd className="mt-2">
-                    {coverageSessionDates.length > 0 ? (
-                      <div className="space-y-2">
-                        {coverageSessionDates.map((sessionDate, index) => {
-                          const sessionNumber = (
-                            coverageSessionNumberByDate[sessionDate]
-                            || getDefaultCoverageSessionNumber(sessionDate, coverageSessionDateOptions)
-                          ).trim();
-                          const sessionSubject = (coverageSessionSubjectByDate[sessionDate] || "").trim();
-
-                          return (
-                            <div
-                              key={sessionDate}
-                              className="rounded-2xl border border-primary/10 bg-white/80 px-3 py-2.5 shadow-sm"
-                            >
-                              <div className="text-sm font-semibold text-foreground">
-                                Session {index + 1}
-                              </div>
-                              <div className="mt-1 text-xs font-medium text-muted-foreground">
-                                {sessionDate}
-                              </div>
-                              <div className="mt-2 text-sm font-medium text-foreground">
-                                Number: {sessionNumber || "-"}
-                              </div>
-                              <div className="mt-1 text-sm font-medium text-foreground">
-                                Subject: {sessionSubject || "-"}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      <span className="text-[15px] font-medium">-</span>
-                    )}
-                  </dd>
-                </div>
-              </>
-            )}
-            <div className="py-4">
-              <dt className="text-[15px] font-bold text-foreground">Evidence</dt>
-              <dd className="mt-1 text-[15px] font-medium">{evidence.length} file(s)</dd>
-            </div>
-          </dl>
-        </aside>
       </div>
 
       <Dialog open={!!previewFile} onOpenChange={(open) => !open && setPreviewFile(null)}>
