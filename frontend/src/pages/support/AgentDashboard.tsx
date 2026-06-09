@@ -440,7 +440,6 @@ const adminSelectableConsoleStatuses = ["Available", "Off"] as const;
 const consolePollIntervalMs = 2500;
 const dashboardTicketPollIntervalMs = 5000;
 const dashboardAgentPollIntervalMs = 15000;
-const coverageTutorRequestTimeoutMs = 30000;
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const documentationStatusReasons = {
@@ -2540,18 +2539,12 @@ const AgentDashboard = () => {
     }
 
     setIsSavingActiveDocumentation(true);
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => {
-      controller.abort();
-    }, coverageTutorRequestTimeoutMs);
-
     try {
       const response = await fetch(
         `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-request`,
         {
           method: "POST",
           headers: buildAdminJsonHeaders(),
-          signal: controller.signal,
           body: JSON.stringify({
             cardId,
             origin: window.location.origin,
@@ -2574,14 +2567,9 @@ const AgentDashboard = () => {
       syncDrafts(payload);
       setActiveDocumentationDraft(buildCoverageDocumentationDraft(payload.ticket));
       toast.success("Tutor request sent.");
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        toast.error("The tutor request workflow is taking too long. Please check n8n and try again.");
-        return;
-      }
+    } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
-      window.clearTimeout(timeoutId);
       setIsSavingActiveDocumentation(false);
     }
   }
