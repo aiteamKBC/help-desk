@@ -456,18 +456,20 @@ const SupportOptions = () => {
                     type="button"
                     onClick={() => void action.onClick()}
                     disabled={action.disabled}
-                    className="group flex min-h-[148px] w-full flex-col justify-between rounded-[24px] border border-primary/12 bg-gradient-to-br from-white to-primary/[0.045] p-5 text-left shadow-soft transition-all duration-1000 ease-out hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-card disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0"
+                    className="group relative flex min-h-[148px] w-full flex-col justify-between overflow-hidden rounded-[24px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.045] p-5 text-left shadow-soft outline-none transition-all duration-500 ease-out hover:-translate-y-1 hover:scale-[1.015] hover:border-primary/35 hover:bg-primary/[0.035] hover:shadow-[0_24px_70px_rgba(98,73,238,0.18)] focus-visible:-translate-y-1 focus-visible:scale-[1.015] focus-visible:border-primary/45 focus-visible:ring-4 focus-visible:ring-primary/15 active:translate-y-0 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:scale-100"
                   >
+                    <span className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_18%,rgba(98,73,238,0.14),transparent_28%),linear-gradient(120deg,transparent_0%,rgba(255,255,255,0.75)_48%,transparent_62%)] opacity-0 transition-opacity duration-500 group-hover:opacity-100 group-focus-visible:opacity-100" />
+                    <span className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-primary/15 blur-2xl opacity-0 transition-all duration-700 group-hover:right-0 group-hover:top-0 group-hover:opacity-100 group-focus-visible:right-0 group-focus-visible:top-0 group-focus-visible:opacity-100" />
                     <span className="flex items-start justify-between gap-4">
-                      <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/[0.08] text-primary ring-1 ring-primary/10 transition group-hover:bg-primary group-hover:text-primary-foreground">
+                      <span className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/[0.08] text-primary ring-1 ring-primary/10 transition-all duration-500 group-hover:rotate-3 group-hover:scale-110 group-hover:bg-primary group-hover:text-primary-foreground group-hover:shadow-[0_14px_32px_rgba(98,73,238,0.28)] group-focus-visible:rotate-3 group-focus-visible:scale-110 group-focus-visible:bg-primary group-focus-visible:text-primary-foreground">
                         <Icon className="h-5 w-5" />
                       </span>
-                      <span className="rounded-full border border-primary/10 bg-white/80 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                      <span className="relative rounded-full border border-primary/10 bg-white/80 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground transition-colors duration-500 group-hover:border-primary/25 group-hover:text-primary">
                         {String(index + 1).padStart(2, "0")}
                       </span>
                     </span>
 
-                    <span className="mt-5 block">
+                    <span className="relative mt-5 block">
                       <span className="block text-base font-semibold text-foreground">
                         {action.title}
                       </span>
@@ -476,14 +478,14 @@ const SupportOptions = () => {
                       </span>
                     </span>
 
-                    <span className="mt-5 flex items-center justify-between gap-3 text-primary">
+                    <span className="relative mt-5 flex items-center justify-between gap-3 text-primary">
                       {action.statusText && (
                         <span className="text-sm font-semibold">
                           {action.statusText}
                         </span>
                       )}
-                      <span className="ml-auto flex h-9 w-9 items-center justify-center rounded-full bg-primary/[0.08] transition group-hover:bg-primary group-hover:text-primary-foreground">
-                        <ArrowRight className="h-4 w-4" />
+                      <span className="ml-auto flex h-9 w-9 items-center justify-center rounded-full bg-primary/[0.08] transition-all duration-500 group-hover:translate-x-1 group-hover:bg-primary group-hover:text-primary-foreground group-hover:shadow-[0_10px_24px_rgba(98,73,238,0.24)] group-focus-visible:translate-x-1 group-focus-visible:bg-primary group-focus-visible:text-primary-foreground">
+                        <ArrowRight className="h-4 w-4 transition-transform duration-500 group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5" />
                       </span>
                     </span>
                   </button>
