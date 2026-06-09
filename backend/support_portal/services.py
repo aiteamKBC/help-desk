@@ -8471,6 +8471,7 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
     card_id = sanitize_text(payload.get("cardId"))
     callback_origin = sanitize_text(payload.get("origin")).rstrip("/")
     requested_documentation = payload.get("documentation")
+    requested_card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else None
     webhook_delivery: dict[str, Any] | None = None
 
     if not public_id:
@@ -8535,6 +8536,29 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
         else:
             documentation = existing_documentation
         coverage_cards = list(documentation.get("coverageCards") or [])
+        if requested_card_payload is not None:
+            normalized_requested_cards = normalize_coverage_cards([requested_card_payload])
+            if normalized_requested_cards and sanitize_text(normalized_requested_cards[0].get("id")) == card_id:
+                requested_card = normalized_requested_cards[0]
+                requested_card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+                if requested_card_index is None:
+                    coverage_cards.append(requested_card)
+                else:
+                    existing_card = normalize_json_object(coverage_cards[requested_card_index])
+                    existing_request_status = sanitize_text(existing_card.get("requestStatus"))
+                    existing_is_submitted = normalize_bool(existing_card.get("locked")) and existing_request_status in {
+                        "requested",
+                        "accepted",
+                        "refused",
+                    }
+                    if not existing_is_submitted:
+                        coverage_cards[requested_card_index] = {
+                            **existing_card,
+                            **requested_card,
+                            "createdAt": sanitize_text(existing_card.get("createdAt"))
+                            or sanitize_text(requested_card.get("createdAt")),
+                        }
+                documentation["coverageCards"] = coverage_cards
         card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
         if card_index is None:
             raise ApiError(404, "Coverage card not found.")

@@ -2513,6 +2513,13 @@ const AgentDashboard = () => {
 
     const currentDraft = activeDocumentationDraft || buildCoverageDocumentationDraft(activeDetail.ticket);
     const targetCard = currentDraft.coverageCards.find((card) => card.id === cardId && card.type === "tutor_choice");
+    const lightweightDocumentation: AdminDocumentation = {
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => ({
+        ...card,
+        presentationFiles: [],
+      })),
+    };
 
     if (!targetCard) {
       return;
@@ -2548,7 +2555,8 @@ const AgentDashboard = () => {
           body: JSON.stringify({
             cardId,
             origin: window.location.origin,
-            documentation: currentDraft,
+            card: targetCard,
+            documentation: lightweightDocumentation,
           }),
         },
       );

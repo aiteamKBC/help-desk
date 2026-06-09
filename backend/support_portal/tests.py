@@ -7022,6 +7022,76 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_card["requestSubmittedByAgentId"], 7)
         self.assertTrue(persisted_card["responseToken"])
 
+    def test_submit_coverage_tutor_request_uses_compact_card_payload_files(self):
+        ticket = {
+            "id": 44,
+            "public_id": "KBC-000044",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {"technical_subcategory": "Coverage", "admin_documentation": {}},
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        card_payload = {
+            "id": "card-compact",
+            "type": "tutor_choice",
+            "tutor": "Ray",
+            "tutorEmail": "ray@example.com",
+            "sessionDetails": "Module: PMP",
+            "presentationFiles": [
+                {
+                    "id": "file-1",
+                    "name": "deck.pdf",
+                    "mimeType": "application/pdf",
+                    "size": 128,
+                    "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+                }
+            ],
+        }
+        lightweight_documentation = {
+            "inquiry": "Coverage request",
+            "ticketId": "KBC-000044",
+            "coverageCards": [{**card_payload, "presentationFiles": []}],
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000044"}}),
+        ):
+            services.submit_coverage_tutor_request(
+                "KBC-000044",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-compact",
+                    "documentation": lightweight_documentation,
+                    "card": card_payload,
+                },
+            )
+
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(len(webhook_payload["request"]["presentationFiles"]), 1)
+        update_params = cursor.execute.call_args_list[0].args[1]
+        persisted_metadata = json.loads(update_params[5])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(len(persisted_card["presentationFiles"]), 1)
+
     def test_submit_coverage_tutor_request_falls_back_to_database_email_lookup(self):
         ticket = {
             "id": 42,
