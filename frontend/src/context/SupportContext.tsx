@@ -194,7 +194,15 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
 }
 
 function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
-  if (!ticket.id) {
+  const hasDraftDetails = Boolean(
+    ticket.email
+    || ticket.learnerName
+    || ticket.category
+    || ticket.technicalSubcategory
+    || ticket.inquiry,
+  );
+
+  if (!ticket.id && !hasDraftDetails) {
     return null;
   }
 

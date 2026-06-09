@@ -527,6 +527,33 @@ const InquiryDetails = () => {
             sessionSubject: selectedCoverageSessionSubjects.join("; "),
           })
         : inquiry.trim();
+
+      if (!isCoverageFlow && !hasExistingTicket) {
+        clearBookingSummary();
+        updateTicket({
+          id: "",
+          learnerName: ticket.learnerName,
+          email: ticket.email,
+          requesterRole: ticket.requesterRole,
+          requesterSource: ticket.requesterSource,
+          category: "Technical",
+          technicalSubcategory,
+          inquiry: submittedInquiry,
+          evidence,
+          status: "Open",
+          statusReason: "",
+          assignedAgentId: null,
+          assignedTeam: "Unassigned",
+          slaStatus: "Pending Review",
+          createdAt: "",
+          chatState: "open",
+          liveChatRequested: false,
+          chatHistory: [],
+        });
+        navigate("/support/options");
+        return;
+      }
+
       const formData = new FormData();
       if (!hasExistingTicket) {
         formData.set("email", ticket.email);
@@ -1073,7 +1100,7 @@ const InquiryDetails = () => {
                 onClick={() => void handleNext()}
                 className="w-full border-0 gradient-primary sm:w-auto"
               >
-                {isSubmitting ? (ticket.id ? "Saving..." : "Creating...") : "Next"}
+                {isSubmitting ? (isCoverageFlow && !ticket.id ? "Creating..." : "Saving...") : "Next"}
                 {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
               </Button>
             </div>

@@ -1,4 +1,4 @@
-import { type ComponentType, useEffect, useState } from "react";
+import { type ComponentType, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
@@ -12,7 +12,13 @@ import {
 import { Button } from "@/components/ui/button";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { useSupport } from "@/context/SupportContext";
+import {
+  type Category,
+  type RequesterSource,
+  type TechnicalSubcategory,
+  type Ticket,
+  useSupport,
+} from "@/context/SupportContext";
 import {
   getSupportResumePath,
   isQuickTicketOnlyRequesterRole,
@@ -32,6 +38,25 @@ interface SupportOptionAction {
   statusText?: string;
 }
 
+interface PublicTicketPayload {
+  id: string;
+  learnerName?: string;
+  email: string;
+  requesterRole?: Ticket["requesterRole"];
+  requesterSource?: RequesterSource;
+  category: Category;
+  technicalSubcategory: TechnicalSubcategory;
+  inquiry: string;
+  status: Ticket["status"];
+  statusReason?: string;
+  assignedAgentId?: number | null;
+  assignedTeam: string;
+  slaStatus: string;
+  createdAt: string;
+  chatState?: Ticket["chatState"];
+  liveChatRequested?: boolean;
+}
+
 const SupportOptions = () => {
   const navigate = useNavigate();
   const { ticket, bookingSummary, clearBookingSummary, updateTicket } = useSupport();
@@ -44,14 +69,26 @@ const SupportOptions = () => {
   const [isOpeningTeamsCall, setIsOpeningTeamsCall] = useState(false);
   const [hasPreparedTeamsCall, setHasPreparedTeamsCall] = useState(false);
   const quickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
+  const [isCreatingTicket, setIsCreatingTicket] = useState(false);
+  const ticketRef = useRef(ticket);
+  const pendingTicketCreationRef = useRef<Promise<Ticket | null> | null>(null);
 
   useEffect(() => {
-    if (!ticket.id) {
-      navigate(ticket.email ? "/support/inquiry" : "/support");
+    ticketRef.current = ticket;
+  }, [ticket]);
+
+  useEffect(() => {
+    if (!ticket.email) {
+      navigate("/support");
       return;
     }
 
-    if (shouldShowStatusStep(ticket, bookingSummary)) {
+    if (!ticket.id && (!ticket.category || !ticket.inquiry.trim())) {
+      navigate("/support/inquiry");
+      return;
+    }
+
+    if (ticket.id && shouldShowStatusStep(ticket, bookingSummary)) {
       navigate(getSupportResumePath(ticket, bookingSummary));
     }
   }, [bookingSummary, navigate, ticket]);
@@ -118,7 +155,97 @@ const SupportOptions = () => {
     };
   }, [quickTicketOnlyFlow, ticket.id]);
 
-  const handleContinueToChat = (entryAction?: SupportChatEntryAction) => {
+  const buildTicketStateFromPayload = (payloadTicket: PublicTicketPayload, currentTicket: Ticket): Ticket => ({
+    ...currentTicket,
+    id: payloadTicket.id,
+    learnerName: payloadTicket.learnerName || currentTicket.learnerName,
+    email: payloadTicket.email || currentTicket.email,
+    requesterRole: payloadTicket.requesterRole || currentTicket.requesterRole,
+    requesterSource: payloadTicket.requesterSource || currentTicket.requesterSource,
+    category: payloadTicket.category || currentTicket.category,
+    technicalSubcategory: payloadTicket.technicalSubcategory || currentTicket.technicalSubcategory,
+    inquiry: payloadTicket.inquiry || currentTicket.inquiry,
+    status: payloadTicket.status || currentTicket.status,
+    statusReason: payloadTicket.statusReason || currentTicket.statusReason,
+    assignedAgentId: payloadTicket.assignedAgentId ?? currentTicket.assignedAgentId,
+    assignedTeam: payloadTicket.assignedTeam || currentTicket.assignedTeam,
+    slaStatus: payloadTicket.slaStatus || currentTicket.slaStatus,
+    createdAt: payloadTicket.createdAt || currentTicket.createdAt,
+    chatState: payloadTicket.chatState ?? currentTicket.chatState,
+    liveChatRequested: payloadTicket.liveChatRequested ?? currentTicket.liveChatRequested,
+  });
+
+  const ensureTicketCreated = async () => {
+    const currentTicket = ticketRef.current;
+    if (currentTicket.id) {
+      return currentTicket;
+    }
+
+    if (pendingTicketCreationRef.current) {
+      return pendingTicketCreationRef.current;
+    }
+
+    if (!currentTicket.email || !currentTicket.category || !currentTicket.inquiry.trim()) {
+      toast.error("Please complete the inquiry details before choosing a support path.");
+      navigate(currentTicket.email ? "/support/inquiry" : "/support");
+      return null;
+    }
+
+    const creationPromise = (async () => {
+      setIsCreatingTicket(true);
+
+      try {
+        const formData = new FormData();
+        formData.set("email", currentTicket.email);
+        formData.set("requesterRole", currentTicket.requesterRole);
+        formData.set("category", currentTicket.category);
+        formData.set("technicalSubcategory", currentTicket.technicalSubcategory);
+        formData.set("inquiry", currentTicket.inquiry);
+        currentTicket.evidence.forEach((file) => {
+          if (file.file) {
+            formData.append("evidenceFiles", file.file, file.name);
+          }
+        });
+
+        const response = await fetch("/api/tickets", {
+          method: "POST",
+          body: formData,
+        });
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              message?: string;
+              ticket?: PublicTicketPayload;
+            }
+          | null;
+
+        if (!response.ok || !payload?.ticket) {
+          toast.error(payload?.message || "We could not create the ticket right now.");
+          return null;
+        }
+
+        const nextTicket = buildTicketStateFromPayload(payload.ticket, currentTicket);
+        ticketRef.current = nextTicket;
+        updateTicket(nextTicket);
+        return nextTicket;
+      } catch {
+        toast.error("We could not connect to the server. Please try again.");
+        return null;
+      } finally {
+        pendingTicketCreationRef.current = null;
+        setIsCreatingTicket(false);
+      }
+    })();
+
+    pendingTicketCreationRef.current = creationPromise;
+    return creationPromise;
+  };
+
+  const handleContinueToChat = async (entryAction?: SupportChatEntryAction) => {
+    const createdTicket = await ensureTicketCreated();
+    if (!createdTicket) {
+      return;
+    }
+
     clearBookingSummary();
     if (entryAction) {
       navigate("/support/chat", {
@@ -133,14 +260,19 @@ const SupportOptions = () => {
   };
 
   const prepareQuickCall = async (showSuccessToast = true) => {
-    if (!ticket.id || isPreparingTeamsCall || hasPreparedTeamsCall) {
+    if (isPreparingTeamsCall || hasPreparedTeamsCall) {
       return hasPreparedTeamsCall;
+    }
+
+    const targetTicket = await ensureTicketCreated();
+    if (!targetTicket) {
+      return false;
     }
 
     setIsPreparingTeamsCall(true);
 
     try {
-      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/teams-call-request`, {
+      const response = await fetch(`/api/tickets/${encodeURIComponent(targetTicket.id)}/teams-call-request`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -161,6 +293,10 @@ const SupportOptions = () => {
       updateTicket({
         assignedTeam: "Support Desk",
       });
+      ticketRef.current = {
+        ...targetTicket,
+        assignedTeam: "Support Desk",
+      };
       if (showSuccessToast) {
         toast.success(payload?.message || "This Teams call has been assigned to the support admin.");
       }
@@ -174,7 +310,7 @@ const SupportOptions = () => {
   };
 
   const handleOpenQuickCall = async () => {
-    if (!ticket.id || isOpeningTeamsCall) {
+    if (isOpeningTeamsCall) {
       return;
     }
 
@@ -203,14 +339,19 @@ const SupportOptions = () => {
   };
 
   const handleQuickSubmit = async () => {
-    if (!ticket.id || isQuickSubmitting) {
+    if (isQuickSubmitting) {
       return;
     }
 
     setIsQuickSubmitting(true);
 
     try {
-      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
+      const targetTicket = await ensureTicketCreated();
+      if (!targetTicket) {
+        return;
+      }
+
+      const response = await fetch(`/api/tickets/${encodeURIComponent(targetTicket.id)}/chat-history`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -218,7 +359,7 @@ const SupportOptions = () => {
         body: JSON.stringify({
           status: "Pending",
           statusReason: quickTicketReason,
-          messages: ticket.chatHistory.map((message) => ({
+          messages: targetTicket.chatHistory.map((message) => ({
             sender: message.sender,
             text: message.text,
             timestamp: message.timestamp,
@@ -248,9 +389,9 @@ const SupportOptions = () => {
       updateTicket({
         status: payload.ticket.status || "Pending",
         statusReason: payload.ticket.statusReason || quickTicketReason,
-        assignedTeam: payload.ticket.assignedTeam || ticket.assignedTeam,
-        slaStatus: payload.ticket.slaStatus || ticket.slaStatus,
-        createdAt: payload.ticket.createdAt || ticket.createdAt,
+        assignedTeam: payload.ticket.assignedTeam || targetTicket.assignedTeam,
+        slaStatus: payload.ticket.slaStatus || targetTicket.slaStatus,
+        createdAt: payload.ticket.createdAt || targetTicket.createdAt,
       });
       toast.success("Your ticket has been submitted directly for team review.");
       navigate("/support/status");
@@ -273,8 +414,10 @@ const SupportOptions = () => {
               : (teamsCallMessage || "Open Microsoft Teams and place the call directly from this saved inquiry."),
           icon: PhoneCall,
           onClick: handleOpenQuickCall,
-          disabled: isLoadingTeamsCall || isPreparingTeamsCall || isOpeningTeamsCall,
-          statusText: isLoadingTeamsCall
+          disabled: isCreatingTicket || isLoadingTeamsCall || isPreparingTeamsCall || isOpeningTeamsCall,
+          statusText: isCreatingTicket
+            ? "Creating ticket..."
+            : isLoadingTeamsCall
             ? "Preparing..."
             : isPreparingTeamsCall
               ? "Assigning..."
@@ -290,8 +433,8 @@ const SupportOptions = () => {
           description: "Send the saved inquiry straight to the support team for review without opening chat first.",
           icon: FileText,
           onClick: handleQuickSubmit,
-          disabled: isQuickSubmitting,
-          statusText: isQuickSubmitting ? "Submitting..." : "Send now",
+          disabled: isCreatingTicket || isQuickSubmitting,
+          statusText: isCreatingTicket ? "Creating ticket..." : isQuickSubmitting ? "Submitting..." : "Send now",
         },
       ]
     : [
@@ -301,7 +444,8 @@ const SupportOptions = () => {
           description: "Open the chatbot immediately and continue the conversation from your saved inquiry.",
           icon: Bot,
           onClick: () => handleContinueToChat(),
-          statusText: "Open chat",
+          disabled: isCreatingTicket,
+          statusText: isCreatingTicket ? "Creating ticket..." : "Open chat",
         },
         {
           id: "live-chat",
@@ -311,14 +455,20 @@ const SupportOptions = () => {
             : "Open chat and request a live support admin directly from the conversation.",
           icon: Headphones,
           onClick: () => handleContinueToChat("live-chat"),
-          statusText: ticket.liveChatRequested ? "Resume" : "Request now",
+          disabled: isCreatingTicket,
+          statusText: isCreatingTicket ? "Creating ticket..." : ticket.liveChatRequested ? "Resume" : "Request now",
         },
         {
           id: "booking-session",
           title: "Booking Session",
           description: "Open the dedicated booking page and reserve your support session without the chat popup.",
           icon: CalendarClock,
-          onClick: () => {
+          onClick: async () => {
+            const createdTicket = await ensureTicketCreated();
+            if (!createdTicket) {
+              return;
+            }
+
             clearBookingSummary();
             navigate("/support/booking", {
               state: {
@@ -326,7 +476,8 @@ const SupportOptions = () => {
               },
             });
           },
-          statusText: "Book now",
+          disabled: isCreatingTicket,
+          statusText: isCreatingTicket ? "Creating ticket..." : "Book now",
         },
         {
           id: "quick-ticket",
@@ -334,8 +485,8 @@ const SupportOptions = () => {
           description: "Submit the saved inquiry directly to the support team without entering the chat flow.",
           icon: FileText,
           onClick: handleQuickSubmit,
-          disabled: isQuickSubmitting,
-          statusText: isQuickSubmitting ? "Submitting..." : "Send now",
+          disabled: isCreatingTicket || isQuickSubmitting,
+          statusText: isCreatingTicket ? "Creating ticket..." : isQuickSubmitting ? "Submitting..." : "Send now",
         },
       ];
   const pageTitle = quickTicketOnlyFlow
@@ -361,7 +512,7 @@ const SupportOptions = () => {
     },
     {
       label: "Current Status",
-      value: ticket.status || "Open",
+      value: ticket.id ? (ticket.status || "Open") : "Not submitted yet",
     },
   ];
 

@@ -178,7 +178,7 @@ ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS = {
 ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES = {"application/pdf"}
 ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
-COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 12
+COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 30
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS = 8
 
@@ -1113,6 +1113,32 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
     return normalized_cards
 
 
+def normalize_documentation_cards(value: Any) -> list[dict[str, Any]]:
+    raw_cards = value if isinstance(value, list) else []
+    normalized_cards: list[dict[str, Any]] = []
+
+    for item in raw_cards:
+        source = normalize_json_object(item)
+        if not source:
+            continue
+
+        normalized_cards.append(
+            {
+                "id": sanitize_text(source.get("id")),
+                "inquiry": sanitize_text(source.get("inquiry")),
+                "symptoms": sanitize_text(source.get("symptoms")),
+                "errors": sanitize_text(source.get("errors")),
+                "steps": sanitize_text(source.get("steps")),
+                "resources": sanitize_text(source.get("resources")),
+                "locked": normalize_bool(source.get("locked")),
+                "createdAt": sanitize_text(source.get("createdAt")),
+                "updatedAt": sanitize_text(source.get("updatedAt")),
+            }
+        )
+
+    return normalized_cards
+
+
 def normalize_admin_documentation(
     value: Any,
     *,
@@ -1162,6 +1188,7 @@ def normalize_admin_documentation(
         "escalationNote": sanitize_text(source.get("escalationNote")),
         "coverageNotes": sanitize_text(source.get("coverageNotes")),
         "coverageCards": normalize_coverage_cards(source.get("coverageCards")),
+        "documentationCards": normalize_documentation_cards(source.get("documentationCards")),
         "errorImages": error_images,
     }
 
@@ -2030,11 +2057,31 @@ def build_coverage_tutor_request_webhook_payload(
 
 
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, response_payload = post_json_webhook(
-        get_coverage_tutor_request_webhook_url(),
-        payload,
-        timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
-    )
+    url = get_coverage_tutor_request_webhook_url()
+    files = list(payload.get("request", {}).get("presentationFiles") or [])
+    if files:
+        stripped_payload = {
+            **payload,
+            "request": {
+                **payload.get("request", {}),
+                "presentationFiles": [
+                    {k: v for k, v in f.items() if k != "dataUrl"}
+                    for f in files
+                ],
+            },
+        }
+        configured, delivered, status, response_payload = post_multipart_webhook(
+            url,
+            stripped_payload,
+            files,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+    else:
+        configured, delivered, status, response_payload = post_json_webhook(
+            url,
+            payload,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
     return {
         "configured": configured,
         "delivered": delivered,
@@ -11274,6 +11321,61 @@ def delete_request(url: str, headers: dict[str, str] | None = None) -> tuple[boo
 
 def post_json_webhook(url: str, payload: dict[str, Any], *, timeout_seconds: int = 20) -> tuple[bool, bool, int | None, Any]:
     return post_json_request(url, payload, timeout_seconds=timeout_seconds)
+
+
+def post_multipart_webhook(
+    url: str,
+    payload: dict[str, Any],
+    files: list[dict[str, Any]],
+    *,
+    timeout_seconds: int = 30,
+) -> tuple[bool, bool, int | None, Any]:
+    """Send a multipart/form-data POST with a JSON body field and binary file attachments."""
+    import mimetypes
+    import uuid
+
+    if not url:
+        return False, False, None, None
+
+    boundary = uuid.uuid4().hex
+    crlf = b"\r\n"
+    parts = []
+
+    json_bytes = json.dumps(payload, default=str).encode("utf-8")
+    parts.append(
+        b"--" + boundary.encode() + crlf +
+        b'Content-Disposition: form-data; name="body"' + crlf +
+        b"Content-Type: application/json" + crlf + crlf +
+        json_bytes + crlf
+    )
+
+    for i, file in enumerate(files):
+        data_url = sanitize_text(file.get("dataUrl") or "")
+        if not data_url.startswith("data:"):
+            continue
+        try:
+            header, b64data = data_url.split(",", 1)
+            import base64 as _b64
+            file_bytes = _b64.b64decode(b64data)
+        except Exception:
+            continue
+        file_name = sanitize_text(file.get("name") or f"attachment_{i}")
+        mime_type = sanitize_text(file.get("mimeType") or "application/octet-stream")
+        parts.append(
+            b"--" + boundary.encode() + crlf +
+            f'Content-Disposition: form-data; name="file_{i}"; filename="{file_name}"'.encode() + crlf +
+            f"Content-Type: {mime_type}".encode() + crlf + crlf +
+            file_bytes + crlf
+        )
+
+    body = b"".join(parts) + b"--" + boundary.encode() + b"--" + crlf
+    request = urllib_request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    return execute_http_request(request, timeout_seconds=timeout_seconds)
 
 
 def send_booking_webhook(payload: dict[str, Any]) -> dict[str, Any]:

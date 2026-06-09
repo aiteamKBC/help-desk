@@ -345,6 +345,18 @@ interface CoverageWorkflowCard {
   presentationFiles: CoverageCardAttachment[];
 }
 
+interface DocumentationWorkflowCard {
+  id: string;
+  inquiry: string;
+  symptoms: string;
+  errors: string;
+  steps: string;
+  resources: string;
+  locked: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface AdminDocumentation {
   inquiry: string;
   symptoms: string;
@@ -361,6 +373,7 @@ interface AdminDocumentation {
   escalationNote?: string;
   coverageNotes: string;
   coverageCards: CoverageWorkflowCard[];
+  documentationCards: DocumentationWorkflowCard[];
   errorImages: DocumentationImage[];
 }
 
@@ -564,13 +577,34 @@ const AgentDashboard = () => {
   const normalizedDashboardSearch = normalizeConsoleSearchValue(dashboardSearch);
   const compactDashboardSearch = compactConsoleSearchValue(normalizedDashboardSearch);
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
+  const isActiveQuickTicket = Boolean(activeDetail) && isDashboardQuickResolutionTicket(activeDetail.ticket);
+  const effectiveActiveTicketTab = isActiveQuickTicket && activeTicketTab === "conversation"
+    ? "documentation"
+    : activeTicketTab;
   const activeCoverageDocumentationBaseline = activeDetail && isActiveCoverageTicket
     ? buildCoverageDocumentationDraft(activeDetail.ticket)
     : null;
-  const activeCoverageDocumentationDraft = activeDocumentationDraft || activeCoverageDocumentationBaseline;
+  const activeCoverageDocumentationDraft = activeDocumentationDraft
+    && activeDetail
+    && activeDocumentationDraft.ticketId === activeDetail.ticket.id
+    ? activeDocumentationDraft
+    : activeCoverageDocumentationBaseline;
   const activeCoverageDocumentationReadOnly = Boolean(activeDetail) && activeDetail.ticket.status === "Closed";
-  const activeCoverageDocumentationDirty = Boolean(activeCoverageDocumentationBaseline && activeDocumentationDraft)
-    && JSON.stringify(activeDocumentationDraft) !== JSON.stringify(activeCoverageDocumentationBaseline);
+  const activeCoverageDocumentationDirty = Boolean(activeCoverageDocumentationBaseline && activeCoverageDocumentationDraft)
+    && JSON.stringify(activeCoverageDocumentationDraft) !== JSON.stringify(activeCoverageDocumentationBaseline);
+  const isActiveStandardDocumentationTicket = Boolean(activeDetail)
+    && activeDetail.ticket.status === "Pending"
+    && !isActiveCoverageTicket;
+  const activeStandardDocumentationBaseline = activeDetail && isActiveStandardDocumentationTicket
+    ? buildStandardDocumentationDraft(activeDetail.ticket)
+    : null;
+  const activeStandardDocumentationDraft = activeDocumentationDraft
+    && activeDetail
+    && activeDocumentationDraft.ticketId === activeDetail.ticket.id
+    ? activeDocumentationDraft
+    : activeStandardDocumentationBaseline;
+  const activeStandardDocumentationDirty = Boolean(activeStandardDocumentationBaseline && activeStandardDocumentationDraft)
+    && JSON.stringify(activeStandardDocumentationDraft) !== JSON.stringify(activeStandardDocumentationBaseline);
   const activeAgents = agents.filter((agent) => agent.isActive !== false && isStaffSupportAccount(agent) && agent.legacySupportAccess === true);
   const signedInAgent = agents.find((agent) => (
     (session?.id && agent.id === session.id)
@@ -1294,12 +1328,17 @@ const AgentDashboard = () => {
   }, [consoleDetail?.ticket.id, chatbotWorkflowConfigured]);
 
   useEffect(() => {
-    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+    if (!activeDetail) {
       setActiveDocumentationDraft(null);
       return;
     }
 
-    setActiveDocumentationDraft(buildCoverageDocumentationDraft(activeDetail.ticket));
+    if (isCoverageTicket(activeDetail.ticket)) {
+      setActiveDocumentationDraft(buildCoverageDocumentationDraft(activeDetail.ticket));
+      return;
+    }
+
+    setActiveDocumentationDraft(buildStandardDocumentationDraft(activeDetail.ticket));
   }, [activeDetail?.ticket.id, activeDetail?.ticket.updatedAt, activeDetail?.ticket.technicalSubcategory]);
 
   useEffect(() => {
@@ -2212,6 +2251,10 @@ const AgentDashboard = () => {
         payload = acknowledgedPayload;
       }
 
+      if (isDashboardQuickResolutionTicket(payload.ticket) && initialTab === "conversation") {
+        setActiveTicketTab("documentation");
+      }
+
       setActiveDetail(payload);
       setTickets((currentTickets) => currentTickets.map((ticket) => (
         ticket.id === payload.ticket.id ? payload.ticket : ticket
@@ -2389,6 +2432,17 @@ const AgentDashboard = () => {
   function updateActiveCoverageDocumentation(updater: (draft: AdminDocumentation) => AdminDocumentation) {
     setActiveDocumentationDraft((currentDraft) => {
       const baseDraft = currentDraft || activeCoverageDocumentationBaseline;
+      if (!baseDraft) {
+        return currentDraft;
+      }
+
+      return updater(baseDraft);
+    });
+  }
+
+  function updateActiveStandardDocumentation(updater: (draft: AdminDocumentation) => AdminDocumentation) {
+    setActiveDocumentationDraft((currentDraft) => {
+      const baseDraft = currentDraft || activeStandardDocumentationBaseline;
       if (!baseDraft) {
         return currentDraft;
       }
@@ -3385,6 +3439,11 @@ const AgentDashboard = () => {
 
     const nextStatus = overrides?.status ?? draftStatus;
     const nextNote = (overrides?.note ?? notes).trim();
+    const standardDocumentationToSave = isActiveStandardDocumentationTicket
+      && activeStandardDocumentationDraft
+      && activeStandardDocumentationDirty
+      ? freezeDocumentationCardsForSave(activeStandardDocumentationDraft)
+      : null;
 
     if (nextStatus !== activeDetail.ticket.status && !nextNote) {
       toast.error("Add an internal note before changing the ticket status.");
@@ -3399,6 +3458,7 @@ const AgentDashboard = () => {
         ...(overrides?.statusReason ? { statusReason: overrides.statusReason } : {}),
         slaStatus: overrides?.slaStatus ?? effectiveDraftSlaStatus,
         note: nextNote,
+        ...(standardDocumentationToSave ? { documentation: standardDocumentationToSave } : {}),
       };
 
       if (canAssignActiveTicket) {
@@ -3426,6 +3486,9 @@ const AgentDashboard = () => {
 
       setActiveDetail(payload);
       syncDrafts(payload);
+      if (standardDocumentationToSave) {
+        setActiveDocumentationDraft(buildStandardDocumentationDraft(payload.ticket));
+      }
       setTickets((currentTickets) => currentTickets.map((ticket) => (
         ticket.id === payload.ticket.id ? payload.ticket : ticket
       )));
@@ -4756,7 +4819,10 @@ const AgentDashboard = () => {
       </Tabs>
 
       <Sheet open={!!activeTicketId} onOpenChange={(open) => !open && closePanel()}>
-        <SheetContent className={cn("w-full overflow-y-auto", isActiveCoverageTicket ? "sm:max-w-6xl" : "sm:max-w-3xl")}>
+        <SheetContent className={cn(
+          "w-full overflow-y-auto",
+          isActiveCoverageTicket || isActiveStandardDocumentationTicket ? "sm:max-w-6xl" : "sm:max-w-3xl",
+        )}>
           {isOpening ? (
             <div className="h-full min-h-[300px] flex items-center justify-center gap-2 text-sm text-muted-foreground">
               <LoaderCircle className="h-4 w-4 animate-spin" /> Loading ticket...
@@ -4810,14 +4876,16 @@ const AgentDashboard = () => {
                 <>
                   <div className="space-y-5 py-5">
                     <Tabs
-                      value={activeTicketTab}
+                      value={effectiveActiveTicketTab}
                       onValueChange={(value) => setActiveTicketTab(value as TicketDetailTab)}
                       className="space-y-4"
                     >
-                  <TabsList className="grid w-full grid-cols-3">
-                    <TabsTrigger value="conversation">
-                      <MessageSquareText className="mr-2 h-4 w-4" /> Conversation
-                    </TabsTrigger>
+                  <TabsList className={cn("grid w-full", isActiveQuickTicket ? "grid-cols-2" : "grid-cols-3")}>
+                    {!isActiveQuickTicket ? (
+                      <TabsTrigger value="conversation">
+                        <MessageSquareText className="mr-2 h-4 w-4" /> Conversation
+                      </TabsTrigger>
+                    ) : null}
                     <TabsTrigger value="documentation">
                       <FileText className="mr-2 h-4 w-4" /> Documentation
                     </TabsTrigger>
@@ -4826,7 +4894,8 @@ const AgentDashboard = () => {
                     </TabsTrigger>
                   </TabsList>
 
-                  <TabsContent value="conversation" className="space-y-5">
+                  {!isActiveQuickTicket ? (
+                    <TabsContent value="conversation" className="space-y-5">
                     <section>
                       <Label className="mb-1.5 block">Inquiry details</Label>
                       <div className="rounded-xl border bg-secondary/40 p-3 text-sm leading-6">
@@ -4882,19 +4951,32 @@ const AgentDashboard = () => {
                         )}
                       </div>
                     </section>
-                  </TabsContent>
+                    </TabsContent>
+                  ) : null}
 
                   <TabsContent value="documentation" className="space-y-5">
-                    <section>
-                      <Label className="mb-1.5 block">Documentation</Label>
-                      <div className="rounded-xl border p-3">
-                        <DocumentationAccordionReadOnly
-                          draft={activeDetail.ticket.documentation}
-                          attachments={activeDetail.attachments}
-                          sessionRequests={activeDetail.sessionRequests}
-                        />
-                      </div>
-                    </section>
+                    {isActiveStandardDocumentationTicket && activeStandardDocumentationDraft ? (
+                      <StandardDocumentationWorkspace
+                        ticket={activeDetail.ticket}
+                        draft={activeStandardDocumentationDraft}
+                        attachments={activeDetail.attachments}
+                        readOnly={!isActiveStandardDocumentationTicket}
+                        isSaving={isSaving}
+                        isDirty={activeStandardDocumentationDirty}
+                        onDraftUpdate={updateActiveStandardDocumentation}
+                      />
+                    ) : (
+                      <section>
+                        <Label className="mb-1.5 block">Documentation</Label>
+                        <div className="rounded-xl border p-3">
+                          <DocumentationAccordionReadOnly
+                            draft={activeDetail.ticket.documentation}
+                            attachments={activeDetail.attachments}
+                            sessionRequests={activeDetail.sessionRequests}
+                          />
+                        </div>
+                      </section>
+                    )}
                   </TabsContent>
 
                   <TabsContent value="details" className="space-y-5">
@@ -5013,29 +5095,27 @@ const AgentDashboard = () => {
                 </Tabs>
               </div>
 
-              <SheetFooter className="flex-col gap-2">
+              <SheetFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
                 <Button
-                  className="w-full gradient-primary border-0"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                  onClick={() => void saveTicket({
+                    status: "Closed",
+                    statusReason: "Closed via Agent",
+                    successMessage: "Ticket closed",
+                  })}
+                  disabled={isSaving}
+                >
+                  <X className="h-4 w-4 mr-2" /> Close
+                </Button>
+                <Button
+                  className="w-full gradient-primary border-0 sm:w-auto"
                   onClick={() => void saveTicket({ successMessage: "Changes saved" })}
                   disabled={isSaving || !canSubmitStatusChange}
                 >
                   {isSaving ? <LoaderCircle className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
                   Save Changes
                 </Button>
-                <div className="grid gap-2 sm:grid-cols-1">
-                  <Button
-                    variant="outline"
-                    className="w-full"
-                    onClick={() => void saveTicket({
-                      status: "Closed",
-                      statusReason: "Closed via Agent",
-                      successMessage: "Ticket closed",
-                    })}
-                    disabled={isSaving}
-                  >
-                    <X className="h-4 w-4 mr-2" /> Close
-                  </Button>
-                </div>
               </SheetFooter>
                 </>
               )}
@@ -7921,6 +8001,253 @@ const ReadOnlyDocumentationValue = ({
   </div>
 );
 
+const documentationCardFields: {
+  key: keyof Pick<DocumentationWorkflowCard, "inquiry" | "symptoms" | "errors" | "steps" | "resources">;
+  label: string;
+  placeholder: string;
+}[] = [
+  { key: "inquiry", label: "Inquiry", placeholder: "Document the support inquiry..." },
+  { key: "symptoms", label: "Symptoms", placeholder: "Capture the observed symptoms..." },
+  { key: "errors", label: "Errors", placeholder: "Add any error details..." },
+  { key: "steps", label: "Steps", placeholder: "Record troubleshooting steps..." },
+  { key: "resources", label: "Resources", placeholder: "Add links, resources, or follow-up notes..." },
+];
+
+const StandardDocumentationWorkspace = ({
+  ticket,
+  draft,
+  attachments,
+  readOnly,
+  isSaving,
+  isDirty,
+  onDraftUpdate,
+}: {
+  ticket: TicketDetail;
+  draft: AdminDocumentation;
+  attachments: AttachmentItem[];
+  readOnly: boolean;
+  isSaving: boolean;
+  isDirty: boolean;
+  onDraftUpdate: (updater: (draft: AdminDocumentation) => AdminDocumentation) => void;
+}) => {
+  const [collapsedCardIds, setCollapsedCardIds] = useState<Set<string>>(new Set());
+  const cardsForDisplay = sortDocumentationWorkflowCardsForDisplay(draft.documentationCards);
+
+  useEffect(() => {
+    setCollapsedCardIds(new Set());
+  }, [ticket.id]);
+
+  function addDocumentationCard() {
+    const nextCard = createDocumentationCard();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      documentationCards: [nextCard, ...currentDraft.documentationCards],
+    }));
+    setCollapsedCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      nextIds.delete(nextCard.id);
+      return nextIds;
+    });
+  }
+
+  function toggleCard(cardId: string) {
+    setCollapsedCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (nextIds.has(cardId)) {
+        nextIds.delete(cardId);
+      } else {
+        nextIds.add(cardId);
+      }
+      return nextIds;
+    });
+  }
+
+  function updateCardField(
+    cardId: string,
+    field: keyof Pick<DocumentationWorkflowCard, "inquiry" | "symptoms" | "errors" | "steps" | "resources">,
+    value: string,
+  ) {
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      documentationCards: currentDraft.documentationCards.map((card) => (
+        card.id === cardId && !card.locked
+          ? { ...card, [field]: value, updatedAt: new Date().toISOString() }
+          : card
+      )),
+    }));
+  }
+
+  return (
+    <section className="space-y-4">
+      <div className="rounded-[28px] border border-primary/15 bg-gradient-to-br from-primary/[0.06] via-white to-fuchsia-50/60 p-4 shadow-[0_18px_45px_rgba(82,54,188,0.10)] sm:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="inline-flex items-center rounded-full border border-primary/15 bg-white/85 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-primary shadow-sm">
+              Requester Submission
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              Fixed starting point from the requester. This section cannot be edited by agents.
+            </p>
+          </div>
+          <div className="rounded-full border border-primary/15 bg-white/80 px-3 py-1 text-xs font-medium text-muted-foreground">
+            Created {formatDateTime(ticket.createdAt)}
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-2xl border border-primary/10 bg-white/90 p-4 text-sm leading-6 text-foreground shadow-sm">
+          {ticket.inquiry?.trim() ? ticket.inquiry : "No inquiry text was submitted."}
+        </div>
+
+        <div className="mt-4">
+          <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+            <Paperclip className="h-3.5 w-3.5" />
+            Requester Attachments
+          </div>
+          {attachments.length > 0 ? (
+            <div className="grid gap-2">
+              {attachments.map((file) => (
+                <div key={file.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-primary/10 bg-white/85 px-3 py-2.5 shadow-sm">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-semibold text-foreground">{file.name}</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      {(file.mimeType || "Unknown type")} - {formatBytes(file.size)}
+                    </div>
+                  </div>
+                  {file.storageUrl ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => window.open(file.storageUrl || "", "_blank", "noopener,noreferrer")}
+                    >
+                      Open
+                    </Button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-dashed border-primary/15 bg-white/60 px-3 py-3 text-sm text-muted-foreground">
+              No requester attachments submitted.
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-[28px] border bg-card/95 p-4 shadow-card sm:p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">Agent Documentation Cards</h3>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Add updates while the ticket is pending. Saved cards become frozen history.
+            </p>
+          </div>
+          <Button
+            type="button"
+            className="border-0 bg-gradient-to-r from-primary to-violet-500 text-white shadow-[0_12px_26px_rgba(82,54,188,0.22)] hover:opacity-95"
+            onClick={addDocumentationCard}
+            disabled={readOnly || isSaving}
+          >
+            Add Documentation Card
+          </Button>
+        </div>
+
+        {cardsForDisplay.length > 0 ? (
+          <div className="mt-4 space-y-3">
+            {cardsForDisplay.map((card) => {
+              const isCollapsed = collapsedCardIds.has(card.id);
+              const isCardReadOnly = readOnly || card.locked;
+
+              return (
+                <article
+                  key={card.id}
+                  className={cn(
+                    "overflow-hidden rounded-[24px] border bg-gradient-to-br from-white via-white to-primary/[0.03] shadow-[0_14px_32px_rgba(15,23,42,0.06)]",
+                    card.locked ? "border-slate-200" : "border-primary/25 ring-1 ring-primary/10",
+                  )}
+                >
+                  <button
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
+                    onClick={() => toggleCard(card.id)}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-foreground">Documentation Card</span>
+                        <span className={cn(
+                          "rounded-full border px-2.5 py-0.5 text-[11px] font-semibold",
+                          card.locked
+                            ? "border-slate-200 bg-slate-50 text-slate-600"
+                            : "border-primary/20 bg-primary/10 text-primary",
+                        )}>
+                          {card.locked ? "Saved" : "Editable"}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {buildDocumentationCardTimestampLabel(card)}
+                      </div>
+                    </div>
+                    <ChevronDown className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", !isCollapsed && "rotate-180")} />
+                  </button>
+
+                  {!isCollapsed ? (
+                    <div className="border-t border-primary/10 px-4 py-4">
+                      {isCardReadOnly ? (
+                        <div className="grid gap-3">
+                          {documentationCardFields.map((field) => (
+                            <ReadOnlyDocumentationBlock key={field.key} label={field.label} value={card[field.key]} />
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="grid gap-3">
+                          {documentationCardFields.map((field) => (
+                            <div key={field.key}>
+                              <Label className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                {field.label}
+                              </Label>
+                              <Textarea
+                                value={card[field.key]}
+                                onChange={(event) => updateCardField(card.id, field.key, event.target.value)}
+                                placeholder={field.placeholder}
+                                className="min-h-[88px] resize-y rounded-2xl bg-white"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="mt-4 rounded-2xl border border-dashed bg-secondary/20 px-4 py-6 text-center text-sm text-muted-foreground">
+            No documentation cards yet. Add the first card when you are ready to document the case.
+          </div>
+        )}
+
+        {isDirty ? (
+          <p className="mt-3 text-xs font-medium text-primary">Unsaved documentation changes.</p>
+        ) : null}
+      </div>
+    </section>
+  );
+};
+
+const ReadOnlyDocumentationBlock = ({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) => (
+  <div className="rounded-2xl border bg-white/85 px-4 py-3">
+    <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">{label}</div>
+    <div className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">{value.trim() ? value : "-"}</div>
+  </div>
+);
+
 const DocumentationAccordionReadOnly = ({
   draft,
   attachments,
@@ -8459,6 +8786,104 @@ function sortCoverageWorkflowCardsForDisplay(cards: CoverageWorkflowCard[]): Cov
   ));
 }
 
+function createDocumentationCard(): DocumentationWorkflowCard {
+  const timestamp = new Date().toISOString();
+
+  return {
+    id: createCoverageCardId(),
+    inquiry: "",
+    symptoms: "",
+    errors: "",
+    steps: "",
+    resources: "",
+    locked: false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function normalizeDocumentationWorkflowCards(
+  cards: DocumentationWorkflowCard[] | null | undefined,
+): DocumentationWorkflowCard[] {
+  return Array.isArray(cards)
+    ? cards.flatMap((card) => {
+        if (!card) {
+          return [];
+        }
+
+        return [{
+          id: card.id || createCoverageCardId(),
+          inquiry: card.inquiry || "",
+          symptoms: card.symptoms || "",
+          errors: card.errors || "",
+          steps: card.steps || "",
+          resources: card.resources || "",
+          locked: Boolean(card.locked),
+          createdAt: card.createdAt || "",
+          updatedAt: card.updatedAt || "",
+        }];
+      })
+    : [];
+}
+
+function getDocumentationWorkflowCardSortTimestamp(card: Pick<DocumentationWorkflowCard, "createdAt" | "updatedAt">) {
+  const createdTimestamp = Date.parse(card.createdAt || "");
+  if (!Number.isNaN(createdTimestamp)) {
+    return createdTimestamp;
+  }
+
+  const updatedTimestamp = Date.parse(card.updatedAt || "");
+  if (!Number.isNaN(updatedTimestamp)) {
+    return updatedTimestamp;
+  }
+
+  return 0;
+}
+
+function sortDocumentationWorkflowCardsForDisplay(cards: DocumentationWorkflowCard[]): DocumentationWorkflowCard[] {
+  return [...cards].sort((leftCard, rightCard) => (
+    getDocumentationWorkflowCardSortTimestamp(rightCard) - getDocumentationWorkflowCardSortTimestamp(leftCard)
+  ));
+}
+
+function buildDocumentationCardTimestampLabel(card: DocumentationWorkflowCard) {
+  if (!card.createdAt) {
+    return "Created time unavailable";
+  }
+
+  if (card.updatedAt && card.updatedAt !== card.createdAt) {
+    return `Created ${formatDateTime(card.createdAt)} | Edited ${formatDateTime(card.updatedAt)}`;
+  }
+
+  return `Created ${formatDateTime(card.createdAt)}`;
+}
+
+function freezeDocumentationCardsForSave(documentation: AdminDocumentation): AdminDocumentation {
+  const timestamp = new Date().toISOString();
+  const nextCards = documentation.documentationCards.map((card) => {
+    if (card.locked) {
+      return card;
+    }
+
+    return {
+      ...card,
+      locked: true,
+      updatedAt: timestamp,
+    };
+  });
+  const latestCard = sortDocumentationWorkflowCardsForDisplay(nextCards)[0];
+
+  return {
+    ...documentation,
+    documentationCards: nextCards,
+    inquiry: latestCard?.inquiry || documentation.inquiry,
+    symptoms: latestCard?.symptoms || documentation.symptoms,
+    errors: latestCard?.errors || documentation.errors,
+    steps: latestCard?.steps || documentation.steps,
+    resources: latestCard?.resources || documentation.resources,
+  };
+}
+
 function getCoverageAttachmentPreviewKind(file: Pick<CoverageCardAttachment, "mimeType" | "dataUrl"> | null | undefined) {
   const mimeType = (file?.mimeType || "").toLowerCase();
   const dataUrl = (file?.dataUrl || "").toLowerCase();
@@ -8596,6 +9021,18 @@ function getCoverageReplyOutcomeLabel(outcome: CoverageTutorReplyOutcome) {
   }
 }
 
+function buildStandardDocumentationDraft(
+  ticket: Pick<TicketDetail, "id" | "chatId" | "documentation">,
+): AdminDocumentation {
+  const normalizedDocumentation = normalizeDocumentationDraft(ticket.documentation);
+
+  return {
+    ...normalizedDocumentation,
+    chatId: normalizedDocumentation.chatId || ticket.chatId || "",
+    ticketId: normalizedDocumentation.ticketId || ticket.id || "",
+  };
+}
+
 function buildCoverageDocumentationDraft(
   ticket: Pick<TicketDetail, "id" | "inquiry" | "chatId" | "documentation">,
 ): AdminDocumentation {
@@ -8630,6 +9067,7 @@ function normalizeDocumentationDraft(documentation?: AdminDocumentation | null):
     escalationNote: documentation?.escalationNote || "",
     coverageNotes: documentation?.coverageNotes || "",
     coverageCards: normalizeCoverageWorkflowCards(documentation?.coverageCards),
+    documentationCards: normalizeDocumentationWorkflowCards(documentation?.documentationCards),
     errorImages: Array.isArray(documentation?.errorImages) ? documentation.errorImages : [],
   };
 }

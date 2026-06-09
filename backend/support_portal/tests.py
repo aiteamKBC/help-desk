@@ -7756,6 +7756,43 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(normalized_documentation["coverageCards"][1]["type"], "note")
         self.assertEqual(normalized_documentation["coverageCards"][1]["note"], "Follow up with another tutor if needed.")
 
+    def test_normalize_admin_documentation_preserves_standard_documentation_cards(self):
+        normalized_documentation = services.normalize_admin_documentation(
+            {
+                "inquiry": "Need Aptem help.",
+                "documentationCards": [
+                    {
+                        "id": "doc-card-1",
+                        "inquiry": "Confirmed the requester issue.",
+                        "symptoms": "Learner cannot open module.",
+                        "errors": "403 page",
+                        "steps": "Checked account access.",
+                        "resources": "Aptem admin portal",
+                        "locked": True,
+                        "createdAt": "2026-06-09T10:00:00Z",
+                        "updatedAt": "2026-06-09T10:05:00Z",
+                        "unexpected": "ignored",
+                    },
+                    "bad-card",
+                ],
+            },
+            fallback_inquiry="Need Aptem help.",
+            fallback_chat_id="CHAT-000201",
+            fallback_ticket_id="KBC-000201",
+        )
+
+        self.assertEqual(len(normalized_documentation["documentationCards"]), 1)
+        persisted_card = normalized_documentation["documentationCards"][0]
+        self.assertEqual(persisted_card["id"], "doc-card-1")
+        self.assertEqual(persisted_card["inquiry"], "Confirmed the requester issue.")
+        self.assertEqual(persisted_card["symptoms"], "Learner cannot open module.")
+        self.assertEqual(persisted_card["errors"], "403 page")
+        self.assertEqual(persisted_card["steps"], "Checked account access.")
+        self.assertEqual(persisted_card["resources"], "Aptem admin portal")
+        self.assertTrue(persisted_card["locked"])
+        self.assertEqual(persisted_card["createdAt"], "2026-06-09T10:00:00Z")
+        self.assertEqual(persisted_card["updatedAt"], "2026-06-09T10:05:00Z")
+
     def test_get_support_booking_url_returns_configured_value(self):
         with patch.object(services.settings, "SUPPORT_BOOKING_URL", "https://outlook.office.com/book/example"):
             response = services.get_support_booking_url()
