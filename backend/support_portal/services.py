@@ -1712,25 +1712,52 @@ def list_coverage_module_options(tutor: Any) -> list[str]:
 
     rows = run_communication_centre_query(
         """
-        SELECT module_name
-        FROM (
-          SELECT DISTINCT NULLIF(TRIM("module_name"), '') AS module_name
-          FROM public."Training_plan"
-          WHERE (
-            LOWER(TRIM("Tutor_name")) = %s
-            OR EXISTS (
-              SELECT 1
-              FROM regexp_split_to_table(COALESCE("Tutor_name", ''), '\\+') AS tutor_part
-              WHERE LOWER(TRIM(tutor_part)) = %s
-            )
+        SELECT DISTINCT
+          NULLIF(TRIM("module_name"), '') AS module_name,
+          NULLIF(TRIM("session_week_day"), '') AS session_week_day,
+          NULLIF(TRIM("session_start_time"), '') AS session_start_time,
+          NULLIF(TRIM("session_end_time"), '') AS session_end_time,
+          NULLIF(TRIM("group_name"), '') AS group_name,
+          NULLIF(TRIM("Cohort_name"), '') AS cohort_name,
+          NULLIF(TRIM("end_date"), '') AS end_date
+        FROM public."Training_plan"
+        WHERE (
+          LOWER(TRIM("Tutor_name")) = %s
+          OR EXISTS (
+            SELECT 1
+            FROM regexp_split_to_table(COALESCE("Tutor_name", ''), '\\+') AS tutor_part
+            WHERE LOWER(TRIM(tutor_part)) = %s
           )
-        ) coverage_modules
-        WHERE module_name IS NOT NULL
-        ORDER BY LOWER(module_name), module_name
+        )
+        ORDER BY module_name
         """,
         [normalized_tutor, normalized_tutor],
     )
-    return [sanitize_text(row.get("module_name")) for row in rows if sanitize_text(row.get("module_name"))]
+    module_names_by_key: dict[str, str] = {}
+    today = django_timezone.localdate()
+
+    for row in rows:
+        module_name = sanitize_text(row.get("module_name"))
+        if not module_name:
+            continue
+
+        time_label = format_coverage_time_option_label(
+            row.get("session_week_day"),
+            row.get("session_start_time"),
+            row.get("session_end_time"),
+            row.get("group_name"),
+            row.get("cohort_name"),
+        )
+        if not time_label:
+            continue
+
+        end_date = parse_coverage_plan_date(row.get("end_date"))
+        if end_date and end_date < today:
+            continue
+
+        module_names_by_key.setdefault(module_name.lower(), module_name)
+
+    return [module_names_by_key[key] for key in sorted(module_names_by_key)]
 
 
 def list_coverage_time_options(tutor: Any, module: Any) -> list[str]:

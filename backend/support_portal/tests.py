@@ -529,11 +529,37 @@ class CoverageOptionsTests(SimpleTestCase):
             services,
             "run_communication_centre_query",
             return_value=[
-                {"module_name": "Commercial Intelligence"},
-                {"module_name": "Martech"},
+                {
+                    "module_name": "Commercial Intelligence",
+                    "session_week_day": "Wednesday",
+                    "session_start_time": "09:00",
+                    "session_end_time": "11:00",
+                    "group_name": "G1",
+                    "cohort_name": "Jun 2026",
+                    "end_date": "2026-09-30",
+                },
+                {
+                    "module_name": "Completed Module",
+                    "session_week_day": "Friday",
+                    "session_start_time": "12:00",
+                    "session_end_time": "14:00",
+                    "group_name": "G2",
+                    "cohort_name": "Feb 2026",
+                    "end_date": "2026-01-30",
+                },
+                {
+                    "module_name": "Martech",
+                    "session_week_day": "Thursday",
+                    "session_start_time": "09:00",
+                    "session_end_time": "11:00",
+                    "group_name": "G1",
+                    "cohort_name": "Jun 2026",
+                    "end_date": "",
+                },
             ],
         ) as run_communication_centre_query:
-            response = services.list_coverage_module_options("Nathan")
+            with patch.object(services.django_timezone, "localdate", return_value=datetime(2026, 6, 1).date()):
+                response = services.list_coverage_module_options("Nathan")
 
         self.assertEqual(response, ["Commercial Intelligence", "Martech"])
         run_communication_centre_query.assert_called_once()

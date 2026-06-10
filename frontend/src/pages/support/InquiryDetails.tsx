@@ -199,6 +199,7 @@ const InquiryDetails = () => {
   const selectedCoverageSessionSubjects = coverageSessionDates.map(
     (sessionDate) => (coverageSessionSubjectByDate[sessionDate] || "").trim(),
   );
+  const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
 
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
   const canSubmit = isCoverageFlow
@@ -390,9 +391,11 @@ const InquiryDetails = () => {
           return;
         }
 
+        const nextAvailableTimeOptions = options.filter((option) => !option.completed);
+
         setCoverageTimeOptions(options);
         setCoverageTime((currentTime) => (
-          currentTime && !options.some((option) => option.label === currentTime) ? "" : currentTime
+          currentTime && !nextAvailableTimeOptions.some((option) => option.label === currentTime) ? "" : currentTime
         ));
       })
       .catch((error: unknown) => {
@@ -831,7 +834,7 @@ const InquiryDetails = () => {
                               ? "Choose tutor first."
                               : isLoadingCoverageModules
                                 ? "Loading modules..."
-                                : "No modules available."}
+                                : "No upcoming modules available."}
                           </div>
                         )}
                       </SelectContent>
@@ -859,17 +862,10 @@ const InquiryDetails = () => {
                         />
                       </SelectTrigger>
                       <SelectContent>
-                        {coverageTimeOptions.length > 0 ? (
-                          coverageTimeOptions.map((item) => (
+                        {availableCoverageTimeOptions.length > 0 ? (
+                          availableCoverageTimeOptions.map((item) => (
                             <SelectItem key={item.label} value={item.label}>
-                              <span className="flex w-full items-center justify-between gap-3">
-                                <span className="truncate">{item.label}</span>
-                                {item.completed ? (
-                                  <span className="shrink-0 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-700">
-                                    Completed
-                                  </span>
-                                ) : null}
-                              </span>
+                              {item.label}
                             </SelectItem>
                           ))
                         ) : (
@@ -878,7 +874,9 @@ const InquiryDetails = () => {
                               ? "Choose module first."
                               : isLoadingCoverageTimes
                                 ? "Loading times..."
-                                : "No times available."}
+                                : coverageTimeOptions.length > 0
+                                  ? "No upcoming times available."
+                                  : "No times available."}
                           </div>
                         )}
                       </SelectContent>

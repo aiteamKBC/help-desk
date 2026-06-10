@@ -6451,6 +6451,7 @@ const CoverageTicketWorkspace = ({
   onConfirmTutorSession: (cardId: string) => void;
 }) => {
   const [tutorOptions, setTutorOptions] = useState<string[]>([]);
+  const [sameModuleTutorOptions, setSameModuleTutorOptions] = useState<string[]>([]);
   const [coverageTutorError, setCoverageTutorError] = useState("");
   const [isLoadingTutorOptions, setIsLoadingTutorOptions] = useState(false);
   const [previewAttachment, setPreviewAttachment] = useState<CoverageCardAttachment | null>(null);
@@ -6476,13 +6477,19 @@ const CoverageTicketWorkspace = ({
     setIsLoadingTutorOptions(true);
     setCoverageTutorError("");
 
-    void fetchCoverageOptions("tutors", coverageInquiryModule ? { module: coverageInquiryModule } : undefined)
-      .then((options) => {
+    const allTutorsRequest = fetchCoverageOptions("tutors");
+    const sameModuleTutorsRequest = coverageInquiryModule
+      ? fetchCoverageOptions("tutors", { module: coverageInquiryModule })
+      : Promise.resolve<string[]>([]);
+
+    void Promise.all([allTutorsRequest, sameModuleTutorsRequest])
+      .then(([allTutorOptions, sameModuleOptions]) => {
         if (cancelled) {
           return;
         }
 
-        setTutorOptions(options);
+        setTutorOptions(allTutorOptions);
+        setSameModuleTutorOptions(sameModuleOptions);
       })
       .catch((error: unknown) => {
         if (cancelled) {
@@ -6490,6 +6497,7 @@ const CoverageTicketWorkspace = ({
         }
 
         setTutorOptions([]);
+        setSameModuleTutorOptions([]);
         setCoverageTutorError(error instanceof Error ? error.message : "We could not load the tutors right now.");
       })
       .finally(() => {
@@ -7006,9 +7014,7 @@ const CoverageTicketWorkspace = ({
               );
             }
 
-            const displayedTutorOptions = card.tutor && !tutorOptions.includes(card.tutor)
-              ? [card.tutor, ...tutorOptions]
-              : tutorOptions;
+            const displayedTutorOptions = buildCoverageTutorOptionsForDisplay(tutorOptions, sameModuleTutorOptions, card.tutor);
             const tutorChoiceStatusLabel = card.requestStatus === "draft" ? "" : getCoverageTutorRequestLabel(card.requestStatus);
             const showCompactTutorChoice = cardReadOnly;
             const compactTutorRequestSummary = summarizeCoverageTutorRequestDetails(card.sessionDetails);
@@ -7167,7 +7173,16 @@ const CoverageTicketWorkspace = ({
                                 </div>
                               ) : (
                                 displayedTutorOptions.map((option) => (
-                                  <SelectItem key={option} value={option}>{option}</SelectItem>
+                                  <SelectItem key={option.name} value={option.name} className="py-2 pr-3">
+                                    <div className="grid w-[calc(var(--radix-select-trigger-width)-2.75rem)] grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+                                      <span className="truncate">{option.name}</span>
+                                      {option.isSameModule ? (
+                                        <span className="shrink-0 rounded-full border border-primary/15 bg-primary/[0.08] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-primary">
+                                          Same module
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                  </SelectItem>
                                 ))
                               )}
                             </SelectContent>
@@ -8031,13 +8046,33 @@ const StandardDocumentationWorkspace = ({
   onDraftUpdate: (updater: (draft: AdminDocumentation) => AdminDocumentation) => void;
 }) => {
   const [collapsedCardIds, setCollapsedCardIds] = useState<Set<string>>(new Set());
+  const cardRefs = useRef<Record<string, HTMLElement | null>>({});
   const cardsForDisplay = sortDocumentationWorkflowCardsForDisplay(draft.documentationCards);
 
   useEffect(() => {
     setCollapsedCardIds(new Set());
   }, [ticket.id]);
 
+  function focusDocumentationCard(cardId: string) {
+    setCollapsedCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      nextIds.delete(cardId);
+      return nextIds;
+    });
+
+    window.setTimeout(() => {
+      cardRefs.current[cardId]?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
+  }
+
   function addDocumentationCard() {
+    const existingEditableCard = draft.documentationCards.find((card) => !card.locked);
+    if (existingEditableCard) {
+      focusDocumentationCard(existingEditableCard.id);
+      toast.info("Finish or discard the editable documentation card first.");
+      return;
+    }
+
     const nextCard = createDocumentationCard();
     onDraftUpdate((currentDraft) => ({
       ...currentDraft,
@@ -8048,6 +8083,9 @@ const StandardDocumentationWorkspace = ({
       nextIds.delete(nextCard.id);
       return nextIds;
     });
+    window.setTimeout(() => {
+      cardRefs.current[nextCard.id]?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
   }
 
   function toggleCard(cardId: string) {
@@ -8075,6 +8113,18 @@ const StandardDocumentationWorkspace = ({
           : card
       )),
     }));
+  }
+
+  function discardDocumentationCard(cardId: string) {
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      documentationCards: currentDraft.documentationCards.filter((card) => card.id !== cardId || card.locked),
+    }));
+    setCollapsedCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      nextIds.delete(cardId);
+      return nextIds;
+    });
   }
 
   return (
@@ -8161,16 +8211,15 @@ const StandardDocumentationWorkspace = ({
               return (
                 <article
                   key={card.id}
+                  ref={(element) => {
+                    cardRefs.current[card.id] = element;
+                  }}
                   className={cn(
                     "overflow-hidden rounded-[24px] border bg-gradient-to-br from-white via-white to-primary/[0.03] shadow-[0_14px_32px_rgba(15,23,42,0.06)]",
                     card.locked ? "border-slate-200" : "border-primary/25 ring-1 ring-primary/10",
                   )}
                 >
-                  <button
-                    type="button"
-                    className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left"
-                    onClick={() => toggleCard(card.id)}
-                  >
+                  <div className="flex w-full items-center justify-between gap-3 px-4 py-3">
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-semibold text-foreground">Documentation Card</span>
@@ -8187,8 +8236,28 @@ const StandardDocumentationWorkspace = ({
                         {buildDocumentationCardTimestampLabel(card)}
                       </div>
                     </div>
-                    <ChevronDown className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", !isCollapsed && "rotate-180")} />
-                  </button>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {!isCardReadOnly ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-8 rounded-full px-3 text-xs"
+                          onClick={() => discardDocumentationCard(card.id)}
+                        >
+                          Discard
+                        </Button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="rounded-full p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                        onClick={() => toggleCard(card.id)}
+                        aria-label={isCollapsed ? "Expand documentation card" : "Collapse documentation card"}
+                      >
+                        <ChevronDown className={cn("h-4 w-4 transition-transform", !isCollapsed && "rotate-180")} />
+                      </button>
+                    </div>
+                  </div>
 
                   {!isCollapsed ? (
                     <div className="border-t border-primary/10 px-4 py-4">
@@ -8846,6 +8915,11 @@ function sortDocumentationWorkflowCardsForDisplay(cards: DocumentationWorkflowCa
   ));
 }
 
+function isDocumentationCardEmpty(card: Pick<DocumentationWorkflowCard, "inquiry" | "symptoms" | "errors" | "steps" | "resources">) {
+  return [card.inquiry, card.symptoms, card.errors, card.steps, card.resources]
+    .every((value) => !(value || "").trim());
+}
+
 function buildDocumentationCardTimestampLabel(card: DocumentationWorkflowCard) {
   if (!card.createdAt) {
     return "Created time unavailable";
@@ -8860,16 +8934,20 @@ function buildDocumentationCardTimestampLabel(card: DocumentationWorkflowCard) {
 
 function freezeDocumentationCardsForSave(documentation: AdminDocumentation): AdminDocumentation {
   const timestamp = new Date().toISOString();
-  const nextCards = documentation.documentationCards.map((card) => {
-    if (card.locked) {
-      return card;
+  const nextCards = documentation.documentationCards.flatMap((card) => {
+    if (!card.locked && isDocumentationCardEmpty(card)) {
+      return [];
     }
 
-    return {
+    if (card.locked) {
+      return [card];
+    }
+
+    return [{
       ...card,
       locked: true,
       updatedAt: timestamp,
-    };
+    }];
   });
   const latestCard = sortDocumentationWorkflowCardsForDisplay(nextCards)[0];
 
@@ -8995,6 +9073,40 @@ function getCoverageTutorRequestLabel(status: CoverageTutorRequestStatus) {
     default:
       return "";
   }
+}
+
+function normalizeCoverageTutorOptionKey(value: string) {
+  return value.trim().toLowerCase();
+}
+
+function buildCoverageTutorOptionsForDisplay(
+  allTutorOptions: string[],
+  sameModuleTutorOptions: string[],
+  currentTutor: string,
+) {
+  const sameModuleTutorKeys = new Set(sameModuleTutorOptions.map(normalizeCoverageTutorOptionKey));
+  const seenTutorKeys = new Set<string>();
+  const options: Array<{ name: string; isSameModule: boolean }> = [];
+
+  const addTutorOption = (name: string) => {
+    const normalizedName = name.trim();
+    const optionKey = normalizeCoverageTutorOptionKey(normalizedName);
+    if (!normalizedName || seenTutorKeys.has(optionKey)) {
+      return;
+    }
+
+    seenTutorKeys.add(optionKey);
+    options.push({
+      name: normalizedName,
+      isSameModule: sameModuleTutorKeys.has(optionKey),
+    });
+  };
+
+  sameModuleTutorOptions.forEach(addTutorOption);
+  allTutorOptions.forEach(addTutorOption);
+  addTutorOption(currentTutor);
+
+  return options;
 }
 
 function getCoverageTutorRequestBadgeClassName(status: CoverageTutorRequestStatus) {
