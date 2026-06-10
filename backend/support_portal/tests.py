@@ -6225,6 +6225,46 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
 
+    def test_send_coverage_tutor_request_webhook_preserves_file_data_urls_in_json_payload(self):
+        payload = {
+            "ticketId": "KBC-000001",
+            "request": {
+                "presentationFiles": [
+                    {
+                        "id": "file-1",
+                        "name": "deck.pdf",
+                        "mimeType": "application/pdf",
+                        "size": 128,
+                        "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+                    }
+                ]
+            },
+        }
+
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+            patch.object(services, "post_multipart_webhook") as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_request_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_not_called()
+        post_json_webhook.assert_called_once_with(
+            "https://n8n.example/webhook",
+            payload,
+            timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+        sent_payload = post_json_webhook.call_args.args[1]
+        self.assertEqual(
+            sent_payload["request"]["presentationFiles"][0]["dataUrl"],
+            "data:application/pdf;base64,ZmFrZQ==",
+        )
+
     def test_queue_coverage_tutor_request_webhook_delivery_starts_background_thread(self):
         thread = MagicMock()
 

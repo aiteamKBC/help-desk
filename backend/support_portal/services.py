@@ -2085,30 +2085,11 @@ def build_coverage_tutor_request_webhook_payload(
 
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_request_webhook_url()
-    files = list(payload.get("request", {}).get("presentationFiles") or [])
-    if files:
-        stripped_payload = {
-            **payload,
-            "request": {
-                **payload.get("request", {}),
-                "presentationFiles": [
-                    {k: v for k, v in f.items() if k != "dataUrl"}
-                    for f in files
-                ],
-            },
-        }
-        configured, delivered, status, response_payload = post_multipart_webhook(
-            url,
-            stripped_payload,
-            files,
-            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
-        )
-    else:
-        configured, delivered, status, response_payload = post_json_webhook(
-            url,
-            payload,
-            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
-        )
+    configured, delivered, status, response_payload = post_json_webhook(
+        url,
+        payload,
+        timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+    )
     return {
         "configured": configured,
         "delivered": delivered,
