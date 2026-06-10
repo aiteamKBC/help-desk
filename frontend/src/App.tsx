@@ -20,6 +20,7 @@ import KnowledgeBaseWorkspace from "./pages/knowledge-base/KnowledgeBaseWorkspac
 import KnowledgeBaseArticle from "./pages/knowledge-base/KnowledgeBaseArticle.tsx";
 
 const queryClient = new QueryClient();
+const supportDashboardRoles = ["agent", "admin", "superadmin"] as const;
 
 const App = () => (
   <QueryClientProvider client={queryClient}>
@@ -39,8 +40,8 @@ const App = () => (
             <Route path="/support/status" element={<TicketStatus />} />
             <Route path="/support/docs" element={<Documentation />} />
             <Route path="/admin/login" element={<AdminLogin />} />
-            <Route path="/admin" element={<RequireAdmin><AgentDashboard /></RequireAdmin>} />
-            <Route path="/agent" element={<RequireAdmin><AgentDashboard /></RequireAdmin>} />
+            <Route path="/admin" element={<RequireAdmin allowedRoles={supportDashboardRoles}><AgentDashboard /></RequireAdmin>} />
+            <Route path="/agent" element={<RequireAdmin allowedRoles={supportDashboardRoles}><AgentDashboard /></RequireAdmin>} />
             <Route path="/knowledge-base" element={<RequireAdmin><KnowledgeBaseWorkspace /></RequireAdmin>} />
             <Route path="/knowledge-base/articles/:fileName" element={<RequireAdmin><KnowledgeBaseArticle /></RequireAdmin>} />
             <Route path="*" element={<NotFound />} />

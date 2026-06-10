@@ -1,10 +1,22 @@
 import { Navigate } from "react-router-dom";
-import { ReactNode, useEffect, useState } from "react";
+import { ReactNode, useEffect, useMemo, useState } from "react";
 import { clearAdminSession, fetchVerifiedAdminSession, getAdminSession, setAdminSession } from "@/lib/adminSession";
 
-export const RequireAdmin = ({ children }: { children: ReactNode }) => {
+const defaultAllowedRoles = ["admin", "superadmin"] as const;
+
+interface RequireAdminProps {
+  children: ReactNode;
+  allowedRoles?: readonly string[];
+}
+
+function buildAllowedRoleSet(allowedRoles: readonly string[]) {
+  return new Set(allowedRoles.map((role) => role.trim().toLowerCase()).filter(Boolean));
+}
+
+export const RequireAdmin = ({ children, allowedRoles = defaultAllowedRoles }: RequireAdminProps) => {
   const [redirectTarget, setRedirectTarget] = useState<"/admin/login" | "/support" | null>(null);
   const [isCheckingSession, setIsCheckingSession] = useState(true);
+  const allowedRoleSet = useMemo(() => buildAllowedRoleSet(allowedRoles), [allowedRoles]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -12,7 +24,7 @@ export const RequireAdmin = ({ children }: { children: ReactNode }) => {
     async function validateAdminSession() {
       const cachedSession = getAdminSession();
       const cachedRole = (cachedSession?.role || "").trim().toLowerCase();
-      const canUseCachedAdminSession = cachedRole === "admin" || cachedRole === "superadmin";
+      const canUseCachedAdminSession = allowedRoleSet.has(cachedRole);
 
       try {
         const { response, admin } = await fetchVerifiedAdminSession(controller.signal);
@@ -47,7 +59,7 @@ export const RequireAdmin = ({ children }: { children: ReactNode }) => {
           return;
         }
 
-        if (normalizedRole !== "admin" && normalizedRole !== "superadmin") {
+        if (!allowedRoleSet.has(normalizedRole)) {
           clearAdminSession();
           setRedirectTarget("/support");
           return;
@@ -74,7 +86,7 @@ export const RequireAdmin = ({ children }: { children: ReactNode }) => {
     void validateAdminSession();
 
     return () => controller.abort();
-  }, []);
+  }, [allowedRoleSet]);
 
   if (isCheckingSession) {
     return null;
