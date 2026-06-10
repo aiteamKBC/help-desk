@@ -29,6 +29,7 @@ from .roles import (
     ADMIN_ACCESS_GROUP_NAME,
     ADMIN_ACCESS_ROLES,
     DEFAULT_ACCOUNT_ROLE,
+    OPERATIONS_ACCESS_GROUP_NAME,
     PUBLIC_SUPPORT_ACCOUNT_ROLE_SET,
     PUBLIC_SUPPORT_ACCOUNT_ROLES,
     ROLE_ADMIN,
@@ -39,6 +40,7 @@ from .roles import (
     ROLE_SUPERADMIN,
     ROLE_USER,
     SUPPORT_ACCESS_GROUP_NAME,
+    SUPPORT_PORTAL_ACCESS_ROLES,
 )
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -3378,15 +3380,25 @@ def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[s
     return synchronized_ticket
 
 
-def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | None:
-    normalized_username = sanitize_text(username).lower()
-    if not normalized_username or not settings.LEGACY_DATABASE_URL:
+def get_support_auth_database_url() -> str:
+    return (
+        sanitize_text(getattr(settings, "KBC_AUTH_DATABASE_URL", ""))
+        or sanitize_text(getattr(settings, "LEGACY_DATABASE_URL", ""))
+    )
+
+
+def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dict[str, Any] | None:
+    normalized_value = sanitize_text(value).lower()
+    auth_database_url = get_support_auth_database_url()
+    if not normalized_value or not auth_database_url:
         return None
 
-    with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+    lookup_column = "u.email" if lookup_kind == "email" else "u.username"
+
+    with psycopg.connect(auth_database_url) as source_connection:
         with source_connection.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT
                   u.id,
                   u.username,
@@ -3410,21 +3422,46 @@ def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | Non
                     INNER JOIN auth_group g ON g.id = ug.group_id
                     WHERE ug.user_id = u.id
                       AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_operations_access,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
                   ) AS has_admin_access
                 FROM auth_user u
-                WHERE LOWER(TRIM(u.username)) = %s
+                WHERE LOWER(TRIM({lookup_column})) = %s
                   AND u.is_active = TRUE
                 LIMIT 1
                 """,
-                [SUPPORT_ACCESS_GROUP_NAME, ADMIN_ACCESS_GROUP_NAME, normalized_username],
+                [
+                    SUPPORT_ACCESS_GROUP_NAME,
+                    OPERATIONS_ACCESS_GROUP_NAME,
+                    ADMIN_ACCESS_GROUP_NAME,
+                    normalized_value,
+                ],
             )
             row = cursor.fetchone()
 
     if not row:
         return None
 
-    user_id, username_val, first_name, last_name, returned_email, password_hash, is_staff, is_superuser, is_active, has_support_access, has_admin_access = row
-    if not (bool(has_support_access) or bool(has_admin_access)):
+    (
+        user_id,
+        username_val,
+        first_name,
+        last_name,
+        returned_email,
+        password_hash,
+        is_staff,
+        is_superuser,
+        is_active,
+        has_support_access,
+        has_operations_access,
+        has_admin_access,
+    ) = row
+    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access)):
         return None
 
     full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
@@ -3441,8 +3478,17 @@ def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | Non
         "is_superuser": bool(is_superuser),
         "is_active": bool(is_active),
         "has_support_access": bool(has_support_access),
+        "has_operations_access": bool(has_operations_access),
         "has_admin_access": bool(has_admin_access),
     }
+
+
+def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | None:
+    return _fetch_legacy_support_user_by_lookup(username, lookup_kind="username")
+
+
+def fetch_legacy_support_user_by_email(email: str) -> dict[str, Any] | None:
+    return _fetch_legacy_support_user_by_lookup(email, lookup_kind="email")
 
 
 
@@ -3741,7 +3787,6 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         or sanitize_text(metadata.get("legacy_auth_email"))
         or None
     )
-    manually_added_agent = normalize_bool(metadata.get("manually_added_agent"))
     return {
         "id": agent_id,
         "username": row["username"],
@@ -3752,10 +3797,9 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         "isActive": is_active,
         "sessionActive": session_active,
         "legacySupportAccess": normalize_bool(metadata.get("legacy_support_access")),
+        "legacyOperationsAccess": normalize_bool(metadata.get("legacy_operations_access")),
         "legacyAdminAccess": normalize_bool(metadata.get("legacy_admin_access")),
         "entraDirectoryAdmin": normalize_bool(metadata.get("entra_directory_admin_access")),
-        "manuallyAddedAgent": manually_added_agent,
-        "canRemoveFromAgentManagement": manually_added_agent,
         "consoleStatus": resolve_agent_console_status(
             metadata,
             session_active=session_active,
@@ -5212,11 +5256,19 @@ def fetch_staff_support_account_by_entra_object_id(entra_object_id: str | None) 
 
 
 def legacy_auth_user_has_admin_login_access(legacy_user: dict[str, Any]) -> bool:
-    return normalize_bool(legacy_user.get("has_support_access")) or normalize_bool(legacy_user.get("has_admin_access"))
+    return (
+        normalize_bool(legacy_user.get("has_support_access"))
+        or normalize_bool(legacy_user.get("has_operations_access"))
+        or normalize_bool(legacy_user.get("has_admin_access"))
+    )
 
 
 def build_support_staff_role_from_legacy_auth_user(legacy_user: dict[str, Any]) -> str:
-    return ROLE_SUPERADMIN if normalize_bool(legacy_user.get("is_superuser")) else ROLE_ADMIN
+    if normalize_bool(legacy_user.get("is_superuser")):
+        return ROLE_SUPERADMIN
+    if normalize_bool(legacy_user.get("has_admin_access")):
+        return ROLE_ADMIN
+    return ROLE_AGENT
 
 
 def build_support_staff_username_candidate(legacy_user: dict[str, Any]) -> str:
@@ -5279,6 +5331,7 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
         "legacy_auth_synced_at": datetime.now(timezone.utc).isoformat(),
         "legacy_auth_email": normalized_email,
         "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
+        "legacy_operations_access": normalize_bool(legacy_user.get("has_operations_access")),
         "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
     }
 
@@ -5750,11 +5803,12 @@ def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enable
     normalized_user_id = int(legacy_auth_user_id or 0)
     if normalized_user_id <= 0:
         raise ApiError(400, "A linked KBC auth user is required.")
-    if not settings.LEGACY_DATABASE_URL:
+    auth_database_url = get_support_auth_database_url()
+    if not auth_database_url:
         raise ApiError(503, "KBC auth database is not configured.")
 
     try:
-        with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+        with psycopg.connect(auth_database_url) as source_connection:
             with source_connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT id FROM auth_user WHERE id = %s AND is_active = TRUE LIMIT 1",
@@ -6815,8 +6869,8 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not username or not password:
         raise ApiError(400, "Username and password are required.")
 
-    # Try manually added agent first (by username or email)
-    manually_added_agent = (
+    # Support-account password login is optional; KBC auth remains the fallback.
+    support_access_agent = (
         fetch_agent_account_by_username(username, active_only=True)
         or run_query_one(
             """
@@ -6824,29 +6878,33 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
             FROM support_accounts
             WHERE LOWER(TRIM(email)) = %s
               AND account_scope = %s
-              AND (metadata->>'manually_added_agent')::boolean = TRUE
+              AND (metadata->>'legacy_support_access')::boolean = TRUE
               AND is_active = TRUE
             LIMIT 1
             """,
             [normalize_email(username), ACCOUNT_SCOPE_STAFF],
         )
     )
-    if manually_added_agent and normalize_bool(
-        normalize_json_object(manually_added_agent.get("metadata")).get("manually_added_agent")
+    if support_access_agent and normalize_bool(
+        normalize_json_object(support_access_agent.get("metadata")).get("legacy_support_access")
     ):
-        agent_metadata = normalize_json_object(manually_added_agent.get("metadata"))
-        if not get_agent_password_hash(agent_metadata):
+        agent_metadata = normalize_json_object(support_access_agent.get("metadata"))
+        if get_agent_password_hash(agent_metadata):
+            if not verify_agent_password(support_access_agent, password):
+                raise ApiError(401, "Invalid username or password.")
+            return {
+                "admin": register_agent_session(
+                    sanitize_text(support_access_agent.get("username")).lower(),
+                    instance_id,
+                    console_status,
+                ),
+                "message": "Login successful.",
+            }
+
+        # Passwordless support accounts should continue through the KBC auth
+        # fallback below or Microsoft sign-in.
+        if not fetch_legacy_support_user_by_username(username):
             raise ApiError(401, "This account does not have a password set. Please sign in with Microsoft.")
-        if not verify_agent_password(manually_added_agent, password):
-            raise ApiError(401, "Invalid username or password.")
-        return {
-            "admin": register_agent_session(
-                sanitize_text(manually_added_agent.get("username")).lower(),
-                instance_id,
-                console_status,
-            ),
-            "message": "Login successful.",
-        }
 
     # Fallback: legacy database login
     legacy_user = fetch_legacy_support_user_by_username(username)
@@ -6858,7 +6916,7 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
         raise ApiError(401, "Invalid username or password.")
 
     if not legacy_auth_user_has_admin_login_access(legacy_user):
-        raise ApiError(403, "This account must have support access or admin access.")
+        raise ApiError(403, "This account must have support, operations, or admin access.")
 
     matched_agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
@@ -7061,27 +7119,19 @@ def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[st
     return list(dict.fromkeys(candidates))
 
 
-def _login_manually_added_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
-    """Login path for agents added via Manage Agents (not Entra directory admins)."""
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT u.id FROM auth_user u
-            INNER JOIN auth_user_groups ug ON ug.user_id = u.id
-            INNER JOIN auth_group g ON g.id = ug.group_id
-            WHERE LOWER(TRIM(u.email)) = %s
-              AND u.is_active = TRUE
-              AND LOWER(TRIM(g.name)) IN (%s, %s)
-            LIMIT 1
-            """,
-            [normalized_email, SUPPORT_ACCESS_GROUP_NAME, ADMIN_ACCESS_GROUP_NAME],
-        )
-        if not cursor.fetchone():
-            raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
-
-    agent = fetch_staff_support_account_by_email(normalized_email)
-    if not agent:
+def _login_support_access_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
+    """Login path for staff who have KBC auth access but no Entra admin role."""
+    candidate_emails = list(dict.fromkeys([normalized_email, *extract_microsoft_login_email_candidates(profile)]))
+    legacy_user = next(
+        (candidate for email in candidate_emails if (candidate := fetch_legacy_support_user_by_email(email))),
+        None,
+    )
+    if not legacy_user:
         raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+    if not legacy_auth_user_has_admin_login_access(legacy_user):
+        raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+
+    agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
     if not normalize_bool(agent.get("is_active")):
         raise ApiError(403, "Your account has been disabled. Please contact an administrator.")
@@ -7172,7 +7222,7 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
         normalized_email = candidate_emails[0] if candidate_emails else ""
         if not normalized_email:
             raise ApiError(403, "Your Microsoft account must provide a valid email address.")
-        matched_agent = _login_manually_added_agent_from_entra(merged_profile, normalized_email)
+        matched_agent = _login_support_access_agent_from_entra(merged_profile, normalized_email)
     else:
         matched_agent = sync_support_staff_account_from_entra_directory_user(merged_profile, roles_payload, support_role)
 
@@ -7191,7 +7241,7 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
 
 
 def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
-    where_clause = "WHERE account_scope = %s AND (metadata->>'manually_added_agent')::boolean = TRUE"
+    where_clause = "WHERE account_scope = %s"
     query_params: list[Any] = [ACCOUNT_SCOPE_STAFF]
     if not include_inactive:
         where_clause += " AND is_active = TRUE"
@@ -7264,7 +7314,13 @@ def search_entra_agents(q: str) -> dict[str, Any]:
     existing_usernames: set[str] = set()
     existing_emails: set[str] = set()
     for account in run_query(
-        "SELECT username, email FROM support_accounts WHERE account_scope = %s AND (metadata->>'manually_added_agent')::boolean = TRUE",
+        """
+        SELECT username, email
+        FROM support_accounts
+        WHERE account_scope = %s
+          AND is_active = TRUE
+          AND (metadata->>'legacy_support_access')::boolean = TRUE
+        """,
         [ACCOUNT_SCOPE_STAFF],
     ):
         if account.get("username"):
@@ -7389,20 +7445,22 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
         raise ApiError(400, "Invalid email address.")
 
     existing = run_query_one(
-        "SELECT id, metadata FROM support_accounts WHERE LOWER(TRIM(email)) = %s AND account_scope = %s LIMIT 1",
+        "SELECT id, role, is_active, metadata FROM support_accounts WHERE LOWER(TRIM(email)) = %s AND account_scope = %s LIMIT 1",
         [email, ACCOUNT_SCOPE_STAFF],
     )
     if existing:
         existing_metadata = normalize_json_object(existing.get("metadata"))
-        if normalize_bool(existing_metadata.get("manually_added_agent")):
+        if normalize_bool(existing_metadata.get("legacy_support_access")) and normalize_bool(existing.get("is_active", True)):
             raise ApiError(409, "This person is already added as an agent.")
-        existing_metadata["manually_added_agent"] = True
         existing_metadata["legacy_support_access"] = True
-        existing_metadata["agent_removed_at"] = ""
+        existing_metadata.pop("manually_added_agent", None)
+        existing_metadata.pop("agent_removed_at", None)
         django_user_id = _ensure_django_support_access(email, display_name or email)
         if django_user_id and not existing_metadata.get("legacy_auth_user_id"):
             existing_metadata["legacy_auth_user_id"] = django_user_id
         persist_agent_metadata(int(existing["id"]), existing_metadata)
+        preserved_role = sanitize_text(existing.get("role")).lower()
+        next_role = preserved_role if preserved_role in {ROLE_ADMIN, ROLE_SUPERADMIN} else ROLE_AGENT
         run_query(
             """
             UPDATE support_accounts
@@ -7412,7 +7470,7 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
                 updated_at = NOW()
             WHERE id = %s AND account_scope = %s
             """,
-            [display_name, ROLE_AGENT, int(existing["id"]), ACCOUNT_SCOPE_STAFF],
+            [display_name, next_role, int(existing["id"]), ACCOUNT_SCOPE_STAFF],
         )
         updated = run_query_one(
             "SELECT id, username, full_name, email, account_scope, role, is_active, metadata FROM support_accounts WHERE id = %s LIMIT 1",
@@ -7450,7 +7508,6 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
                 "entra_user_principal_name": sanitize_text(payload.get("email") or ""),
                 "entra_directory_admin_access": False,
                 "legacy_support_access": True,
-                "manually_added_agent": True,
                 **({"legacy_auth_user_id": django_user_id} if django_user_id else {}),
             }),
         ],
@@ -7504,20 +7561,16 @@ def remove_agent(account_id: int) -> None:
         raise ApiError(404, "Agent not found.")
 
     metadata = normalize_json_object(agent.get("metadata"))
-    if not normalize_bool(metadata.get("manually_added_agent")):
-        raise ApiError(403, "Only manually added agents can be removed from here.")
-
     email = normalize_email(agent.get("email") or "")
-    metadata["manually_added_agent"] = False
     metadata["legacy_support_access"] = False
     metadata["session_active"] = False
     metadata["console_status"] = DEFAULT_AGENT_CONSOLE_STATUS
     metadata["agent_removed_at"] = datetime.now(timezone.utc).isoformat()
+    metadata.pop("manually_added_agent", None)
     run_query(
         """
         UPDATE support_accounts
-        SET is_active = FALSE,
-            metadata = %s::jsonb,
+        SET metadata = %s::jsonb,
             updated_at = NOW()
         WHERE id = %s AND account_scope = %s
         """,
@@ -7731,7 +7784,7 @@ def serialize_admin_notification_log_item(row: dict[str, Any]) -> dict[str, Any]
 
 
 def list_admin_notifications(actor_username: Any, instance_id: Any, *, limit: Any = 25) -> dict[str, Any]:
-    actor = require_agent_session_actor(actor_username, instance_id, allowed_roles=ADMIN_ACCESS_ROLES)
+    actor = require_agent_session_actor(actor_username, instance_id, allowed_roles=SUPPORT_PORTAL_ACCESS_ROLES)
     actor_id = str(int(actor["id"]))
     resolved_limit = max(1, min(parse_int(limit, 25), 50))
     notifications = run_query(

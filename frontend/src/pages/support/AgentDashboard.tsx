@@ -48,7 +48,6 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -97,9 +96,9 @@ interface AdminAgent {
   consoleStatus?: string;
   selectedConsoleStatus?: string;
   legacySupportAccess?: boolean;
+  legacyOperationsAccess?: boolean;
   legacyAdminAccess?: boolean;
-  manuallyAddedAgent?: boolean;
-  canRemoveFromAgentManagement?: boolean;
+  entraDirectoryAdmin?: boolean;
 }
 
 interface PendingTransferRequest {
@@ -459,6 +458,7 @@ const documentationStatusReasons = {
   Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed via Agent"],
   Pending: [defaultPendingDocumentationStatusReason, "Awaiting support meeting", "Escalation", "Quick Ticket"],
 } as const;
+const adminDashboardAccessRoles = new Set<string>(["agent", "admin", "superadmin"]);
 const userManagementRoles = new Set<string>(["admin", "superadmin"]);
 type AdminConsoleStatus = (typeof adminConsoleStatuses)[number];
 type AdminSelectableConsoleStatus = (typeof adminSelectableConsoleStatuses)[number];
@@ -548,15 +548,12 @@ const AgentDashboard = () => {
   const [agentSearchResults, setAgentSearchResults] = useState<EntraSearchResult[]>([]);
   const [isSearchingAgents, setIsSearchingAgents] = useState(false);
   const [isAddingAgentId, setIsAddingAgentId] = useState<string | null>(null);
-  const [removingAgentIds, setRemovingAgentIds] = useState<Set<number>>(new Set());
-  const [confirmRemoveAgent, setConfirmRemoveAgent] = useState<AdminAgent | null>(null);
   const [error, setError] = useState("");
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
   const [consoleTimerNow, setConsoleTimerNow] = useState(() => Date.now());
   const [notificationLog, setNotificationLog] = useState<AdminNotificationLogItem[]>([]);
   const seenTransferNotificationKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedTransferNotificationsRef = useRef(false);
-  const pendingRemovedAgentIdsRef = useRef<Set<number>>(new Set());
   const canManageUsers = userManagementRoles.has((session?.role || "").toLowerCase())
     && !!(session?.legacyAdminAccess || session?.entraDirectoryAdmin);
   const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
@@ -605,7 +602,11 @@ const AgentDashboard = () => {
     : activeStandardDocumentationBaseline;
   const activeStandardDocumentationDirty = Boolean(activeStandardDocumentationBaseline && activeStandardDocumentationDraft)
     && JSON.stringify(activeStandardDocumentationDraft) !== JSON.stringify(activeStandardDocumentationBaseline);
-  const activeAgents = agents.filter((agent) => agent.isActive !== false && isStaffSupportAccount(agent) && agent.legacySupportAccess === true);
+  const activeAgents = agents.filter((agent) => (
+    agent.isActive !== false
+    && isStaffSupportAccount(agent)
+    && hasSupportDashboardAccess(agent)
+  ));
   const signedInAgent = agents.find((agent) => (
     (session?.id && agent.id === session.id)
     || (session?.username && agent.username === session.username)
@@ -668,7 +669,7 @@ const AgentDashboard = () => {
       }
 
       if (response.status === 403) {
-        redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has admin access.", "/support");
+        redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has support dashboard access.", "/support");
         return null;
       }
 
@@ -685,8 +686,8 @@ const AgentDashboard = () => {
       }
 
       const normalizedRole = (admin.role || "").trim().toLowerCase();
-      if (normalizedRole !== "admin" && normalizedRole !== "superadmin") {
-        redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has admin access.", "/support");
+      if (!adminDashboardAccessRoles.has(normalizedRole)) {
+        redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has support dashboard access.", "/support");
         return null;
       }
 
@@ -1864,15 +1865,6 @@ const AgentDashboard = () => {
     }
   }
 
-  function filterPendingRemovedAgents(nextAgents: AdminAgent[]) {
-    const pendingRemovedAgentIds = pendingRemovedAgentIdsRef.current;
-    if (pendingRemovedAgentIds.size === 0) {
-      return nextAgents;
-    }
-
-    return nextAgents.filter((agent) => !pendingRemovedAgentIds.has(agent.id));
-  }
-
   async function loadDashboard() {
     setIsLoading(true);
     setError("");
@@ -1895,8 +1887,7 @@ const AgentDashboard = () => {
         return;
       }
       setTickets(tickets);
-      const visibleAgents = filterPendingRemovedAgents(nextAgents);
-      setAgents(visibleAgents);
+      setAgents(nextAgents);
       setNotificationLog(nextNotificationLog);
       syncConsoleStatusFromAgents(visibleAgents);
       setChatbotWorkflowConfigured(
@@ -1967,8 +1958,7 @@ const AgentDashboard = () => {
       if (!isCurrentDashboardSession(requestSession)) {
         return;
       }
-      const visibleAgents = filterPendingRemovedAgents(nextAgents);
-      setAgents(visibleAgents);
+      setAgents(nextAgents);
       syncConsoleStatusFromAgents(visibleAgents);
     } catch (fetchError) {
       if (!silent) {
@@ -2104,7 +2094,6 @@ const AgentDashboard = () => {
       }
       const newAgent = payload?.agent;
       if (newAgent) {
-        pendingRemovedAgentIdsRef.current.delete(newAgent.id);
         setAgents((prev) => [...prev, newAgent]);
       }
       setAgentSearchResults((prev) => prev.map((r) => r.entraId === result.entraId ? { ...r, alreadyAdded: true } : r));
@@ -2113,42 +2102,6 @@ const AgentDashboard = () => {
       toast.error("Could not add agent.");
     } finally {
       setIsAddingAgentId(null);
-    }
-  }
-
-  async function removeAgentById(agent: AdminAgent) {
-    if (agent.canRemoveFromAgentManagement !== true) {
-      toast.info("This agent is managed from KBC permissions. Turn ticket access off or update KBC auth.");
-      return;
-    }
-
-    const previousAgents = agents;
-    pendingRemovedAgentIdsRef.current.add(agent.id);
-    setAgents((prev) => prev.filter((a) => a.id !== agent.id));
-    setRemovingAgentIds((prev) => new Set(prev).add(agent.id));
-    try {
-      const response = await fetch(`/api/admin/accounts/${agent.id}`, {
-        method: "DELETE",
-        headers: buildAdminJsonHeaders(),
-      });
-      const payload = (await response.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
-      if (!response.ok) {
-        pendingRemovedAgentIdsRef.current.delete(agent.id);
-        setAgents(previousAgents);
-        toast.error(payload?.message || "Could not remove agent.");
-        return;
-      }
-      toast.success(`${agent.fullName || agent.username} removed.`);
-    } catch {
-      pendingRemovedAgentIdsRef.current.delete(agent.id);
-      setAgents(previousAgents);
-      toast.error("Could not remove agent.");
-    } finally {
-      setRemovingAgentIds((prev) => {
-        const next = new Set(prev);
-        next.delete(agent.id);
-        return next;
-      });
     }
   }
 
@@ -4278,9 +4231,9 @@ const AgentDashboard = () => {
                       })
                       .map((agent) => {
                         const isToggling = togglingAccessIds.has(agent.id);
-                        const hasAccess = agent.legacySupportAccess === true;
+                        const hasSupportAccess = agent.legacySupportAccess === true;
+                        const hasOperationsAccess = agent.legacyOperationsAccess === true;
                         const isCurrentUser = session?.id === agent.id;
-                        const canRemoveAgent = agent.canRemoveFromAgentManagement === true && !isCurrentUser;
                         return (
                           <div key={agent.id} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
                             <div className="flex min-w-0 items-center gap-3">
@@ -4300,36 +4253,21 @@ const AgentDashboard = () => {
                             <div className="flex shrink-0 items-center gap-3">
                               <span className={cn(
                                 "hidden text-xs font-medium sm:block",
-                                hasAccess ? "text-emerald-600" : "text-muted-foreground",
+                                hasSupportAccess || hasOperationsAccess ? "text-emerald-600" : "text-muted-foreground",
                               )}>
-                                {hasAccess ? "Receives tickets" : "No ticket access"}
+                                {hasSupportAccess ? "Receives tickets" : hasOperationsAccess ? "Operations access" : "No ticket access"}
                               </span>
                               <Switch
-                                checked={hasAccess}
+                                checked={hasSupportAccess}
                                 disabled={isToggling}
                                 onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
                                 aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
                               />
-                              {canRemoveAgent ? (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  disabled={removingAgentIds.has(agent.id)}
-                                  onClick={() => setConfirmRemoveAgent(agent)}
-                                  className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive"
-                                  aria-label={`Remove ${agent.fullName || agent.username}`}
-                                >
-                                  {removingAgentIds.has(agent.id) ? (
-                                    <LoaderCircle className="h-4 w-4 animate-spin" />
-                                  ) : (
-                                    <X className="h-4 w-4" />
-                                  )}
-                                </Button>
-                              ) : (
+                              {isCurrentUser ? (
                                 <span className="hidden w-8 text-center text-[10px] font-medium uppercase tracking-wide text-muted-foreground sm:inline">
-                                  KBC
+                                  You
                                 </span>
-                              )}
+                              ) : null}
                             </div>
                           </div>
                         );
@@ -4404,33 +4342,6 @@ const AgentDashboard = () => {
               </SheetContent>
             </Sheet>
 
-            <Dialog open={!!confirmRemoveAgent} onOpenChange={(open) => { if (!open) setConfirmRemoveAgent(null); }}>
-              <DialogContent className="max-w-sm">
-                <DialogHeader>
-                  <DialogTitle>Remove Agent</DialogTitle>
-                  <DialogDescription>
-                    Are you sure you want to remove <span className="font-medium text-foreground">{confirmRemoveAgent?.fullName || confirmRemoveAgent?.username}</span> as an agent? They will lose support portal access.
-                  </DialogDescription>
-                </DialogHeader>
-                <DialogFooter className="flex-col gap-2 sm:flex-row">
-                  <Button variant="outline" className="w-full" onClick={() => setConfirmRemoveAgent(null)}>
-                    Cancel
-                  </Button>
-                  <Button
-                    variant="destructive"
-                    className="w-full"
-                    disabled={confirmRemoveAgent ? removingAgentIds.has(confirmRemoveAgent.id) : false}
-                    onClick={() => {
-                      if (!confirmRemoveAgent) return;
-                      void removeAgentById(confirmRemoveAgent);
-                      setConfirmRemoveAgent(null);
-                    }}
-                  >
-                    Remove
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
           </TabsContent>
 
           <TabsContent value="console" className="mt-0 min-h-0 flex-1">
@@ -9397,6 +9308,17 @@ function getDisplayedTicketStatus(source: {
 function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">) {
   const normalizedScope = (agent.accountScope || "").trim().toLowerCase();
   return normalizedScope === "staff";
+}
+
+function hasSupportDashboardAccess(agent: Pick<AdminAgent, "role" | "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess" | "entraDirectoryAdmin">) {
+  const normalizedRole = (agent.role || "").trim().toLowerCase();
+  return Boolean(
+    agent.legacySupportAccess
+    || agent.legacyOperationsAccess
+    || agent.legacyAdminAccess
+    || agent.entraDirectoryAdmin
+    || adminDashboardAccessRoles.has(normalizedRole),
+  );
 }
 
 function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicketFilter) {

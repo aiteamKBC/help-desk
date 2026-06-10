@@ -8,6 +8,8 @@ export interface AdminSession {
   sessionActive?: boolean;
   consoleStatus?: string;
   selectedConsoleStatus?: string;
+  legacySupportAccess?: boolean;
+  legacyOperationsAccess?: boolean;
   legacyAdminAccess?: boolean;
   entraDirectoryAdmin?: boolean;
 }

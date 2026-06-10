@@ -5,7 +5,7 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 from django.contrib.auth.models import Group
 
-from .roles import ADMIN_ACCESS_GROUP_NAME, SUPPORT_ACCESS_GROUP_NAME
+from .roles import ADMIN_ACCESS_GROUP_NAME, OPERATIONS_ACCESS_GROUP_NAME, SUPPORT_ACCESS_GROUP_NAME
 
 User = get_user_model()
 
@@ -20,6 +20,10 @@ def user_has_support_access(user) -> bool:
 
 def user_has_admin_access(user) -> bool:
     return user_has_group_access(user, ADMIN_ACCESS_GROUP_NAME)
+
+
+def user_has_operations_access(user) -> bool:
+    return user_has_group_access(user, OPERATIONS_ACCESS_GROUP_NAME)
 
 
 def sync_access_group_membership(user, group_name: str, enabled: bool) -> None:
@@ -44,6 +48,10 @@ def sync_admin_access_group_membership(user, enabled: bool) -> None:
     sync_access_group_membership(user, ADMIN_ACCESS_GROUP_NAME, enabled)
 
 
+def sync_operations_access_group_membership(user, enabled: bool) -> None:
+    sync_access_group_membership(user, OPERATIONS_ACCESS_GROUP_NAME, enabled)
+
+
 class SupportAccessFormMixin:
     support_access = forms.BooleanField(
         required=False,
@@ -55,11 +63,17 @@ class SupportAccessFormMixin:
         label="Admin access",
         help_text="Allow this support account to use the admin dashboard login.",
     )
+    operations_access = forms.BooleanField(
+        required=False,
+        label="Operations access",
+        help_text="Allow this operations account to sign in as a support agent.",
+    )
 
     def _initialize_support_access_field(self) -> None:
         instance = getattr(self, "instance", None)
         self.fields["support_access"].initial = user_has_support_access(instance) if instance is not None else False
         self.fields["admin_access"].initial = user_has_admin_access(instance) if instance is not None else False
+        self.fields["operations_access"].initial = user_has_operations_access(instance) if instance is not None else False
 
 
 class SupportAccessUserChangeForm(SupportAccessFormMixin, UserChangeForm):
@@ -89,8 +103,8 @@ class SupportAccessUserAdmin(DjangoUserAdmin):
         (
             "Support access",
             {
-                "fields": ("support_access", "admin_access"),
-                "description": "Grant both support access and admin access to allow this user to sign in to the support dashboard.",
+                "fields": ("support_access", "operations_access", "admin_access"),
+                "description": "Grant support or operations access for agent sign-in. Grant admin access for dashboard administration.",
             },
         ),
     )
@@ -99,11 +113,15 @@ class SupportAccessUserAdmin(DjangoUserAdmin):
             "Support access",
             {
                 "classes": ("wide",),
-                "fields": ("support_access", "admin_access"),
+                "fields": ("support_access", "operations_access", "admin_access"),
             },
         ),
     )
-    list_display = DjangoUserAdmin.list_display + ("support_access_enabled", "admin_access_enabled")
+    list_display = DjangoUserAdmin.list_display + (
+        "support_access_enabled",
+        "operations_access_enabled",
+        "admin_access_enabled",
+    )
 
     @admin.display(boolean=True, description="Support")
     def support_access_enabled(self, obj):
@@ -113,9 +131,14 @@ class SupportAccessUserAdmin(DjangoUserAdmin):
     def admin_access_enabled(self, obj):
         return user_has_admin_access(obj)
 
+    @admin.display(boolean=True, description="Operations")
+    def operations_access_enabled(self, obj):
+        return user_has_operations_access(obj)
+
     def save_related(self, request, form, formsets, change):
         super().save_related(request, form, formsets, change)
         sync_support_access_group_membership(form.instance, bool(form.cleaned_data.get("support_access")))
+        sync_operations_access_group_membership(form.instance, bool(form.cleaned_data.get("operations_access")))
         sync_admin_access_group_membership(form.instance, bool(form.cleaned_data.get("admin_access")))
 
 

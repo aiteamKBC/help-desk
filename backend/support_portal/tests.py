@@ -990,6 +990,8 @@ class AdminSessionViewTests(SimpleTestCase):
                     "sessionActive": False,
                     "consoleStatus": "Off",
                     "selectedConsoleStatus": "Off",
+                    "legacySupportAccess": False,
+                    "legacyOperationsAccess": False,
                     "legacyAdminAccess": False,
                     "entraDirectoryAdmin": False,
                 }
@@ -1054,6 +1056,8 @@ class AdminSessionViewTests(SimpleTestCase):
                     "sessionActive": False,
                     "consoleStatus": "Off",
                     "selectedConsoleStatus": "Off",
+                    "legacySupportAccess": False,
+                    "legacyOperationsAccess": False,
                     "legacyAdminAccess": False,
                     "entraDirectoryAdmin": False,
                 },
@@ -1069,6 +1073,90 @@ class AdminSessionViewTests(SimpleTestCase):
 
     def test_admin_tickets_requires_server_session(self):
         request = self.factory.get("/api/admin/tickets")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "agent",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 7,
+                    "username": "admin1",
+                    "full_name": "Admin One",
+                    "email": None,
+                    "role": "agent",
+                },
+            ) as require_agent_session_actor,
+            patch.object(views, "list_admin_tickets", return_value={"tickets": []}) as list_admin_tickets,
+        ):
+            response = views.admin_tickets(request)
+
+        self.assertEqual(response.status_code, 200)
+        require_agent_session_actor.assert_called_once_with(
+            "admin1",
+            "instance-1",
+            allowed_roles=views.SUPPORT_PORTAL_ACCESS_ROLES,
+        )
+        list_admin_tickets.assert_called_once_with()
+
+    def test_admin_accounts_get_allows_agent_session(self):
+        request = self.factory.get("/api/admin/accounts")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "agent",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 7,
+                    "username": "admin1",
+                    "full_name": "Admin One",
+                    "email": None,
+                    "role": "agent",
+                },
+            ) as require_agent_session_actor,
+            patch.object(views, "list_agents", return_value={"accounts": []}) as list_agents,
+        ):
+            response = views.admin_accounts(request)
+
+        self.assertEqual(response.status_code, 200)
+        require_agent_session_actor.assert_called_once_with(
+            "admin1",
+            "instance-1",
+            allowed_roles=views.SUPPORT_PORTAL_ACCESS_ROLES,
+        )
+        list_agents.assert_called_once_with(include_inactive=True)
+
+    def test_admin_accounts_post_still_requires_admin_access_role(self):
+        request = self.factory.post(
+            "/api/admin/accounts",
+            data=json.dumps({"email": "agent@example.com"}),
+            content_type="application/json",
+        )
         self.attach_session(
             request,
             {
@@ -1095,17 +1183,17 @@ class AdminSessionViewTests(SimpleTestCase):
                     "role": "admin",
                 },
             ) as require_agent_session_actor,
-            patch.object(views, "list_admin_tickets", return_value={"tickets": []}) as list_admin_tickets,
+            patch.object(views, "add_entra_agent", return_value={"agent": {"id": 8}}) as add_entra_agent,
         ):
-            response = views.admin_tickets(request)
+            response = views.admin_accounts(request)
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 201)
         require_agent_session_actor.assert_called_once_with(
             "admin1",
             "instance-1",
             allowed_roles=views.ADMIN_ACCESS_ROLES,
         )
-        list_admin_tickets.assert_called_once_with()
+        add_entra_agent.assert_called_once_with({"email": "agent@example.com"})
 
     def test_admin_ticket_detail_uses_server_session_actor_for_updates(self):
         request = self.factory.patch(
@@ -2491,7 +2579,7 @@ class AdminLoginTests(SimpleTestCase):
             "username": "omar1",
             "full_name": "Omar One",
             "email": "omar1@kentbusinesscollege.com",
-            "role": "admin",
+            "role": "agent",
             "metadata": {},
         }
         registered_session = {
@@ -2499,12 +2587,14 @@ class AdminLoginTests(SimpleTestCase):
             "username": "omar1",
             "fullName": "Omar One",
             "email": "omar1@kentbusinesscollege.com",
-            "role": "admin",
+            "role": "agent",
             "sessionActive": True,
             "consoleStatus": "Off",
         }
 
         with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=None),
+            patch.object(services, "run_query_one", return_value=None),
             patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user) as fetch_legacy_support_user_by_username,
             patch.object(services, "sync_support_staff_account_from_legacy_auth_user", return_value=synced_agent) as sync_support_staff_account_from_legacy_auth_user,
             patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
@@ -2553,6 +2643,8 @@ class AdminLoginTests(SimpleTestCase):
         }
 
         with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=None),
+            patch.object(services, "run_query_one", return_value=None),
             patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user) as fetch_legacy_support_user_by_username,
             patch.object(services, "sync_support_staff_account_from_legacy_auth_user", return_value=synced_agent) as sync_support_staff_account_from_legacy_auth_user,
             patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
@@ -2566,6 +2658,57 @@ class AdminLoginTests(SimpleTestCase):
         fetch_legacy_support_user_by_username.assert_called_once_with("ayman")
         sync_support_staff_account_from_legacy_auth_user.assert_called_once_with(legacy_user)
         register_agent_session.assert_called_once_with("ayman", "instance-2", "Off")
+
+    def test_admin_login_accepts_kbc_auth_password_for_operations_access_user(self):
+        legacy_user = {
+            "id": 9,
+            "username": "operations1",
+            "first_name": "Operations",
+            "last_name": "Agent",
+            "full_name": "Operations Agent",
+            "email": "operations.agent@kentbusinesscollege.com",
+            "password_hash": make_password("ops-pass"),
+            "is_staff": False,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": False,
+            "has_operations_access": True,
+            "has_admin_access": False,
+        }
+        synced_agent = {
+            "id": 9,
+            "username": "operations1",
+            "full_name": "Operations Agent",
+            "email": "operations.agent@kentbusinesscollege.com",
+            "role": "agent",
+            "metadata": {},
+        }
+        registered_session = {
+            "id": 9,
+            "username": "operations1",
+            "fullName": "Operations Agent",
+            "email": "operations.agent@kentbusinesscollege.com",
+            "role": "agent",
+            "sessionActive": True,
+            "consoleStatus": "Off",
+        }
+
+        with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=None),
+            patch.object(services, "run_query_one", return_value=None),
+            patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user) as fetch_legacy_support_user_by_username,
+            patch.object(services, "sync_support_staff_account_from_legacy_auth_user", return_value=synced_agent) as sync_support_staff_account_from_legacy_auth_user,
+            patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
+        ):
+            response = services.get_admin_login_response(
+                {"username": "Operations1", "password": "ops-pass", "instanceId": "instance-ops"}
+            )
+
+        self.assertEqual(response["admin"], registered_session)
+        self.assertEqual(response["message"], "Login successful.")
+        fetch_legacy_support_user_by_username.assert_called_once_with("operations1")
+        sync_support_staff_account_from_legacy_auth_user.assert_called_once_with(legacy_user)
+        register_agent_session.assert_called_once_with("operations1", "instance-ops", "Off")
 
     def test_admin_login_rejects_kbc_auth_user_without_support_or_admin_access_after_password_check(self):
         legacy_user = {
@@ -2584,6 +2727,8 @@ class AdminLoginTests(SimpleTestCase):
         }
 
         with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=None),
+            patch.object(services, "run_query_one", return_value=None),
             patch.object(services, "fetch_legacy_support_user_by_username", return_value=legacy_user),
             patch.object(services, "sync_support_staff_account_from_legacy_auth_user") as sync_support_staff_account_from_legacy_auth_user,
             patch.object(services, "register_agent_session") as register_agent_session,
@@ -2594,12 +2739,16 @@ class AdminLoginTests(SimpleTestCase):
                 )
 
         self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "This account must have support access or admin access.")
+        self.assertEqual(error_context.exception.message, "This account must have support, operations, or admin access.")
         sync_support_staff_account_from_legacy_auth_user.assert_not_called()
         register_agent_session.assert_not_called()
 
     def test_admin_login_rejects_kbc_auth_user_without_support_or_admin_access(self):
-        with patch.object(services, "fetch_legacy_support_user_by_username", return_value=None):
+        with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=None),
+            patch.object(services, "run_query_one", return_value=None),
+            patch.object(services, "fetch_legacy_support_user_by_username", return_value=None),
+        ):
             with self.assertRaises(services.ApiError) as error_context:
                 services.get_admin_login_response({"username": "coach1", "password": "coach-pass", "instanceId": "instance-1"})
 
@@ -2761,6 +2910,11 @@ class AdminLoginTests(SimpleTestCase):
                 "fetch_microsoft_graph_directory_roles",
                 return_value=(True, True, 200, []),
             ),
+            patch.object(
+                services,
+                "_login_support_access_agent_from_entra",
+                side_effect=services.ApiError(403, "Your Microsoft account does not have access to the support portal."),
+            ),
         ):
             with self.assertRaises(services.ApiError) as error_context:
                 services.get_admin_microsoft_login_response(
@@ -2773,9 +2927,126 @@ class AdminLoginTests(SimpleTestCase):
                 )
 
         self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "Your Microsoft account does not have Entra admin center access.")
+        self.assertEqual(error_context.exception.message, "Your Microsoft account does not have access to the support portal.")
+
+    def test_admin_microsoft_login_syncs_operations_access_user_without_entra_admin_role(self):
+        id_token = build_unverified_jwt(
+            {
+                "nonce": "nonce-ops",
+                "preferred_username": "holom.mark@kentbusinesscollege.com",
+            }
+        )
+        legacy_user = {
+            "id": 19,
+            "username": "holom.mark",
+            "first_name": "Holom",
+            "last_name": "Mark",
+            "full_name": "Holom Mark",
+            "email": "holom.mark@kentbusinesscollege.com",
+            "password_hash": "",
+            "is_staff": False,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": False,
+            "has_operations_access": True,
+            "has_admin_access": False,
+        }
+        synced_agent = {
+            "id": 19,
+            "username": "holom.mark",
+            "full_name": "Holom Mark",
+            "email": "holom.mark@kentbusinesscollege.com",
+            "role": "agent",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_operations_access": True},
+        }
+        refreshed_agent = {
+            **synced_agent,
+            "metadata": {
+                "legacy_operations_access": True,
+                "entra_object_id": "entra-object-ops",
+                "entra_email": "holom.mark@kentbusinesscollege.com",
+            },
+        }
+        registered_session = {
+            "id": 19,
+            "username": "holom.mark",
+            "fullName": "Holom Mark",
+            "email": "holom.mark@kentbusinesscollege.com",
+            "role": "agent",
+            "sessionActive": True,
+            "consoleStatus": "Off",
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.settings, "AZURE_LOGIN_TENANT_ID", "tenant-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_ID", "client-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_SECRET", "secret-123"),
+            patch.object(
+                services,
+                "post_form_request",
+                return_value=(True, True, 200, {"access_token": "access-token-ops", "id_token": id_token}),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_me",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    {
+                        "id": "entra-object-ops",
+                        "mail": "holom.mark@kentbusinesscollege.com",
+                        "userPrincipalName": "holom.mark@kentbusinesscollege.com",
+                        "displayName": "Holom Mark",
+                    },
+                ),
+            ),
+            patch.object(services, "fetch_microsoft_graph_directory_roles", return_value=(True, True, 200, [])),
+            patch.object(services, "fetch_legacy_support_user_by_email", return_value=legacy_user) as fetch_legacy_support_user_by_email,
+            patch.object(services, "sync_support_staff_account_from_legacy_auth_user", return_value=synced_agent) as sync_support_staff_account_from_legacy_auth_user,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "fetch_agent_account_by_id", return_value=refreshed_agent),
+            patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
+        ):
+            response = services.get_admin_microsoft_login_response(
+                {
+                    "code": "auth-code-ops",
+                    "redirectUri": "http://127.0.0.1:3000/api/admin/microsoft/callback",
+                    "expectedNonce": "nonce-ops",
+                    "instanceId": "instance-ops",
+                }
+            )
+
+        self.assertEqual(response["admin"], registered_session)
+        fetch_legacy_support_user_by_email.assert_called_with("holom.mark@kentbusinesscollege.com")
+        sync_support_staff_account_from_legacy_auth_user.assert_called_once_with(legacy_user)
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertEqual(saved_metadata["entra_object_id"], "entra-object-ops")
+        self.assertTrue(saved_metadata["legacy_operations_access"])
+        register_agent_session.assert_called_once_with("holom.mark", "instance-ops", "Off")
 
     def test_build_support_staff_role_from_legacy_auth_user_uses_django_superuser_for_superadmin(self):
+        self.assertEqual(
+            services.build_support_staff_role_from_legacy_auth_user(
+                {"has_support_access": True, "has_admin_access": False, "is_superuser": False}
+            ),
+            "agent",
+        )
+        self.assertEqual(
+            services.build_support_staff_role_from_legacy_auth_user(
+                {"has_support_access": False, "has_operations_access": True, "has_admin_access": False, "is_superuser": False}
+            ),
+            "agent",
+        )
         self.assertEqual(
             services.build_support_staff_role_from_legacy_auth_user(
                 {"has_support_access": True, "has_admin_access": True, "is_superuser": False}
@@ -2820,12 +3091,11 @@ class SupportDirectoryTests(SimpleTestCase):
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(response["legacySupportAccess"])
 
-    def test_remove_agent_soft_removes_manually_added_agent(self):
+    def test_remove_agent_turns_off_support_access(self):
         agent = {
             "id": 31,
             "email": "omar.badr@kentbusinesscollege.com",
             "metadata": {
-                "manually_added_agent": True,
                 "legacy_support_access": True,
                 "session_active": True,
                 "console_status": "Available",
@@ -2844,7 +3114,7 @@ class SupportDirectoryTests(SimpleTestCase):
         self.assertIn("UPDATE support_accounts", update_sql)
         self.assertNotIn("DELETE FROM support_accounts", update_sql)
         saved_metadata = json.loads(update_params[0])
-        self.assertFalse(saved_metadata["manually_added_agent"])
+        self.assertNotIn("manually_added_agent", saved_metadata)
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(saved_metadata["session_active"])
         self.assertEqual(saved_metadata["console_status"], "Off")
@@ -2852,43 +3122,6 @@ class SupportDirectoryTests(SimpleTestCase):
 
     def test_list_agents_returns_only_current_support_access_staff_profiles(self):
         with (
-            patch.object(
-                services,
-                "fetch_legacy_support_directory_users",
-                return_value=[
-                    {
-                        "id": 77,
-                        "username": "omar1",
-                        "first_name": "Omar",
-                        "last_name": "One",
-                        "full_name": "Omar One",
-                        "email": "omar1@kentbusinesscollege.com",
-                        "is_staff": False,
-                        "is_superuser": False,
-                        "is_active": True,
-                        "has_support_access": True,
-                        "has_admin_access": False,
-                    }
-                ],
-            ),
-            patch.object(
-                services,
-                "sync_support_staff_account_from_legacy_auth_user",
-                return_value={
-                    "id": 23,
-                    "username": "omar1",
-                    "full_name": "Omar One",
-                    "email": "omar1@kentbusinesscollege.com",
-                    "account_scope": "staff",
-                    "role": "admin",
-                    "is_active": True,
-                    "metadata": {
-                        "legacy_auth_user_id": 77,
-                        "legacy_support_access": True,
-                        "legacy_admin_access": False,
-                    },
-                },
-            ),
             patch.object(
                 services,
                 "run_query",
@@ -2906,30 +3139,6 @@ class SupportDirectoryTests(SimpleTestCase):
                             "legacy_support_access": True,
                             "legacy_admin_access": False,
                         },
-                    },
-                    {
-                        "id": 24,
-                        "username": "legacyadmin",
-                        "full_name": "Legacy Admin",
-                        "email": "legacyadmin@example.com",
-                        "account_scope": "staff",
-                        "role": "admin",
-                        "is_active": True,
-                        "metadata": {
-                            "legacy_auth_user_id": 88,
-                            "legacy_support_access": False,
-                            "legacy_admin_access": True,
-                        },
-                    },
-                    {
-                        "id": 25,
-                        "username": "student1",
-                        "full_name": "Student One",
-                        "email": "student1@example.com",
-                        "account_scope": "requester",
-                        "role": "user",
-                        "is_active": True,
-                        "metadata": {},
                     },
                 ],
             ),
@@ -4956,7 +5165,7 @@ class AdminNotificationLogTests(SimpleTestCase):
         ):
             response = services.list_admin_notifications("ahmedhamamo", "instance-1", limit="12")
 
-        self.assertEqual(run_query.call_args.args[1], ["9", "9", "9", "9", "9", "9", 12])
+        self.assertEqual(run_query.call_args.args[1], ["9", "9", "9", "9", "9", "9", "9", 12])
         self.assertEqual(len(response["notifications"]), 1)
         self.assertEqual(
             response["notifications"][0],

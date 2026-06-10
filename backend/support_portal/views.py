@@ -16,7 +16,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods
 
 from .contracts import LEGACY_ENDPOINTS
-from .roles import ADMIN_ACCESS_ROLES
+from .roles import ADMIN_ACCESS_ROLES, SUPPORT_PORTAL_ACCESS_ROLES
 from .services import (
     acknowledge_ticket_escalation_closure,
     acknowledge_ticket_escalation_notification,
@@ -279,7 +279,7 @@ def clear_request_admin_session(request) -> None:
     request.session.flush()
 
 
-def require_request_admin_session(request, *, allowed_roles: set[str] | None = ADMIN_ACCESS_ROLES) -> tuple[dict, dict]:
+def require_request_admin_session(request, *, allowed_roles: set[str] | None = SUPPORT_PORTAL_ACCESS_ROLES) -> tuple[dict, dict]:
     session_payload = request.session.get(ADMIN_SESSION_KEY)
     if not isinstance(session_payload, dict):
         raise ApiError(401, "Admin session is required.")
@@ -307,7 +307,7 @@ def require_request_admin_session(request, *, allowed_roles: set[str] | None = A
     return actor, request.session[ADMIN_SESSION_KEY]
 
 
-def build_session_bound_admin_payload(request, *, allowed_roles: set[str] | None = ADMIN_ACCESS_ROLES) -> dict:
+def build_session_bound_admin_payload(request, *, allowed_roles: set[str] | None = SUPPORT_PORTAL_ACCESS_ROLES) -> dict:
     actor, session_payload = require_request_admin_session(request, allowed_roles=allowed_roles)
     payload = parse_json_body(request)
     payload["actorUsername"] = actor["username"]
@@ -330,6 +330,8 @@ def build_admin_session_response(actor: dict, session_payload: dict) -> dict:
         "sessionActive": serialized_actor.get("sessionActive"),
         "consoleStatus": serialized_actor.get("consoleStatus"),
         "selectedConsoleStatus": serialized_actor.get("selectedConsoleStatus"),
+        "legacySupportAccess": bool(serialized_actor.get("legacySupportAccess")),
+        "legacyOperationsAccess": bool(serialized_actor.get("legacyOperationsAccess")),
         "legacyAdminAccess": bool(serialized_actor.get("legacyAdminAccess")),
         "entraDirectoryAdmin": bool(serialized_actor.get("entraDirectoryAdmin")),
     }
@@ -555,10 +557,11 @@ def admin_logout(request):
 @require_http_methods(["GET", "POST"])
 def admin_accounts(request):
     try:
-        require_request_admin_session(request)
         if request.method == "POST":
+            require_request_admin_session(request, allowed_roles=ADMIN_ACCESS_ROLES)
             agent = add_entra_agent(parse_json_body(request))
             return JsonResponse(agent, status=201)
+        require_request_admin_session(request)
         return JsonResponse(list_agents(include_inactive=True))
     except Exception as error:
         return handle_api_error(error)
@@ -567,7 +570,7 @@ def admin_accounts(request):
 @require_GET
 def admin_agents_search(request):
     try:
-        require_request_admin_session(request)
+        require_request_admin_session(request, allowed_roles=ADMIN_ACCESS_ROLES)
         q = sanitize_text(request.GET.get("q", ""))
         return JsonResponse(search_entra_agents(q))
     except Exception as error:
@@ -580,7 +583,7 @@ admin_agents = admin_accounts
 @require_http_methods(["PATCH", "DELETE"])
 def admin_account_detail(request, account_id: int):
     try:
-        require_request_admin_session(request)
+        require_request_admin_session(request, allowed_roles=ADMIN_ACCESS_ROLES)
         if request.method == "DELETE":
             remove_agent(account_id)
             return JsonResponse({"ok": True})
