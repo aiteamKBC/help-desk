@@ -66,6 +66,7 @@ from .services import (
     serve_frontend_asset,
     submit_coverage_tutor_request,
     update_admin_ticket,
+    update_admin_ticket_archive_state,
     update_agent_support_access,
     update_ticket,
 )
@@ -630,6 +631,15 @@ def admin_ticket_detail(request, public_id: str):
             return JsonResponse(get_admin_ticket_detail_response(public_id))
 
         return JsonResponse(update_admin_ticket(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_archive(request, public_id: str):
+    try:
+        require_request_admin_session(request)
+        return JsonResponse(update_admin_ticket_archive_state(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 

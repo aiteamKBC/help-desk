@@ -23,6 +23,7 @@ urlpatterns = [
     path("admin/accounts/<int:account_id>", views.admin_account_detail, name="admin-account-detail"),
     path("admin/tickets", views.admin_tickets, name="admin-tickets"),
     path("admin/notifications", views.admin_notifications, name="admin-notifications"),
+    path("admin/tickets/<str:public_id>/archive", views.admin_ticket_archive, name="admin-ticket-archive"),
     path("admin/tickets/<str:public_id>/attachments/<int:attachment_id>/download", views.admin_ticket_attachment_download, name="admin-ticket-attachment-download"),
     path("admin/tickets/<str:public_id>/chat-history", views.admin_ticket_chat_history, name="admin-ticket-chat-history"),
     path("admin/tickets/<str:public_id>/ai-agent-message", views.admin_ticket_ai_message, name="admin-ticket-ai-message"),

@@ -3879,6 +3879,11 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "slaStatus": row["sla_status"],
         "slaAttentionRequired": bool(row.get("sla_attention_required")),
         "evidenceCount": int(row.get("evidence_count") or 0),
+        "isArchived": normalize_bool(row.get("is_archived")),
+        "archivedAt": row.get("archived_at"),
+        "archivedById": int(row["archived_by_id"]) if row.get("archived_by_id") else None,
+        "archivedByName": row.get("archived_by_name") or "",
+        "archivedByUsername": row.get("archived_by_username") or "",
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -6650,6 +6655,9 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           t.priority,
           t.evidence_count,
           t.metadata,
+          t.is_archived,
+          t.archived_at,
+          t.archived_by_id,
           t.created_at,
           t.updated_at,
           t.closed_at,
@@ -6663,7 +6671,9 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           l.phone AS learner_phone,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
-          a.full_name AS assigned_agent_name
+          a.full_name AS assigned_agent_name,
+          archived_by.username AS archived_by_username,
+          archived_by.full_name AS archived_by_name
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
@@ -6671,6 +6681,8 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           ON c.id = t.conversation_id
         LEFT JOIN support_accounts a
           ON a.id = t.assigned_agent_id
+        LEFT JOIN support_accounts archived_by
+          ON archived_by.id = t.archived_by_id
         WHERE t.public_id = %s
         LIMIT 1
         """,
@@ -7597,6 +7609,9 @@ def list_admin_tickets() -> dict[str, Any]:
           t.sla_status,
           t.metadata,
           t.evidence_count,
+          t.is_archived,
+          t.archived_at,
+          t.archived_by_id,
           t.created_at,
           t.updated_at,
           t.conversation_id,
@@ -7609,7 +7624,9 @@ def list_admin_tickets() -> dict[str, Any]:
           l.phone AS learner_phone,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
-          a.full_name AS assigned_agent_name
+          a.full_name AS assigned_agent_name,
+          archived_by.username AS archived_by_username,
+          archived_by.full_name AS archived_by_name
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
@@ -7617,6 +7634,8 @@ def list_admin_tickets() -> dict[str, Any]:
           ON c.id = t.conversation_id
         LEFT JOIN support_accounts a
           ON a.id = t.assigned_agent_id
+        LEFT JOIN support_accounts archived_by
+          ON archived_by.id = t.archived_by_id
         ORDER BY
           CASE t.priority
             WHEN 'Urgent' THEN 0
@@ -8608,6 +8627,7 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
               t.assigned_agent_id,
               t.sla_status,
               t.metadata,
+              t.is_archived,
               t.created_at,
               t.conversation_id,
               l.full_name AS learner_name,
@@ -8625,6 +8645,8 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
             raise ApiError(404, "Ticket not found.")
         if not is_coverage_ticket_record(ticket):
             raise ApiError(409, "This ticket is not a coverage ticket.")
+        if normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Restore this ticket before editing it.")
 
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         existing_documentation = normalize_admin_documentation(
@@ -9221,6 +9243,7 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
               t.assigned_team,
               t.assigned_agent_id,
               t.sla_status,
+              t.is_archived,
               t.created_at,
               t.updated_at,
               t.conversation_id
@@ -9235,6 +9258,8 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
             raise ApiError(404, "Ticket not found.")
         if not is_coverage_ticket_record(ticket):
             raise ApiError(409, "This ticket is not a coverage ticket.")
+        if normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Restore this ticket before editing it.")
 
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         documentation, _ = derive_coverage_tutor_response_state(
@@ -10382,6 +10407,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
               t.assigned_team,
               t.sla_status,
               t.metadata,
+              t.is_archived,
               t.created_at,
               t.closed_at,
               t.conversation_id,
@@ -10401,6 +10427,9 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
         if not ticket:
             raise ApiError(404, "Ticket not found.")
+
+        if normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Restore this ticket before editing it.")
 
         apply_ticket_sla_policy(ticket)
 
@@ -10732,6 +10761,80 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
     detail_public_id = follow_up_public_id or public_id
     detail = fetch_admin_ticket_detail(detail_public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def update_admin_ticket_archive_state(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if "archived" not in payload:
+        raise ApiError(400, "archived field is required.")
+
+    should_archive = normalize_bool(payload.get("archived"))
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT id, public_id, is_archived
+            FROM tickets
+            WHERE public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        actor_row = fetch_actor_by_username(actor_username) if actor_username else None
+        actor = (
+            {
+                "id": actor_row["id"],
+                "role": actor_row["role"],
+                "label": actor_row.get("full_name") or actor_row["username"],
+            }
+            if actor_row
+            else None
+        )
+        current_archive_state = normalize_bool(ticket.get("is_archived"))
+
+        if current_archive_state != should_archive:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET
+                      is_archived = %s,
+                      archived_at = CASE WHEN %s THEN NOW() ELSE NULL END,
+                      archived_by_id = CASE WHEN %s THEN %s ELSE NULL END,
+                      updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [
+                        should_archive,
+                        should_archive,
+                        should_archive,
+                        actor_row["id"] if actor_row else None,
+                        ticket["id"],
+                    ],
+                )
+
+            insert_history_event(
+                ticket["id"],
+                "ticket_archived" if should_archive else "ticket_unarchived",
+                actor,
+                {
+                    "archived": should_archive,
+                    "from": current_archive_state,
+                    "to": should_archive,
+                },
+            )
+
+    detail = fetch_admin_ticket_detail(public_id)
     if not detail:
         raise ApiError(404, "Ticket not found.")
 

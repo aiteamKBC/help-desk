@@ -15,6 +15,7 @@ LEGACY_ENDPOINTS = [
     {"method": "GET", "path": "/api/admin/tickets/:publicId"},
     {"method": "GET", "path": "/api/admin/tickets/:publicId/attachments/:attachmentId/download"},
     {"method": "PATCH", "path": "/api/admin/tickets/:publicId"},
+    {"method": "POST", "path": "/api/admin/tickets/:publicId/archive"},
     {"method": "POST", "path": "/api/admin/tickets/:publicId/chat-history"},
     {"method": "POST", "path": "/api/admin/tickets/:publicId/ai-agent-message"},
     {"method": "POST", "path": "/api/tickets"},

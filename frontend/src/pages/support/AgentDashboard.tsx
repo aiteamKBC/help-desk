@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
+  Archive,
   Bot,
   AlertOctagon,
   ArrowLeft,
@@ -29,7 +30,6 @@ import {
   Settings2,
   Ticket as TicketIcon,
   UserRound,
-  UserPlus,
   Users,
   X,
 } from "lucide-react";
@@ -235,6 +235,11 @@ interface TicketSummary {
   slaStatus: "Pending Review" | "On Track" | "Breached";
   slaAttentionRequired?: boolean;
   evidenceCount: number;
+  isArchived?: boolean;
+  archivedAt?: string | null;
+  archivedById?: number | null;
+  archivedByName?: string;
+  archivedByUsername?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -400,14 +405,6 @@ interface ListResponse {
   agent?: AdminAgent;
 }
 
-interface EntraSearchResult {
-  entraId: string;
-  displayName: string;
-  email: string;
-  username: string;
-  alreadyAdded: boolean;
-}
-
 interface DetailResponse extends TicketDetailResponse {
   message?: string;
 }
@@ -467,6 +464,7 @@ type DocumentationIssuesAddressed = "yes" | "no" | "";
 type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreached" | "quickResolution" | "escalation" | "coverage";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
+type DashboardArchiveScope = "active" | "archived";
 type AdminView = "dashboard" | "coverage" | "console" | "management";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type CoverageWorkspaceTab = "documentation" | "details";
@@ -512,6 +510,7 @@ const AgentDashboard = () => {
   const [dashboardTicketFilter, setDashboardTicketFilter] = useState<DashboardTicketFilter>("all");
   const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>("newest");
   const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
+  const [dashboardArchiveScope, setDashboardArchiveScope] = useState<DashboardArchiveScope>("active");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
@@ -540,14 +539,10 @@ const AgentDashboard = () => {
   const [isSavingDocumentation, setIsSavingDocumentation] = useState(false);
   const [isSavingActiveDocumentation, setIsSavingActiveDocumentation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [archiveActionTicketId, setArchiveActionTicketId] = useState("");
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
-  const [showAddAgentSheet, setShowAddAgentSheet] = useState(false);
-  const [agentSearchQuery, setAgentSearchQuery] = useState("");
-  const [agentSearchResults, setAgentSearchResults] = useState<EntraSearchResult[]>([]);
-  const [isSearchingAgents, setIsSearchingAgents] = useState(false);
-  const [isAddingAgentId, setIsAddingAgentId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
   const [consoleTimerNow, setConsoleTimerNow] = useState(() => Date.now());
@@ -574,6 +569,7 @@ const AgentDashboard = () => {
   const normalizedDashboardSearch = normalizeConsoleSearchValue(dashboardSearch);
   const compactDashboardSearch = compactConsoleSearchValue(normalizedDashboardSearch);
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
+  const activeTicketIsArchived = Boolean(activeDetail?.ticket.isArchived);
   const isActiveQuickTicket = Boolean(activeDetail) && isDashboardQuickResolutionTicket(activeDetail.ticket);
   const effectiveActiveTicketTab = isActiveQuickTicket && activeTicketTab === "conversation"
     ? "documentation"
@@ -586,12 +582,13 @@ const AgentDashboard = () => {
     && activeDocumentationDraft.ticketId === activeDetail.ticket.id
     ? activeDocumentationDraft
     : activeCoverageDocumentationBaseline;
-  const activeCoverageDocumentationReadOnly = Boolean(activeDetail) && activeDetail.ticket.status === "Closed";
+  const activeCoverageDocumentationReadOnly = Boolean(activeDetail) && (activeDetail.ticket.status === "Closed" || activeTicketIsArchived);
   const activeCoverageDocumentationDirty = Boolean(activeCoverageDocumentationBaseline && activeCoverageDocumentationDraft)
     && JSON.stringify(activeCoverageDocumentationDraft) !== JSON.stringify(activeCoverageDocumentationBaseline);
   const isActiveStandardDocumentationTicket = Boolean(activeDetail)
     && activeDetail.ticket.status === "Pending"
-    && !isActiveCoverageTicket;
+    && !isActiveCoverageTicket
+    && !activeTicketIsArchived;
   const activeStandardDocumentationBaseline = activeDetail && isActiveStandardDocumentationTicket
     ? buildStandardDocumentationDraft(activeDetail.ticket)
     : null;
@@ -614,6 +611,10 @@ const AgentDashboard = () => {
   const resolvedSessionAgentId = signedInAgent?.id ?? session?.id ?? null;
   const dashboardSessionAgentId = resolvedSessionAgentId;
   const scopedConsoleTickets = tickets.filter((ticket) => {
+    if (isArchivedTicket(ticket)) {
+      return false;
+    }
+
     if (isQuickResolutionTicket(ticket)) {
       return false;
     }
@@ -818,6 +819,10 @@ const AgentDashboard = () => {
     ? visibleOpenConsoleTickets
     : visibleClosedConsoleTickets;
   const myOpenConsoleQueueTickets = tickets.filter((ticket) => {
+    if (isArchivedTicket(ticket)) {
+      return false;
+    }
+
     if (isQuickResolutionTicket(ticket)) {
       return false;
     }
@@ -884,9 +889,10 @@ const AgentDashboard = () => {
     return getAgentDisplayName(leftAgent).localeCompare(getAgentDisplayName(rightAgent), undefined, { sensitivity: "base" });
   });
   const selectedDraftAgent = sortedAgents.find((agent) => String(agent.id) === draftAgentId) || null;
-  const availableAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Available").length;
-  const busyAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
-  const offAgentCount = sortedAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
+  const ticketReceivingAgents = sortedAgents.filter(hasTicketAccess);
+  const availableAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Available").length;
+  const busyAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
+  const offAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
   const dashboardAgentFilterOptions = [
     { value: "all" as DashboardAssignedFilter, label: isCoverageDashboardView ? "All Coverage Tickets" : "All Tickets" },
     ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
@@ -899,9 +905,13 @@ const AgentDashboard = () => {
       })),
   ];
   const assignableAdminAgents = sortedAgents.filter((agent) => (agent.role || "").toLowerCase() === "admin");
+  const activeTicketCount = tickets.filter((ticket) => !isArchivedTicket(ticket)).length;
+  const dashboardArchiveScopedTickets = tickets.filter((ticket) => (
+    dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
+  ));
   const dashboardBaseTickets = isCoverageDashboardView
-    ? tickets.filter((ticket) => isCoverageTicket(ticket))
-    : tickets;
+    ? dashboardArchiveScopedTickets.filter((ticket) => isCoverageTicket(ticket))
+    : dashboardArchiveScopedTickets;
   const dashboardAssignmentScopedTickets = filterDashboardTicketsByAssignee(
     dashboardBaseTickets,
     dashboardAssignedFilter,
@@ -963,9 +973,14 @@ const AgentDashboard = () => {
         ? leftTimestamp - rightTimestamp
         : rightTimestamp - leftTimestamp;
     });
-  const dashboardTableTitle = dashboardTicketFilter === "all" && isCoverageDashboardView
+  const dashboardActiveTableTitle = dashboardTicketFilter === "all" && isCoverageDashboardView
     ? "Coverage Tickets"
     : getDashboardTableTitle(dashboardTicketFilter);
+  const dashboardTableTitle = dashboardArchiveScope === "archived"
+    ? dashboardTicketFilter === "all"
+      ? (isCoverageDashboardView ? "Archived Coverage Tickets" : "Archived Tickets")
+      : `Archived ${dashboardActiveTableTitle}`
+    : dashboardActiveTableTitle;
   const dashboardAssignedFilterLabel = getDashboardAssignedFilterLabel(
     dashboardAssignedFilter,
     dashboardSessionAgentName,
@@ -988,6 +1003,8 @@ const AgentDashboard = () => {
   );
   const dashboardEmptyMessage = normalizedDashboardSearch
     ? "No matching tickets found for this search."
+    : dashboardArchiveScope === "archived"
+      ? (isCoverageDashboardView ? "No archived coverage tickets found." : "No archived tickets found.")
     : dashboardAssignedFilter !== "all"
       ? getDashboardAssignedFilterEmptyMessage(dashboardTicketFilter, dashboardAssignedFilterEmptyTarget)
       : isCoverageDashboardView && dashboardTicketFilter === "all"
@@ -1000,7 +1017,8 @@ const AgentDashboard = () => {
   );
   const canAssignActiveTicket = Boolean(
     isSuperadminSession
-    && activeDetail,
+    && activeDetail
+    && !activeTicketIsArchived,
   );
   const isActiveTicketAlreadyAssigned = Boolean(activeDetail?.ticket.assignedAgentId);
   const canForceCloseConsoleChat = Boolean(consoleDetail)
@@ -1889,7 +1907,7 @@ const AgentDashboard = () => {
       setTickets(tickets);
       setAgents(nextAgents);
       setNotificationLog(nextNotificationLog);
-      syncConsoleStatusFromAgents(visibleAgents);
+      syncConsoleStatusFromAgents(nextAgents);
       setChatbotWorkflowConfigured(
         Boolean(migrationStatusPayload?.adminAiWebhookConfigured ?? migrationStatusPayload?.chatbotWebhookConfigured),
       );
@@ -1959,7 +1977,7 @@ const AgentDashboard = () => {
         return;
       }
       setAgents(nextAgents);
-      syncConsoleStatusFromAgents(visibleAgents);
+      syncConsoleStatusFromAgents(nextAgents);
     } catch (fetchError) {
       if (!silent) {
         setError(fetchError instanceof Error ? fetchError.message : "We could not load support accounts right now.");
@@ -2053,55 +2071,6 @@ const AgentDashboard = () => {
         next.delete(agent.id);
         return next;
       });
-    }
-  }
-
-  async function searchEntraAgents(q: string) {
-    if (q.trim().length < 2) {
-      setAgentSearchResults([]);
-      return;
-    }
-    setIsSearchingAgents(true);
-    try {
-      const response = await fetch(`/api/admin/agents/search?q=${encodeURIComponent(q.trim())}`, {
-        headers: buildAdminJsonHeaders(),
-      });
-      const payload = (await response.json().catch(() => null)) as { results?: EntraSearchResult[]; message?: string } | null;
-      if (!response.ok) {
-        toast.error(payload?.message || "Could not search agents.");
-        return;
-      }
-      setAgentSearchResults(payload?.results || []);
-    } catch {
-      toast.error("Could not search agents.");
-    } finally {
-      setIsSearchingAgents(false);
-    }
-  }
-
-  async function addEntraAgent(result: EntraSearchResult) {
-    setIsAddingAgentId(result.entraId);
-    try {
-      const response = await fetch("/api/admin/accounts", {
-        method: "POST",
-        headers: buildAdminJsonHeaders(),
-        body: JSON.stringify(result),
-      });
-      const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
-      if (!response.ok) {
-        toast.error(payload?.message || "Could not add agent.");
-        return;
-      }
-      const newAgent = payload?.agent;
-      if (newAgent) {
-        setAgents((prev) => [...prev, newAgent]);
-      }
-      setAgentSearchResults((prev) => prev.map((r) => r.entraId === result.entraId ? { ...r, alreadyAdded: true } : r));
-      toast.success(`${result.displayName || result.email} added as an agent.`);
-    } catch {
-      toast.error("Could not add agent.");
-    } finally {
-      setIsAddingAgentId(null);
     }
   }
 
@@ -2356,6 +2325,46 @@ const AgentDashboard = () => {
     ));
   }
 
+  async function updateTicketArchiveState(ticket: TicketSummary, shouldArchive: boolean) {
+    if (
+      shouldArchive
+      && ticket.status !== "Closed"
+      && typeof window !== "undefined"
+      && !window.confirm("Archive this active ticket? It will be hidden from active dashboards until restored.")
+    ) {
+      return;
+    }
+
+    setArchiveActionTicketId(ticket.id);
+
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticket.id)}/archive`, {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({ archived: shouldArchive }),
+      });
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not update the ticket archive right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      if (activeDetail?.ticket.id === payload.ticket.id) {
+        syncDrafts(payload);
+      }
+      toast.success(shouldArchive ? "Ticket archived" : "Ticket restored");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setArchiveActionTicketId("");
+    }
+  }
+
   function updateDocumentationField(field: keyof AdminDocumentation, value: string) {
     setDocumentationDraft((currentDraft) => {
       if (!currentDraft) {
@@ -2462,6 +2471,10 @@ const AgentDashboard = () => {
     showSuccessToast?: boolean;
   }) {
     if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return null;
+    }
+    if (activeDetail.ticket.isArchived) {
+      toast.error("Restore this ticket before editing it.");
       return null;
     }
 
@@ -3389,6 +3402,10 @@ const AgentDashboard = () => {
     if (!activeDetail) {
       return;
     }
+    if (activeDetail.ticket.isArchived) {
+      toast.error("Restore this ticket before editing it.");
+      return;
+    }
 
     const nextStatus = overrides?.status ?? draftStatus;
     const nextNote = (overrides?.note ?? notes).trim();
@@ -3528,13 +3545,14 @@ const AgentDashboard = () => {
               <div className="flex flex-col gap-3 lg:items-end">
                 <div className="flex items-center gap-3">
                   <span className="text-xs text-muted-foreground">{dashboardTableCountLabel}</span>
-                  {dashboardTicketFilter !== "all" || dashboardSortOrder !== "newest" ? (
+                  {dashboardTicketFilter !== "all" || dashboardSortOrder !== "newest" || dashboardArchiveScope !== "active" ? (
                     <Button
                       size="sm"
                       variant="outline"
                       onClick={() => {
                         setDashboardTicketFilter("all");
                         setDashboardSortOrder("newest");
+                        setDashboardArchiveScope("active");
                       }}
                     >
                       Reset View
@@ -3542,6 +3560,23 @@ const AgentDashboard = () => {
                   ) : null}
                 </div>
                 <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+                  <div className="inline-flex rounded-xl border bg-secondary/40 p-1">
+                    {(["active", "archived"] as const).map((scope) => (
+                      <button
+                        key={scope}
+                        type="button"
+                        onClick={() => setDashboardArchiveScope(scope)}
+                        className={cn(
+                          "rounded-lg px-3 py-2 text-xs font-semibold transition",
+                          dashboardArchiveScope === scope
+                            ? "bg-primary text-primary-foreground shadow-sm"
+                            : "text-muted-foreground hover:bg-background hover:text-foreground",
+                        )}
+                      >
+                        {scope === "active" ? "Active" : "Archive"}
+                      </button>
+                    ))}
+                  </div>
                   {!isCoverageDashboardView ? (
                     <div className="w-full sm:w-[170px]">
                       <Select
@@ -3636,13 +3671,13 @@ const AgentDashboard = () => {
                         </div>
                       </div>
                       <div className="max-h-[320px] overflow-y-auto p-2">
-                        {sortedAgents.length === 0 ? (
+                        {ticketReceivingAgents.length === 0 ? (
                           <div className="rounded-xl border border-dashed px-3 py-4 text-sm text-muted-foreground">
-                            No active agents found.
+                            No ticket-enabled agents found.
                           </div>
                         ) : (
                           <div className="space-y-2">
-                            {sortedAgents.map((agent) => {
+                            {ticketReceivingAgents.map((agent) => {
                               const agentStatus = normalizeAdminConsoleStatus(agent.consoleStatus);
 
                               return (
@@ -3707,7 +3742,7 @@ const AgentDashboard = () => {
               <table className="w-full text-sm">
                 <thead className="bg-secondary/50 text-muted-foreground">
                   <tr className="text-left">
-                    {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA"].map((heading) => (
+                    {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"].map((heading) => (
                       <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
                     ))}
                   </tr>
@@ -3760,6 +3795,28 @@ const AgentDashboard = () => {
                         <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
                           {ticket.slaStatus}
                         </span>
+                      </td>
+                      <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-8 whitespace-nowrap rounded-full"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
+                          }}
+                          disabled={archiveActionTicketId === ticket.id}
+                        >
+                          {archiveActionTicketId === ticket.id ? (
+                            <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                          ) : isArchivedTicket(ticket) ? (
+                            <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                          ) : (
+                            <Archive className="mr-1.5 h-3.5 w-3.5" />
+                          )}
+                          {isArchivedTicket(ticket) ? "Restore" : "Archive"}
+                        </Button>
                       </td>
                     </tr>
                   ))}
@@ -3946,7 +4003,7 @@ const AgentDashboard = () => {
                 {useCompactAdminSidebar ? (
                     <div className="space-y-2 text-center text-[11px] font-medium text-muted-foreground">
                       <div className="rounded-xl border bg-background px-2 py-2">
-                        <div className="text-base font-semibold text-foreground">{tickets.length}</div>
+                        <div className="text-base font-semibold text-foreground">{activeTicketCount}</div>
                         <div>Tickets</div>
                       </div>
                       <div className={cn("rounded-xl border px-2 py-2", myOpenChatCardToneClassName)}>
@@ -3959,7 +4016,7 @@ const AgentDashboard = () => {
                     <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Overview</div>
                     <div className="mt-3 grid grid-cols-2 gap-3">
                       <div className="rounded-xl border bg-background px-3 py-3">
-                        <div className="text-2xl font-bold">{tickets.length}</div>
+                        <div className="text-2xl font-bold">{activeTicketCount}</div>
                         <div className="text-xs text-muted-foreground">Tickets</div>
                       </div>
                       <div className={cn("rounded-xl border px-3 py-3", myOpenChatCardToneClassName)}>
@@ -4175,27 +4232,14 @@ const AgentDashboard = () => {
                         Agents added here receive ticket assignments.
                       </p>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <div className="relative w-full sm:w-[240px]">
-                        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                        <Input
-                          value={managementSearch}
-                          onChange={(e) => setManagementSearch(e.target.value)}
-                          placeholder="Search agents..."
-                          className="pl-10"
-                        />
-                      </div>
-                      <Button
-                        className="shrink-0 border-0 gradient-primary"
-                        onClick={() => {
-                          setShowAddAgentSheet(true);
-                          setAgentSearchQuery("");
-                          setAgentSearchResults([]);
-                        }}
-                      >
-                        <UserPlus className="mr-2 h-4 w-4" />
-                        Add Agent
-                      </Button>
+                    <div className="relative w-full sm:w-[280px]">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={managementSearch}
+                        onChange={(e) => setManagementSearch(e.target.value)}
+                        placeholder="Search agents..."
+                        className="pl-10"
+                      />
                     </div>
                   </div>
                 </div>
@@ -4216,7 +4260,7 @@ const AgentDashboard = () => {
                     );
                   }).length === 0 ? (
                     <div className="p-10 text-center text-sm text-muted-foreground">
-                      No agents added yet. Use "Add Agent" to add someone from Microsoft Entra.
+                      No matching support accounts found. Manage Support Access and Operations Access from Communication Centre.
                     </div>
                   ) : (
                     agents
@@ -4276,71 +4320,6 @@ const AgentDashboard = () => {
                 </div>
               </div>
             </div>
-
-            <Sheet open={showAddAgentSheet} onOpenChange={setShowAddAgentSheet}>
-              <SheetContent className="w-full sm:max-w-md">
-                <SheetHeader>
-                  <SheetTitle>Add Agent</SheetTitle>
-                  <SheetDescription>Search for a person in Microsoft Entra and add them as an agent.</SheetDescription>
-                </SheetHeader>
-                <div className="mt-6 space-y-4">
-                  <div className="relative">
-                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      placeholder="Search by name or email..."
-                      className="pl-10"
-                      value={agentSearchQuery}
-                      onChange={(e) => {
-                        setAgentSearchQuery(e.target.value);
-                        void searchEntraAgents(e.target.value);
-                      }}
-                      autoFocus
-                    />
-                  </div>
-
-                  {isSearchingAgents ? (
-                    <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
-                      <LoaderCircle className="h-4 w-4 animate-spin" />
-                      Searching...
-                    </div>
-                  ) : agentSearchQuery.trim().length >= 2 && agentSearchResults.length === 0 ? (
-                    <div className="py-8 text-center text-sm text-muted-foreground">
-                      No results found in Microsoft Entra.
-                    </div>
-                  ) : (
-                    <div className="divide-y rounded-2xl border">
-                      {agentSearchResults.map((result) => (
-                        <div key={result.entraId} className="flex items-center justify-between gap-3 px-4 py-3">
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-medium text-foreground">{result.displayName}</div>
-                            <div className="truncate text-xs text-muted-foreground">{result.email}</div>
-                          </div>
-                          <Button
-                            size="sm"
-                            disabled={result.alreadyAdded || isAddingAgentId === result.entraId}
-                            onClick={() => void addEntraAgent(result)}
-                            className="shrink-0 border-0 gradient-primary"
-                          >
-                            {isAddingAgentId === result.entraId ? (
-                              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-                            ) : result.alreadyAdded ? (
-                              "Added"
-                            ) : (
-                              "Add"
-                            )}
-                          </Button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <SheetFooter className="mt-6">
-                  <Button variant="outline" className="w-full" onClick={() => setShowAddAgentSheet(false)}>
-                    Close
-                  </Button>
-                </SheetFooter>
-              </SheetContent>
-            </Sheet>
 
           </TabsContent>
 
@@ -4743,6 +4722,11 @@ const AgentDashboard = () => {
               <SheetHeader>
                 <SheetTitle className="flex items-center gap-2">
                   Ticket <span className="font-mono">{activeDetail.ticket.id}</span>
+                  {activeTicketIsArchived ? (
+                    <span className="rounded-full border border-slate-200 bg-slate-100 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-600">
+                      Archived
+                    </span>
+                  ) : null}
                 </SheetTitle>
                 <SheetDescription>
                   {activeDetail.ticket.learnerName || activeDetail.ticket.email} - {formatTicketHeaderCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)}
@@ -4757,6 +4741,8 @@ const AgentDashboard = () => {
                   readOnly={activeCoverageDocumentationReadOnly}
                   isSaving={isSavingActiveDocumentation}
                   isSavingDetails={isSaving}
+                  isArchived={activeTicketIsArchived}
+                  isArchiving={archiveActionTicketId === activeDetail.ticket.id}
                   isDirty={activeCoverageDocumentationDirty}
                   notes={notes}
                   onNotesChange={setNotes}
@@ -4780,6 +4766,7 @@ const AgentDashboard = () => {
                   onCancel={closePanel}
                   onSave={() => void saveActiveCoverageDocumentation()}
                   onSaveDetails={() => void saveTicket({ successMessage: "Changes saved" })}
+                  onArchiveToggle={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
                   onSubmitTutorChoiceCard={(cardId) => void submitActiveCoverageTutorChoiceCard(cardId)}
                   onConfirmTutorSession={(cardId) => void confirmActiveCoverageTutorSession(cardId)}
                 />
@@ -4894,7 +4881,11 @@ const AgentDashboard = () => {
                     <div className="grid gap-3 md:grid-cols-3">
                       <div>
                         <Label className="mb-1.5 block">Status</Label>
-                        <Select value={draftStatus} onValueChange={(value) => setDraftStatus(value as TicketSummary["status"])}>
+                        <Select
+                          value={draftStatus}
+                          onValueChange={(value) => setDraftStatus(value as TicketSummary["status"])}
+                          disabled={activeTicketIsArchived || isSaving}
+                        >
                           <SelectTrigger><SelectValue /></SelectTrigger>
                           <SelectContent>
                             {statuses.map((status) => (
@@ -4950,7 +4941,7 @@ const AgentDashboard = () => {
                         <Select
                           value={effectiveDraftSlaStatus}
                           onValueChange={(value) => setDraftSlaStatus(value as TicketSummary["slaStatus"])}
-                          disabled={isSlaAutoManaged}
+                          disabled={activeTicketIsArchived || isSlaAutoManaged || isSaving}
                         >
                           <SelectTrigger><SelectValue /></SelectTrigger>
                           <SelectContent>
@@ -4977,6 +4968,12 @@ const AgentDashboard = () => {
                       <InfoCard label="Updated" value={formatDateTime(activeDetail.ticket.updatedAt)} />
                       <InfoCard label="Priority" value={activeDetail.ticket.priority} />
                       <InfoCard label="Evidence Count" value={String(activeDetail.ticket.evidenceCount)} />
+                      {activeTicketIsArchived ? (
+                        <InfoCard
+                          label="Archived"
+                          value={formatArchivedTicketLabel(activeDetail.ticket)}
+                        />
+                      ) : null}
                     </div>
 
                     <section>
@@ -4991,6 +4988,7 @@ const AgentDashboard = () => {
                         placeholder="Add an internal note visible to support staff only..."
                         value={notes}
                         onChange={(event) => setNotes(event.target.value)}
+                        readOnly={activeTicketIsArchived}
                       />
                       {isStatusChanging ? (
                         <p className={cn("mt-2 text-xs", canSubmitStatusChange ? "text-muted-foreground" : "text-destructive")}>
@@ -5008,6 +5006,22 @@ const AgentDashboard = () => {
 
               <SheetFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
                 <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                  onClick={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
+                  disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id}
+                >
+                  {archiveActionTicketId === activeDetail.ticket.id ? (
+                    <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
+                  ) : activeTicketIsArchived ? (
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                  ) : (
+                    <Archive className="h-4 w-4 mr-2" />
+                  )}
+                  {activeTicketIsArchived ? "Restore Ticket" : "Archive Ticket"}
+                </Button>
+                <Button
                   variant="outline"
                   className="w-full sm:w-auto"
                   onClick={() => void saveTicket({
@@ -5015,14 +5029,14 @@ const AgentDashboard = () => {
                     statusReason: "Closed via Agent",
                     successMessage: "Ticket closed",
                   })}
-                  disabled={isSaving}
+                  disabled={isSaving || activeTicketIsArchived}
                 >
                   <X className="h-4 w-4 mr-2" /> Close
                 </Button>
                 <Button
                   className="w-full gradient-primary border-0 sm:w-auto"
                   onClick={() => void saveTicket({ successMessage: "Changes saved" })}
-                  disabled={isSaving || !canSubmitStatusChange}
+                  disabled={isSaving || activeTicketIsArchived || !canSubmitStatusChange}
                 >
                   {isSaving ? <LoaderCircle className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
                   Save Changes
@@ -6303,6 +6317,8 @@ const CoverageTicketWorkspace = ({
   readOnly,
   isSaving,
   isSavingDetails,
+  isArchived,
+  isArchiving,
   isDirty,
   notes,
   onNotesChange,
@@ -6326,6 +6342,7 @@ const CoverageTicketWorkspace = ({
   onCancel,
   onSave,
   onSaveDetails,
+  onArchiveToggle,
   onSubmitTutorChoiceCard,
   onConfirmTutorSession,
 }: {
@@ -6335,6 +6352,8 @@ const CoverageTicketWorkspace = ({
   readOnly: boolean;
   isSaving: boolean;
   isSavingDetails: boolean;
+  isArchived: boolean;
+  isArchiving: boolean;
   isDirty: boolean;
   notes: string;
   onNotesChange: (value: string) => void;
@@ -6358,6 +6377,7 @@ const CoverageTicketWorkspace = ({
   onCancel: () => void;
   onSave: () => void;
   onSaveDetails: () => void;
+  onArchiveToggle: () => void;
   onSubmitTutorChoiceCard: (cardId: string) => void;
   onConfirmTutorSession: (cardId: string) => void;
 }) => {
@@ -6447,7 +6467,9 @@ const CoverageTicketWorkspace = ({
     expandCoverageHistoryCards();
     onDraftUpdate((currentDraft) => ({
       ...currentDraft,
-      coverageCards: [...currentDraft.coverageCards, createCoverageTutorChoiceCard(currentDraft.inquiry)],
+      coverageCards: currentDraft.coverageCards.some(isOpenCoverageTutorChoiceDraft)
+        ? currentDraft.coverageCards
+        : [...currentDraft.coverageCards, createCoverageTutorChoiceCard(currentDraft.inquiry)],
     }));
   };
 
@@ -6594,6 +6616,7 @@ const CoverageTicketWorkspace = ({
     });
   };
   const coverageCardsForDisplay = sortCoverageWorkflowCardsForDisplay(draft.coverageCards);
+  const hasOpenTutorChoiceDraft = draft.coverageCards.some(isOpenCoverageTutorChoiceDraft);
 
   return (
     <div className="space-y-4 py-4">
@@ -6671,7 +6694,12 @@ const CoverageTicketWorkspace = ({
               </div>
               {!readOnly ? (
                 <div className="flex flex-wrap gap-2">
-                  <Button className="border-0 gradient-primary text-white shadow-[0_16px_30px_rgba(82,54,188,0.22)]" onClick={addTutorChoiceCard} disabled={isSaving}>
+                  <Button
+                    className="border-0 gradient-primary text-white shadow-[0_16px_30px_rgba(82,54,188,0.22)]"
+                    onClick={addTutorChoiceCard}
+                    disabled={isSaving || hasOpenTutorChoiceDraft}
+                    title={hasOpenTutorChoiceDraft ? "Submit or remove the current tutor choice first." : undefined}
+                  >
                     Add Tutor Choice Card
                   </Button>
                   <Button className="border-0 bg-violet-600 text-white shadow-[0_16px_30px_rgba(109,40,217,0.18)] hover:bg-violet-700" onClick={addNoteCard} disabled={isSaving}>
@@ -7222,7 +7250,7 @@ const CoverageTicketWorkspace = ({
                       </div>
                       <Button
                         onClick={() => void onSubmitTutorChoiceCard(card.id)}
-                        disabled={isSaving || isLoadingTutorOptions || isTutorEmailLoading}
+                        disabled={isSaving || isLoadingTutorOptions || isTutorEmailLoading || card.presentationFiles.length === 0}
                         className="border-0 gradient-primary"
                       >
                         {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
@@ -7243,11 +7271,30 @@ const CoverageTicketWorkspace = ({
 
       <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
         <div className="text-xs text-muted-foreground">
-          {readOnly ? "Closed tickets are view-only." : "Save your work or submit a tutor request. Coverage tickets close after a tutor accepts the request."}
+          {isArchived
+            ? "Archived coverage tickets are view-only until restored."
+            : readOnly
+              ? "Closed tickets are view-only."
+              : "Save your work or submit a tutor request. Coverage tickets close after a tutor accepts the request."}
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" onClick={onCancel}>
             Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={onArchiveToggle}
+            disabled={isSaving || isSavingDetails || isArchiving}
+          >
+            {isArchiving ? (
+              <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+            ) : isArchived ? (
+              <RefreshCw className="mr-2 h-4 w-4" />
+            ) : (
+              <Archive className="mr-2 h-4 w-4" />
+            )}
+            {isArchived ? "Restore Ticket" : "Archive Ticket"}
           </Button>
           {!readOnly ? (
             <>
@@ -8466,6 +8513,16 @@ function isCoverageTicket(ticket?: Pick<TicketSummary, "technicalSubcategory"> |
   return ticket?.technicalSubcategory === "Coverage";
 }
 
+function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
+  return ticket?.isArchived === true;
+}
+
+function formatArchivedTicketLabel(ticket: Pick<TicketSummary, "archivedAt" | "archivedByName" | "archivedByUsername">) {
+  const archivedAtLabel = ticket.archivedAt ? formatDateTime(ticket.archivedAt) : "Unknown date";
+  const archivedByLabel = ticket.archivedByName || ticket.archivedByUsername;
+  return archivedByLabel ? `${archivedAtLabel} by ${archivedByLabel}` : archivedAtLabel;
+}
+
 function createCoverageCardId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -8653,6 +8710,13 @@ function createCoverageNoteCard(): CoverageWorkflowCard {
     confirmedByAgentUsername: "",
     presentationFiles: [],
   };
+}
+
+function isOpenCoverageTutorChoiceDraft(card: CoverageWorkflowCard) {
+  return card.type === "tutor_choice"
+    && !card.locked
+    && !card.submittedAt
+    && normalizeCoverageTutorRequestStatus(card.requestStatus) === "draft";
 }
 
 function normalizeCoverageCardAttachment(attachment: CoverageCardAttachment | null | undefined): CoverageCardAttachment | null {
@@ -9319,6 +9383,10 @@ function hasSupportDashboardAccess(agent: Pick<AdminAgent, "role" | "legacySuppo
     || agent.entraDirectoryAdmin
     || adminDashboardAccessRoles.has(normalizedRole),
   );
+}
+
+function hasTicketAccess(agent: Pick<AdminAgent, "legacySupportAccess">) {
+  return agent.legacySupportAccess === true;
 }
 
 function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicketFilter) {

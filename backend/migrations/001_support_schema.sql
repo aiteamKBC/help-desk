@@ -144,6 +144,15 @@ ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS status_reason TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS is_archived BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS archived_by_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE tickets
 DROP CONSTRAINT IF EXISTS tickets_conversation_id_key;
 
 UPDATE tickets
@@ -232,6 +241,7 @@ CREATE INDEX IF NOT EXISTS idx_learners_support_account_id ON learners(support_a
 CREATE INDEX IF NOT EXISTS idx_tickets_learner_id ON tickets(learner_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_agent_id ON tickets(assigned_agent_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_is_archived ON tickets(is_archived);
 CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ticket_attachments_ticket_id ON ticket_attachments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ticket_history_ticket_id ON ticket_history(ticket_id, created_at DESC);
