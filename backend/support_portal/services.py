@@ -5,6 +5,7 @@ import json
 import mimetypes
 import re
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,6 +108,8 @@ PENDING_SLA_BREACH_AFTER = timedelta(days=3)
 SLA_ATTENTION_REASON_PENDING_OVERDUE = "pending_over_3_days"
 CHAT_INACTIVITY_REMINDER_AFTER = timedelta(minutes=2)
 CHAT_INACTIVITY_AUTO_CLOSE_AFTER = timedelta(minutes=3)
+OPEN_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS = 10
+BACKGROUND_TICKET_SYNC_MIN_INTERVAL_SECONDS = 10
 INACTIVITY_WAITING_SINCE_METADATA_KEY = "inactivity_waiting_since"
 INACTIVITY_REMINDER_SENT_AT_METADATA_KEY = "inactivity_reminder_sent_at"
 UK_SUPPORT_TIMEZONE = "Europe/London"
@@ -183,6 +186,11 @@ DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
 COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 30
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS = 8
+_open_ticket_inactivity_sync_lock = threading.Lock()
+_last_open_ticket_inactivity_sync_started_monotonic = 0.0
+_ticket_background_sync_lock = threading.Lock()
+_ticket_background_sync_in_progress = False
+_last_ticket_background_sync_started_monotonic = 0.0
 
 
 @dataclass
@@ -216,6 +224,36 @@ def get_support_attachment_max_file_bytes() -> int:
         normalized_value = DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES
 
     return max(normalized_value, 1024)
+
+
+def get_open_ticket_inactivity_sync_min_interval_seconds() -> int:
+    configured_value = getattr(
+        settings,
+        "SUPPORT_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS",
+        OPEN_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS,
+    )
+
+    try:
+        normalized_value = int(configured_value)
+    except (TypeError, ValueError):
+        normalized_value = OPEN_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS
+
+    return max(normalized_value, 0)
+
+
+def get_ticket_background_sync_min_interval_seconds() -> int:
+    configured_value = getattr(
+        settings,
+        "SUPPORT_TICKET_BACKGROUND_SYNC_MIN_INTERVAL_SECONDS",
+        BACKGROUND_TICKET_SYNC_MIN_INTERVAL_SECONDS,
+    )
+
+    try:
+        normalized_value = int(configured_value)
+    except (TypeError, ValueError):
+        normalized_value = BACKGROUND_TICKET_SYNC_MIN_INTERVAL_SECONDS
+
+    return max(normalized_value, 0)
 
 
 def get_support_attachment_extension(file_name: str) -> str:
@@ -3102,23 +3140,49 @@ def is_coverage_session_confirmation_available(card: dict[str, Any], *, now: dat
     return comparison_now >= session_start_at
 
 
-def reconcile_coverage_tutor_requests_from_history(ticket_id: Any, documentation: dict[str, Any]) -> dict[str, Any]:
-    normalized_documentation = normalize_admin_documentation(documentation)
-    if not ticket_id:
-        return normalized_documentation
+def list_coverage_tutor_request_history_rows(ticket_ids: list[Any]) -> dict[int, list[dict[str, Any]]]:
+    normalized_ticket_ids: list[int] = []
+    for ticket_id in ticket_ids:
+        try:
+            parsed_ticket_id = int(ticket_id or 0)
+        except (TypeError, ValueError):
+            continue
+        if parsed_ticket_id > 0:
+            normalized_ticket_ids.append(parsed_ticket_id)
 
-    coverage_cards = list(normalized_documentation.get("coverageCards") or [])
+    if not normalized_ticket_ids:
+        return {}
 
     request_history_rows = run_query(
         """
-        SELECT payload, created_at
+        SELECT ticket_id, payload, created_at
         FROM ticket_history
-        WHERE ticket_id = %s
+        WHERE ticket_id = ANY(%s)
           AND event_type = 'coverage_tutor_requested'
-        ORDER BY created_at ASC, id ASC
+        ORDER BY ticket_id ASC, created_at ASC, id ASC
         """,
-        [ticket_id],
+        [normalized_ticket_ids],
     )
+
+    request_history_rows_by_ticket_id: dict[int, list[dict[str, Any]]] = {}
+    for row in request_history_rows:
+        try:
+            normalized_ticket_id = int(row.get("ticket_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if normalized_ticket_id <= 0:
+            continue
+        request_history_rows_by_ticket_id.setdefault(normalized_ticket_id, []).append(row)
+
+    return request_history_rows_by_ticket_id
+
+
+def reconcile_coverage_tutor_requests_from_request_history(
+    documentation: dict[str, Any],
+    request_history_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_documentation = normalize_admin_documentation(documentation)
+    coverage_cards = list(normalized_documentation.get("coverageCards") or [])
     if not request_history_rows:
         return normalized_documentation
 
@@ -3230,7 +3294,22 @@ def reconcile_coverage_tutor_requests_from_history(ticket_id: Any, documentation
     return normalized_documentation
 
 
-def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[str, Any]:
+def reconcile_coverage_tutor_requests_from_history(ticket_id: Any, documentation: dict[str, Any]) -> dict[str, Any]:
+    try:
+        normalized_ticket_id = int(ticket_id or 0)
+    except (TypeError, ValueError):
+        normalized_ticket_id = 0
+    if normalized_ticket_id <= 0:
+        return normalize_admin_documentation(documentation)
+
+    request_history_rows = list_coverage_tutor_request_history_rows([normalized_ticket_id]).get(normalized_ticket_id, [])
+    return reconcile_coverage_tutor_requests_from_request_history(documentation, request_history_rows)
+
+
+def synchronize_coverage_tutor_workflow_ticket(
+    ticket: dict[str, Any],
+    request_history_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if not is_coverage_ticket_record(ticket):
         return ticket
 
@@ -3241,7 +3320,10 @@ def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[s
         fallback_chat_id=build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
         fallback_ticket_id=ticket.get("public_id") or "",
     )
-    recovered_documentation = reconcile_coverage_tutor_requests_from_history(ticket.get("id"), current_documentation)
+    if request_history_rows is None:
+        recovered_documentation = reconcile_coverage_tutor_requests_from_history(ticket.get("id"), current_documentation)
+    else:
+        recovered_documentation = reconcile_coverage_tutor_requests_from_request_history(current_documentation, request_history_rows)
     current_latest_response = get_latest_coverage_tutor_response(ticket_metadata)
     outcome = get_coverage_tutor_response_outcome_for_status_reason(ticket.get("status_reason"))
     if outcome in {"accepted", "rejected"}:
@@ -3261,6 +3343,12 @@ def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[s
         derived_documentation = recovered_documentation
         derived_latest_response = current_latest_response
 
+    resolved_ticket = {
+        **ticket,
+        "_resolved_documentation": derived_documentation,
+        "_resolved_latest_coverage_tutor_response": derived_latest_response,
+        "_coverage_state_resolved": True,
+    }
     effective_outcome = sanitize_text(derived_latest_response.get("outcome") if derived_latest_response else "").lower() or outcome
     documentation_changed = derived_documentation != current_documentation
     latest_response_changed = normalize_latest_coverage_tutor_response(current_latest_response) != normalize_latest_coverage_tutor_response(derived_latest_response)
@@ -3274,7 +3362,7 @@ def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[s
     status_changed = next_status != sanitize_text(ticket.get("status"))
 
     if not documentation_changed and not latest_response_changed and not status_changed and not status_reason_changed:
-        return ticket
+        return resolved_ticket
 
     next_sla_status = ticket.get("sla_status")
     next_sla_attention_required = bool(ticket.get("sla_attention_required"))
@@ -3364,7 +3452,7 @@ def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[s
     if latest_response_changed:
         insert_history_event(ticket["id"], "coverage_tutor_response", None, derived_latest_response)
 
-    synchronized_ticket = dict(ticket)
+    synchronized_ticket = dict(resolved_ticket)
     synchronized_ticket["status"] = next_status
     synchronized_ticket["status_reason"] = next_status_reason
     synchronized_ticket["sla_status"] = next_sla_status
@@ -3380,6 +3468,38 @@ def synchronize_coverage_tutor_workflow_ticket(ticket: dict[str, Any]) -> dict[s
     return synchronized_ticket
 
 
+def synchronize_coverage_tutor_workflow_tickets(tickets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    coverage_ticket_ids: list[int] = []
+    for ticket in tickets:
+        if not is_coverage_ticket_record(ticket):
+            continue
+        try:
+            normalized_ticket_id = int(ticket.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if normalized_ticket_id > 0:
+            coverage_ticket_ids.append(normalized_ticket_id)
+
+    request_history_rows_by_ticket_id = list_coverage_tutor_request_history_rows(coverage_ticket_ids)
+    synchronized_tickets: list[dict[str, Any]] = []
+    for ticket in tickets:
+        try:
+            normalized_ticket_id = int(ticket.get("id") or 0)
+        except (TypeError, ValueError):
+            normalized_ticket_id = 0
+        if normalized_ticket_id > 0:
+            synchronized_tickets.append(
+                synchronize_coverage_tutor_workflow_ticket(
+                    ticket,
+                    request_history_rows=request_history_rows_by_ticket_id.get(normalized_ticket_id, []),
+                )
+            )
+            continue
+        synchronized_tickets.append(synchronize_coverage_tutor_workflow_ticket(ticket))
+
+    return synchronized_tickets
+
+
 def get_support_auth_database_url() -> str:
     return (
         sanitize_text(getattr(settings, "KBC_AUTH_DATABASE_URL", ""))
@@ -3393,7 +3513,20 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
     if not normalized_value or not auth_database_url:
         return None
 
-    lookup_column = "u.email" if lookup_kind == "email" else "u.username"
+    lookup_params: list[Any]
+    if lookup_kind == "id":
+        try:
+            lookup_value = int(normalized_value)
+        except (TypeError, ValueError):
+            return None
+        if lookup_value <= 0:
+            return None
+        lookup_clause = "u.id = %s"
+        lookup_params = [lookup_value]
+    else:
+        lookup_column = "u.email" if lookup_kind == "email" else "u.username"
+        lookup_clause = f"LOWER(TRIM({lookup_column})) = %s"
+        lookup_params = [normalized_value]
 
     with psycopg.connect(auth_database_url) as source_connection:
         with source_connection.cursor() as cursor:
@@ -3431,7 +3564,7 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
                       AND LOWER(TRIM(g.name)) = %s
                   ) AS has_admin_access
                 FROM auth_user u
-                WHERE LOWER(TRIM({lookup_column})) = %s
+                WHERE {lookup_clause}
                   AND u.is_active = TRUE
                 LIMIT 1
                 """,
@@ -3439,7 +3572,7 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
                     SUPPORT_ACCESS_GROUP_NAME,
                     OPERATIONS_ACCESS_GROUP_NAME,
                     ADMIN_ACCESS_GROUP_NAME,
-                    normalized_value,
+                    *lookup_params,
                 ],
             )
             row = cursor.fetchone()
@@ -3489,6 +3622,260 @@ def fetch_legacy_support_user_by_username(username: str) -> dict[str, Any] | Non
 
 def fetch_legacy_support_user_by_email(email: str) -> dict[str, Any] | None:
     return _fetch_legacy_support_user_by_lookup(email, lookup_kind="email")
+
+
+def fetch_legacy_support_user_by_id(user_id: Any) -> dict[str, Any] | None:
+    return _fetch_legacy_support_user_by_lookup(str(user_id), lookup_kind="id")
+
+
+def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None:
+    (
+        user_id,
+        username_val,
+        first_name,
+        last_name,
+        returned_email,
+        password_hash,
+        is_staff,
+        is_superuser,
+        is_active,
+        has_support_access,
+        has_operations_access,
+        has_admin_access,
+    ) = row
+    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access)):
+        return None
+
+    full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
+
+    return {
+        "id": int(user_id),
+        "username": sanitize_text(username_val),
+        "first_name": sanitize_text(first_name),
+        "last_name": sanitize_text(last_name),
+        "full_name": full_name,
+        "email": sanitize_text(returned_email).lower(),
+        "password_hash": sanitize_text(password_hash),
+        "is_staff": bool(is_staff),
+        "is_superuser": bool(is_superuser),
+        "is_active": bool(is_active),
+        "has_support_access": bool(has_support_access),
+        "has_operations_access": bool(has_operations_access),
+        "has_admin_access": bool(has_admin_access),
+    }
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> dict[str, dict[Any, dict[str, Any]]]:
+    """Load current Communication Centre access for all visible agents in one query."""
+    auth_database_url = get_support_auth_database_url()
+    if not auth_database_url or not accounts:
+        return {"id": {}, "email": {}, "username": {}}
+
+    legacy_ids: set[int] = set()
+    emails: set[str] = set()
+    usernames: set[str] = set()
+    for account in accounts:
+        metadata = normalize_json_object(account.get("metadata"))
+        legacy_auth_user_id = _positive_int(metadata.get("legacy_auth_user_id"))
+        if legacy_auth_user_id:
+            legacy_ids.add(legacy_auth_user_id)
+
+        for email_candidate in (
+            account.get("email"),
+            metadata.get("legacy_auth_email"),
+            metadata.get("entra_email"),
+        ):
+            normalized_email = normalize_email(sanitize_text(email_candidate or ""))
+            if normalized_email:
+                emails.add(normalized_email)
+
+        username_candidate = sanitize_text(account.get("username") or "").lower()
+        if username_candidate:
+            usernames.add(username_candidate)
+
+    if not legacy_ids and not emails and not usernames:
+        return {"id": {}, "email": {}, "username": {}}
+
+    with psycopg.connect(auth_database_url) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  u.id,
+                  u.username,
+                  u.first_name,
+                  u.last_name,
+                  LOWER(TRIM(u.email)) AS email,
+                  u.password,
+                  u.is_staff,
+                  u.is_superuser,
+                  u.is_active,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_support_access,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_operations_access,
+                  EXISTS(
+                    SELECT 1
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = %s
+                  ) AS has_admin_access
+                FROM auth_user u
+                WHERE u.is_active = TRUE
+                  AND (
+                    u.id = ANY(%s::int[])
+                    OR LOWER(TRIM(u.email)) = ANY(%s::text[])
+                    OR LOWER(TRIM(u.username)) = ANY(%s::text[])
+                  )
+                """,
+                [
+                    SUPPORT_ACCESS_GROUP_NAME,
+                    OPERATIONS_ACCESS_GROUP_NAME,
+                    ADMIN_ACCESS_GROUP_NAME,
+                    list(legacy_ids),
+                    list(emails),
+                    list(usernames),
+                ],
+            )
+            rows = cursor.fetchall()
+
+    users_by_id: dict[int, dict[str, Any]] = {}
+    users_by_email: dict[str, dict[str, Any]] = {}
+    users_by_username: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        legacy_user = _legacy_support_user_from_row(row)
+        if not legacy_user:
+            continue
+        users_by_id[int(legacy_user["id"])] = legacy_user
+        if legacy_user.get("email"):
+            users_by_email[normalize_email(legacy_user["email"])] = legacy_user
+        if legacy_user.get("username"):
+            users_by_username[sanitize_text(legacy_user["username"]).lower()] = legacy_user
+
+    return {
+        "id": users_by_id,
+        "email": users_by_email,
+        "username": users_by_username,
+    }
+
+
+def refresh_staff_account_legacy_access(
+    account: dict[str, Any],
+    legacy_lookup: dict[str, dict[Any, dict[str, Any]]] | None = None,
+    *,
+    persist: bool = False,
+) -> dict[str, Any]:
+    """Refresh Communication Centre access flags before showing staff accounts."""
+    if not get_support_auth_database_url():
+        return account
+
+    metadata = normalize_json_object(account.get("metadata"))
+    legacy_user = None
+    legacy_auth_user_id = _positive_int(metadata.get("legacy_auth_user_id"))
+
+    if legacy_lookup is not None:
+        if legacy_auth_user_id:
+            legacy_user = legacy_lookup.get("id", {}).get(legacy_auth_user_id)
+        if not legacy_user:
+            for email_candidate in (
+                account.get("email"),
+                metadata.get("legacy_auth_email"),
+                metadata.get("entra_email"),
+            ):
+                normalized_email = normalize_email(sanitize_text(email_candidate or ""))
+                if normalized_email:
+                    legacy_user = legacy_lookup.get("email", {}).get(normalized_email)
+                if legacy_user:
+                    break
+        if not legacy_user:
+            username_candidate = sanitize_text(account.get("username") or "").lower()
+            if username_candidate:
+                legacy_user = legacy_lookup.get("username", {}).get(username_candidate)
+    elif legacy_auth_user_id > 0:
+        legacy_user = fetch_legacy_support_user_by_id(legacy_auth_user_id)
+
+    if legacy_lookup is None and not legacy_user:
+        for email_candidate in (
+            account.get("email"),
+            metadata.get("legacy_auth_email"),
+            metadata.get("entra_email"),
+        ):
+            normalized_email = normalize_email(sanitize_text(email_candidate or ""))
+            if not normalized_email:
+                continue
+            legacy_user = fetch_legacy_support_user_by_email(normalized_email)
+            if legacy_user:
+                break
+
+    if legacy_lookup is None and not legacy_user:
+        username_candidate = sanitize_text(account.get("username") or "")
+        if username_candidate:
+            legacy_user = fetch_legacy_support_user_by_username(username_candidate)
+
+    refreshed_metadata = dict(metadata)
+    has_legacy_marker = any(
+        key in refreshed_metadata
+        for key in (
+            "legacy_auth_user_id",
+            "legacy_auth_email",
+            "legacy_support_access",
+            "legacy_operations_access",
+            "legacy_admin_access",
+        )
+    )
+
+    if legacy_user:
+        refreshed_metadata.update(
+            {
+                "legacy_auth_user_id": int(legacy_user["id"]),
+                "legacy_auth_source": "kbc_auth_user",
+                "legacy_auth_synced_at": datetime.now(timezone.utc).isoformat(),
+                "legacy_auth_email": normalize_email(legacy_user.get("email")),
+                "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
+                "legacy_operations_access": normalize_bool(legacy_user.get("has_operations_access")),
+                "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
+            }
+        )
+    elif has_legacy_marker:
+        refreshed_metadata.update(
+            {
+                "legacy_auth_synced_at": datetime.now(timezone.utc).isoformat(),
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+                "session_active": False,
+                "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
+            }
+        )
+
+    if refreshed_metadata != metadata:
+        if persist:
+            persist_agent_metadata(int(account["id"]), refreshed_metadata)
+        return {
+            **account,
+            "metadata": refreshed_metadata,
+        }
+
+    return account
 
 
 
@@ -3812,14 +4199,18 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
+    requester_name = row.get("learner_name") or ""
     documentation = normalize_admin_documentation(
-        ticket_metadata.get("admin_documentation"),
+        row.get("_resolved_documentation", ticket_metadata.get("admin_documentation")),
         fallback_inquiry=sanitize_text(row.get("inquiry")),
         fallback_chat_id=build_public_chat_id(row.get("public_id"), row.get("conversation_id"), conversation_metadata),
         fallback_ticket_id=row.get("public_id") or "",
     )
-    latest_coverage_tutor_response = get_latest_coverage_tutor_response(ticket_metadata)
-    if is_coverage_ticket_record(row):
+    latest_coverage_tutor_response = (
+        normalize_latest_coverage_tutor_response(row.get("_resolved_latest_coverage_tutor_response"))
+        or get_latest_coverage_tutor_response(ticket_metadata)
+    )
+    if is_coverage_ticket_record(row) and not row.get("_coverage_state_resolved"):
         documentation, latest_coverage_tutor_response = derive_coverage_tutor_response_state(
             ticket_public_id=row.get("public_id") or "",
             inquiry=row.get("inquiry"),
@@ -3839,7 +4230,8 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "id": row["public_id"],
-        "learnerName": row.get("learner_name") or "",
+        "learnerName": requester_name,
+        "requesterName": requester_name,
         "email": row.get("learner_email") or "",
         "learnerPhone": row.get("learner_phone") or "",
         "requesterRole": get_ticket_requester_role(ticket_metadata),
@@ -5071,6 +5463,20 @@ def sync_open_ticket_inactivity(
     reference_time: datetime | None = None,
     allow_reminder: bool = True,
 ) -> dict[str, int]:
+    global _last_open_ticket_inactivity_sync_started_monotonic
+
+    if not public_id:
+        min_interval_seconds = get_open_ticket_inactivity_sync_min_interval_seconds()
+        if min_interval_seconds > 0:
+            comparison_now = time.monotonic()
+            with _open_ticket_inactivity_sync_lock:
+                if (
+                    _last_open_ticket_inactivity_sync_started_monotonic
+                    and (comparison_now - _last_open_ticket_inactivity_sync_started_monotonic) < min_interval_seconds
+                ):
+                    return {"scanned": 0, "reminded": 0, "closed": 0}
+                _last_open_ticket_inactivity_sync_started_monotonic = comparison_now
+
     params: list[Any] = []
     public_id_filter = ""
     if public_id:
@@ -6848,6 +7254,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
     response["ticket"] = {
         "id": existing_ticket["public_id"],
         "learnerName": requester.get("display_name") or learner.get("full_name") or "",
+        "requesterName": requester.get("display_name") or learner.get("full_name") or "",
         "email": learner["email"],
         "requesterRole": get_ticket_requester_role(existing_ticket_metadata, default=requester_role),
         "category": existing_ticket["category"],
@@ -7270,9 +7677,14 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         query_params,
     )
     open_assigned_chat_agent_ids = get_open_assigned_live_chat_agent_ids()
+    legacy_lookup = fetch_legacy_support_users_for_accounts(accounts)
+    refreshed_accounts = [
+        refresh_staff_account_legacy_access(account, legacy_lookup)
+        for account in accounts
+    ]
     serialized_accounts = [
         serialize_agent(account, open_assigned_chat_agent_ids=open_assigned_chat_agent_ids)
-        for account in accounts
+        for account in refreshed_accounts
     ]
 
     return {
@@ -7592,8 +8004,84 @@ def remove_agent(account_id: int) -> None:
         _remove_django_support_access(email)
 
 
+def _sync_tickets_background() -> None:
+    global _ticket_background_sync_in_progress
+
+    try:
+        sync_open_ticket_inactivity()
+        tickets = run_query(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.inquiry,
+              t.technical_subcategory,
+              t.status,
+              t.status_reason,
+              t.sla_status,
+              t.metadata,
+              t.created_at,
+              t.updated_at,
+              t.conversation_id,
+              t.assigned_agent_id,
+              t.assigned_team,
+              c.status AS conversation_status,
+              c.metadata AS conversation_metadata,
+              a.username AS assigned_agent_username,
+              a.full_name AS assigned_agent_name
+            FROM tickets t
+            LEFT JOIN conversations c
+              ON c.id = t.conversation_id
+            LEFT JOIN support_accounts a
+              ON a.id = t.assigned_agent_id
+            WHERE t.is_archived = FALSE
+            """
+        )
+        try:
+            synced_tickets = synchronize_coverage_tutor_workflow_tickets(tickets)
+        except Exception:
+            synced_tickets = []
+            for ticket in tickets:
+                try:
+                    synced_tickets.append(synchronize_coverage_tutor_workflow_ticket(ticket))
+                except Exception:
+                    synced_tickets.append(ticket)
+
+        for ticket in synced_tickets:
+            try:
+                apply_ticket_sla_policy(ticket, persist=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        with _ticket_background_sync_lock:
+            _ticket_background_sync_in_progress = False
+
+
+def trigger_ticket_background_sync() -> None:
+    global _ticket_background_sync_in_progress, _last_ticket_background_sync_started_monotonic
+
+    min_interval_seconds = get_ticket_background_sync_min_interval_seconds()
+    comparison_now = time.monotonic()
+    with _ticket_background_sync_lock:
+        if _ticket_background_sync_in_progress:
+            return
+        if (
+            min_interval_seconds > 0
+            and _last_ticket_background_sync_started_monotonic
+            and (comparison_now - _last_ticket_background_sync_started_monotonic) < min_interval_seconds
+        ):
+            return
+        _ticket_background_sync_in_progress = True
+        _last_ticket_background_sync_started_monotonic = comparison_now
+
+    threading.Thread(target=_sync_tickets_background, daemon=True).start()
+
+
 def list_admin_tickets() -> dict[str, Any]:
-    sync_open_ticket_inactivity()
+    trigger_ticket_background_sync()
+
     tickets = run_query(
         """
         SELECT
@@ -7648,8 +8136,7 @@ def list_admin_tickets() -> dict[str, Any]:
         """
     )
 
-    tickets = [synchronize_coverage_tutor_workflow_ticket(ticket) for ticket in tickets]
-    tickets = [apply_ticket_sla_policy(ticket, persist=True) for ticket in tickets]
+    tickets = [apply_ticket_sla_policy(ticket) for ticket in tickets]
     tickets = sort_tickets_by_priority_and_recency(tickets)
     return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
 
@@ -7777,6 +8264,7 @@ def is_current_admin_notification_history_item(event_type: Any, payload: Any, ti
 def serialize_admin_notification_log_item(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
+    requester_name = row.get("learner_name") or ""
     normalized_payload = normalize_history_payload(
         row.get("payload"),
         ticket_public_id=row.get("public_id"),
@@ -7793,7 +8281,8 @@ def serialize_admin_notification_log_item(row: dict[str, Any]) -> dict[str, Any]
         "createdAt": row["created_at"],
         "ticketId": row["public_id"],
         "chatId": build_public_chat_id(row.get("public_id"), row.get("conversation_id"), conversation_metadata),
-        "learnerName": row.get("learner_name") or "",
+        "learnerName": requester_name,
+        "requesterName": requester_name,
         "email": row.get("learner_email") or "",
         "requesterRole": get_ticket_requester_role(ticket_metadata),
         "status": row["status"],
@@ -11080,6 +11569,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
         "ticket": {
             "id": public_id,
             "learnerName": requester.get("display_name") or learner.get("full_name") or "",
+            "requesterName": requester.get("display_name") or learner.get("full_name") or "",
             "email": learner["email"],
             "requesterRole": requester_role,
             "requesterSource": requester_source,
@@ -11278,6 +11768,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
         "ticket": {
             "id": existing_ticket["public_id"],
             "learnerName": existing_ticket.get("learner_name") or "",
+            "requesterName": existing_ticket.get("learner_name") or "",
             "email": existing_ticket["email"],
             "requesterRole": requester_role,
             "requesterSource": requester_source,

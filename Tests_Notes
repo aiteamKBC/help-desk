@@ -51,3 +51,47 @@ Ticket: unchanged, usually still Open. Chat: unchanged, usually open. User sees:
 5.Add transfer message (you are currently speaking to ...)
 6.Solve duplication in messages![alt text](image.png)
 7.After duplication when trying to scroll upward I am forced to chat bottom
+=================================================
+->Coverage cards should have an "x" icon to remove cards
+->Also remove the "?" in front of coverage cards
+->"Submit to tutor" will send data to a n8n workflow, it is url is in .env.local. as N8N_MAIL_WEBHOOK_UR
+Data will be the Tutor name, e-mail, file attacched (presentation) -> A response should change status reason in database to Tutor accepted or Tutor rejected
+->In both cases Accepted or rejected, notify agent through dashboard notifications
+->if Accepted add an acceptance card, summarizing new tutor session details and have a button "Confirm session" that can be active only at the time of the session known, when clicked ticket will be closed
+---------------------------------------------------
+LAST NOTES To Hamamo:
+->Saving freezez changes
+->Added Inquiry tab
+->Reverse show cards, form latest to oldest
+->Assign ticket to first editor and Superadmin can overwrite assignment
+Requested by Eng. Ayman:
+->Coach/requester can choose date of exact session (Each session has a date an name in training plan in comm, center) [Done] 
+
+->Notification through dasboard and e-mail to training plan team when ticket added, or its status/status reason edited [DONE]
+->Edit on N8N accept/refuse form: Make that the turtor can accept or refuse one time only, and further clicking can change the status reason. [DONE]
+->Shifted ticket creation after suuport form chosen (or action taken)
+->Send E-mail to learningplan team [Done]
+->Allow pending to be edited [Done]
+->Make support ticket in view similar to Coverage ticket [Done]
+-> session details and preffered  in e-mail notification [Done]
+->COVERAGE: Only one active choice card / archive [Done]
+======================================
+Modifications/Features To Do:
+->Change Learner to Requester as in ticket details
+->Add Delete in Archive + deleting log
+->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no Action 
+->Coverage ticket, automatic sent to all replacements, if one accepted --> Tutor accepted, and all other tutors are informed if tried to accept or refuse
+->Add attachments in documentation  
+->Add Direct Call for coaches
+->Check All support methods flows and test all
+-------
+->Tutor e-mail field bug
+->check assignment in case for more than one member editing coverage ticket.
+->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)] 
+->Change Coverage Category -> Operations not Technical
+
+
+
+=========================================
+Current Ticket Closed Rule:
+-> Closed on finding replacement [Done]

@@ -202,6 +202,7 @@ interface LatestCoverageTutorResponse {
 interface TicketSummary {
   id: string;
   learnerName: string;
+  requesterName?: string;
   email: string;
   learnerPhone: string;
   requesterRole: string;
@@ -282,6 +283,7 @@ interface AdminNotificationLogItem extends HistoryItem {
   ticketId: string;
   chatId: string;
   learnerName: string;
+  requesterName?: string;
   email: string;
   requesterRole: string;
   status: "Open" | "Pending" | "Closed";
@@ -526,6 +528,7 @@ const AgentDashboard = () => {
   const [draftSlaStatus, setDraftSlaStatus] = useState<TicketSummary["slaStatus"]>("Pending Review");
   const [notes, setNotes] = useState("");
   const [isLoading, setIsLoading] = useState(true);
+  const [isAgentsLoading, setIsAgentsLoading] = useState(true);
   const [isOpening, setIsOpening] = useState(false);
   const [isConsoleOpening, setIsConsoleOpening] = useState(false);
   const [isSendingConsoleChat, setIsSendingConsoleChat] = useState(false);
@@ -568,6 +571,9 @@ const AgentDashboard = () => {
   const compactConsoleSearch = compactConsoleSearchValue(normalizedConsoleSearch);
   const normalizedDashboardSearch = normalizeConsoleSearchValue(dashboardSearch);
   const compactDashboardSearch = compactConsoleSearchValue(normalizedDashboardSearch);
+  const dashboardSearchPlaceholder = isCoverageDashboardView
+    ? "Search by tutor, module, chat ID, or ticket ID"
+    : "Search by requester name, chat ID, or ticket ID";
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
   const activeTicketIsArchived = Boolean(activeDetail?.ticket.isArchived);
   const isActiveQuickTicket = Boolean(activeDetail) && isDashboardQuickResolutionTicket(activeDetail.ticket);
@@ -602,8 +608,9 @@ const AgentDashboard = () => {
   const activeAgents = agents.filter((agent) => (
     agent.isActive !== false
     && isStaffSupportAccount(agent)
-    && hasSupportDashboardAccess(agent)
+    && hasCurrentCommunicationCentreAccess(agent)
   ));
+  const managementAgents = activeAgents;
   const signedInAgent = agents.find((agent) => (
     (session?.id && agent.id === session.id)
     || (session?.username && agent.username === session.username)
@@ -783,7 +790,7 @@ const AgentDashboard = () => {
     const searchableFields = [
       ticket.id,
       getDisplayedChatReference(ticket),
-      ticket.learnerName,
+      getRequesterDisplayName(ticket),
       ticket.email,
       formatRequesterRoleLabel(ticket.requesterRole),
       ticket.category,
@@ -928,8 +935,7 @@ const AgentDashboard = () => {
       const searchableFields = [
         getDisplayedChatReference(ticket),
         ticket.id,
-        ticket.learnerName,
-        ticket.email,
+        ...getDashboardRequesterColumnSummary(ticket, { preferCoverageInquiry: isCoverageDashboardView }).searchTerms,
         formatRequesterRoleLabel(ticket.requesterRole),
       ];
 
@@ -1555,12 +1561,12 @@ const AgentDashboard = () => {
       }
 
       toast.info(
-        `New coverage ticket ${ticket.id} created for ${pendingCoverageTicketNotification.requesterName || ticket.learnerName || ticket.email || "requester"}.`,
+        `New coverage ticket ${ticket.id} created for ${pendingCoverageTicketNotification.requesterName || getRequesterDisplayName(ticket, "requester")}.`,
       );
       showAdminDesktopNotification(
         `coverage-ticket:${ticket.id}:${pendingCoverageTicketNotification.createdAt}`,
         "New Coverage Ticket",
-        `${ticket.id} • ${pendingCoverageTicketNotification.requesterName || ticket.learnerName || ticket.email || "Requester"}`,
+        `${ticket.id} • ${pendingCoverageTicketNotification.requesterName || getRequesterDisplayName(ticket)}`,
       );
     }
 
@@ -1610,7 +1616,7 @@ const AgentDashboard = () => {
 
     for (const ticket of newWaitingLiveChatNotifications) {
       toast.info(
-        `Live chat is waiting for an available admin for ${ticket.id} (${ticket.learnerName || ticket.email || "Learner"}).`,
+        `Live chat is waiting for an available admin for ${ticket.id} (${getRequesterDisplayName(ticket)}).`,
       );
       showAdminDesktopNotification(
         `waiting-live-chat:${ticket.id}:${ticket.liveChatRequestedAt || ticket.createdAt}`,
@@ -1889,28 +1895,80 @@ const AgentDashboard = () => {
 
     try {
       const requestSession = sessionRef.current;
+      const shouldTrackInitialAgentLoad = agents.length === 0;
+      if (shouldTrackInitialAgentLoad) {
+        setIsAgentsLoading(true);
+      }
+
+      const ticketsPromise = fetchTicketsList()
+        .then((tickets) => ({ tickets, error: null as unknown }))
+        .catch((fetchError) => ({ tickets: null, error: fetchError }));
+      const agentsPromise = fetchAgentsList()
+        .then((nextAgents) => ({ agents: nextAgents, error: null as unknown }))
+        .catch((fetchError) => ({ agents: null, error: fetchError }));
+      const migrationStatusPromise = fetch("/api/migration-status")
+        .then(async (response) => ((await response.json().catch(() => null)) as MigrationStatusResponse | null))
+        .catch(() => null);
+      const notificationLogPromise = fetchNotificationLog()
+        .then((nextNotificationLog) => nextNotificationLog)
+        .catch(() => [] as AdminNotificationLogItem[]);
+
+      void agentsPromise
+        .then((agentsResult) => {
+          if (!isCurrentDashboardSession(requestSession)) {
+            return;
+          }
+
+          if (!agentsResult.agents) {
+            setError((currentError) => (
+              currentError
+              || (agentsResult.error instanceof Error
+                ? agentsResult.error.message
+                : "We could not load support accounts right now.")
+            ));
+            return;
+          }
+
+          setAgents(agentsResult.agents);
+          syncConsoleStatusFromAgents(agentsResult.agents);
+        })
+        .finally(() => {
+          if (shouldTrackInitialAgentLoad && isCurrentDashboardSession(requestSession)) {
+            setIsAgentsLoading(false);
+          }
+        });
+
+      void migrationStatusPromise.then((migrationStatusPayload) => {
+        if (!isCurrentDashboardSession(requestSession)) {
+          return;
+        }
+
+        setChatbotWorkflowConfigured(
+          Boolean(migrationStatusPayload?.adminAiWebhookConfigured ?? migrationStatusPayload?.chatbotWebhookConfigured),
+        );
+      });
+
+      void notificationLogPromise.then((nextNotificationLog) => {
+        if (!isCurrentDashboardSession(requestSession)) {
+          return;
+        }
+
+        setNotificationLog(nextNotificationLog);
+      });
+
       const verifiedSession = await revalidateAdminSession({ silent: true });
       if (!verifiedSession || !isCurrentDashboardSession(requestSession)) {
         return;
       }
 
-      const [tickets, nextAgents, migrationStatusResponse, nextNotificationLog] = await Promise.all([
-        fetchTicketsList(),
-        fetchAgentsList(),
-        fetch("/api/migration-status"),
-        fetchNotificationLog().catch(() => []),
-      ]);
-      const migrationStatusPayload = (await migrationStatusResponse.json().catch(() => null)) as MigrationStatusResponse | null;
-      if (!isCurrentDashboardSession()) {
+      const ticketsResult = await ticketsPromise;
+      if (ticketsResult.error) {
+        throw ticketsResult.error;
+      }
+      if (!ticketsResult.tickets || !isCurrentDashboardSession(requestSession)) {
         return;
       }
-      setTickets(tickets);
-      setAgents(nextAgents);
-      setNotificationLog(nextNotificationLog);
-      syncConsoleStatusFromAgents(nextAgents);
-      setChatbotWorkflowConfigured(
-        Boolean(migrationStatusPayload?.adminAiWebhookConfigured ?? migrationStatusPayload?.chatbotWebhookConfigured),
-      );
+      setTickets(ticketsResult.tickets);
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : "We could not load the dashboard right now.");
     } finally {
@@ -3713,9 +3771,9 @@ const AgentDashboard = () => {
                     <Input
                       value={dashboardSearch}
                       onChange={(event) => setDashboardSearch(event.target.value)}
-                      placeholder="Search by learner name, chat ID, or ticket ID"
+                      placeholder={dashboardSearchPlaceholder}
                       className="pl-10"
-                      aria-label="Search tickets by learner name, chat ID, or ticket ID"
+                      aria-label={dashboardSearchPlaceholder}
                     />
                   </div>
                 </div>
@@ -3742,84 +3800,91 @@ const AgentDashboard = () => {
               <table className="w-full text-sm">
                 <thead className="bg-secondary/50 text-muted-foreground">
                   <tr className="text-left">
-                    {["Chat ID", "Ticket ID", "Learner", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"].map((heading) => (
+                    {["Chat ID", "Ticket ID", "Requester", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"].map((heading) => (
                       <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {visibleDashboardTickets.map((ticket) => (
-                    <tr
-                      key={ticket.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => void openTicket(ticket.id)}
-                      onKeyDown={(event) => {
-                        if (event.key !== "Enter" && event.key !== " ") {
-                          return;
-                        }
+                  {visibleDashboardTickets.map((ticket) => {
+                    const requesterColumnSummary = getDashboardRequesterColumnSummary(
+                      ticket,
+                      { preferCoverageInquiry: isCoverageDashboardView },
+                    );
 
-                        event.preventDefault();
-                        void openTicket(ticket.id);
-                      }}
-                      className={cn(
-                        "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-secondary/20",
-                        getTicketTransferRowClassName(ticket),
-                      )}
-                    >
-                      <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
-                      <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
-                      <td className="px-4 py-3 min-w-[240px]">
-                        <div className="font-medium">{ticket.learnerName || "Learner"}</div>
-                        <div className="text-xs text-muted-foreground">{ticket.email}</div>
-                        <div className="mt-2">
-                          <RequesterRoleBadge role={ticket.requesterRole} />
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</td>
-                      <td className="px-4 py-3"><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
-                      <td className="px-4 py-3 text-muted-foreground">{getDisplayedTicketStatusReason(ticket)}</td>
-                      <td className="px-4 py-3">
-                        <AssignedAgentBadge
-                          assignedAgentId={ticket.assignedAgentId}
-                          assignedAgentName={ticket.assignedAgentName}
-                          statusReason={ticket.statusReason}
-                          documentation={ticket.documentation}
-                          pendingEscalationNotification={ticket.pendingEscalationNotification}
-                          latestEscalationClosure={ticket.latestEscalationClosure}
-                          latestTransferDecision={ticket.latestTransferDecision}
-                        />
-                      </td>
-                      <td className="px-4 py-3 whitespace-nowrap">{formatDateTime(ticket.createdAt)}</td>
-                      <td className="px-4 py-3">
-                        <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
-                          {ticket.slaStatus}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-8 whitespace-nowrap rounded-full"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
-                          }}
-                          disabled={archiveActionTicketId === ticket.id}
-                        >
-                          {archiveActionTicketId === ticket.id ? (
-                            <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                          ) : isArchivedTicket(ticket) ? (
-                            <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                          ) : (
-                            <Archive className="mr-1.5 h-3.5 w-3.5" />
-                          )}
-                          {isArchivedTicket(ticket) ? "Restore" : "Archive"}
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
+                    return (
+                      <tr
+                        key={ticket.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => void openTicket(ticket.id)}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter" && event.key !== " ") {
+                            return;
+                          }
+
+                          event.preventDefault();
+                          void openTicket(ticket.id);
+                        }}
+                        className={cn(
+                          "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-secondary/20",
+                          getTicketTransferRowClassName(ticket),
+                        )}
+                      >
+                        <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
+                        <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
+                        <td className="px-4 py-3 min-w-[240px]">
+                          <div className="font-medium">{requesterColumnSummary.primaryText}</div>
+                          <div className="text-xs text-muted-foreground">{requesterColumnSummary.secondaryText}</div>
+                          <div className="mt-2">
+                            <RequesterRoleBadge role={ticket.requesterRole} />
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</td>
+                        <td className="px-4 py-3"><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
+                        <td className="px-4 py-3 text-muted-foreground">{getDisplayedTicketStatusReason(ticket)}</td>
+                        <td className="px-4 py-3">
+                          <AssignedAgentBadge
+                            assignedAgentId={ticket.assignedAgentId}
+                            assignedAgentName={ticket.assignedAgentName}
+                            statusReason={ticket.statusReason}
+                            documentation={ticket.documentation}
+                            pendingEscalationNotification={ticket.pendingEscalationNotification}
+                            latestEscalationClosure={ticket.latestEscalationClosure}
+                            latestTransferDecision={ticket.latestTransferDecision}
+                          />
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">{formatDateTime(ticket.createdAt)}</td>
+                        <td className="px-4 py-3">
+                          <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
+                            {ticket.slaStatus}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="h-8 whitespace-nowrap rounded-full"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
+                            }}
+                            disabled={archiveActionTicketId === ticket.id}
+                          >
+                            {archiveActionTicketId === ticket.id ? (
+                              <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            ) : isArchivedTicket(ticket) ? (
+                              <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                            ) : (
+                              <Archive className="mr-1.5 h-3.5 w-3.5" />
+                            )}
+                            {isArchivedTicket(ticket) ? "Restore" : "Archive"}
+                          </Button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -4229,7 +4294,7 @@ const AgentDashboard = () => {
                     <div>
                       <h2 className="text-lg font-semibold text-foreground">Agent Management</h2>
                       <p className="mt-1 text-sm text-muted-foreground">
-                        Agents added here receive ticket assignments.
+                        Showing current Communication Centre support, operations, and admin access.
                       </p>
                     </div>
                     <div className="relative w-full sm:w-[280px]">
@@ -4245,12 +4310,12 @@ const AgentDashboard = () => {
                 </div>
 
                 <div className="divide-y">
-                  {isLoading ? (
+                  {isAgentsLoading ? (
                     <div className="flex items-center justify-center gap-2 p-10 text-sm text-muted-foreground">
                       <LoaderCircle className="h-4 w-4 animate-spin" />
                       Loading agents...
                     </div>
-                  ) : agents.filter((agent) => {
+                  ) : managementAgents.filter((agent) => {
                     if (!managementSearch.trim()) return true;
                     const q = managementSearch.toLowerCase();
                     return (
@@ -4263,7 +4328,7 @@ const AgentDashboard = () => {
                       No matching support accounts found. Manage Support Access and Operations Access from Communication Centre.
                     </div>
                   ) : (
-                    agents
+                    managementAgents
                       .filter((agent) => {
                         if (!managementSearch.trim()) return true;
                         const q = managementSearch.toLowerCase();
@@ -4556,7 +4621,7 @@ const AgentDashboard = () => {
                             resizeHandlePosition="bottom"
                           >
                             <div className="grid gap-3 sm:grid-cols-2">
-                              <ConsoleField label="Name" icon={UserRound} value={consoleDetail.ticket.learnerName || "-"} />
+                              <ConsoleField label="Name" icon={UserRound} value={getRequesterDisplayName(consoleDetail.ticket, "-")} />
                               <ConsoleField label="E-mail" icon={Mail} value={consoleDetail.ticket.email || "-"} />
                               <ConsoleField label="Requester Role" icon={UserRound} value={formatRequesterRoleLabel(consoleDetail.ticket.requesterRole)} />
                               <ConsoleField label="Phone" icon={Phone} value={consoleDetail.ticket.learnerPhone || "-"} />
@@ -4729,7 +4794,7 @@ const AgentDashboard = () => {
                   ) : null}
                 </SheetTitle>
                 <SheetDescription>
-                  {activeDetail.ticket.learnerName || activeDetail.ticket.email} - {formatTicketHeaderCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)}
+                  {getRequesterDisplayName(activeDetail.ticket, activeDetail.ticket.email || "-")} - {formatTicketHeaderCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)}
                 </SheetDescription>
               </SheetHeader>
 
@@ -5209,7 +5274,7 @@ const ConsoleQueueList = ({
                 {humanizeChatState(ticket.chatState)}
               </span>
             </div>
-            <div className="mt-2 font-medium">{ticket.learnerName || "Learner"}</div>
+            <div className="mt-2 font-medium">{getRequesterDisplayName(ticket)}</div>
             <div className="mt-2">
               <RequesterRoleBadge role={ticket.requesterRole} />
             </div>
@@ -5381,7 +5446,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-primary">Ticket {pendingCoverageTicketNotification.ticketId}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {pendingCoverageTicketNotification.requesterName || ticket.learnerName || ticket.email || "Requester"}
+                    {pendingCoverageTicketNotification.requesterName || getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge
@@ -5441,7 +5506,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-primary">{ticket.id}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || ticket.email || "Learner"}
+                    {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge role={ticket.requesterRole} className="border-primary/20 bg-primary/5 text-primary" />
@@ -5496,7 +5561,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-amber-900">Ticket {pendingEscalationNotification.ticketId}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || ticket.email || "Learner"}
+                    {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge role={ticket.requesterRole} className="border-amber-300 bg-white/70 text-amber-900" />
@@ -5543,7 +5608,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-primary">Ticket {pendingTeamsCallNotification.ticketId}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || pendingTeamsCallNotification.requesterName || ticket.email || "Learner"}
+                    {pendingTeamsCallNotification.requesterName || getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge role={pendingTeamsCallNotification.requesterRole || ticket.requesterRole} className="border-primary/20 bg-white/80 text-primary" />
@@ -5591,7 +5656,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-amber-900">{ticket.id}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || ticket.email || "Learner"}
+                    {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge role={ticket.requesterRole} className="border-amber-300 bg-white/70 text-amber-900" />
@@ -5667,7 +5732,7 @@ const AdminNotificationsPanel = ({
                     Ticket {latestCoverageTutorResponse.ticketId}
                   </div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || ticket.email || "Learner"}
+                    {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge
@@ -5739,7 +5804,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-emerald-900">Ticket {latestEscalationClosure.ticketId}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || ticket.email || "Learner"}
+                    {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge role={ticket.requesterRole} className="border-emerald-300 bg-white/70 text-emerald-900" />
@@ -5790,7 +5855,7 @@ const AdminNotificationsPanel = ({
                 <div className="min-w-0">
                   <div className="font-mono text-xs font-semibold text-primary">{ticket.id}</div>
                   <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                    {ticket.learnerName || ticket.email || "Learner"}
+                    {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
                     <RequesterRoleBadge role={ticket.requesterRole} className="border-primary/20 bg-primary/5 text-primary" />
@@ -5876,7 +5941,7 @@ const AdminNotificationLogCard = ({
             {getDisplayedChatReference(item, true)}
           </div>
           <div className="mt-1 truncate text-sm font-semibold text-foreground">
-            {item.learnerName || item.email || "Learner"}
+            {getRequesterDisplayName(item)}
           </div>
           <div className="mt-2">
             <RequesterRoleBadge role={item.requesterRole} className="border-primary/20 bg-primary/5 text-primary" />
@@ -9374,14 +9439,11 @@ function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">)
   return normalizedScope === "staff";
 }
 
-function hasSupportDashboardAccess(agent: Pick<AdminAgent, "role" | "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess" | "entraDirectoryAdmin">) {
-  const normalizedRole = (agent.role || "").trim().toLowerCase();
+function hasCurrentCommunicationCentreAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess">) {
   return Boolean(
     agent.legacySupportAccess
     || agent.legacyOperationsAccess
-    || agent.legacyAdminAccess
-    || agent.entraDirectoryAdmin
-    || adminDashboardAccessRoles.has(normalizedRole),
+    || agent.legacyAdminAccess,
   );
 }
 
@@ -10096,6 +10158,56 @@ function formatCategoryLabel(category: string, technicalSubcategory: string) {
   }
 
   return category;
+}
+
+type RequesterDisplaySubject = {
+  requesterName?: string | null;
+  learnerName?: string | null;
+  email?: string | null;
+};
+
+type DashboardRequesterSummarySubject = RequesterDisplaySubject & {
+  technicalSubcategory?: string | null;
+  documentation?: Pick<AdminDocumentation, "inquiry"> | null;
+};
+
+function getRequesterDisplayName(subject: RequesterDisplaySubject | null | undefined, fallback = "Requester") {
+  const candidates = [subject?.requesterName, subject?.learnerName, subject?.email];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return fallback;
+}
+
+function getDashboardRequesterColumnSummary(
+  ticket: DashboardRequesterSummarySubject | null | undefined,
+  options?: { preferCoverageInquiry?: boolean },
+) {
+  const defaultPrimaryText = getRequesterDisplayName(ticket);
+  const defaultSecondaryText = ticket?.email?.trim() || "";
+
+  if (!options?.preferCoverageInquiry || ticket?.technicalSubcategory !== "Coverage") {
+    return {
+      primaryText: defaultPrimaryText,
+      secondaryText: defaultSecondaryText,
+      searchTerms: [defaultPrimaryText, defaultSecondaryText].filter(Boolean),
+    };
+  }
+
+  const parsedInquiry = parseCoverageInquiry(ticket?.documentation?.inquiry || "");
+  const tutor = parsedInquiry?.tutor?.trim() || "";
+  const moduleName = parsedInquiry?.module?.trim() || "";
+  const primaryText = tutor || defaultPrimaryText;
+  const secondaryText = moduleName || defaultSecondaryText;
+
+  return {
+    primaryText,
+    secondaryText,
+    searchTerms: [primaryText, secondaryText, tutor, moduleName, defaultPrimaryText, defaultSecondaryText].filter(Boolean),
+  };
 }
 
 function formatTicketHeaderCategoryLabel(category: string, technicalSubcategory: string) {

@@ -2386,6 +2386,7 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertTrue(summary["chatIsActive"])
         self.assertTrue(summary["liveChatRequested"])
         self.assertEqual(summary["requesterRole"], "user")
+        self.assertEqual(summary["requesterName"], "Ali Test")
         self.assertEqual(summary["priority"], "Normal")
         self.assertFalse(inactive_summary["chatIsActive"])
         self.assertFalse(inactive_summary["liveChatRequested"])
@@ -2548,7 +2549,7 @@ class SlaPolicyTests(SimpleTestCase):
         }
 
         with (
-            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services, "trigger_ticket_background_sync"),
             patch.object(services, "run_query", return_value=[normal_priority_ticket, closed_high_priority_ticket, high_priority_active_ticket]),
             patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
         ):
@@ -2556,6 +2557,40 @@ class SlaPolicyTests(SimpleTestCase):
 
         self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000010", "KBC-000011", "KBC-000012"])
         self.assertEqual(result["tickets"][0]["priority"], "High")
+
+    def test_list_coverage_tutor_request_history_rows_groups_rows_by_ticket(self):
+        request_history_rows = [
+            {"ticket_id": 21, "payload": {"cardId": "card-1"}, "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc)},
+            {"ticket_id": 22, "payload": {"cardId": "card-2"}, "created_at": datetime(2026, 5, 14, 9, 5, tzinfo=timezone.utc)},
+            {"ticket_id": 21, "payload": {"cardId": "card-3"}, "created_at": datetime(2026, 5, 14, 9, 10, tzinfo=timezone.utc)},
+        ]
+
+        with patch.object(services, "run_query", return_value=request_history_rows) as run_query:
+            result = services.list_coverage_tutor_request_history_rows(["21", 22, None, 0, "bad"])
+
+        self.assertEqual(run_query.call_count, 1)
+        self.assertEqual(run_query.call_args.args[1], [[21, 22]])
+        self.assertEqual([row["payload"]["cardId"] for row in result[21]], ["card-1", "card-3"])
+        self.assertEqual([row["payload"]["cardId"] for row in result[22]], ["card-2"])
+
+    def test_trigger_ticket_background_sync_skips_recent_restart(self):
+        original_in_progress = services._ticket_background_sync_in_progress
+        original_last_started = services._last_ticket_background_sync_started_monotonic
+        services._ticket_background_sync_in_progress = False
+        services._last_ticket_background_sync_started_monotonic = 100.0
+
+        try:
+            with (
+                patch.object(services, "get_ticket_background_sync_min_interval_seconds", return_value=10),
+                patch.object(services.time, "monotonic", return_value=105.0),
+                patch.object(services.threading, "Thread") as thread_cls,
+            ):
+                services.trigger_ticket_background_sync()
+
+            thread_cls.assert_not_called()
+        finally:
+            services._ticket_background_sync_in_progress = original_in_progress
+            services._last_ticket_background_sync_started_monotonic = original_last_started
 
 
 class AdminLoginTests(SimpleTestCase):
@@ -3121,6 +3156,21 @@ class SupportDirectoryTests(SimpleTestCase):
         remove_django_support_access.assert_called_once_with("omar.badr@kentbusinesscollege.com")
 
     def test_list_agents_returns_only_current_support_access_staff_profiles(self):
+        legacy_user = {
+            "id": 77,
+            "username": "omar1",
+            "first_name": "Omar",
+            "last_name": "One",
+            "full_name": "Omar One",
+            "email": "omar1@kentbusinesscollege.com",
+            "password_hash": "",
+            "is_staff": False,
+            "is_superuser": False,
+            "is_active": True,
+            "has_support_access": True,
+            "has_operations_access": False,
+            "has_admin_access": False,
+        }
         with (
             patch.object(
                 services,
@@ -3142,12 +3192,56 @@ class SupportDirectoryTests(SimpleTestCase):
                     },
                 ],
             ),
+            patch.object(
+                services,
+                "fetch_legacy_support_users_for_accounts",
+                return_value={"id": {77: legacy_user}, "email": {}, "username": {}},
+            ),
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
             patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
         ):
             response = services.list_agents()
 
         returned_ids = {account["id"] for account in response["accounts"]}
         self.assertEqual(returned_ids, {23})
+        persist_agent_metadata.assert_not_called()
+
+    def test_list_agents_refreshes_removed_communication_centre_access(self):
+        stale_agent = {
+            "id": 421,
+            "username": "ahmedhamamo095@gmail.com",
+            "full_name": "ahmedhamamo095@gmail.com",
+            "email": "AHMEDHAMAMO095@gmail.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 421,
+                "legacy_support_access": True,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+                "session_active": True,
+                "console_status": "Available",
+            },
+        }
+
+        with (
+            patch.object(services, "run_query", return_value=[stale_agent]),
+            patch.object(
+                services,
+                "fetch_legacy_support_users_for_accounts",
+                return_value={"id": {}, "email": {}, "username": {}},
+            ),
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = services.list_agents()
+
+        refreshed_agent = response["accounts"][0]
+        self.assertFalse(refreshed_agent["legacySupportAccess"])
+        self.assertFalse(refreshed_agent["legacyOperationsAccess"])
+        self.assertEqual(refreshed_agent["consoleStatus"], "Off")
+        persist_agent_metadata.assert_not_called()
 
     def test_serialize_agent_falls_back_to_legacy_auth_email_for_support_profiles(self):
         serialized = services.serialize_agent(
@@ -5179,6 +5273,7 @@ class AdminNotificationLogTests(SimpleTestCase):
                 "ticketId": "KBC-000017",
                 "chatId": "CHAT-000044",
                 "learnerName": "Lina",
+                "requesterName": "Lina",
                 "email": "lina@example.com",
                 "requesterRole": "coach",
                 "status": "Pending",
@@ -5231,6 +5326,7 @@ class AdminNotificationLogTests(SimpleTestCase):
         self.assertFalse(notification["isCurrent"])
         self.assertEqual(notification["eventType"], "transfer_request_accepted")
         self.assertEqual(notification["chatId"], "CHAT-000052")
+        self.assertEqual(notification["requesterName"], "Mona")
 
     def test_serialize_admin_notification_log_item_marks_current_teams_call_notification_as_current(self):
         history_payload = {
