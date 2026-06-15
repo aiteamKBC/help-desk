@@ -17,15 +17,17 @@ import {
   type RequesterSource,
   type TechnicalSubcategory,
   type Ticket,
-  useSupport,
 } from "@/context/SupportContext";
+import { useSupport } from "@/context/useSupport";
 import {
   getSupportResumePath,
-  isQuickTicketOnlyRequesterRole,
+  isCoachRequesterRole,
   quickTicketReason,
   shouldShowStatusStep,
   type SupportChatEntryAction,
 } from "@/lib/supportFlow";
+import { setTicketBookingProgress } from "@/lib/supportTicketProgress";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
 interface SupportOptionAction {
@@ -68,10 +70,11 @@ const SupportOptions = () => {
   const [isPreparingTeamsCall, setIsPreparingTeamsCall] = useState(false);
   const [isOpeningTeamsCall, setIsOpeningTeamsCall] = useState(false);
   const [hasPreparedTeamsCall, setHasPreparedTeamsCall] = useState(false);
-  const quickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
+  const isCoachRequester = isCoachRequesterRole(ticket.requesterRole);
   const [isCreatingTicket, setIsCreatingTicket] = useState(false);
   const ticketRef = useRef(ticket);
   const pendingTicketCreationRef = useRef<Promise<Ticket | null> | null>(null);
+  const clearedBookingProgressTicketRef = useRef("");
 
   useEffect(() => {
     ticketRef.current = ticket;
@@ -94,7 +97,20 @@ const SupportOptions = () => {
   }, [bookingSummary, navigate, ticket]);
 
   useEffect(() => {
-    if (!quickTicketOnlyFlow) {
+    if (!ticket.id || clearedBookingProgressTicketRef.current === ticket.id) {
+      return;
+    }
+
+    if (shouldShowStatusStep(ticket, bookingSummary)) {
+      return;
+    }
+
+    clearedBookingProgressTicketRef.current = ticket.id;
+    void setTicketBookingProgress(ticket.id, false);
+  }, [bookingSummary, ticket]);
+
+  useEffect(() => {
+    if (!isCoachRequester) {
       setTeamsCallUrl("");
       setTeamsCallTargetLabel("");
       setTeamsCallMessage("");
@@ -153,7 +169,7 @@ const SupportOptions = () => {
     return () => {
       cancelled = true;
     };
-  }, [quickTicketOnlyFlow, ticket.id]);
+  }, [isCoachRequester, ticket.id]);
 
   const buildTicketStateFromPayload = (payloadTicket: PublicTicketPayload, currentTicket: Ticket): Ticket => ({
     ...currentTicket,
@@ -402,9 +418,60 @@ const SupportOptions = () => {
     }
   };
 
-  const supportActions: SupportOptionAction[] = quickTicketOnlyFlow
-    ? [
-        {
+  const supportActions: SupportOptionAction[] = [
+    {
+      id: "chatbot",
+      title: "Chatbot",
+      description: "Open the chatbot immediately and continue the conversation from your saved inquiry.",
+      icon: Bot,
+      onClick: () => handleContinueToChat(),
+      disabled: isCreatingTicket,
+      statusText: isCreatingTicket ? "Creating ticket..." : "Open chat",
+    },
+    {
+      id: "live-chat",
+      title: ticket.liveChatRequested ? "Live Chat Requested" : "Live Chat",
+      description: ticket.liveChatRequested
+        ? "Continue to the chat and stay connected while the support team picks up your request."
+        : "Open chat and request a live support admin directly from the conversation.",
+      icon: Headphones,
+      onClick: () => handleContinueToChat("live-chat"),
+      disabled: isCreatingTicket,
+      statusText: isCreatingTicket ? "Creating ticket..." : ticket.liveChatRequested ? "Resume" : "Request now",
+    },
+    {
+      id: "booking-session",
+      title: "Booking Session",
+      description: "Open the dedicated booking page and reserve your support session without the chat popup.",
+      icon: CalendarClock,
+      onClick: async () => {
+        const createdTicket = await ensureTicketCreated();
+        if (!createdTicket) {
+          return;
+        }
+
+        await setTicketBookingProgress(createdTicket.id, true);
+        clearBookingSummary();
+        navigate("/support/booking", {
+          state: {
+            returnPath: "/support/options",
+          },
+        });
+      },
+      disabled: isCreatingTicket,
+      statusText: isCreatingTicket ? "Creating ticket..." : "Book now",
+    },
+    {
+      id: "quick-ticket",
+      title: "Submit Ticket Directly",
+      description: "Submit the saved inquiry directly to the support team without entering the chat flow.",
+      icon: FileText,
+      onClick: handleQuickSubmit,
+      disabled: isCreatingTicket || isQuickSubmitting,
+      statusText: isCreatingTicket ? "Creating ticket..." : isQuickSubmitting ? "Submitting..." : "Send now",
+    },
+    ...(isCoachRequester
+      ? [{
           id: "teams-call",
           title: "Call on Microsoft Teams",
           description: hasPreparedTeamsCall
@@ -426,79 +493,18 @@ const SupportOptions = () => {
                 : hasPreparedTeamsCall
                   ? "Assigned"
                   : "Start call",
-        },
-        {
-          id: "quick-ticket",
-          title: "Submit Ticket Directly",
-          description: "Send the saved inquiry straight to the support team for review without opening chat first.",
-          icon: FileText,
-          onClick: handleQuickSubmit,
-          disabled: isCreatingTicket || isQuickSubmitting,
-          statusText: isCreatingTicket ? "Creating ticket..." : isQuickSubmitting ? "Submitting..." : "Send now",
-        },
-      ]
-    : [
-        {
-          id: "chatbot",
-          title: "Chatbot",
-          description: "Open the chatbot immediately and continue the conversation from your saved inquiry.",
-          icon: Bot,
-          onClick: () => handleContinueToChat(),
-          disabled: isCreatingTicket,
-          statusText: isCreatingTicket ? "Creating ticket..." : "Open chat",
-        },
-        {
-          id: "live-chat",
-          title: ticket.liveChatRequested ? "Live Chat Requested" : "Live Chat",
-          description: ticket.liveChatRequested
-            ? "Continue to the chat and stay connected while the support team picks up your request."
-            : "Open chat and request a live support admin directly from the conversation.",
-          icon: Headphones,
-          onClick: () => handleContinueToChat("live-chat"),
-          disabled: isCreatingTicket,
-          statusText: isCreatingTicket ? "Creating ticket..." : ticket.liveChatRequested ? "Resume" : "Request now",
-        },
-        {
-          id: "booking-session",
-          title: "Booking Session",
-          description: "Open the dedicated booking page and reserve your support session without the chat popup.",
-          icon: CalendarClock,
-          onClick: async () => {
-            const createdTicket = await ensureTicketCreated();
-            if (!createdTicket) {
-              return;
-            }
-
-            clearBookingSummary();
-            navigate("/support/booking", {
-              state: {
-                returnPath: "/support/options",
-              },
-            });
-          },
-          disabled: isCreatingTicket,
-          statusText: isCreatingTicket ? "Creating ticket..." : "Book now",
-        },
-        {
-          id: "quick-ticket",
-          title: "Submit Ticket Directly",
-          description: "Submit the saved inquiry directly to the support team without entering the chat flow.",
-          icon: FileText,
-          onClick: handleQuickSubmit,
-          disabled: isCreatingTicket || isQuickSubmitting,
-          statusText: isCreatingTicket ? "Creating ticket..." : isQuickSubmitting ? "Submitting..." : "Send now",
-        },
-      ];
-  const pageTitle = quickTicketOnlyFlow
-    ? "Choose quick call or submit ticket directly"
-    : "Choose how you want to continue";
-  const pageDescription = quickTicketOnlyFlow
-    ? "Your inquiry details are saved. Pick the fastest support route below: start a Teams call or submit the ticket directly for review."
+        }]
+      : []),
+  ];
+  const pageTitle = "Choose how you want to continue";
+  const pageDescription = isCoachRequester
+    ? "Your inquiry details are saved. Pick the route that fits your issue, or open a direct Microsoft Teams call when you want the fastest coach hand-off."
     : "Your inquiry details are saved. Pick the route that fits your issue and we will take you straight there.";
-  const actionTitle = quickTicketOnlyFlow ? "Quick Support Actions" : "Support Actions";
-  const actionDescription = quickTicketOnlyFlow
-    ? "Everything is in one focused panel. Choose to open a Teams call or send the ticket directly from here."
+  const actionTitle = "Support Actions";
+  const actionDescription = isCoachRequester
+    ? "Everything is in one focused panel. Choose chatbot, live chat, booking, direct ticket submission, or a Microsoft Teams call."
     : "Everything is in one focused panel. Choose chatbot, live chat, booking, or direct ticket submission.";
+  const supportActionsGridClassName = "mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-12 xl:auto-rows-fr";
   const ticketSummaryItems = [
     {
       label: "Requester",
@@ -516,9 +522,25 @@ const SupportOptions = () => {
     },
   ];
 
+  const getSupportActionCardLayout = (actionId: string, index: number) => {
+    if (!isCoachRequester) {
+      return "xl:col-span-6";
+    }
+
+    if (actionId === "teams-call") {
+      return "md:col-span-2 xl:col-span-6";
+    }
+
+    if (index < 3) {
+      return "xl:col-span-4";
+    }
+
+    return "xl:col-span-6";
+  };
+
   return (
     <SupportLayout>
-      <StepIndicator current={quickTicketOnlyFlow ? 3 : 2.5} />
+      <StepIndicator current={3} />
       <div className="mx-auto max-w-6xl">
         <div className="relative overflow-hidden rounded-[32px] border border-primary/10 bg-[radial-gradient(circle_at_top_right,rgba(98,73,238,0.14),transparent_32%),linear-gradient(135deg,#ffffff_0%,#ffffff_58%,rgba(98,73,238,0.055)_100%)] p-6 shadow-card md:p-8 lg:p-10">
           <div className="pointer-events-none absolute -right-24 top-20 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
@@ -562,7 +584,7 @@ const SupportOptions = () => {
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div className="flex items-start gap-4">
                 <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-soft">
-                  {quickTicketOnlyFlow ? <PhoneCall className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
+                  {isCoachRequester ? <PhoneCall className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
                 </div>
                 <div>
                   <h2 className="text-xl font-semibold text-foreground">
@@ -574,11 +596,11 @@ const SupportOptions = () => {
                 </div>
               </div>
               <div className="rounded-full border border-primary/10 bg-primary/[0.05] px-4 py-2 text-xs font-semibold text-primary">
-                {quickTicketOnlyFlow ? "2 fast options" : "4 support paths"}
+                {isCoachRequester ? "5 support paths" : "4 support paths"}
               </div>
             </div>
 
-            {quickTicketOnlyFlow && (
+            {isCoachRequester && (
               <div className="mt-5 rounded-[24px] border border-primary/15 bg-primary/[0.04] px-4 py-4">
                 <div className="text-sm font-semibold text-foreground">
                   {hasPreparedTeamsCall
@@ -591,15 +613,16 @@ const SupportOptions = () => {
                   {hasPreparedTeamsCall
                     ? `This ticket is already assigned to ${teamsCallTargetLabel || "the support admin"} and ready for your Teams call.`
                     : teamsCallTargetLabel
-                      ? `You can call ${teamsCallTargetLabel} directly in Microsoft Teams from the first option below.`
+                      ? `You can call ${teamsCallTargetLabel} directly in Microsoft Teams from the Teams option below.`
                       : "Your saved inquiry stays attached so you can still submit the ticket directly later if you need written follow-up."}
                 </p>
               </div>
             )}
 
-            <div className={`mt-6 grid gap-4 ${quickTicketOnlyFlow ? "lg:grid-cols-2" : "lg:grid-cols-2"}`}>
+            <div className={supportActionsGridClassName}>
               {supportActions.map((action, index) => {
                 const Icon = action.icon;
+                const isTeamsCallAction = action.id === "teams-call";
 
                 return (
                   <button
@@ -607,7 +630,11 @@ const SupportOptions = () => {
                     type="button"
                     onClick={() => void action.onClick()}
                     disabled={action.disabled}
-                    className="group relative flex min-h-[148px] w-full flex-col justify-between overflow-hidden rounded-[24px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.045] p-5 text-left shadow-soft outline-none transition-all duration-500 ease-out hover:-translate-y-1 hover:scale-[1.015] hover:border-primary/35 hover:bg-primary/[0.035] hover:shadow-[0_24px_70px_rgba(98,73,238,0.18)] focus-visible:-translate-y-1 focus-visible:scale-[1.015] focus-visible:border-primary/45 focus-visible:ring-4 focus-visible:ring-primary/15 active:translate-y-0 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:scale-100"
+                    className={cn(
+                      "group relative flex min-h-[168px] w-full flex-col justify-between overflow-hidden rounded-[24px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.045] p-5 text-left shadow-soft outline-none transition-all duration-500 ease-out hover:-translate-y-1 hover:scale-[1.015] hover:border-primary/35 hover:bg-primary/[0.035] hover:shadow-[0_24px_70px_rgba(98,73,238,0.18)] focus-visible:-translate-y-1 focus-visible:scale-[1.015] focus-visible:border-primary/45 focus-visible:ring-4 focus-visible:ring-primary/15 active:translate-y-0 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:scale-100",
+                      getSupportActionCardLayout(action.id, index),
+                      isTeamsCallAction && "border-primary/20 from-white via-primary/[0.03] to-primary/[0.08]",
+                    )}
                   >
                     <span className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_18%,rgba(98,73,238,0.14),transparent_28%),linear-gradient(120deg,transparent_0%,rgba(255,255,255,0.75)_48%,transparent_62%)] opacity-0 transition-opacity duration-500 group-hover:opacity-100 group-focus-visible:opacity-100" />
                     <span className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-primary/15 blur-2xl opacity-0 transition-all duration-700 group-hover:right-0 group-hover:top-0 group-hover:opacity-100 group-focus-visible:right-0 group-focus-visible:top-0 group-focus-visible:opacity-100" />

@@ -318,6 +318,53 @@ class LearnerLookupTests(SimpleTestCase):
         self.assertEqual(response["ticket"]["requesterRole"], "user")
         self.assertEqual(response["bookingSummary"], booking_summary)
 
+    def test_verify_email_response_promotes_existing_ticket_to_coach_when_coach_access_is_enabled(self):
+        learner = {"id": 9, "full_name": "Coach Learner", "email": "coach@example.com"}
+        requester = {
+            "email": "coach@example.com",
+            "role": "coach",
+            "display_name": "Coach Learner",
+            "learner": learner,
+            "account": None,
+        }
+        ticket = {
+            "id": 77,
+            "public_id": "KBC-000077",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "inquiry": "Need coach support",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": None,
+            "assigned_team": "Unassigned",
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 5, 15, 10, 0, tzinfo=timezone.utc),
+            "metadata": {"requester_role": "user"},
+            "conversation_status": "open",
+            "conversation_metadata": {},
+        }
+        cursor = MagicMock()
+        cursor_manager = MagicMock()
+        cursor_manager.__enter__.return_value = cursor
+        cursor_manager.__exit__.return_value = False
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_manager
+
+        with (
+            patch.object(services, "resolve_public_support_requester", return_value=requester),
+            patch.object(services, "find_latest_active_ticket_for_learner", return_value=ticket),
+            patch.object(services, "get_latest_ticket_booking_summary", return_value=None),
+            patch.object(services, "connection", mock_connection),
+        ):
+            response = services.get_verify_email_response({"email": "COACH@EXAMPLE.COM"})
+
+        self.assertEqual(response["ticket"]["requesterRole"], "coach")
+        update_call = cursor.execute.call_args
+        self.assertIn("UPDATE tickets", update_call.args[0])
+        self.assertEqual(update_call.args[1][1], 77)
+        updated_metadata = json.loads(update_call.args[1][0])
+        self.assertEqual(updated_metadata["requester_role"], "coach")
+
     def test_verify_email_response_uses_managed_public_requester_account(self):
         requester = {
             "email": "coach@example.com",
@@ -403,6 +450,28 @@ class LearnerLookupTests(SimpleTestCase):
         self.assertEqual(result["role"], "user")
         self.assertIsNone(result["account"])
         self.assertEqual(result["source"], "kbc_users_data")
+
+    def test_resolve_public_support_requester_promotes_kbc_learner_with_coach_access(self):
+        learner = {"id": 22, "full_name": "Legacy Coach", "email": "legacy@example.com", "source": "legacy_kbc_users_data"}
+
+        with (
+            patch.object(services, "fetch_public_requester_account_by_email", return_value=None),
+            patch.object(services, "find_kbc_learner_by_email", return_value=learner),
+            patch.object(services, "has_public_requester_coach_access", return_value=True),
+        ):
+            result = services.resolve_public_support_requester("legacy@example.com")
+
+        self.assertEqual(
+            result,
+            {
+                "email": "legacy@example.com",
+                "role": "coach",
+                "account": None,
+                "learner": learner,
+                "display_name": "Legacy Coach",
+                "source": "kbc_users_data",
+            },
+        )
 
     def test_resolve_public_support_requester_rejects_email_without_kbc_or_entra_match(self):
         managed_account = {
@@ -609,6 +678,42 @@ class CoverageOptionsTests(SimpleTestCase):
         self.assertIn('FROM public."Tutors_Modules"', sql)
         self.assertEqual(params, ["nathan", "nathan", "nathan"])
 
+    def test_list_coverage_coach_options_returns_active_names(self):
+        with patch.object(
+            services,
+            "run_communication_centre_query",
+            return_value=[
+                {"coach_name": "Mona Adel"},
+                {"coach_name": "mona adel"},
+                {"coach_name": "Youssef Samir"},
+                {"coach_name": ""},
+            ],
+        ) as run_communication_centre_query:
+            response = services.list_coverage_coach_options()
+
+        self.assertEqual(response, ["Mona Adel", "Youssef Samir"])
+        run_communication_centre_query.assert_called_once()
+        sql = run_communication_centre_query.call_args.args[0]
+        self.assertIn("FROM public.coach_profiles", sql)
+
+    def test_get_coverage_coach_email_prefers_valid_match(self):
+        with patch.object(
+            services,
+            "run_communication_centre_query",
+            return_value=[
+                {"coach_email": ""},
+                {"coach_email": "Mona.Adel@kentbusinesscollege.com"},
+            ],
+        ) as run_communication_centre_query:
+            response = services.get_coverage_coach_email("Mona Adel")
+
+        self.assertEqual(response, "mona.adel@kentbusinesscollege.com")
+        run_communication_centre_query.assert_called_once()
+        sql = run_communication_centre_query.call_args.args[0]
+        params = run_communication_centre_query.call_args.args[1]
+        self.assertIn("FROM public.coach_profiles", sql)
+        self.assertEqual(params, ["mona adel", "mona adel", "mona adel"])
+
     def test_get_coverage_options_response_formats_and_deduplicates_times(self):
         with patch.object(
             services,
@@ -777,6 +882,25 @@ class CoverageOptionsTests(SimpleTestCase):
             },
         )
         get_coverage_tutor_email.assert_called_once_with("Nathan")
+
+    def test_get_coverage_options_response_returns_coach_email_value(self):
+        with patch.object(
+            services,
+            "get_coverage_coach_email",
+            return_value="mona.adel@kentbusinesscollege.com",
+        ) as get_coverage_coach_email:
+            response = services.get_coverage_options_response(
+                {"type": "coach-email", "coach": "Mona Adel"}
+            )
+
+        self.assertEqual(
+            response,
+            {
+                "type": "coach-email",
+                "value": "mona.adel@kentbusinesscollege.com",
+            },
+        )
+        get_coverage_coach_email.assert_called_once_with("Mona Adel")
 
     def test_coverage_options_view_returns_json_payload(self):
         request = self.factory.get("/api/coverage-options?type=tutors")
@@ -1284,15 +1408,79 @@ class AdminSessionViewTests(SimpleTestCase):
             response = views.admin_ticket_chat_history(request, "KBC-000001")
 
         self.assertEqual(response.status_code, 200)
-        save_chat_history.assert_called_once_with(
-            "KBC-000001",
-            {
+        save_chat_history.assert_called_once()
+        self.assertEqual(
+            save_chat_history.call_args.args,
+            (
+                "KBC-000001",
+                {
+                    "status": "Open",
+                    "actorUsername": "fatma",
+                    "instanceId": "current-instance",
+                    "messages": [{"sender": "agent", "text": "Hello"}],
+                },
+            ),
+        )
+        self.assertEqual(save_chat_history.call_args.kwargs["uploaded_files"], [])
+
+    def test_admin_ticket_chat_history_accepts_multipart_attachments_and_uses_server_session_actor(self):
+        uploaded_file = SimpleUploadedFile("chat-proof.png", b"png", content_type="image/png")
+        request = self.factory.post(
+            "/api/admin/tickets/KBC-000001/chat-history",
+            data={
                 "status": "Open",
-                "actorUsername": "fatma",
-                "instanceId": "current-instance",
-                "messages": [{"sender": "agent", "text": "Hello"}],
+                "actorUsername": "attacker",
+                "messages": json.dumps([{"sender": "agent", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}]),
+                "attachmentFiles": uploaded_file,
             },
         )
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 9,
+                    "username": "fatma",
+                    "fullName": "Fatma Queue",
+                    "email": "fatma@example.com",
+                    "role": "admin",
+                    "instanceId": "current-instance",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 9,
+                    "username": "fatma",
+                    "full_name": "Fatma Queue",
+                    "email": "fatma@example.com",
+                    "role": "admin",
+                },
+            ),
+            patch.object(views, "save_chat_history", return_value={"ok": True}) as save_chat_history,
+        ):
+            response = views.admin_ticket_chat_history(request, "KBC-000001")
+
+        self.assertEqual(response.status_code, 200)
+        save_chat_history.assert_called_once()
+        self.assertEqual(
+            save_chat_history.call_args.args,
+            (
+                "KBC-000001",
+                {
+                    "status": "Open",
+                    "actorUsername": "fatma",
+                    "instanceId": "current-instance",
+                    "messages": [{"sender": "agent", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}],
+                },
+            ),
+        )
+        uploaded_files = save_chat_history.call_args.kwargs["uploaded_files"]
+        self.assertEqual(len(uploaded_files), 1)
+        self.assertEqual(uploaded_files[0].name, "chat-proof.png")
 
 
 class TicketAttachmentUploadTests(SimpleTestCase):
@@ -1347,6 +1535,68 @@ class TicketAttachmentUploadTests(SimpleTestCase):
         uploaded_files = update_ticket.call_args.kwargs["uploaded_files"]
         self.assertEqual(len(uploaded_files), 1)
         self.assertEqual(uploaded_files[0].name, "evidence.pdf")
+
+    def test_ticket_chat_history_accepts_multipart_attachment_uploads(self):
+        uploaded_file = SimpleUploadedFile("chat-proof.png", b"png", content_type="image/png")
+        request = self.factory.post(
+            "/api/tickets/KBC-000001/chat-history",
+            data={
+                "status": "Open",
+                "messages": json.dumps([{"sender": "user", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}]),
+                "attachmentFiles": uploaded_file,
+            },
+        )
+
+        with patch.object(views, "save_chat_history", return_value={"ok": True}) as save_chat_history:
+            response = views.ticket_chat_history(request, "KBC-000001")
+
+        self.assertEqual(response.status_code, 200)
+        save_chat_history.assert_called_once()
+        self.assertEqual(
+            save_chat_history.call_args.args,
+            (
+                "KBC-000001",
+                {
+                    "status": "Open",
+                    "messages": [{"sender": "user", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}],
+                },
+            ),
+        )
+        uploaded_files = save_chat_history.call_args.kwargs["uploaded_files"]
+        self.assertEqual(len(uploaded_files), 1)
+        self.assertEqual(uploaded_files[0].name, "chat-proof.png")
+
+    def test_ticket_chatbot_message_accepts_multipart_attachment_uploads(self):
+        uploaded_file = SimpleUploadedFile("chat-proof.png", b"png", content_type="image/png")
+        request = self.factory.post(
+            "/api/tickets/KBC-000001/chatbot-message",
+            data={
+                "message": "",
+                "clientTimeZone": "Africa/Cairo",
+                "messages": json.dumps([{"sender": "user", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}]),
+                "attachmentFiles": uploaded_file,
+            },
+        )
+
+        with patch.object(views, "send_chatbot_message", return_value={"ok": True}) as send_chatbot_message:
+            response = views.ticket_chatbot_message(request, "KBC-000001")
+
+        self.assertEqual(response.status_code, 200)
+        send_chatbot_message.assert_called_once()
+        self.assertEqual(
+            send_chatbot_message.call_args.args,
+            (
+                "KBC-000001",
+                {
+                    "message": "",
+                    "clientTimeZone": "Africa/Cairo",
+                    "messages": [{"sender": "user", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}],
+                },
+            ),
+        )
+        uploaded_files = send_chatbot_message.call_args.kwargs["uploaded_files"]
+        self.assertEqual(len(uploaded_files), 1)
+        self.assertEqual(uploaded_files[0].name, "chat-proof.png")
 
 
 class SupportSessionValidationTests(SimpleTestCase):
@@ -1779,6 +2029,63 @@ class SupportSessionValidationTests(SimpleTestCase):
         with patch.object(services.settings, "SUPPORT_SESSION_SLOT_INTERVAL_MINUTES", 30):
             self.assertFalse(services.is_support_session_time_aligned(requested_datetime))
 
+    def test_support_session_availability_uses_microsoft_graph_slots(self):
+        ticket = {"id": 77, "public_id": "KBC-000077"}
+        availability_payload = {
+            "value": [
+                {
+                    "staffId": "staff-1",
+                    "availabilityItems": [
+                        {
+                            "status": "available",
+                            "startDateTime": {"dateTime": "2099-01-07T08:00:00"},
+                            "endDateTime": {"dateTime": "2099-01-07T09:00:00"},
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with (
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "is_direct_microsoft_booking_configured", return_value=True),
+            patch.object(services, "request_microsoft_graph_access_token", return_value=(True, True, 200, {"access_token": "token"})),
+            patch.object(
+                services,
+                "get_microsoft_booking_service_details",
+                return_value=(True, True, 200, {"staffMemberIds": ["staff-1"], "defaultDuration": "PT1H"}),
+            ),
+            patch.object(
+                services,
+                "get_microsoft_booking_staff_availability_window",
+                return_value=(True, True, 200, availability_payload),
+            ),
+        ):
+            response = services.get_support_session_availability_response(
+                "KBC-000077",
+                "2099-01-07",
+                "Europe/London",
+            )
+
+        self.assertEqual(response["source"], "microsoft_graph")
+        self.assertEqual(response["options"], [{"value": "08:00", "label": "8:00 AM"}])
+
+    def test_support_session_availability_falls_back_when_graph_is_not_configured(self):
+        ticket = {"id": 77, "public_id": "KBC-000077"}
+
+        with (
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "is_direct_microsoft_booking_configured", return_value=False),
+        ):
+            response = services.get_support_session_availability_response(
+                "KBC-000077",
+                "2099-01-07",
+                "Europe/London",
+            )
+
+        self.assertEqual(response["source"], "fallback")
+        self.assertIn({"value": "08:00", "label": "8:00 AM"}, response["options"])
+
     def test_extract_booking_webhook_result_marks_teams_reservation_as_confirmed(self):
         result = services.extract_booking_webhook_result(
             {
@@ -2004,6 +2311,26 @@ class SupportSessionValidationTests(SimpleTestCase):
 
         self.assertIsNone(result)
 
+    def test_get_latest_ticket_booking_summary_includes_return_path(self):
+        with patch.object(
+            services,
+            "run_query_one",
+            return_value={
+                "requested_date": "2026-05-12",
+                "requested_time": "11:30",
+                "status": "scheduled",
+                "metadata": {
+                    "reservation_confirmed": True,
+                    "meeting_join_url": "https://teams.microsoft.com/example",
+                    "return_path": "/support/options",
+                },
+                "created_at": datetime(2026, 5, 10, 11, 0, tzinfo=timezone.utc),
+            },
+        ):
+            result = services.get_latest_ticket_booking_summary(17)
+
+        self.assertEqual(result["returnPath"], "/support/options")
+
     def test_send_chatbot_message_rejects_when_ticket_is_awaiting_meeting(self):
         ticket = {
             "id": 77,
@@ -2031,7 +2358,7 @@ class SupportSessionValidationTests(SimpleTestCase):
 
         self.assertEqual(error_context.exception.status_code, 409)
 
-    def test_send_chatbot_message_rejects_coach_quick_ticket_only_role(self):
+    def test_send_chatbot_message_allows_coach_requester_role(self):
         ticket = {
             "id": 77,
             "public_id": "KBC-000077",
@@ -2053,14 +2380,89 @@ class SupportSessionValidationTests(SimpleTestCase):
         with (
             patch.object(services, "sync_open_ticket_inactivity"),
             patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(
+                services,
+                "send_chatbot_webhook",
+                return_value={"configured": True, "delivered": True, "status": 200, "reply": "Thanks"},
+            ) as send_chatbot_webhook,
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "sync_conversation_messages", return_value=[]),
         ):
-            with self.assertRaises(services.ApiError) as error_context:
-                services.send_chatbot_message("KBC-000077", {"message": "hello"})
+            response = services.send_chatbot_message("KBC-000077", {"message": "hello"})
 
-        self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "Coach accounts can only submit quick tickets or quick calls from the support portal.")
+        self.assertTrue(response["ok"])
+        self.assertEqual(send_chatbot_webhook.call_args.args[0]["message"], "hello")
 
-    def test_request_live_chat_rejects_coach_quick_ticket_only_role(self):
+    def test_send_chatbot_webhook_uses_dedicated_timeout_and_suppresses_failed_reply(self):
+        with patch.object(
+            services,
+            "post_json_webhook",
+            return_value=(True, False, None, {"message": "Request timed out."}),
+        ) as post_json_webhook:
+            response = services.send_chatbot_webhook({"message": "hello"})
+
+        post_json_webhook.assert_called_once_with(
+            services.settings.CHATBOT_WEBHOOK_URL,
+            {"message": "hello"},
+            timeout_seconds=services.CHATBOT_WEBHOOK_TIMEOUT_SECONDS,
+        )
+        self.assertTrue(response["configured"])
+        self.assertFalse(response["delivered"])
+        self.assertEqual(response["reply"], "")
+
+    def test_send_chatbot_message_accepts_attachment_only_message(self):
+        ticket = {
+            "id": 77,
+            "public_id": "KBC-000077",
+            "conversation_id": 55,
+            "metadata": {},
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "inquiry": "Need help with Teams",
+            "status": "Open",
+            "status_reason": "",
+            "priority": "Normal",
+            "assigned_team": "Support Desk",
+            "learner_id": 9,
+            "learner_full_name": "Ali Test",
+            "learner_email": "ali@example.com",
+            "learner_phone": "01000000000",
+        }
+        uploaded_file = SimpleUploadedFile("chat-proof.png", b"png", content_type="image/png")
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "send_chatbot_webhook", return_value={"configured": True, "delivered": True, "status": 200, "reply": "Thanks"}) as send_chatbot_webhook,
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "sync_conversation_messages", return_value=[] ) as sync_conversation_messages,
+        ):
+            response = services.send_chatbot_message(
+                "KBC-000077",
+                {
+                    "message": "",
+                    "clientTimeZone": "Africa/Cairo",
+                    "messages": [
+                        {
+                            "sender": "user",
+                            "text": "",
+                            "timestamp": "10:30 AM",
+                            "clientMessageId": "msg-1",
+                            "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}],
+                        }
+                    ],
+                },
+                uploaded_files=[uploaded_file],
+            )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(send_chatbot_webhook.call_args.args[0]["message"], "Shared attachment: chat-proof.png.")
+        self.assertEqual(sync_conversation_messages.call_args.kwargs["ticket_public_id"], "KBC-000077")
+        self.assertEqual(sync_conversation_messages.call_args.kwargs["uploaded_files"], [uploaded_file])
+
+    def test_request_live_chat_allows_coach_requester_role(self):
         ticket = {
             "id": 77,
             "public_id": "KBC-000077",
@@ -2068,22 +2470,48 @@ class SupportSessionValidationTests(SimpleTestCase):
             "metadata": {"requester_role": "coach"},
             "status": "Open",
             "status_reason": "",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "priority": "High",
+            "created_at": datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc),
+            "assigned_team": "Unassigned",
             "assigned_agent_id": None,
+            "conversation_status": "open",
+            "learner_name": "Coach One",
             "learner_email": "coach@example.com",
+            "learner_source": "kbc_users_data",
+            "learner_metadata": {},
         }
+        refreshed_ticket = {
+            "public_id": "KBC-000077",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
 
         with (
             patch.object(services, "sync_open_ticket_inactivity"),
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
-            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "run_query_one", side_effect=[ticket, refreshed_ticket]),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "assign_waiting_live_chat_tickets", return_value=[]),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "queue_live_agent_unavailable_notification") as queue_unavailable,
         ):
-            with self.assertRaises(services.ApiError) as error_context:
-                services.request_live_chat("KBC-000077")
+            response = services.request_live_chat("KBC-000077")
 
-        self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "Coach accounts can only submit quick tickets or quick calls from the support portal.")
+        self.assertTrue(response["ok"])
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
+        queue_unavailable.assert_called_once()
 
-    def test_create_support_session_request_rejects_coach_quick_ticket_only_role(self):
+    def test_create_support_session_request_allows_coach_requester_role(self):
         ticket = {
             "id": 77,
             "public_id": "KBC-000077",
@@ -2102,25 +2530,61 @@ class SupportSessionValidationTests(SimpleTestCase):
             "learner_email": "coach@example.com",
             "learner_phone": "01000000000",
         }
+        created_session_request = {
+            "id": 31,
+            "created_at": datetime(2026, 6, 10, 9, 0, tzinfo=timezone.utc),
+        }
+        booking_result = {
+            "configured": True,
+            "delivered": True,
+            "status": 201,
+            "reservationConfirmed": True,
+            "slotUnavailable": False,
+            "meetingJoinUrl": "https://teams.microsoft.com/example",
+            "calendarEventId": "evt_123",
+            "calendarEventUrl": None,
+            "organizerEmail": "support@example.com",
+            "bookingReference": "ref_123",
+            "message": "",
+            "bookingMode": "webhook",
+            "graphApiVersion": None,
+            "durationMinutes": 30,
+        }
+        cursor = MagicMock()
+        cursor_manager = MagicMock()
+        cursor_manager.__enter__.return_value = cursor
+        cursor_manager.__exit__.return_value = False
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_manager
 
         with (
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "validate_support_session_request", return_value=""),
             patch.object(services, "resolve_support_session_datetime", return_value=datetime(2026, 6, 12, 9, 0, tzinfo=timezone.utc)),
             patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "dictfetchone", return_value=created_session_request),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "send_support_session_booking", return_value=booking_result),
+            patch.object(services, "update_support_session_request_record"),
+            patch.object(services, "connection", mock_connection),
         ):
-            with self.assertRaises(services.ApiError) as error_context:
-                services.create_support_session_request(
-                    "KBC-000077",
-                    {
-                        "date": "2026-06-12",
-                        "time": "09:00",
-                        "scheduledAt": "2026-06-12T09:00:00+00:00",
-                    },
-                )
+            response = services.create_support_session_request(
+                "KBC-000077",
+                {
+                    "date": "2026-06-12",
+                    "time": "09:00",
+                    "scheduledAt": "2026-06-12T09:00:00+00:00",
+                    "returnPath": "/support/options",
+                },
+            )
 
-        self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "Coach accounts can only submit quick tickets or quick calls from the support portal.")
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["reservationConfirmed"])
+        self.assertEqual(response["ticket"]["status"], "Pending")
+        insert_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(json.loads(insert_params[3])["return_path"], "/support/options")
 
     def test_cancel_support_session_request_reopens_ticket_after_cancellation(self):
         ticket = {
@@ -2557,6 +3021,78 @@ class SlaPolicyTests(SimpleTestCase):
 
         self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000010", "KBC-000011", "KBC-000012"])
         self.assertEqual(result["tickets"][0]["priority"], "High")
+
+    def test_list_admin_tickets_hides_open_pre_submission_support_flow_tickets(self):
+        visible_ticket = {
+            "id": 11,
+            "public_id": "KBC-000011",
+            "learner_name": "User One",
+            "learner_email": "user@example.com",
+            "learner_phone": "01000000001",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "inquiry": "User issue",
+            "status": "Open",
+            "status_reason": "",
+            "priority": "Normal",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Unassigned",
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "is_archived": False,
+            "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "metadata": {"requester_role": "user"},
+        }
+        hidden_booking_ticket = {
+            **visible_ticket,
+            "id": 12,
+            "public_id": "KBC-000012",
+            "metadata": {
+                "requester_role": "user",
+                services.SUPPORT_FLOW_STAGE_METADATA_KEY: services.SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS,
+            },
+        }
+        hidden_cancelled_direct_booking_ticket = {
+            **visible_ticket,
+            "id": 13,
+            "public_id": "KBC-000013",
+            "metadata": {"requester_role": "user"},
+            "latest_session_request_status": "cancelled",
+            "latest_session_request_metadata": {"return_path": "/support/options"},
+        }
+        visible_cancelled_chat_booking_ticket = {
+            **visible_ticket,
+            "id": 14,
+            "public_id": "KBC-000014",
+            "metadata": {"requester_role": "user", "live_chat_requested": True},
+            "latest_session_request_status": "cancelled",
+            "latest_session_request_metadata": {"return_path": "/support/options"},
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(
+                services,
+                "run_query",
+                return_value=[
+                    hidden_booking_ticket,
+                    hidden_cancelled_direct_booking_ticket,
+                    visible_cancelled_chat_booking_ticket,
+                    visible_ticket,
+                ],
+            ),
+            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+        ):
+            result = services.list_admin_tickets()
+
+        self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000014", "KBC-000011"])
 
     def test_list_coverage_tutor_request_history_rows_groups_rows_by_ticket(self):
         request_history_rows = [
@@ -5104,6 +5640,9 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "full_name": "Omar Helmy",
             "role": "admin",
             "email": "omar@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True},
         }
         detail = {
             "ticket": {
@@ -5145,7 +5684,82 @@ class AdminTicketUpdateTests(SimpleTestCase):
             {"fromAgentId": None, "toAgentId": 9, "toAgentName": "Omar Helmy"},
         )
 
-    def test_update_admin_ticket_allows_superadmin_to_reassign_existing_ticket(self):
+    def test_update_admin_ticket_queues_quick_ticket_closed_notification(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "learner_id": 44,
+            "category": "Technical",
+            "technical_subcategory": "Aptem",
+            "inquiry": "Help needed",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "priority": "Normal",
+            "assigned_agent_id": 9,
+            "assigned_team": "Support Desk",
+            "sla_status": "On Track",
+            "metadata": {},
+            "is_archived": False,
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": 88,
+            "conversation_metadata": {},
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "assigned_agent_username": "agent",
+            "assigned_agent_name": "Support Agent",
+        }
+        actor_row = {
+            "id": 9,
+            "username": "agent",
+            "full_name": "Support Agent",
+            "role": "admin",
+            "email": "agent@example.com",
+        }
+        detail = {
+            "ticket": {
+                "id": "KBC-000017",
+                "status": "Closed",
+                "statusReason": services.STATUS_REASON_CLOSED_BY_AGENT,
+                "slaStatus": "On Track",
+            }
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "get_latest_ticket_escalation_notification", return_value=None),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "persist_conversation_chat_duration"),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value=detail),
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_closed,
+        ):
+            response = services.update_admin_ticket(
+                "KBC-000017",
+                {
+                    "status": "Closed",
+                    "statusReason": services.STATUS_REASON_CLOSED_BY_AGENT,
+                    "note": "Resolved",
+                    "actorUsername": "agent",
+                },
+            )
+
+        self.assertEqual(response, detail)
+        queue_closed.assert_called_once()
+        self.assertEqual(queue_closed.call_args.kwargs["status"], "Closed")
+        self.assertEqual(queue_closed.call_args.kwargs["status_reason"], services.STATUS_REASON_CLOSED_BY_AGENT)
+
+    def test_update_admin_ticket_allows_admin_to_assign_ticket_receiver(self):
         ticket = {
             "id": 17,
             "public_id": "KBC-000017",
@@ -5165,17 +5779,20 @@ class AdminTicketUpdateTests(SimpleTestCase):
         }
         actor_row = {
             "id": 1,
-            "username": "super",
-            "full_name": "Super Admin",
-            "role": "superadmin",
-            "email": "super@example.com",
+            "username": "manager",
+            "full_name": "Support Manager",
+            "role": "admin",
+            "email": "manager@example.com",
         }
         selected_agent = {
             "id": 9,
             "username": "omar",
             "full_name": "Omar Helmy",
-            "role": "admin",
+            "role": "agent",
             "email": "omar@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True},
         }
         detail = {
             "ticket": {
@@ -5206,7 +5823,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
         ):
             response = services.update_admin_ticket(
                 "KBC-000017",
-                {"note": "Reassigned", "actorUsername": "super", "assignedAgentId": 9},
+                {"note": "Reassigned", "actorUsername": "manager", "assignedAgentId": 9},
             )
 
         self.assertEqual(response, detail)
@@ -5216,9 +5833,248 @@ class AdminTicketUpdateTests(SimpleTestCase):
         insert_history_event.assert_any_call(
             17,
             "assignment_changed",
-            {"id": 1, "role": "superadmin", "label": "Super Admin"},
+            {"id": 1, "role": "admin", "label": "Support Manager"},
             {"fromAgentId": 5, "toAgentId": 9, "toAgentName": "Omar Helmy"},
         )
+
+    def test_update_admin_ticket_rejects_assignment_from_non_admin_actor(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": 5,
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "assigned_agent_username": "ahmed",
+            "assigned_agent_name": "Ahmed Hamamo",
+            "inquiry": "Help needed",
+        }
+        actor_row = {
+            "id": 3,
+            "username": "agent",
+            "full_name": "Support Agent",
+            "role": "agent",
+            "email": "agent@example.com",
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.update_admin_ticket(
+                    "KBC-000017",
+                    {"note": "Reassigned", "actorUsername": "agent", "assignedAgentId": 9},
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 403)
+        self.assertEqual(raised_error.exception.message, "Only admins and superadmins can assign tickets.")
+
+    def test_update_admin_ticket_rejects_assignment_to_account_without_ticket_access(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": 5,
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "assigned_agent_username": "ahmed",
+            "assigned_agent_name": "Ahmed Hamamo",
+            "inquiry": "Help needed",
+        }
+        actor_row = {
+            "id": 1,
+            "username": "manager",
+            "full_name": "Support Manager",
+            "role": "admin",
+            "email": "manager@example.com",
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", side_effect=[ticket, None]),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.update_admin_ticket(
+                    "KBC-000017",
+                    {"note": "Reassigned", "actorUsername": "manager", "assignedAgentId": 9},
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 400)
+        self.assertEqual(raised_error.exception.message, "The selected agent does not receive tickets.")
+
+
+class AdminTicketPermanentDeleteTests(SimpleTestCase):
+    def build_mock_connection(self):
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+        return mock_connection, cursor
+
+    def test_delete_admin_ticket_permanently_requires_superadmin(self):
+        actor_row = {
+            "id": 9,
+            "username": "omar",
+            "full_name": "Omar Helmy",
+            "role": "admin",
+        }
+
+        with patch.object(services, "fetch_actor_by_username", return_value=actor_row):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.delete_admin_ticket_permanently(
+                    "KBC-000017",
+                    {"actorUsername": "omar", "confirmTicketId": "KBC-000017"},
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 403)
+        self.assertEqual(raised_error.exception.message, "Only superadmins can permanently delete archived tickets.")
+
+    def test_delete_admin_ticket_permanently_requires_archived_ticket(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "is_archived": False,
+            "conversation_id": None,
+            "conversation_metadata": {},
+        }
+        actor_row = {
+            "id": 1,
+            "username": "super",
+            "full_name": "Super Admin",
+            "role": "superadmin",
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "run_query_one", return_value=ticket),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.delete_admin_ticket_permanently(
+                    "KBC-000017",
+                    {"actorUsername": "super", "confirmTicketId": "KBC-000017"},
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 409)
+        self.assertEqual(raised_error.exception.message, "Archive this ticket before deleting it permanently.")
+
+    def test_delete_admin_ticket_permanently_deletes_orphaned_conversation_and_files(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "is_archived": True,
+            "conversation_id": 42,
+            "conversation_metadata": {
+                "chat_public_id": "CHAT-000042",
+                "latest_ticket_public_id": "KBC-000017",
+            },
+        }
+        actor_row = {
+            "id": 1,
+            "username": "super",
+            "full_name": "Super Admin",
+            "role": "superadmin",
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "run_query", return_value=[]),
+            patch.object(services, "list_ticket_attachment_storage_keys", return_value=["attachments/file-1.pdf", "attachments/file-2.pdf"]),
+            patch.object(services, "delete_support_attachment_file") as delete_attachment_file,
+            patch.object(services, "connection", mock_connection),
+        ):
+            response = services.delete_admin_ticket_permanently(
+                "KBC-000017",
+                {"actorUsername": "super", "confirmTicketId": "KBC-000017"},
+            )
+
+        self.assertEqual(response["ticketId"], "KBC-000017")
+        self.assertTrue(response["conversationDeleted"])
+        self.assertEqual(
+            [call.args[1][0] for call in cursor.execute.call_args_list],
+            [17, 42],
+        )
+        executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+        self.assertIn("DELETE FROM tickets", executed_sql[0])
+        self.assertIn("DELETE FROM conversations", executed_sql[1])
+        self.assertEqual(
+            [call.args[0] for call in delete_attachment_file.call_args_list],
+            ["attachments/file-1.pdf", "attachments/file-2.pdf"],
+        )
+
+    def test_delete_admin_ticket_permanently_updates_shared_conversation_metadata(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "is_archived": True,
+            "conversation_id": 42,
+            "conversation_metadata": {
+                "chat_public_id": "KBC-000017",
+                "latest_ticket_public_id": "KBC-000017",
+                "parent_ticket_public_id": "KBC-000017",
+            },
+        }
+        actor_row = {
+            "id": 1,
+            "username": "super",
+            "full_name": "Super Admin",
+            "role": "superadmin",
+        }
+        remaining_tickets = [
+            {
+                "id": 16,
+                "public_id": "KBC-000016",
+                "metadata": {},
+                "created_at": datetime(2026, 6, 13, 10, 0, tzinfo=timezone.utc),
+            }
+        ]
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "run_query", return_value=remaining_tickets),
+            patch.object(services, "list_ticket_attachment_storage_keys", return_value=[]),
+            patch.object(services, "delete_support_attachment_file"),
+            patch.object(services, "connection", mock_connection),
+        ):
+            response = services.delete_admin_ticket_permanently(
+                "KBC-000017",
+                {"actorUsername": "super", "confirmTicketId": "KBC-000017"},
+            )
+
+        self.assertEqual(response["ticketId"], "KBC-000017")
+        self.assertFalse(response["conversationDeleted"])
+        self.assertEqual(len(cursor.execute.call_args_list), 2)
+        update_params = cursor.execute.call_args_list[1].args[1]
+        persisted_metadata = json.loads(update_params[0])
+        self.assertEqual(update_params[1], 42)
+        self.assertEqual(persisted_metadata["latest_ticket_public_id"], "KBC-000016")
+        self.assertEqual(persisted_metadata["parent_ticket_public_id"], "KBC-000016")
+        self.assertEqual(persisted_metadata["chat_public_id"], "CHAT-000042")
 
 
 class AdminNotificationLogTests(SimpleTestCase):
@@ -5878,6 +6734,56 @@ class AgentQueueTests(SimpleTestCase):
         assign_ticket_to_agent.assert_not_called()
         persist_agent_metadata.assert_not_called()
 
+    def test_request_live_chat_queues_operations_alert_when_no_agent_available(self):
+        ticket = {
+            "id": 56,
+            "public_id": "KBC-000056",
+            "status": "Open",
+            "status_reason": "",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "priority": "High",
+            "metadata": {},
+            "created_at": datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc),
+            "assigned_team": "Unassigned",
+            "conversation_id": 82,
+            "assigned_agent_id": None,
+            "conversation_status": "open",
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "learner_source": "kbc_users_data",
+            "learner_metadata": {},
+        }
+        refreshed_ticket = {
+            "public_id": "KBC-000056",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", side_effect=[ticket, refreshed_ticket]),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "assign_waiting_live_chat_tickets", return_value=[]),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "queue_live_agent_unavailable_notification") as queue_unavailable,
+        ):
+            response = services.request_live_chat("KBC-000056")
+
+        self.assertTrue(response["ok"])
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
+        queue_unavailable.assert_called_once()
+        self.assertEqual(queue_unavailable.call_args.args[0]["public_id"], "KBC-000056")
+
     def test_assign_waiting_live_chat_tickets_assigns_one_ticket_per_available_agent(self):
         comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
         available_agent = {
@@ -6149,6 +7055,139 @@ class AgentQueueTests(SimpleTestCase):
                 services.INACTIVITY_REMINDER_SENT_AT_METADATA_KEY: None,
             },
         )
+
+    def test_save_chat_history_forwards_uploaded_files_to_chat_sync(self):
+        ticket = {
+            "id": 23,
+            "public_id": "KBC-000023",
+            "conversation_id": 88,
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc),
+            "assigned_agent_username": "fatma",
+        }
+        uploaded_file = SimpleUploadedFile("chat-proof.png", b"png", content_type="image/png")
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(
+                services,
+                "apply_ticket_chat_history_sync",
+                return_value=([], "", "Pending Review", False),
+            ) as apply_ticket_chat_history_sync,
+        ):
+            services.save_chat_history(
+                "KBC-000023",
+                {
+                    "status": "Open",
+                    "messages": [{"sender": "user", "text": "", "attachments": [{"clientAttachmentId": "att-1", "name": "chat-proof.png", "size": 3}]}],
+                },
+                uploaded_files=[uploaded_file],
+            )
+
+        self.assertEqual(apply_ticket_chat_history_sync.call_args.kwargs["ticket_public_id"], "KBC-000023")
+        self.assertEqual(apply_ticket_chat_history_sync.call_args.kwargs["uploaded_files"], [uploaded_file])
+
+    def test_save_chat_history_queues_quick_ticket_submitted_notification(self):
+        ticket = {
+            "id": 23,
+            "public_id": "KBC-000023",
+            "conversation_id": 88,
+            "category": "Technical",
+            "technical_subcategory": "Aptem",
+            "priority": "Normal",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            "conversation_status": "open",
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "assigned_agent_username": None,
+        }
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "clear_prepared_support_teams_call"),
+            patch.object(
+                services,
+                "apply_ticket_chat_history_sync",
+                return_value=([], services.STATUS_REASON_QUICK_TICKET, "On Track", False),
+            ),
+            patch.object(services, "queue_quick_ticket_submitted_notification") as queue_submitted,
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_closed,
+        ):
+            services.save_chat_history(
+                "KBC-000023",
+                {
+                    "status": "Pending",
+                    "statusReason": services.STATUS_REASON_QUICK_TICKET,
+                    "messages": [],
+                },
+            )
+
+        queue_submitted.assert_called_once()
+        self.assertEqual(queue_submitted.call_args.kwargs["status"], "Pending")
+        self.assertEqual(queue_submitted.call_args.kwargs["status_reason"], services.STATUS_REASON_QUICK_TICKET)
+        queue_closed.assert_not_called()
+
+    def test_save_chat_history_queues_quick_ticket_closed_notification(self):
+        ticket = {
+            "id": 23,
+            "public_id": "KBC-000023",
+            "conversation_id": 88,
+            "category": "Technical",
+            "technical_subcategory": "Aptem",
+            "priority": "Normal",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_team": "Support Desk",
+            "sla_status": "On Track",
+            "metadata": {},
+            "created_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            "conversation_status": "open",
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "assigned_agent_username": "agent",
+        }
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "persist_conversation_chat_duration"),
+            patch.object(
+                services,
+                "apply_ticket_chat_history_sync",
+                return_value=([], services.STATUS_REASON_CLOSED_BY_AGENT, "On Track", False),
+            ),
+            patch.object(services, "queue_quick_ticket_submitted_notification") as queue_submitted,
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_closed,
+        ):
+            services.save_chat_history(
+                "KBC-000023",
+                {
+                    "status": "Closed",
+                    "statusReason": services.STATUS_REASON_CLOSED_BY_AGENT,
+                    "messages": [],
+                },
+            )
+
+        queue_submitted.assert_not_called()
+        queue_closed.assert_called_once()
+        self.assertEqual(queue_closed.call_args.kwargs["status"], "Closed")
+        self.assertEqual(queue_closed.call_args.kwargs["status_reason"], services.STATUS_REASON_CLOSED_BY_AGENT)
 
     def test_try_auto_assign_quick_ticket_prefers_available_admin_and_updates_ticket(self):
         ticket = {
@@ -6479,6 +7518,55 @@ class AgentQueueTests(SimpleTestCase):
             persist_conversation_chat_duration.assert_called_once()
             self.assertEqual(persist_conversation_chat_duration.call_args.args[:2], (23, 88))
 
+    def test_save_chat_history_accepts_closed_by_requester_reason(self):
+        ticket = {
+            "id": 23,
+            "public_id": "KBC-000023",
+            "conversation_id": 88,
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": None,
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "metadata": {"live_chat_requested": True},
+            "created_at": datetime.now(timezone.utc),
+            "conversation_status": "open",
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "sync_conversation_messages", return_value=[]),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "persist_conversation_chat_duration"),
+        ):
+            response = services.save_chat_history(
+                "KBC-000023",
+                {
+                    "status": "Closed",
+                    "statusReason": services.STATUS_REASON_CLOSED_BY_REQUESTER,
+                    "messages": [],
+                },
+            )
+
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[1], services.STATUS_REASON_CLOSED_BY_REQUESTER)
+        self.assertEqual(response["ticket"]["statusReason"], services.STATUS_REASON_CLOSED_BY_REQUESTER)
+
     def test_heartbeat_agent_session_reports_replaced_session(self):
         active_metadata = {
             "session_active": True,
@@ -6603,6 +7691,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                 "id": "choice-1",
                 "tutor": "Adey",
                 "tutorEmail": "adey@example.com",
+                "coach": "Mona Adel",
+                "coachEmail": "mona.adel@example.com",
                 "responseToken": "token-1",
                 "sessionDetails": "Module: EVM",
                 "presentationFiles": [],
@@ -6633,6 +7723,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             payload["callback"]["result"]["refuseUrl"],
             "https://technicalsupport.kentbusinesscollege.net/coverage/tutor-response/result?action=refuse",
         )
+        self.assertEqual(payload["coach"]["name"], "Mona Adel")
+        self.assertEqual(payload["coach"]["email"], "mona.adel@example.com")
 
     def test_freeze_coverage_documentation_snapshot_locks_saved_cards_and_preserves_previous_content(self):
         existing_documentation = {
@@ -7179,6 +8271,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                 "run_query",
                 return_value=[
                     {
+                        "ticket_id": 349,
                         "payload": {
                             "toAgentId": 599,
                             "toAgentName": "Engagement",
@@ -7339,6 +8432,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                             "type": "tutor_choice",
                             "tutor": "Nathan",
                             "tutorEmail": "nathan@example.com",
+                            "coach": "Mona Adel",
+                            "coachEmail": "mona.adel@example.com",
                             "sessionDetails": "Module: APM",
                             "presentationFiles": [
                                 {
@@ -7378,6 +8473,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         webhook_payload = queue_webhook.call_args.kwargs["payload"]
         self.assertEqual(webhook_payload["tutor"]["name"], "Nathan")
         self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
+        self.assertEqual(webhook_payload["coach"]["name"], "Mona Adel")
+        self.assertEqual(webhook_payload["coach"]["email"], "mona.adel@example.com")
         self.assertEqual(len(webhook_payload["request"]["presentationFiles"]), 1)
         self.assertEqual(queue_webhook.call_args.kwargs["ticket_public_id"], "KBC-000041")
         self.assertEqual(queue_webhook.call_args.kwargs["card_id"], "card-1")
@@ -7392,6 +8489,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_card["requestStatus"], "requested")
         self.assertEqual(persisted_card["requestSubmittedByAgentId"], 7)
         self.assertTrue(persisted_card["responseToken"])
+        self.assertEqual(persisted_card["coach"], "Mona Adel")
+        self.assertEqual(persisted_card["coachEmail"], "mona.adel@example.com")
 
     def test_submit_coverage_tutor_request_uses_compact_card_payload_files(self):
         ticket = {
@@ -7528,6 +8627,71 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
         self.assertEqual(persisted_card["tutorEmail"], "andrew.millington@kentbusinesscollege.com")
 
+    def test_submit_coverage_tutor_request_falls_back_to_database_coach_email_lookup(self):
+        ticket = {
+            "id": 142,
+            "public_id": "KBC-000142",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "inquiry": "Coverage request",
+                    "ticketId": "KBC-000142",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Andrew",
+                            "tutorEmail": "andrew@example.com",
+                            "coach": "Mona Adel",
+                            "coachEmail": "",
+                            "sessionDetails": "Module: APM",
+                            "presentationFiles": [],
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "get_coverage_coach_email", return_value="mona.adel@kentbusinesscollege.com") as get_coverage_coach_email,
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000142"}}),
+        ):
+            response = services.submit_coverage_tutor_request(
+                "KBC-000142",
+                {"actorUsername": "ahmed", "cardId": "card-1"},
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000142")
+        get_coverage_coach_email.assert_called_once_with("Mona Adel")
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(webhook_payload["coach"]["email"], "mona.adel@kentbusinesscollege.com")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        persisted_metadata = json.loads(update_params[5])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["coachEmail"], "mona.adel@kentbusinesscollege.com")
+
     def test_submit_coverage_tutor_request_clears_previous_latest_response_notification(self):
         ticket = {
             "id": 43,
@@ -7603,6 +8767,237 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         update_params = cursor.execute.call_args_list[0].args[1]
         persisted_metadata = json.loads(update_params[5])
         self.assertNotIn("latest_coverage_tutor_response", persisted_metadata)
+
+    def test_send_coverage_tutor_follow_up_files_sends_only_new_files_and_preserves_ticket_status(self):
+        ticket = {
+            "id": 45,
+            "public_id": "KBC-000045",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "inquiry": "Coverage request",
+                    "ticketId": "KBC-000045",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "presentationFiles": [
+                                {
+                                    "id": "file-1",
+                                    "name": "deck.pdf",
+                                    "mimeType": "application/pdf",
+                                    "size": 128,
+                                    "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        follow_up_file = {
+            "id": "file-2",
+            "name": "slides-2.pdf",
+            "mimeType": "application/pdf",
+            "size": 256,
+            "dataUrl": "data:application/pdf;base64,Zm9sbG93LXVw",
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_follow_up_webhook_delivery") as queue_webhook,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000045"}}),
+        ):
+            response = services.send_coverage_tutor_follow_up_files(
+                "KBC-000045",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-1",
+                    "presentationFiles": [follow_up_file],
+                },
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000045")
+        queue_webhook.assert_called_once()
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(webhook_payload["event"], "coverage_tutor_follow_up")
+        self.assertEqual(webhook_payload["request"]["requestStatus"], "requested")
+        self.assertEqual(webhook_payload["followUp"]["fileCount"], 1)
+        self.assertEqual(len(webhook_payload["followUp"]["presentationFiles"]), 1)
+        self.assertEqual(len(webhook_payload["request"]["presentationFiles"]), 2)
+
+        update_sql = cursor.execute.call_args_list[0].args[0]
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertIn("SET metadata = %s::jsonb", update_sql)
+        persisted_metadata = json.loads(update_params[0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["requestStatus"], "requested")
+        self.assertEqual(len(persisted_card["presentationFiles"]), 2)
+        self.assertEqual(insert_history.call_args.args[1], "coverage_tutor_follow_up_sent")
+
+    def test_send_coverage_tutor_follow_up_files_allows_accepted_closed_ticket(self):
+        ticket = {
+            "id": 46,
+            "public_id": "KBC-000046",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Closed",
+            "status_reason": "Tutor Accepted",
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "inquiry": "Coverage request",
+                    "ticketId": "KBC-000046",
+                    "coverageCards": [
+                        {
+                            "id": "card-accepted",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "accepted",
+                            "locked": True,
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "respondedAt": "2026-06-04T10:20:00Z",
+                            "presentationFiles": [],
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_follow_up_webhook_delivery") as queue_webhook,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000046"}}),
+        ):
+            response = services.send_coverage_tutor_follow_up_files(
+                "KBC-000046",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-accepted",
+                    "presentationFiles": [
+                        {
+                            "id": "file-accepted-1",
+                            "name": "accepted-follow-up.pdf",
+                            "mimeType": "application/pdf",
+                            "size": 512,
+                            "dataUrl": "data:application/pdf;base64,YWNjZXB0ZWQ=",
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000046")
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(webhook_payload["request"]["requestStatus"], "accepted")
+        self.assertEqual(webhook_payload["followUp"]["fileCount"], 1)
+        update_params = cursor.execute.call_args_list[0].args[1]
+        persisted_metadata = json.loads(update_params[0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["requestStatus"], "accepted")
+        self.assertEqual(len(persisted_card["presentationFiles"]), 1)
+
+    def test_send_coverage_tutor_follow_up_files_rejects_refused_request(self):
+        ticket = {
+            "id": 47,
+            "public_id": "KBC-000047",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Rejected",
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "inquiry": "Coverage request",
+                    "ticketId": "KBC-000047",
+                    "coverageCards": [
+                        {
+                            "id": "card-refused",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "refused",
+                            "locked": True,
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "respondedAt": "2026-06-04T10:20:00Z",
+                            "presentationFiles": [],
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.send_coverage_tutor_follow_up_files(
+                    "KBC-000047",
+                    {
+                        "actorUsername": "ahmed",
+                        "cardId": "card-refused",
+                        "presentationFiles": [
+                            {
+                                "id": "file-refused-1",
+                                "name": "refused-follow-up.pdf",
+                                "mimeType": "application/pdf",
+                                "size": 512,
+                                "dataUrl": "data:application/pdf;base64,cmVmdXNlZA==",
+                            }
+                        ],
+                    },
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 409)
+        self.assertEqual(
+            raised_error.exception.message,
+            "Follow-up files can only be sent for requested or accepted tutor requests.",
+        )
 
     def test_process_coverage_tutor_response_adds_reply_card_and_updates_status_reason(self):
         ticket = {
@@ -8084,6 +9479,8 @@ class BookingContextTests(SimpleTestCase):
                         "type": "tutor_choice",
                         "tutor": "Nathan",
                         "tutorEmail": "nathan.shields@kentbusinesscollege.com",
+                        "coach": "Mona Adel",
+                        "coachEmail": "mona.adel@kentbusinesscollege.com",
                         "sessionDetails": "Module: APM",
                         "requestStatus": "pending",
                         "locked": True,
@@ -8122,6 +9519,8 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(normalized_documentation["coverageCards"][0]["type"], "tutor_choice")
         self.assertEqual(normalized_documentation["coverageCards"][0]["tutor"], "Nathan")
         self.assertEqual(normalized_documentation["coverageCards"][0]["tutorEmail"], "nathan.shields@kentbusinesscollege.com")
+        self.assertEqual(normalized_documentation["coverageCards"][0]["coach"], "Mona Adel")
+        self.assertEqual(normalized_documentation["coverageCards"][0]["coachEmail"], "mona.adel@kentbusinesscollege.com")
         self.assertEqual(normalized_documentation["coverageCards"][0]["requestStatus"], "requested")
         self.assertEqual(len(normalized_documentation["coverageCards"][0]["presentationFiles"]), 1)
         self.assertEqual(normalized_documentation["coverageCards"][1]["type"], "note")
@@ -8388,6 +9787,34 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(response["prefill"]["specialRequests"], "Need help joining my live class.")
         run_query_one.assert_called_once()
 
+    def test_set_ticket_booking_progress_updates_ticket_metadata(self):
+        ticket_row = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Open",
+            "metadata": {},
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services, "run_query_one", return_value=ticket_row),
+            patch.object(services, "connection", mock_connection),
+        ):
+            response = services.set_ticket_booking_progress("KBC-000017", active=True)
+
+        self.assertTrue(response["ticket"]["bookingInProgress"])
+        metadata_patch = json.loads(cursor.execute.call_args.args[1][0])
+        self.assertEqual(
+            metadata_patch[services.SUPPORT_FLOW_STAGE_METADATA_KEY],
+            services.SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS,
+        )
+        self.assertTrue(metadata_patch["booking_started_at"])
+
     def test_get_ticket_chat_context_response_returns_intro_message(self):
         ticket_row = {
             "public_id": "KBC-000123",
@@ -8418,14 +9845,18 @@ class BookingContextTests(SimpleTestCase):
         self.assertIsNone(response["ticket"]["assignedAgentId"])
         run_query_one.assert_called_once()
 
-    def test_get_ticket_chat_context_response_rejects_coach_quick_ticket_only_role(self):
+    def test_get_ticket_chat_context_response_allows_coach_requester_role(self):
         ticket_row = {
             "public_id": "KBC-000123",
             "metadata": {"requester_role": "coach"},
+            "conversation_id": 55,
             "status": "Open",
             "status_reason": "",
+            "assigned_agent_id": None,
             "category": "Technical",
             "technical_subcategory": "Teams",
+            "conversation_status": "open",
+            "conversation_metadata": {},
             "learner_id": 11,
             "learner_full_name": "Coach One",
             "learner_email": "coach@example.com",
@@ -8434,12 +9865,13 @@ class BookingContextTests(SimpleTestCase):
         with (
             patch.object(services, "sync_open_ticket_inactivity"),
             patch.object(services, "run_query_one", return_value=ticket_row),
+            patch.object(services, "mark_conversation_as_active"),
         ):
-            with self.assertRaises(services.ApiError) as error_context:
-                services.get_ticket_chat_context_response("KBC-000123")
+            response = services.get_ticket_chat_context_response("KBC-000123")
 
-        self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "Coach accounts can only submit quick tickets or quick calls from the support portal.")
+        self.assertEqual(response["learner"]["fullName"], "Coach One")
+        self.assertEqual(response["ticket"]["technicalSubcategory"], "Teams")
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
 
     def test_get_ticket_chat_history_response_keeps_intro_message_when_not_persisted_yet(self):
         ticket_row = {

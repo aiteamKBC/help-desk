@@ -1,38 +1,25 @@
 import { Check } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { useSupport } from "@/context/SupportContext";
-import { canReturnToChat, isQuickTicketOnlyRequesterRole, shouldShowStatusStep } from "@/lib/supportFlow";
+import { useSupport } from "@/context/useSupport";
+import { shouldShowStatusStep } from "@/lib/supportFlow";
 import { cn } from "@/lib/utils";
 
-const defaultSteps = [
+const supportSteps = [
   { label: "Email", path: "/", number: 1 },
   { label: "Inquiry", path: "/support/inquiry", number: 2 },
-  { label: "Chat", path: "/support/chat", number: 3 },
-  { label: "Status", path: "/support/status", number: 4 },
-];
-
-const coachSteps = [
-  { label: "Email", path: "/", number: 1 },
-  { label: "Inquiry", path: "/support/inquiry", number: 2 },
-  { label: "Options", path: "/support/options", number: 3 },
+  { label: "Support", path: "/support/options", number: 3 },
   { label: "Status", path: "/support/status", number: 4 },
 ];
 
 export const StepIndicator = ({ current }: { current: number }) => {
   const navigate = useNavigate();
   const { ticket, bookingSummary } = useSupport();
-  const quickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
-  const steps = quickTicketOnlyFlow ? coachSteps : defaultSteps;
-  const chatStepAvailable = canReturnToChat(ticket);
+  const steps = supportSteps;
   const normalizedCurrent = Math.min(Math.max(current, 1), steps.length);
   const isInterimStep = !Number.isInteger(current);
   const furthestStepReached = (() => {
     if (shouldShowStatusStep(ticket, bookingSummary)) {
       return 4;
-    }
-
-    if (quickTicketOnlyFlow) {
-      return ticket.id ? 3 : ticket.email ? 2 : 1;
     }
 
     if (ticket.id) {
@@ -46,13 +33,7 @@ export const StepIndicator = ({ current }: { current: number }) => {
     return 1;
   })();
 
-  const isStepAvailable = (stepIndex: number) => {
-    if (!quickTicketOnlyFlow && stepIndex === 3 && !chatStepAvailable) {
-      return false;
-    }
-
-    return stepIndex <= furthestStepReached;
-  };
+  const isStepAvailable = (stepIndex: number) => stepIndex <= furthestStepReached;
 
   return (
     <div className="mx-auto mb-6 w-full max-w-3xl sm:mb-8">

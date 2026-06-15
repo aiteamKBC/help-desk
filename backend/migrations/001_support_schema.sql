@@ -36,6 +36,20 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS message_attachments (
+  id BIGSERIAL PRIMARY KEY,
+  conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  client_message_id TEXT NOT NULL,
+  client_attachment_id TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  mime_type TEXT,
+  file_size BIGINT,
+  storage_url TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT message_attachments_conversation_attachment_key UNIQUE (conversation_id, client_attachment_id)
+);
+
 DO $$
 BEGIN
   IF EXISTS (
@@ -247,6 +261,8 @@ CREATE INDEX IF NOT EXISTS idx_ticket_attachments_ticket_id ON ticket_attachment
 CREATE INDEX IF NOT EXISTS idx_ticket_history_ticket_id ON ticket_history(ticket_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_support_session_requests_ticket_id ON support_session_requests(ticket_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_created_at ON messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_id_created_at ON message_attachments(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation_message_id ON message_attachments(conversation_id, client_message_id);
 
 INSERT INTO support_accounts (username, full_name, email, role)
 VALUES

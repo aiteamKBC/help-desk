@@ -32,8 +32,8 @@ import {
   type EvidenceFile,
   type RequesterSource,
   type TechnicalSubcategory,
-  useSupport,
 } from "@/context/SupportContext";
+import { useSupport } from "@/context/useSupport";
 import {
   buildCoverageInquiry,
   fetchCoverageOptions,
@@ -429,6 +429,7 @@ const InquiryDetails = () => {
     }
 
     loadCoverageSessionDateOptions(coverageTutor, coverageModule, coverageTime);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Keep session-date loading tied to the selected coverage inputs only.
   }, [coverageModule, coverageTime, coverageTutor, isCoverageFlow]);
 
   useEffect(() => {

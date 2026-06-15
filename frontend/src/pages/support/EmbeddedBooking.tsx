@@ -13,7 +13,8 @@ import {
 } from "@/components/ui/select";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { type ChatMessage, useSupport } from "@/context/SupportContext";
+import { type ChatMessage } from "@/context/SupportContext";
+import { useSupport } from "@/context/useSupport";
 import {
   awaitingMeetingReason,
   canReturnToChat,
@@ -21,6 +22,11 @@ import {
   shouldShowStatusStep,
   type SupportBookingLocationState,
 } from "@/lib/supportFlow";
+import { setTicketBookingProgress } from "@/lib/supportTicketProgress";
+import {
+  fetchSupportSessionAvailability,
+  type SupportSessionTimeOption,
+} from "@/lib/supportBooking";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -199,9 +205,12 @@ const EmbeddedBooking = () => {
   const { ticket, bookingSummary, updateTicket, setBookingSummary } = useSupport();
   const [bookingDate, setBookingDate] = useState("");
   const [bookingTime, setBookingTime] = useState("");
+  const [bookingTimeOptions, setBookingTimeOptions] = useState<SupportSessionTimeOption[]>([]);
+  const [isLoadingAvailability, setIsLoadingAvailability] = useState(false);
   const [isBooking, setIsBooking] = useState(false);
   const requestedReturnPath = (location.state as SupportBookingLocationState | null)?.returnPath;
   const returnPath = requestedReturnPath || (canReturnToChat(ticket) ? "/support/chat" : "/support/options");
+  const hasStatusStep = shouldShowStatusStep(ticket, bookingSummary);
 
   useEffect(() => {
     if (!ticket.id) {
@@ -214,14 +223,71 @@ const EmbeddedBooking = () => {
       return;
     }
 
-    if (shouldShowStatusStep(ticket, bookingSummary)) {
+    if (hasStatusStep) {
       navigate(getSupportResumePath(ticket, bookingSummary));
     }
-  }, [bookingSummary, navigate, ticket]);
+  }, [bookingSummary, hasStatusStep, navigate, ticket]);
 
   const minBookingDate = formatDateInputValue(new Date());
   const bookingValidationMessage = getSupportSessionValidationMessage(bookingDate, bookingTime);
-  const bookingTimeOptions = buildSupportSessionTimeOptions(bookingDate);
+
+  useEffect(() => {
+    if (!bookingDate || !ticket.id) {
+      setBookingTimeOptions([]);
+      setIsLoadingAvailability(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingAvailability(true);
+    setBookingTimeOptions([]);
+
+    const loadAvailability = async () => {
+      try {
+        const payload = await fetchSupportSessionAvailability(
+          ticket.id,
+          bookingDate,
+          Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        setBookingTimeOptions(payload.options || []);
+      } catch {
+        if (!cancelled) {
+          setBookingTimeOptions(buildSupportSessionTimeOptions(bookingDate));
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingAvailability(false);
+        }
+      }
+    };
+
+    void loadAvailability();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bookingDate, ticket.id]);
+
+  useEffect(() => {
+    if (!ticket.id || hasStatusStep) {
+      return;
+    }
+
+    void setTicketBookingProgress(ticket.id, true);
+  }, [hasStatusStep, ticket.id]);
+
+  const handleBack = async () => {
+    if (ticket.id) {
+      await setTicketBookingProgress(ticket.id, false);
+    }
+
+    navigate(returnPath);
+  };
 
   const handleBooking = async () => {
     if (!ticket.id || !bookingDate || !bookingTime) {
@@ -253,6 +319,7 @@ const EmbeddedBooking = () => {
           time: bookingTime,
           scheduledAt: requestedDateTime.toISOString(),
           clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+          returnPath,
         }),
       });
 
@@ -289,6 +356,7 @@ const EmbeddedBooking = () => {
         ...bookingDetails,
         reservationConfirmed: Boolean(payload?.reservationConfirmed),
         meetingJoinUrl: payload?.meetingJoinUrl || null,
+        returnPath,
       });
       setBookingDate("");
       setBookingTime("");
@@ -321,7 +389,7 @@ const EmbeddedBooking = () => {
               <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
               Booking Session
             </div>
-            <Button variant="ghost" onClick={() => navigate(returnPath)} className="shrink-0">
+            <Button variant="ghost" onClick={() => void handleBack()} className="shrink-0">
               <ArrowLeft className="mr-2 h-4 w-4" />
               {returnPath === "/support/chat" ? "Back to Chat" : "Back"}
             </Button>
@@ -367,9 +435,13 @@ const EmbeddedBooking = () => {
 
                   <div className="space-y-2">
                     <Label htmlFor="booking-time">Time</Label>
-                    <Select value={bookingTime} onValueChange={setBookingTime} disabled={!bookingDate || bookingTimeOptions.length === 0}>
+                    <Select
+                      value={bookingTime}
+                      onValueChange={setBookingTime}
+                      disabled={!bookingDate || isLoadingAvailability || bookingTimeOptions.length === 0}
+                    >
                       <SelectTrigger id="booking-time">
-                        <SelectValue placeholder={bookingDate ? "Select a time slot" : "Choose a date first"} />
+                        <SelectValue placeholder={bookingDate ? (isLoadingAvailability ? "Loading available times..." : "Select a time slot") : "Choose a date first"} />
                       </SelectTrigger>
                       <SelectContent>
                         {bookingTimeOptions.map((option) => (
@@ -380,7 +452,7 @@ const EmbeddedBooking = () => {
                   </div>
                 </div>
 
-                {bookingDate && bookingTimeOptions.length === 0 ? (
+                {bookingDate && !isLoadingAvailability && bookingTimeOptions.length === 0 ? (
                   <p className="text-xs text-destructive">
                     No available session times match the 24-hour notice and UK support hours for this date.
                   </p>

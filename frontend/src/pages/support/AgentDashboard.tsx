@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Archive,
@@ -29,6 +29,7 @@ import {
   SendHorizontal,
   Settings2,
   Ticket as TicketIcon,
+  Trash2,
   UserRound,
   Users,
   X,
@@ -51,6 +52,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   Sheet,
   SheetContent,
@@ -79,8 +88,18 @@ import {
   setAdminSessionOnWindow,
   type AdminSession,
 } from "@/lib/adminSession";
-import { fetchCoverageOptions, fetchCoverageTutorEmail, parseCoverageInquiry } from "@/lib/coverageSupport";
+import { fetchCoverageCoachEmail, fetchCoverageOptions, fetchCoverageTutorEmail, parseCoverageInquiry } from "@/lib/coverageSupport";
 import { buildCsrfHeaders } from "@/lib/csrf";
+import {
+  buildChatRequestBody,
+  createPendingChatAttachment,
+  getChatAttachmentOpenUrl,
+  getChatAttachmentPreviewKind,
+  revokeChatAttachmentPreviewUrl,
+  revokeChatAttachmentPreviewUrls,
+  supportChatAttachmentAccept,
+  type ChatAttachment,
+} from "@/lib/supportChat";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -253,11 +272,13 @@ interface TicketDetail extends TicketSummary {
 
 interface ChatHistoryItem {
   id: string | number;
+  clientMessageId?: string;
   role: string;
   source?: "message" | "history_event" | "intro";
   senderLabel: string;
   text: string;
   createdAt: string;
+  attachments?: ChatAttachment[];
 }
 
 interface AttachmentItem {
@@ -328,6 +349,8 @@ interface CoverageWorkflowCard {
   note: string;
   tutor: string;
   tutorEmail: string;
+  coach: string;
+  coachEmail: string;
   sessionDetails: string;
   replyText: string;
   requestStatus: CoverageTutorRequestStatus;
@@ -411,6 +434,12 @@ interface DetailResponse extends TicketDetailResponse {
   message?: string;
 }
 
+interface PermanentDeleteResponse {
+  ok?: boolean;
+  ticketId?: string;
+  message?: string;
+}
+
 interface MigrationStatusResponse {
   adminAiWebhookConfigured?: boolean;
   chatbotWebhookConfigured?: boolean;
@@ -453,12 +482,14 @@ const dashboardTicketPollIntervalMs = 5000;
 const dashboardAgentPollIntervalMs = 15000;
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
+const emptyTicketSummaryList: TicketSummary[] = [];
 const documentationStatusReasons = {
-  Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed via Agent"],
+  Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed by Requester", "Closed via Agent"],
   Pending: [defaultPendingDocumentationStatusReason, "Awaiting support meeting", "Escalation", "Quick Ticket"],
 } as const;
 const adminDashboardAccessRoles = new Set<string>(["agent", "admin", "superadmin"]);
 const userManagementRoles = new Set<string>(["admin", "superadmin"]);
+const ticketAssignmentRoles = new Set<string>(["admin", "superadmin"]);
 type AdminConsoleStatus = (typeof adminConsoleStatuses)[number];
 type AdminSelectableConsoleStatus = (typeof adminSelectableConsoleStatuses)[number];
 type DocumentationWorkflowStatus = (typeof documentationWorkflowStatuses)[number];
@@ -470,6 +501,7 @@ type DashboardArchiveScope = "active" | "archived";
 type AdminView = "dashboard" | "coverage" | "console" | "management";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type CoverageWorkspaceTab = "documentation" | "details";
+const coverageCoachUnsetSelectValue = "__coverage_no_coach__";
 
 function buildAdminJsonHeaders() {
   return buildCsrfHeaders({
@@ -508,6 +540,10 @@ const AgentDashboard = () => {
   const [consoleTicketId, setConsoleTicketId] = useState(initialConsoleDeepLink.ticketId);
   const [consoleDetail, setConsoleDetail] = useState<TicketDetailResponse | null>(null);
   const [consoleChatInput, setConsoleChatInput] = useState("");
+  const [consolePendingAttachments, setConsolePendingAttachments] = useState<ChatAttachment[]>([]);
+  const [chatPreviewAttachment, setChatPreviewAttachment] = useState<ChatAttachment | null>(null);
+  const consoleAttachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const consolePendingAttachmentsRef = useRef<ChatAttachment[]>([]);
   const [consoleAiInput, setConsoleAiInput] = useState("");
   const [dashboardTicketFilter, setDashboardTicketFilter] = useState<DashboardTicketFilter>("all");
   const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>("newest");
@@ -543,17 +579,34 @@ const AgentDashboard = () => {
   const [isSavingActiveDocumentation, setIsSavingActiveDocumentation] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [archiveActionTicketId, setArchiveActionTicketId] = useState("");
+  const [ticketPendingArchive, setTicketPendingArchive] = useState<TicketSummary | null>(null);
+  const [deleteActionTicketId, setDeleteActionTicketId] = useState("");
+  const [ticketPendingPermanentDelete, setTicketPendingPermanentDelete] = useState<TicketSummary | null>(null);
+  const [deleteConfirmationTicketId, setDeleteConfirmationTicketId] = useState("");
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
+  const chatPreviewAttachmentUrl = chatPreviewAttachment ? getChatAttachmentOpenUrl(chatPreviewAttachment) : "";
+  const chatPreviewAttachmentKind = getChatAttachmentPreviewKind(chatPreviewAttachment);
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
   const [consoleTimerNow, setConsoleTimerNow] = useState(() => Date.now());
   const [notificationLog, setNotificationLog] = useState<AdminNotificationLogItem[]>([]);
   const seenTransferNotificationKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedTransferNotificationsRef = useRef(false);
+  const loadDashboardRef = useRef<() => Promise<void>>(async () => {});
+  const syncAgentSessionHeartbeatRef = useRef<
+    (silent?: boolean, statusOverride?: AdminSelectableConsoleStatus) => Promise<boolean>
+  >(async () => false);
+  const refreshTicketsOnlyRef = useRef<(silent?: boolean) => Promise<void>>(async () => {});
+  const refreshAgentsOnlyRef = useRef<(silent?: boolean) => Promise<void>>(async () => {});
+  const refreshConsoleTicketDetailRef = useRef<(ticketId: string) => Promise<void>>(async () => {});
+  const clearConsolePendingAttachmentsRef = useRef<(revokePreviewUrls?: boolean) => void>(() => {});
+  const showAdminDesktopNotificationRef = useRef<(key: string, title: string, body: string) => void>(() => {});
+  const openConsoleChatRef = useRef<(ticketId: string) => Promise<void>>(async () => {});
   const canManageUsers = userManagementRoles.has((session?.role || "").toLowerCase())
     && !!(session?.legacyAdminAccess || session?.entraDirectoryAdmin);
+  const canAssignTickets = ticketAssignmentRoles.has((session?.role || "").toLowerCase());
   const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
   const isConsoleView = adminView === "console";
   const isCoverageDashboardView = adminView === "coverage";
@@ -576,6 +629,7 @@ const AgentDashboard = () => {
     : "Search by requester name, chat ID, or ticket ID";
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
   const activeTicketIsArchived = Boolean(activeDetail?.ticket.isArchived);
+  const activeTicketCanBePermanentlyDeleted = activeTicketIsArchived && isSuperadminSession;
   const isActiveQuickTicket = Boolean(activeDetail) && isDashboardQuickResolutionTicket(activeDetail.ticket);
   const effectiveActiveTicketTab = isActiveQuickTicket && activeTicketTab === "conversation"
     ? "documentation"
@@ -911,7 +965,7 @@ const AgentDashboard = () => {
         label: getAgentDisplayName(agent),
       })),
   ];
-  const assignableAdminAgents = sortedAgents.filter((agent) => (agent.role || "").toLowerCase() === "admin");
+  const assignableTicketAgents = ticketReceivingAgents;
   const activeTicketCount = tickets.filter((ticket) => !isArchivedTicket(ticket)).length;
   const dashboardArchiveScopedTickets = tickets.filter((ticket) => (
     dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
@@ -987,6 +1041,17 @@ const AgentDashboard = () => {
       ? (isCoverageDashboardView ? "Archived Coverage Tickets" : "Archived Tickets")
       : `Archived ${dashboardActiveTableTitle}`
     : dashboardActiveTableTitle;
+  const isArchiveMode = dashboardArchiveScope === "archived";
+  const useCompactArchiveDashboardTable = dashboardArchiveScope === "archived";
+  const dashboardTableHeadings = useCompactArchiveDashboardTable
+    ? ["Ticket", "Requester", "Category", "Status", "Assigned Agent", "Created", "SLA", "Actions"]
+    : ["Chat ID", "Ticket ID", "Requester", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"];
+  const hasDashboardViewOverrides = (
+    dashboardTicketFilter !== "all"
+    || dashboardSortOrder !== "newest"
+    || dashboardArchiveScope !== "active"
+  );
+  const dashboardResetActionLabel = isArchiveMode ? "Back to Active" : "Reset Filters";
   const dashboardAssignedFilterLabel = getDashboardAssignedFilterLabel(
     dashboardAssignedFilter,
     dashboardSessionAgentName,
@@ -1022,9 +1087,16 @@ const AgentDashboard = () => {
     && consoleDetail.ticket.assignedAgentId === resolvedSessionAgentId
   );
   const canAssignActiveTicket = Boolean(
-    isSuperadminSession
+    canAssignTickets
     && activeDetail
     && !activeTicketIsArchived,
+  );
+  const normalizedDeleteConfirmationTicketId = deleteConfirmationTicketId.trim().toUpperCase();
+  const normalizedPendingPermanentDeleteTicketId = ticketPendingPermanentDelete?.id.trim().toUpperCase() || "";
+  const canConfirmPermanentDelete = Boolean(
+    normalizedPendingPermanentDeleteTicketId
+    && normalizedDeleteConfirmationTicketId === normalizedPendingPermanentDeleteTicketId
+    && deleteActionTicketId !== ticketPendingPermanentDelete?.id
   );
   const isActiveTicketAlreadyAssigned = Boolean(activeDetail?.ticket.assignedAgentId);
   const canForceCloseConsoleChat = Boolean(consoleDetail)
@@ -1098,7 +1170,7 @@ const AgentDashboard = () => {
         const rightRequestedAt = Date.parse(rightTicket.liveChatRequestedAt || "");
         return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
       })
-    : [];
+    : emptyTicketSummaryList;
   const transferDecisionNotifications = tickets
     .filter((ticket) => {
       const latestTransferDecision = ticket.latestTransferDecision;
@@ -1250,6 +1322,10 @@ const AgentDashboard = () => {
         : Boolean(documentationIssuesAddressed)
   );
   const consoleDurationStart = consoleDetail ? getConsoleDurationStartInfo(consoleDetail.ticket) : null;
+  const hasConsoleDetail = Boolean(consoleDetail);
+  const consoleDetailTicketId = consoleDetail?.ticket.id || "";
+  const consoleDetailTicketChatState = consoleDetail?.ticket.chatState || "";
+  const consoleDurationStartedAt = consoleDurationStart?.startedAt || "";
   const persistedConsoleDurationMinutes = consoleDetail?.ticket.chatDurationMinutes ?? 0;
   const consoleDurationLabel = !consoleDetail
     ? ""
@@ -1282,7 +1358,7 @@ const AgentDashboard = () => {
   }
 
   useEffect(() => {
-    void loadDashboard();
+    void loadDashboardRef.current();
   }, []);
 
   useEffect(() => {
@@ -1294,10 +1370,10 @@ const AgentDashboard = () => {
       return;
     }
 
-    void syncAgentSessionHeartbeat(true);
+    void syncAgentSessionHeartbeatRef.current(true);
 
     const intervalId = window.setInterval(() => {
-      void syncAgentSessionHeartbeat(true);
+      void syncAgentSessionHeartbeatRef.current(true);
     }, 30000);
 
     return () => window.clearInterval(intervalId);
@@ -1324,6 +1400,7 @@ const AgentDashboard = () => {
       setDocumentationEscalationNote("");
       setDocumentationIssuesAddressed("");
       setConsoleChatInput("");
+      clearConsolePendingAttachmentsRef.current(true);
       setConsoleAiInput("");
       return;
     }
@@ -1339,6 +1416,7 @@ const AgentDashboard = () => {
       deriveDocumentationIssuesAddressed(consoleDetail.ticket.chatState, consoleDetail.ticket.documentation),
     );
     setConsoleChatInput("");
+    clearConsolePendingAttachmentsRef.current(true);
     setConsoleAiInput("");
     setAiThreads((currentThreads) => {
       if (currentThreads[consoleDetail.ticket.id]) {
@@ -1350,6 +1428,7 @@ const AgentDashboard = () => {
         [consoleDetail.ticket.id]: [buildInitialAiMessage(consoleDetail.ticket, chatbotWorkflowConfigured)],
       };
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Reset the console workspace only when the selected ticket changes.
   }, [consoleDetail?.ticket.id, chatbotWorkflowConfigured]);
 
   useEffect(() => {
@@ -1364,7 +1443,16 @@ const AgentDashboard = () => {
     }
 
     setActiveDocumentationDraft(buildStandardDocumentationDraft(activeDetail.ticket));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Keep the active documentation draft in sync with the tracked ticket fields only.
   }, [activeDetail?.ticket.id, activeDetail?.ticket.updatedAt, activeDetail?.ticket.technicalSubcategory]);
+
+  useEffect(() => {
+    consolePendingAttachmentsRef.current = consolePendingAttachments;
+  }, [consolePendingAttachments]);
+
+  useEffect(() => () => {
+    revokeChatAttachmentPreviewUrls(consolePendingAttachmentsRef.current);
+  }, []);
 
   useEffect(() => {
     if (adminView !== "console" || !consoleDetail) {
@@ -1403,10 +1491,10 @@ const AgentDashboard = () => {
     }
 
     const intervalId = window.setInterval(() => {
-      void refreshTicketsOnly(true);
+      void refreshTicketsOnlyRef.current(true);
 
       if (consoleTicketId && !isConsoleOpening && !isSendingConsoleChat) {
-        void refreshConsoleTicketDetail(consoleTicketId);
+        void refreshConsoleTicketDetailRef.current(consoleTicketId);
       }
     }, consolePollIntervalMs);
 
@@ -1419,11 +1507,11 @@ const AgentDashboard = () => {
     }
 
     const ticketsIntervalId = window.setInterval(() => {
-      void refreshTicketsOnly(true);
+      void refreshTicketsOnlyRef.current(true);
     }, dashboardTicketPollIntervalMs);
 
     const agentsIntervalId = window.setInterval(() => {
-      void refreshAgentsOnly(true);
+      void refreshAgentsOnlyRef.current(true);
     }, dashboardAgentPollIntervalMs);
 
     return () => {
@@ -1563,7 +1651,7 @@ const AgentDashboard = () => {
       toast.info(
         `New coverage ticket ${ticket.id} created for ${pendingCoverageTicketNotification.requesterName || getRequesterDisplayName(ticket, "requester")}.`,
       );
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `coverage-ticket:${ticket.id}:${pendingCoverageTicketNotification.createdAt}`,
         "New Coverage Ticket",
         `${ticket.id} • ${pendingCoverageTicketNotification.requesterName || getRequesterDisplayName(ticket)}`,
@@ -1577,7 +1665,7 @@ const AgentDashboard = () => {
       }
 
       toast.info(`New transfer request for ${ticket.id} from ${pendingTransferRequest.fromAgentName}.`);
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `request:${ticket.id}:${pendingTransferRequest.requestedAt}:${pendingTransferRequest.toAgentId}`,
         "New Transfer Request",
         `${ticket.id} from ${pendingTransferRequest.fromAgentName}.`,
@@ -1591,7 +1679,7 @@ const AgentDashboard = () => {
       }
 
       toast.info(`Escalation notice received for ${pendingEscalationNotification.ticketId} from ${pendingEscalationNotification.fromAgentName}.`);
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `escalation:${ticket.id}:${pendingEscalationNotification.requestedAt}:${pendingEscalationNotification.toAgentId}`,
         "Escalation Notice",
         `${pendingEscalationNotification.ticketId} from ${pendingEscalationNotification.fromAgentName}.`,
@@ -1607,7 +1695,7 @@ const AgentDashboard = () => {
       toast.info(
         `Teams call request received for ${pendingTeamsCallNotification.ticketId} from ${pendingTeamsCallNotification.requesterName}.`,
       );
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `teams-call:${ticket.id}:${pendingTeamsCallNotification.requestedAt}:${pendingTeamsCallNotification.toAgentId}`,
         "Teams Call Request",
         `${pendingTeamsCallNotification.ticketId} from ${pendingTeamsCallNotification.requesterName}.`,
@@ -1618,7 +1706,7 @@ const AgentDashboard = () => {
       toast.info(
         `Live chat is waiting for an available admin for ${ticket.id} (${getRequesterDisplayName(ticket)}).`,
       );
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `waiting-live-chat:${ticket.id}:${ticket.liveChatRequestedAt || ticket.createdAt}`,
         "Waiting Live Chat",
         `${ticket.id} is waiting for an available admin.`,
@@ -1636,7 +1724,7 @@ const AgentDashboard = () => {
           ? `Transfer accepted for ${ticket.id} by ${latestTransferDecision.decidedByName}.`
           : `Transfer declined for ${ticket.id} by ${latestTransferDecision.decidedByName}.`,
       );
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `decision:${ticket.id}:${latestTransferDecision.status}:${latestTransferDecision.decidedAt}`,
         latestTransferDecision.status === "accepted" ? "Transfer Accepted" : "Transfer Declined",
         `${ticket.id} by ${latestTransferDecision.decidedByName}.`,
@@ -1650,7 +1738,7 @@ const AgentDashboard = () => {
       }
 
       toast.info(`Escalated ticket ${latestEscalationClosure.ticketId} was closed by ${latestEscalationClosure.closedByName}.`);
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `escalation-closed:${ticket.id}:${latestEscalationClosure.closedAt}:${latestEscalationClosure.fromAgentId}`,
         "Escalated Ticket Closed",
         `${latestEscalationClosure.ticketId} was closed by ${latestEscalationClosure.closedByName}.`,
@@ -1669,7 +1757,7 @@ const AgentDashboard = () => {
           ? `Tutor accepted coverage session for ${ticket.id}. The ticket was closed automatically.`
           : `Tutor refused coverage session for ${ticket.id}.`,
       );
-      showAdminDesktopNotification(
+      showAdminDesktopNotificationRef.current(
         `coverage-response:${ticket.id}:${latestCoverageTutorResponse.cardId}:${latestCoverageTutorResponse.respondedAt}`,
         wasAccepted ? "Tutor Accepted • Ticket Closed" : "Tutor Refused",
         `${ticket.id} • ${latestCoverageTutorResponse.tutor}`,
@@ -1730,13 +1818,13 @@ const AgentDashboard = () => {
   ]);
 
   useEffect(() => {
-    if (!isConsoleView || !consoleDetail || !consoleDurationStart) {
+    if (!isConsoleView || !hasConsoleDetail || !consoleDurationStartedAt) {
       return;
     }
 
     setConsoleTimerNow(Date.now());
 
-    if (consoleDetail.ticket.chatState === "closed") {
+    if (consoleDetailTicketChatState === "closed") {
       return;
     }
 
@@ -1747,11 +1835,12 @@ const AgentDashboard = () => {
     return () => window.clearInterval(intervalId);
   }, [
     isConsoleView,
-    consoleDetail?.ticket.id,
-    consoleDetail?.ticket.chatState,
+    hasConsoleDetail,
+    consoleDetailTicketId,
+    consoleDetailTicketChatState,
     consoleDetail?.ticket.queueAssignedAt,
     consoleDetail?.ticket.liveChatRequestedAt,
-    consoleDurationStart?.startedAt,
+    consoleDurationStartedAt,
   ]);
 
   const kpis = [
@@ -2358,7 +2447,7 @@ const AgentDashboard = () => {
     setConsoleQueueTab(nextConsoleDeepLink.queueTab);
 
     if (nextConsoleDeepLink.ticketId) {
-      void openConsoleChat(nextConsoleDeepLink.ticketId);
+      void openConsoleChatRef.current(nextConsoleDeepLink.ticketId);
     }
   }, [isLoading, location.search]);
 
@@ -2383,13 +2472,28 @@ const AgentDashboard = () => {
     ));
   }
 
-  async function updateTicketArchiveState(ticket: TicketSummary, shouldArchive: boolean) {
+  function removeTicketAcrossViews(ticketId: string) {
+    setTickets((currentTickets) => currentTickets.filter((ticket) => ticket.id !== ticketId));
+
+    if (activeDetail?.ticket.id === ticketId || activeTicketId === ticketId) {
+      closePanel();
+    }
+    if (consoleDetail?.ticket.id === ticketId || consoleTicketId === ticketId) {
+      collapseConsoleWorkspace();
+    }
+  }
+
+  async function updateTicketArchiveState(
+    ticket: TicketSummary,
+    shouldArchive: boolean,
+    options: { confirmedActiveArchive?: boolean } = {},
+  ) {
     if (
       shouldArchive
       && ticket.status !== "Closed"
-      && typeof window !== "undefined"
-      && !window.confirm("Archive this active ticket? It will be hidden from active dashboards until restored.")
+      && !options.confirmedActiveArchive
     ) {
+      setTicketPendingArchive(ticket);
       return;
     }
 
@@ -2415,11 +2519,76 @@ const AgentDashboard = () => {
       if (activeDetail?.ticket.id === payload.ticket.id) {
         syncDrafts(payload);
       }
+      if (shouldArchive) {
+        setTicketPendingArchive(null);
+      }
       toast.success(shouldArchive ? "Ticket archived" : "Ticket restored");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setArchiveActionTicketId("");
+    }
+  }
+
+  function openPermanentDeleteDialog(ticket: TicketSummary) {
+    if (!isArchivedTicket(ticket)) {
+      toast.error("Archive this ticket before deleting it permanently.");
+      return;
+    }
+    if (!isSuperadminSession) {
+      toast.error("Only superadmins can permanently delete archived tickets.");
+      return;
+    }
+
+    setTicketPendingPermanentDelete(ticket);
+    setDeleteConfirmationTicketId("");
+  }
+
+  function dismissPermanentDeleteDialog() {
+    if (deleteActionTicketId) {
+      return;
+    }
+
+    setTicketPendingPermanentDelete(null);
+    setDeleteConfirmationTicketId("");
+  }
+
+  async function permanentlyDeleteSelectedTicket() {
+    const selectedTicket = ticketPendingPermanentDelete;
+    if (!selectedTicket) {
+      return;
+    }
+    if (normalizedDeleteConfirmationTicketId !== normalizedPendingPermanentDeleteTicketId) {
+      toast.error("Type the ticket ID to confirm permanent deletion.");
+      return;
+    }
+
+    setDeleteActionTicketId(selectedTicket.id);
+
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(selectedTicket.id)}/delete-permanently`, {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({ confirmTicketId: deleteConfirmationTicketId.trim() }),
+      });
+      const payload = (await response.json().catch(() => null)) as PermanentDeleteResponse | null;
+
+      if (!response.ok || !payload?.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not permanently delete this ticket right now.");
+        return;
+      }
+
+      removeTicketAcrossViews(selectedTicket.id);
+      setTicketPendingPermanentDelete(null);
+      setDeleteConfirmationTicketId("");
+      toast.success("Ticket deleted permanently");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setDeleteActionTicketId("");
     }
   }
 
@@ -2623,6 +2792,16 @@ const AgentDashboard = () => {
       return;
     }
 
+    if (targetCard.coach.trim() && !targetCard.coachEmail.trim()) {
+      toast.error("Add the coach e-mail before submitting the request.");
+      return;
+    }
+
+    if (targetCard.coach.trim() && !isValidCoverageTutorEmail(targetCard.coachEmail)) {
+      toast.error("Please enter a valid coach e-mail before submitting the request.");
+      return;
+    }
+
     setIsSavingActiveDocumentation(true);
     try {
       const response = await fetch(
@@ -2655,6 +2834,56 @@ const AgentDashboard = () => {
       toast.success("Tutor request sent.");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsSavingActiveDocumentation(false);
+    }
+  }
+
+  async function sendActiveCoverageTutorFollowUpFiles(
+    cardId: string,
+    presentationFiles: CoverageCardAttachment[],
+  ): Promise<boolean> {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return false;
+    }
+
+    if (presentationFiles.length === 0) {
+      toast.error("Add at least one presentation file before sending the follow-up.");
+      return false;
+    }
+
+    setIsSavingActiveDocumentation(true);
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-follow-up`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({
+            cardId,
+            presentationFiles,
+          }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return false;
+        }
+        toast.error(payload?.message || "We could not send these presentation files right now.");
+        return false;
+      }
+
+      syncDetailAcrossViews(payload);
+      syncDrafts(payload);
+      setActiveDocumentationDraft(buildCoverageDocumentationDraft(payload.ticket));
+      toast.success("Presentation files sent to tutor.");
+      return true;
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+      return false;
     } finally {
       setIsSavingActiveDocumentation(false);
     }
@@ -2857,37 +3086,90 @@ const AgentDashboard = () => {
     }
   }
 
+  const clearConsolePendingAttachments = (revokePreviewUrls = false) => {
+    if (revokePreviewUrls) {
+      if (chatPreviewAttachment && consolePendingAttachmentsRef.current.some((attachment) => attachment.id === chatPreviewAttachment.id)) {
+        setChatPreviewAttachment(null);
+      }
+      revokeChatAttachmentPreviewUrls(consolePendingAttachmentsRef.current);
+    }
+    setConsolePendingAttachments([]);
+    if (consoleAttachmentInputRef.current) {
+      consoleAttachmentInputRef.current.value = "";
+    }
+  };
+
+  const openConsoleAttachmentPicker = () => {
+    consoleAttachmentInputRef.current?.click();
+  };
+
+  const handleConsoleAttachmentInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    setConsolePendingAttachments((currentAttachments) => [
+      ...currentAttachments,
+      ...files.map(createPendingChatAttachment),
+    ]);
+  };
+
+  const removeConsolePendingAttachment = (attachmentId: string) => {
+    setConsolePendingAttachments((currentAttachments) => {
+      const attachmentToRemove = currentAttachments.find((attachment) => attachment.id === attachmentId);
+      if (attachmentToRemove) {
+        if (chatPreviewAttachment?.id === attachmentToRemove.id) {
+          setChatPreviewAttachment(null);
+        }
+        revokeChatAttachmentPreviewUrl(attachmentToRemove);
+      }
+      return currentAttachments.filter((attachment) => attachment.id !== attachmentId);
+    });
+  };
+
   async function handleConsoleChatSend() {
-    if (!consoleDetail || !consoleChatInput.trim() || !adminCanReplyToLiveChat || isSendingConsoleChat) {
+    const attachmentsToSend = consolePendingAttachments;
+    if ((!consoleChatInput.trim() && attachmentsToSend.length === 0) || !consoleDetail || !adminCanReplyToLiveChat || isSendingConsoleChat) {
       return;
     }
 
     const messageText = consoleChatInput.trim();
+    const clientMessageId = crypto.randomUUID();
     const outgoingMessage: ChatHistoryItem = {
-      id: Date.now(),
+      id: clientMessageId,
+      clientMessageId,
       role: "agent",
       senderLabel: session?.fullName || session?.username || "Support Agent",
       text: messageText,
       createdAt: new Date().toISOString(),
+      attachments: attachmentsToSend,
     };
     const optimisticDetail: TicketDetailResponse = {
       ...consoleDetail,
       chatHistory: [...consoleDetail.chatHistory, outgoingMessage],
     };
+    const requestBody = buildChatRequestBody(
+      {
+        status: consoleDetail.ticket.status,
+        statusReason: consoleDetail.ticket.statusReason,
+      },
+      serializeConsoleChatHistory(optimisticDetail.chatHistory),
+    );
+    const requestHeaders = requestBody.headers ? buildCsrfHeaders(requestBody.headers) : buildCsrfHeaders();
 
     setConsoleChatInput("");
+    clearConsolePendingAttachments();
     setIsSendingConsoleChat(true);
     setConsoleDetail(optimisticDetail);
 
     try {
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(consoleDetail.ticket.id)}/chat-history`, {
         method: "POST",
-        headers: buildAdminJsonHeaders(),
-        body: JSON.stringify({
-          status: consoleDetail.ticket.status,
-          statusReason: consoleDetail.ticket.statusReason,
-          messages: serializeConsoleChatHistory(optimisticDetail.chatHistory),
-        }),
+        headers: requestHeaders,
+        body: requestBody.body,
       });
 
       const payload = (await response.json().catch(() => null)) as { message?: string } | null;
@@ -2898,6 +3180,7 @@ const AgentDashboard = () => {
         }
         setConsoleDetail(consoleDetail);
         setConsoleChatInput(messageText);
+        setConsolePendingAttachments(attachmentsToSend);
         toast.error(payload?.message || "We could not send the chat message right now.");
         return;
       }
@@ -2907,6 +3190,7 @@ const AgentDashboard = () => {
     } catch {
       setConsoleDetail(consoleDetail);
       setConsoleChatInput(messageText);
+      setConsolePendingAttachments(attachmentsToSend);
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setIsSendingConsoleChat(false);
@@ -3528,6 +3812,15 @@ const AgentDashboard = () => {
     }
   }
 
+  loadDashboardRef.current = loadDashboard;
+  syncAgentSessionHeartbeatRef.current = syncAgentSessionHeartbeat;
+  refreshTicketsOnlyRef.current = refreshTicketsOnly;
+  refreshAgentsOnlyRef.current = refreshAgentsOnly;
+  refreshConsoleTicketDetailRef.current = refreshConsoleTicketDetail;
+  clearConsolePendingAttachmentsRef.current = clearConsolePendingAttachments;
+  showAdminDesktopNotificationRef.current = showAdminDesktopNotification;
+  openConsoleChatRef.current = openConsoleChat;
+
   function renderDashboardWorkspace() {
     const coverageDashboardKpiFilters: DashboardTicketFilter[] = ["coverage", "pending", "closed", "slaBreached"];
     const visibleKpis = isCoverageDashboardView
@@ -3589,36 +3882,61 @@ const AgentDashboard = () => {
           ) : null}
         </div>
 
-        <div className="bg-card overflow-hidden rounded-2xl border shadow-card">
+        <div className={cn(
+          "bg-card overflow-hidden rounded-2xl border shadow-card transition-colors",
+          isArchiveMode && "border-amber-200/80",
+        )}>
           <div className="border-b px-4 py-4 sm:px-5">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <h2 className="font-semibold">{dashboardTableTitle}</h2>
-                {dashboardTicketFilter === "quickResolution" ? (
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    These tickets skip the chat console and stay available from the dashboard only.
-                  </p>
-                ) : null}
-              </div>
-              <div className="flex flex-col gap-3 lg:items-end">
-                <div className="flex items-center gap-3">
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="font-semibold">{dashboardTableTitle}</h2>
+                    {isArchiveMode ? (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
+                        <Archive className="h-3.5 w-3.5" />
+                        Archived View
+                      </span>
+                    ) : null}
+                  </div>
+                  {isArchiveMode ? (
+                    <div className="mt-2 inline-flex max-w-full items-center gap-2 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-900">
+                      <Archive className="h-3.5 w-3.5 shrink-0" />
+                      <span>Archived tickets are separate from the live queue.</span>
+                    </div>
+                  ) : dashboardTicketFilter === "quickResolution" ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      These tickets skip the chat console and stay available from the dashboard only.
+                    </p>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-3 lg:shrink-0">
                   <span className="text-xs text-muted-foreground">{dashboardTableCountLabel}</span>
-                  {dashboardTicketFilter !== "all" || dashboardSortOrder !== "newest" || dashboardArchiveScope !== "active" ? (
+                  {hasDashboardViewOverrides ? (
                     <Button
                       size="sm"
                       variant="outline"
+                      className={cn(
+                        isArchiveMode && "border-amber-200 bg-white text-amber-900 hover:bg-amber-50 hover:text-amber-950",
+                      )}
                       onClick={() => {
                         setDashboardTicketFilter("all");
                         setDashboardSortOrder("newest");
                         setDashboardArchiveScope("active");
                       }}
                     >
-                      Reset View
+                      {dashboardResetActionLabel}
                     </Button>
                   ) : null}
                 </div>
-                <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
-                  <div className="inline-flex rounded-xl border bg-secondary/40 p-1">
+              </div>
+              <div className="flex w-full flex-col gap-3 xl:flex-row xl:flex-wrap xl:items-center">
+                  <div className={cn(
+                    "inline-flex rounded-xl border p-1 transition-colors",
+                    isArchiveMode
+                      ? "border-amber-200 bg-amber-50/80"
+                      : "bg-secondary/40",
+                  )}>
                     {(["active", "archived"] as const).map((scope) => (
                       <button
                         key={scope}
@@ -3627,11 +3945,13 @@ const AgentDashboard = () => {
                         className={cn(
                           "rounded-lg px-3 py-2 text-xs font-semibold transition",
                           dashboardArchiveScope === scope
-                            ? "bg-primary text-primary-foreground shadow-sm"
+                            ? scope === "archived"
+                              ? "bg-amber-500 text-white shadow-sm"
+                              : "bg-primary text-primary-foreground shadow-sm"
                             : "text-muted-foreground hover:bg-background hover:text-foreground",
                         )}
                       >
-                        {scope === "active" ? "Active" : "Archive"}
+                        {scope === "active" ? "Active" : "Archived"}
                       </button>
                     ))}
                   </div>
@@ -3766,7 +4086,7 @@ const AgentDashboard = () => {
                       </div>
                     </DropdownMenuContent>
                   </DropdownMenu>
-                  <div className="relative w-full lg:w-[360px]">
+                  <div className="relative w-full xl:ml-auto xl:max-w-[360px]">
                     <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
                       value={dashboardSearch}
@@ -3800,7 +4120,7 @@ const AgentDashboard = () => {
               <table className="w-full text-sm">
                 <thead className="bg-secondary/50 text-muted-foreground">
                   <tr className="text-left">
-                    {["Chat ID", "Ticket ID", "Requester", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"].map((heading) => (
+                    {dashboardTableHeadings.map((heading) => (
                       <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
                     ))}
                   </tr>
@@ -3831,18 +4151,40 @@ const AgentDashboard = () => {
                           getTicketTransferRowClassName(ticket),
                         )}
                       >
-                        <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
-                        <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
-                        <td className="px-4 py-3 min-w-[240px]">
+                        {useCompactArchiveDashboardTable ? (
+                          <td className="px-4 py-3 min-w-[170px]">
+                            <div className="font-mono font-medium whitespace-nowrap">{ticket.id}</div>
+                            <div className="mt-1 text-xs font-mono text-muted-foreground">
+                              {getDisplayedChatReference(ticket)}
+                            </div>
+                          </td>
+                        ) : (
+                          <>
+                            <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
+                            <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
+                          </>
+                        )}
+                        <td className={cn("px-4 py-3", useCompactArchiveDashboardTable ? "min-w-[200px]" : "min-w-[240px]")}>
                           <div className="font-medium">{requesterColumnSummary.primaryText}</div>
                           <div className="text-xs text-muted-foreground">{requesterColumnSummary.secondaryText}</div>
                           <div className="mt-2">
-                            <RequesterRoleBadge role={ticket.requesterRole} />
+                            <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} />
                           </div>
                         </td>
                         <td className="px-4 py-3">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</td>
-                        <td className="px-4 py-3"><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
-                        <td className="px-4 py-3 text-muted-foreground">{getDisplayedTicketStatusReason(ticket)}</td>
+                        {useCompactArchiveDashboardTable ? (
+                          <td className="px-4 py-3 min-w-[150px]">
+                            <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
+                            <div className="mt-2 text-xs text-muted-foreground">
+                              {getDisplayedTicketStatusReason(ticket)}
+                            </div>
+                          </td>
+                        ) : (
+                          <>
+                            <td className="px-4 py-3"><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
+                            <td className="px-4 py-3 text-muted-foreground">{getDisplayedTicketStatusReason(ticket)}</td>
+                          </>
+                        )}
                         <td className="px-4 py-3">
                           <AssignedAgentBadge
                             assignedAgentId={ticket.assignedAgentId}
@@ -3861,26 +4203,49 @@ const AgentDashboard = () => {
                           </span>
                         </td>
                         <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            className="h-8 whitespace-nowrap rounded-full"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
-                            }}
-                            disabled={archiveActionTicketId === ticket.id}
-                          >
-                            {archiveActionTicketId === ticket.id ? (
-                              <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                            ) : isArchivedTicket(ticket) ? (
-                              <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-                            ) : (
-                              <Archive className="mr-1.5 h-3.5 w-3.5" />
-                            )}
-                            {isArchivedTicket(ticket) ? "Restore" : "Archive"}
-                          </Button>
+                          <div className="flex items-center justify-end gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-8 whitespace-nowrap rounded-full"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
+                              }}
+                              disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
+                            >
+                              {archiveActionTicketId === ticket.id ? (
+                                <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                              ) : isArchivedTicket(ticket) ? (
+                                <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                              ) : (
+                                <Archive className="mr-1.5 h-3.5 w-3.5" />
+                              )}
+                              {isArchivedTicket(ticket) ? "Restore" : "Archive"}
+                            </Button>
+                            {isArchivedTicket(ticket) && isSuperadminSession ? (
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="destructive"
+                                className="h-8 w-8 rounded-full"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openPermanentDeleteDialog(ticket);
+                                }}
+                                disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
+                                title="Delete Permanently"
+                                aria-label={`Delete ticket ${ticket.id} permanently`}
+                              >
+                                {deleteActionTicketId === ticket.id ? (
+                                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            ) : null}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -3889,7 +4254,6 @@ const AgentDashboard = () => {
               </table>
             </div>
           )}
-        </div>
       </div>
     );
   }
@@ -4657,9 +5021,16 @@ const AgentDashboard = () => {
                               title: message.senderLabel,
                               text: message.text,
                               createdAt: message.createdAt,
+                              attachments: message.attachments || [],
                             }))}
                             composerValue={consoleChatInput}
                             onComposerChange={setConsoleChatInput}
+                            composerAttachments={consolePendingAttachments}
+                            attachmentInputRef={consoleAttachmentInputRef}
+                            onAttachmentOpen={setChatPreviewAttachment}
+                            onAttachmentButtonClick={openConsoleAttachmentPicker}
+                            onAttachmentInputChange={handleConsoleAttachmentInputChange}
+                            onAttachmentRemove={removeConsolePendingAttachment}
                             onSend={handleConsoleChatSend}
                             sendDisabled={!adminCanReplyToLiveChat || isSendingConsoleChat}
                             sendLabel={isSendingConsoleChat ? "Sending..." : "Send"}
@@ -4669,7 +5040,7 @@ const AgentDashboard = () => {
                                 : liveChatLocked
                                 ? "This chat is closed."
                                 : consoleDetail.ticket.liveChatRequested
-                                  ? "Type your message..."
+                                  ? "Type your message or attach files..."
                                   : "The learner must choose Live Chat before admin replies are enabled."
                             }
                             emptyMessage="No live chat messages are available for this conversation yet."
@@ -4812,13 +5183,11 @@ const AgentDashboard = () => {
                   notes={notes}
                   onNotesChange={setNotes}
                   draftStatus={draftStatus}
-                  onDraftStatusChange={setDraftStatus}
-                  statusOptions={activeDetail.ticket.status === "Closed" ? statuses : statuses.filter((status) => status !== "Closed")}
                   canAssignActiveTicket={canAssignActiveTicket}
                   draftAgentId={draftAgentId}
                   onDraftAgentChange={setDraftAgentId}
                   selectedDraftAgent={selectedDraftAgent}
-                  assignableAdminAgents={assignableAdminAgents}
+                  assignableTicketAgents={assignableTicketAgents}
                   isActiveTicketAlreadyAssigned={isActiveTicketAlreadyAssigned}
                   isSlaAutoManaged={isSlaAutoManaged}
                   effectiveDraftSlaStatus={effectiveDraftSlaStatus}
@@ -4833,6 +5202,7 @@ const AgentDashboard = () => {
                   onSaveDetails={() => void saveTicket({ successMessage: "Changes saved" })}
                   onArchiveToggle={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
                   onSubmitTutorChoiceCard={(cardId) => void submitActiveCoverageTutorChoiceCard(cardId)}
+                  onSendTutorFollowUpFiles={sendActiveCoverageTutorFollowUpFiles}
                   onConfirmTutorSession={(cardId) => void confirmActiveCoverageTutorSession(cardId)}
                 />
               ) : (
@@ -4908,7 +5278,34 @@ const AgentDashboard = () => {
                                 <span className="font-medium text-foreground">{message.senderLabel}</span>
                                 <span>{formatDateTime(message.createdAt)}</span>
                               </div>
-                              <div className="mt-1 text-sm leading-6">{message.text}</div>
+                              {message.text ? <div className="mt-1 text-sm leading-6">{message.text}</div> : null}
+                              {message.attachments?.length ? (
+                                <div className="mt-3 flex flex-col gap-2">
+                                  {message.attachments.map((attachment) => (
+                                    getChatAttachmentOpenUrl(attachment) ? (
+                                      <button
+                                        type="button"
+                                        key={attachment.id}
+                                        onClick={() => setChatPreviewAttachment(attachment)}
+                                        className="inline-flex max-w-full items-center gap-2 rounded-xl border border-primary/10 bg-white px-3 py-2 text-xs shadow-sm transition hover:border-primary/25"
+                                      >
+                                        <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                                        <span className="truncate font-medium text-foreground">{attachment.name}</span>
+                                        <span className="shrink-0 text-muted-foreground">{formatBytes(attachment.size)}</span>
+                                      </button>
+                                    ) : (
+                                      <div
+                                        key={attachment.id}
+                                        className="inline-flex max-w-full items-center gap-2 rounded-xl border border-border bg-white px-3 py-2 text-xs shadow-sm"
+                                      >
+                                        <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                                        <span className="truncate font-medium text-foreground">{attachment.name}</span>
+                                        <span className="shrink-0 text-muted-foreground">{formatBytes(attachment.size)}</span>
+                                      </div>
+                                    )
+                                  ))}
+                                </div>
+                              ) : null}
                             </div>
                           ))
                         )}
@@ -4960,7 +5357,7 @@ const AgentDashboard = () => {
                         </Select>
                       </div>
                       <div>
-                        <Label className="mb-1.5 block">Assign Admin</Label>
+                        <Label className="mb-1.5 block">Assign Agent</Label>
                         {canAssignActiveTicket ? (
                           <>
                             <Select value={draftAgentId} onValueChange={setDraftAgentId}>
@@ -4968,12 +5365,12 @@ const AgentDashboard = () => {
                                 {selectedDraftAgent ? (
                                   <AgentStatusLabel agent={selectedDraftAgent} />
                                 ) : (
-                                  <span className="text-sm text-foreground">Select admin</span>
+                                  <span className="text-sm text-foreground">Select agent</span>
                                 )}
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="unassigned">Unassigned</SelectItem>
-                                {assignableAdminAgents.map((agent) => (
+                                {assignableTicketAgents.map((agent) => (
                                   <SelectItem key={agent.id} value={String(agent.id)} className="py-2">
                                     <AgentStatusLabel agent={agent} />
                                   </SelectItem>
@@ -4981,7 +5378,7 @@ const AgentDashboard = () => {
                               </SelectContent>
                             </Select>
                             <p className="mt-1 text-xs text-muted-foreground">
-                              Only superadmins can assign or reassign tickets to admin accounts.
+                              Admins and superadmins can assign tickets to staff who receive tickets.
                             </p>
                           </>
                         ) : (
@@ -4995,8 +5392,8 @@ const AgentDashboard = () => {
                             </div>
                             <p className="mt-1 text-xs text-muted-foreground">
                               {isActiveTicketAlreadyAssigned
-                                ? "Only superadmins can reassign this ticket."
-                                : "Only superadmins can assign or reassign tickets to admin accounts."}
+                                ? "Only admins and superadmins can reassign this ticket."
+                                : "Only admins and superadmins can assign or reassign tickets to staff who receive tickets."}
                             </p>
                           </>
                         )}
@@ -5075,7 +5472,7 @@ const AgentDashboard = () => {
                   variant="outline"
                   className="w-full sm:w-auto"
                   onClick={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
-                  disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id}
+                  disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id}
                 >
                   {archiveActionTicketId === activeDetail.ticket.id ? (
                     <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
@@ -5086,6 +5483,22 @@ const AgentDashboard = () => {
                   )}
                   {activeTicketIsArchived ? "Restore Ticket" : "Archive Ticket"}
                 </Button>
+                {activeTicketCanBePermanentlyDeleted ? (
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    className="w-full sm:w-auto"
+                    onClick={() => openPermanentDeleteDialog(activeDetail.ticket)}
+                    disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id}
+                  >
+                    {deleteActionTicketId === activeDetail.ticket.id ? (
+                      <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-4 w-4 mr-2" />
+                    )}
+                    Delete Permanently
+                  </Button>
+                ) : null}
                 <Button
                   variant="outline"
                   className="w-full sm:w-auto"
@@ -5117,6 +5530,212 @@ const AgentDashboard = () => {
           )}
         </SheetContent>
       </Sheet>
+
+      <AlertDialog
+        open={Boolean(ticketPendingArchive)}
+        onOpenChange={(open) => {
+          if (!open && !archiveActionTicketId) {
+            setTicketPendingArchive(null);
+          }
+        }}
+      >
+        <AlertDialogContent className="overflow-hidden border-0 bg-white p-0 shadow-2xl sm:max-w-lg">
+          <div className="bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 px-6 py-5 text-white">
+            <div className="flex items-start gap-4">
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/10 ring-1 ring-white/20">
+                <Archive className="h-5 w-5" />
+              </div>
+              <AlertDialogHeader className="space-y-1 text-left">
+                <AlertDialogTitle className="text-xl font-semibold tracking-tight text-white">
+                  Archive Active Ticket?
+                </AlertDialogTitle>
+                <AlertDialogDescription className="text-sm leading-6 text-slate-200">
+                  This ticket will leave the active queue, but it can still be restored from the archived view.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+            </div>
+          </div>
+
+          <div className="space-y-4 px-6 py-5">
+            <div className="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50/80 p-4 text-sm sm:grid-cols-2">
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Ticket ID</div>
+                <div className="mt-1 font-semibold text-slate-950">{ticketPendingArchive?.id || "Selected ticket"}</div>
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Requester</div>
+                <div className="mt-1 font-semibold text-slate-950">
+                  {ticketPendingArchive ? getRequesterDisplayName(ticketPendingArchive) : "Requester"}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Category</div>
+                <div className="mt-1 font-semibold text-slate-950">
+                  {ticketPendingArchive
+                    ? formatCategoryLabel(ticketPendingArchive.category, ticketPendingArchive.technicalSubcategory)
+                    : "Support request"}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Status</div>
+                <div className="mt-1 font-semibold text-slate-950">{ticketPendingArchive?.status || "Active"}</div>
+              </div>
+            </div>
+
+            <AlertDialogFooter className="gap-2 sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setTicketPendingArchive(null)}
+                disabled={Boolean(archiveActionTicketId)}
+                className="rounded-xl"
+              >
+                Keep Active
+              </Button>
+              <Button
+                type="button"
+                onClick={() => {
+                  if (ticketPendingArchive) {
+                    void updateTicketArchiveState(ticketPendingArchive, true, { confirmedActiveArchive: true });
+                  }
+                }}
+                disabled={!ticketPendingArchive || Boolean(archiveActionTicketId)}
+                className="rounded-xl bg-slate-950 text-white hover:bg-slate-800"
+              >
+                {archiveActionTicketId === ticketPendingArchive?.id ? (
+                  <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Archive className="mr-2 h-4 w-4" />
+                )}
+                Archive Ticket
+              </Button>
+            </AlertDialogFooter>
+          </div>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <Dialog
+        open={Boolean(ticketPendingPermanentDelete)}
+        onOpenChange={(open) => {
+          if (!open) {
+            dismissPermanentDeleteDialog();
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete Ticket Permanently</DialogTitle>
+            <DialogDescription>
+              This permanently removes the archived ticket, its attachments, its history, and any linked session requests.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-3 text-sm text-foreground">
+              <div className="font-medium">
+                {ticketPendingPermanentDelete ? `${ticketPendingPermanentDelete.id} - ${getRequesterDisplayName(ticketPendingPermanentDelete)}` : "Selected ticket"}
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                Type <span className="font-semibold text-foreground">{ticketPendingPermanentDelete?.id || "the ticket ID"}</span> to confirm permanent deletion.
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="permanent-delete-ticket-id">Ticket ID confirmation</Label>
+              <Input
+                id="permanent-delete-ticket-id"
+                autoComplete="off"
+                value={deleteConfirmationTicketId}
+                onChange={(event) => setDeleteConfirmationTicketId(event.target.value)}
+                placeholder={ticketPendingPermanentDelete?.id || "Type ticket ID"}
+                disabled={Boolean(deleteActionTicketId)}
+              />
+            </div>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={dismissPermanentDeleteDialog}
+                disabled={Boolean(deleteActionTicketId)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={() => void permanentlyDeleteSelectedTicket()}
+                disabled={!canConfirmPermanentDelete}
+              >
+                {deleteActionTicketId === ticketPendingPermanentDelete?.id ? (
+                  <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <Trash2 className="h-4 w-4 mr-2" />
+                )}
+                Delete Permanently
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(chatPreviewAttachment)} onOpenChange={(open) => !open && setChatPreviewAttachment(null)}>
+        <DialogContent className="max-h-[90vh] max-w-5xl overflow-hidden">
+          <DialogHeader>
+            <DialogTitle className="truncate pr-8">{chatPreviewAttachment?.name || "Attachment Preview"}</DialogTitle>
+            <DialogDescription>
+              {chatPreviewAttachment?.mimeType || "Attachment"} {chatPreviewAttachment ? `- ${formatBytes(chatPreviewAttachment.size)}` : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {chatPreviewAttachment && chatPreviewAttachmentUrl ? (
+            chatPreviewAttachmentKind === "image" ? (
+              <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
+                <img
+                  src={chatPreviewAttachmentUrl}
+                  alt={chatPreviewAttachment.name}
+                  className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
+                />
+              </div>
+            ) : chatPreviewAttachmentKind === "pdf" ? (
+              <div className="overflow-hidden rounded-2xl border bg-secondary/10">
+                <iframe
+                  src={chatPreviewAttachmentUrl}
+                  title={chatPreviewAttachment.name}
+                  className="h-[70vh] w-full border-0"
+                />
+              </div>
+            ) : chatPreviewAttachmentKind === "video" ? (
+              <div className="overflow-hidden rounded-2xl border bg-secondary/10 p-3">
+                <video
+                  src={chatPreviewAttachmentUrl}
+                  controls
+                  className="mx-auto max-h-[70vh] w-full rounded-xl bg-black"
+                />
+              </div>
+            ) : (
+              <div className="rounded-2xl border bg-secondary/10 p-5">
+                <div className="text-sm text-foreground">
+                  Preview is not available for this file type yet.
+                </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  You can still download the file from here without leaving the page.
+                </div>
+                <div className="mt-4">
+                  <a
+                    href={chatPreviewAttachmentUrl}
+                    download={chatPreviewAttachment.name}
+                    className="inline-flex items-center rounded-full border px-4 py-2 text-sm font-medium text-primary transition hover:bg-secondary/40"
+                  >
+                    Download File
+                  </a>
+                </div>
+              </div>
+            )
+          ) : (
+            <div className="rounded-2xl border bg-secondary/10 p-5 text-sm text-muted-foreground">
+              This attachment is not available for preview right now.
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
     </SupportLayout>
   );
@@ -5276,7 +5895,7 @@ const ConsoleQueueList = ({
             </div>
             <div className="mt-2 font-medium">{getRequesterDisplayName(ticket)}</div>
             <div className="mt-2">
-              <RequesterRoleBadge role={ticket.requesterRole} />
+              <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} />
             </div>
             <div className="mt-1 text-xs text-muted-foreground">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</div>
             <div className="mt-2">
@@ -5451,6 +6070,7 @@ const AdminNotificationsPanel = ({
                   <div className="mt-2">
                     <RequesterRoleBadge
                       role={pendingCoverageTicketNotification.requesterRole || ticket.requesterRole}
+                      source={ticket.requesterSource}
                       className="border-primary/20 bg-white/80 text-primary"
                     />
                   </div>
@@ -5509,7 +6129,7 @@ const AdminNotificationsPanel = ({
                     {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
-                    <RequesterRoleBadge role={ticket.requesterRole} className="border-primary/20 bg-primary/5 text-primary" />
+                    <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} className="border-primary/20 bg-primary/5 text-primary" />
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">
                     From {pendingTransferRequest.fromAgentName} • {formatDateTime(pendingTransferRequest.requestedAt)}
@@ -5564,7 +6184,7 @@ const AdminNotificationsPanel = ({
                     {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
-                    <RequesterRoleBadge role={ticket.requesterRole} className="border-amber-300 bg-white/70 text-amber-900" />
+                    <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} className="border-amber-300 bg-white/70 text-amber-900" />
                   </div>
                   <div className="mt-1 text-xs text-amber-900/75">
                     From {pendingEscalationNotification.fromAgentName} to {pendingEscalationNotification.toAgentName}
@@ -5611,7 +6231,7 @@ const AdminNotificationsPanel = ({
                     {pendingTeamsCallNotification.requesterName || getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
-                    <RequesterRoleBadge role={pendingTeamsCallNotification.requesterRole || ticket.requesterRole} className="border-primary/20 bg-white/80 text-primary" />
+                    <RequesterRoleBadge role={pendingTeamsCallNotification.requesterRole || ticket.requesterRole} source={ticket.requesterSource} className="border-primary/20 bg-white/80 text-primary" />
                   </div>
                   <div className="mt-1 text-xs text-primary/75">
                     Direct Teams call requested for {pendingTeamsCallNotification.toAgentName} • {formatDateTime(pendingTeamsCallNotification.requestedAt)}
@@ -5659,7 +6279,7 @@ const AdminNotificationsPanel = ({
                     {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
-                    <RequesterRoleBadge role={ticket.requesterRole} className="border-amber-300 bg-white/70 text-amber-900" />
+                    <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} className="border-amber-300 bg-white/70 text-amber-900" />
                   </div>
                   <div className="mt-1 text-xs text-amber-900/75">
                     Live chat requested • {formatDateTime(ticket.liveChatRequestedAt || ticket.createdAt)}
@@ -5737,6 +6357,7 @@ const AdminNotificationsPanel = ({
                   <div className="mt-2">
                     <RequesterRoleBadge
                       role={ticket.requesterRole}
+                      source={ticket.requesterSource}
                       className={cn(
                         wasAccepted
                           ? "border-emerald-300 bg-white/70 text-emerald-900"
@@ -5807,7 +6428,7 @@ const AdminNotificationsPanel = ({
                     {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
-                    <RequesterRoleBadge role={ticket.requesterRole} className="border-emerald-300 bg-white/70 text-emerald-900" />
+                    <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} className="border-emerald-300 bg-white/70 text-emerald-900" />
                   </div>
                   <div className="mt-1 text-xs text-emerald-900/75">
                     From {latestEscalationClosure.fromAgentName} to {latestEscalationClosure.toAgentName}
@@ -5858,7 +6479,7 @@ const AdminNotificationsPanel = ({
                     {getRequesterDisplayName(ticket)}
                   </div>
                   <div className="mt-2">
-                    <RequesterRoleBadge role={ticket.requesterRole} className="border-primary/20 bg-primary/5 text-primary" />
+                    <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} className="border-primary/20 bg-primary/5 text-primary" />
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">
                     {wasAccepted ? "Accepted" : "Declined"} by {latestTransferDecision.decidedByName} • {formatDateTime(latestTransferDecision.decidedAt)}
@@ -5944,7 +6565,7 @@ const AdminNotificationLogCard = ({
             {getRequesterDisplayName(item)}
           </div>
           <div className="mt-2">
-            <RequesterRoleBadge role={item.requesterRole} className="border-primary/20 bg-primary/5 text-primary" />
+            <RequesterRoleBadge role={item.requesterRole} source={item.requesterSource} className="border-primary/20 bg-primary/5 text-primary" />
           </div>
           <div className="mt-2 text-sm font-medium text-foreground">
             {getActivityEventSummary(item)}
@@ -6030,6 +6651,12 @@ const ConsoleChatPanel = ({
   messages,
   composerValue,
   onComposerChange,
+  composerAttachments = [],
+  onAttachmentOpen,
+  attachmentInputRef,
+  onAttachmentButtonClick,
+  onAttachmentInputChange,
+  onAttachmentRemove,
   onSend,
   sendDisabled,
   sendLabel,
@@ -6054,9 +6681,16 @@ const ConsoleChatPanel = ({
     title: string;
     text: string;
     createdAt: string;
+    attachments?: ChatAttachment[];
   }>;
   composerValue: string;
   onComposerChange: (value: string) => void;
+  composerAttachments?: ChatAttachment[];
+  onAttachmentOpen?: (attachment: ChatAttachment) => void;
+  attachmentInputRef?: RefObject<HTMLInputElement | null>;
+  onAttachmentButtonClick?: () => void;
+  onAttachmentInputChange?: (event: ChangeEvent<HTMLInputElement>) => void;
+  onAttachmentRemove?: (attachmentId: string) => void;
   onSend: () => Promise<void>;
   sendDisabled: boolean;
   sendLabel: string;
@@ -6073,6 +6707,8 @@ const ConsoleChatPanel = ({
 }) => {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
+  const attachmentsEnabled = Boolean(attachmentInputRef && onAttachmentButtonClick && onAttachmentInputChange && onAttachmentRemove);
+  const composerSendDisabled = sendDisabled || (!composerValue.trim() && composerAttachments.length === 0);
   const { height, startResize } = useVerticalPanelResize({
     enabled: resizable,
     defaultHeight,
@@ -6151,14 +6787,56 @@ const ConsoleChatPanel = ({
             </div>
           ) : (
             messages.map((message) => (
-              <ConsoleChatBubble key={message.id} message={message} />
+              <ConsoleChatBubble key={message.id} message={message} onAttachmentOpen={onAttachmentOpen} />
             ))
           )}
         </div>
       </div>
 
       <div className="border-t bg-card p-3 md:p-4">
+        {attachmentsEnabled ? (
+          <input
+            ref={attachmentInputRef}
+            type="file"
+            multiple
+            accept={supportChatAttachmentAccept}
+            onChange={onAttachmentInputChange}
+            className="sr-only"
+          />
+        ) : null}
+        {attachmentsEnabled && composerAttachments.length > 0 ? (
+          <div className="mb-3 flex flex-wrap gap-2">
+            {composerAttachments.map((attachment) => (
+              <div
+                key={attachment.id}
+                className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-full border border-primary/12 bg-primary/[0.04] px-3 py-1.5 text-xs shadow-sm"
+              >
+                <button
+                  type="button"
+                  onClick={() => onAttachmentOpen?.(attachment)}
+                  className="truncate font-medium text-foreground underline-offset-4 hover:underline"
+                >
+                  {attachment.name}
+                </button>
+                <span className="shrink-0 text-muted-foreground">{formatBytes(attachment.size)}</span>
+                <button
+                  type="button"
+                  onClick={() => onAttachmentRemove(attachment.id)}
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition hover:bg-primary/10 hover:text-foreground"
+                  aria-label={`Remove ${attachment.name}`}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
         <div className="flex items-end gap-2">
+          {attachmentsEnabled ? (
+            <Button type="button" variant="ghost" size="icon" onClick={onAttachmentButtonClick} disabled={sendDisabled}>
+              <Paperclip className="h-4 w-4" />
+            </Button>
+          ) : null}
           <Input
             value={composerValue}
             onChange={(event) => onComposerChange(event.target.value)}
@@ -6172,7 +6850,7 @@ const ConsoleChatPanel = ({
             className="h-11"
             disabled={sendDisabled}
           />
-          <Button onClick={() => void onSend()} className="h-11 shrink-0" disabled={sendDisabled}>
+          <Button onClick={() => void onSend()} className="h-11 shrink-0" disabled={composerSendDisabled}>
             <SendHorizontal className="mr-2 h-4 w-4" />
             {sendLabel}
           </Button>
@@ -6185,15 +6863,19 @@ const ConsoleChatPanel = ({
 
 const ConsoleChatBubble = ({
   message,
+  onAttachmentOpen,
 }: {
   message: {
     role: "assistant" | "user" | "system";
     title: string;
     text: string;
     createdAt: string;
+    attachments?: ChatAttachment[];
   };
+  onAttachmentOpen?: (attachment: ChatAttachment) => void;
 }) => {
   const isUser = message.role === "user";
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
 
   return (
     <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
@@ -6208,7 +6890,36 @@ const ConsoleChatBubble = ({
             ? "border-primary/10 bg-primary text-primary-foreground"
             : "border-border bg-background text-foreground",
         )}>
-          {message.text}
+          <div className="space-y-3">
+            {message.text ? <div>{message.text}</div> : null}
+            {attachments.length > 0 ? (
+              <div className="flex flex-col gap-2">
+                {attachments.map((attachment) => (
+                  getChatAttachmentOpenUrl(attachment) ? (
+                    <button
+                      type="button"
+                      key={attachment.id}
+                      onClick={() => onAttachmentOpen?.(attachment)}
+                      className="inline-flex max-w-full items-center gap-2 rounded-xl border border-primary/12 bg-background/90 px-3 py-2 text-xs shadow-sm transition hover:border-primary/25"
+                    >
+                      <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate font-medium text-foreground">{attachment.name}</span>
+                      <span className="shrink-0 text-muted-foreground">{formatBytes(attachment.size)}</span>
+                    </button>
+                  ) : (
+                    <div
+                      key={attachment.id}
+                      className="inline-flex max-w-full items-center gap-2 rounded-xl border border-border/80 bg-background/80 px-3 py-2 text-xs shadow-sm"
+                    >
+                      <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate font-medium text-foreground">{attachment.name}</span>
+                      <span className="shrink-0 text-muted-foreground">{formatBytes(attachment.size)}</span>
+                    </div>
+                  )
+                ))}
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
     </div>
@@ -6220,22 +6931,17 @@ const CoverageTicketDetailsPanel = ({
   history,
   readOnly,
   isSaving,
-  notes,
-  onNotesChange,
   draftStatus,
-  onDraftStatusChange,
-  statusOptions,
   canAssignActiveTicket,
   draftAgentId,
   onDraftAgentChange,
   selectedDraftAgent,
-  assignableAdminAgents,
+  assignableTicketAgents,
   isActiveTicketAlreadyAssigned,
   isSlaAutoManaged,
   effectiveDraftSlaStatus,
   onDraftSlaStatusChange,
   slaStatuses,
-  isStatusChanging,
   canSubmitStatusChange,
   onCancel,
   onSaveDetails,
@@ -6244,22 +6950,17 @@ const CoverageTicketDetailsPanel = ({
   history: HistoryItem[];
   readOnly: boolean;
   isSaving: boolean;
-  notes: string;
-  onNotesChange: (value: string) => void;
   draftStatus: TicketSummary["status"];
-  onDraftStatusChange: (value: TicketSummary["status"]) => void;
-  statusOptions: TicketSummary["status"][];
   canAssignActiveTicket: boolean;
   draftAgentId: string;
   onDraftAgentChange: (value: string) => void;
   selectedDraftAgent: AdminAgent | null;
-  assignableAdminAgents: AdminAgent[];
+  assignableTicketAgents: AdminAgent[];
   isActiveTicketAlreadyAssigned: boolean;
   isSlaAutoManaged: boolean;
   effectiveDraftSlaStatus: TicketSummary["slaStatus"];
   onDraftSlaStatusChange: (value: TicketSummary["slaStatus"]) => void;
   slaStatuses: TicketSummary["slaStatus"][];
-  isStatusChanging: boolean;
   canSubmitStatusChange: boolean;
   onCancel: () => void;
   onSaveDetails: () => void;
@@ -6289,7 +6990,7 @@ const CoverageTicketDetailsPanel = ({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="unassigned">Unassigned</SelectItem>
-                {assignableAdminAgents.map((agent) => (
+                {assignableTicketAgents.map((agent) => (
                   <SelectItem key={agent.id} value={String(agent.id)} className="py-2">
                     <AgentStatusLabel agent={agent} />
                   </SelectItem>
@@ -6297,7 +6998,7 @@ const CoverageTicketDetailsPanel = ({
               </SelectContent>
             </Select>
             <p className="mt-1 text-xs text-muted-foreground">
-              Only superadmins can assign or reassign tickets to agent accounts.
+              Admins and superadmins can assign tickets to staff who receive tickets.
             </p>
           </>
         ) : (
@@ -6311,8 +7012,8 @@ const CoverageTicketDetailsPanel = ({
             </div>
             <p className="mt-1 text-xs text-muted-foreground">
               {isActiveTicketAlreadyAssigned
-                ? "Only superadmins can reassign this ticket."
-                : "Only superadmins can assign or reassign tickets to agent accounts."}
+                ? "Only admins and superadmins can reassign this ticket."
+                : "Only admins and superadmins can assign or reassign tickets to staff who receive tickets."}
             </p>
           </>
         )}
@@ -6388,13 +7089,11 @@ const CoverageTicketWorkspace = ({
   notes,
   onNotesChange,
   draftStatus,
-  onDraftStatusChange,
-  statusOptions,
   canAssignActiveTicket,
   draftAgentId,
   onDraftAgentChange,
   selectedDraftAgent,
-  assignableAdminAgents,
+  assignableTicketAgents,
   isActiveTicketAlreadyAssigned,
   isSlaAutoManaged,
   effectiveDraftSlaStatus,
@@ -6409,6 +7108,7 @@ const CoverageTicketWorkspace = ({
   onSaveDetails,
   onArchiveToggle,
   onSubmitTutorChoiceCard,
+  onSendTutorFollowUpFiles,
   onConfirmTutorSession,
 }: {
   ticket: TicketDetail;
@@ -6423,13 +7123,11 @@ const CoverageTicketWorkspace = ({
   notes: string;
   onNotesChange: (value: string) => void;
   draftStatus: TicketSummary["status"];
-  onDraftStatusChange: (value: TicketSummary["status"]) => void;
-  statusOptions: TicketSummary["status"][];
   canAssignActiveTicket: boolean;
   draftAgentId: string;
   onDraftAgentChange: (value: string) => void;
   selectedDraftAgent: AdminAgent | null;
-  assignableAdminAgents: AdminAgent[];
+  assignableTicketAgents: AdminAgent[];
   isActiveTicketAlreadyAssigned: boolean;
   isSlaAutoManaged: boolean;
   effectiveDraftSlaStatus: TicketSummary["slaStatus"];
@@ -6444,21 +7142,32 @@ const CoverageTicketWorkspace = ({
   onSaveDetails: () => void;
   onArchiveToggle: () => void;
   onSubmitTutorChoiceCard: (cardId: string) => void;
+  onSendTutorFollowUpFiles: (cardId: string, presentationFiles: CoverageCardAttachment[]) => Promise<boolean>;
   onConfirmTutorSession: (cardId: string) => void;
 }) => {
   const [tutorOptions, setTutorOptions] = useState<string[]>([]);
+  const [coachOptions, setCoachOptions] = useState<string[]>([]);
   const [sameModuleTutorOptions, setSameModuleTutorOptions] = useState<string[]>([]);
   const [coverageTutorError, setCoverageTutorError] = useState("");
   const [isLoadingTutorOptions, setIsLoadingTutorOptions] = useState(false);
+  const [isLoadingCoachOptions, setIsLoadingCoachOptions] = useState(false);
   const [previewAttachment, setPreviewAttachment] = useState<CoverageCardAttachment | null>(null);
   const [editingTutorEmailCardIds, setEditingTutorEmailCardIds] = useState<Set<string>>(new Set());
   const [loadingTutorEmailCardIds, setLoadingTutorEmailCardIds] = useState<Set<string>>(new Set());
+  const [editingCoachEmailCardIds, setEditingCoachEmailCardIds] = useState<Set<string>>(new Set());
+  const [loadingCoachEmailCardIds, setLoadingCoachEmailCardIds] = useState<Set<string>>(new Set());
   const [collapsedCoverageCardIds, setCollapsedCoverageCardIds] = useState<Set<string>>(new Set());
+  const [pendingFollowUpFilesByCardId, setPendingFollowUpFilesByCardId] = useState<Record<string, CoverageCardAttachment[]>>({});
   const [workspaceTab, setWorkspaceTab] = useState<CoverageWorkspaceTab>("documentation");
   const hasSavedCoverageSnapshot = Boolean(ticket.documentation?.coverageCards?.length || ticket.documentation?.coverageNotes?.trim());
   const previewAttachmentKind = getCoverageAttachmentPreviewKind(previewAttachment);
   const parsedCoverageInquiry = parseCoverageInquiry(draft.inquiry);
   const coverageInquiryModule = parsedCoverageInquiry?.module?.trim() || "";
+  const draftRef = useRef(draft);
+
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
 
   useEffect(() => {
     setWorkspaceTab("documentation");
@@ -6469,23 +7178,30 @@ const CoverageTicketWorkspace = ({
   }, [ticket.id]);
 
   useEffect(() => {
+    setPendingFollowUpFilesByCardId({});
+  }, [ticket.id]);
+
+  useEffect(() => {
     let cancelled = false;
     setIsLoadingTutorOptions(true);
+    setIsLoadingCoachOptions(true);
     setCoverageTutorError("");
 
     const allTutorsRequest = fetchCoverageOptions("tutors");
     const sameModuleTutorsRequest = coverageInquiryModule
       ? fetchCoverageOptions("tutors", { module: coverageInquiryModule })
       : Promise.resolve<string[]>([]);
+    const coachOptionsRequest = fetchCoverageOptions("coaches");
 
-    void Promise.all([allTutorsRequest, sameModuleTutorsRequest])
-      .then(([allTutorOptions, sameModuleOptions]) => {
+    void Promise.all([allTutorsRequest, sameModuleTutorsRequest, coachOptionsRequest])
+      .then(([allTutorOptions, sameModuleOptions, allCoachOptions]) => {
         if (cancelled) {
           return;
         }
 
         setTutorOptions(allTutorOptions);
         setSameModuleTutorOptions(sameModuleOptions);
+        setCoachOptions(allCoachOptions);
       })
       .catch((error: unknown) => {
         if (cancelled) {
@@ -6494,11 +7210,13 @@ const CoverageTicketWorkspace = ({
 
         setTutorOptions([]);
         setSameModuleTutorOptions([]);
-        setCoverageTutorError(error instanceof Error ? error.message : "We could not load the tutors right now.");
+        setCoachOptions([]);
+        setCoverageTutorError(error instanceof Error ? error.message : "We could not load the coverage options right now.");
       })
       .finally(() => {
         if (!cancelled) {
           setIsLoadingTutorOptions(false);
+          setIsLoadingCoachOptions(false);
         }
       });
 
@@ -6560,6 +7278,33 @@ const CoverageTicketWorkspace = ({
       nextIds.delete(cardId);
       return nextIds;
     });
+    setEditingCoachEmailCardIds((currentIds) => {
+      if (!currentIds.has(cardId)) {
+        return currentIds;
+      }
+
+      const nextIds = new Set(currentIds);
+      nextIds.delete(cardId);
+      return nextIds;
+    });
+    setLoadingTutorEmailCardIds((currentIds) => {
+      if (!currentIds.has(cardId)) {
+        return currentIds;
+      }
+
+      const nextIds = new Set(currentIds);
+      nextIds.delete(cardId);
+      return nextIds;
+    });
+    setLoadingCoachEmailCardIds((currentIds) => {
+      if (!currentIds.has(cardId)) {
+        return currentIds;
+      }
+
+      const nextIds = new Set(currentIds);
+      nextIds.delete(cardId);
+      return nextIds;
+    });
   };
 
   const setTutorEmailEditing = (cardId: string, isEditing: boolean) => {
@@ -6586,6 +7331,40 @@ const CoverageTicketWorkspace = ({
     });
   };
 
+  const setCoachEmailEditing = (cardId: string, isEditing: boolean) => {
+    setEditingCoachEmailCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (isEditing) {
+        nextIds.add(cardId);
+      } else {
+        nextIds.delete(cardId);
+      }
+      return nextIds;
+    });
+  };
+
+  const setCoachEmailLoading = (cardId: string, isLoading: boolean) => {
+    setLoadingCoachEmailCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (isLoading) {
+        nextIds.add(cardId);
+      } else {
+        nextIds.delete(cardId);
+      }
+      return nextIds;
+    });
+  };
+
+  const handleTutorEmailChange = (cardId: string, tutorEmail: string) => {
+    setTutorEmailEditing(cardId, true);
+    updateCoverageCard(cardId, { tutorEmail });
+  };
+
+  const handleCoachEmailChange = (cardId: string, coachEmail: string) => {
+    setCoachEmailEditing(cardId, true);
+    updateCoverageCard(cardId, { coachEmail });
+  };
+
   const handleTutorChange = (cardId: string, tutor: string) => {
     expandCoverageHistoryCards();
     updateCoverageCard(cardId, {
@@ -6602,19 +7381,13 @@ const CoverageTicketWorkspace = ({
     setTutorEmailLoading(cardId, true);
     void fetchCoverageTutorEmail(tutor)
       .then((email) => {
-        onDraftUpdate((currentDraft) => ({
-          ...currentDraft,
-          coverageCards: currentDraft.coverageCards.map((card) => (
-            card.id === cardId && card.tutor === tutor
-              ? {
-                  ...card,
-                  tutorEmail: email,
-                  updatedAt: new Date().toISOString(),
-                }
-              : card
-          )),
-        }));
-        setTutorEmailEditing(cardId, !email);
+        const currentCard = draftRef.current.coverageCards.find((card) => card.id === cardId);
+        if (!currentCard || currentCard.tutor !== tutor || currentCard.tutorEmail.trim()) {
+          return;
+        }
+
+        updateCoverageCard(cardId, { tutorEmail: email });
+        setTutorEmailEditing(cardId, !email.trim());
       })
       .catch((error: unknown) => {
         setTutorEmailEditing(cardId, true);
@@ -6622,6 +7395,39 @@ const CoverageTicketWorkspace = ({
       })
       .finally(() => {
         setTutorEmailLoading(cardId, false);
+      });
+  };
+
+  const handleCoachChange = (cardId: string, coach: string) => {
+    expandCoverageHistoryCards();
+    updateCoverageCard(cardId, {
+      coach,
+      coachEmail: "",
+    });
+    setCoachEmailEditing(cardId, false);
+    setCoachEmailLoading(cardId, false);
+
+    if (!coach.trim()) {
+      return;
+    }
+
+    setCoachEmailLoading(cardId, true);
+    void fetchCoverageCoachEmail(coach)
+      .then((email) => {
+        const currentCard = draftRef.current.coverageCards.find((card) => card.id === cardId);
+        if (!currentCard || currentCard.coach !== coach || currentCard.coachEmail.trim()) {
+          return;
+        }
+
+        updateCoverageCard(cardId, { coachEmail: email });
+        setCoachEmailEditing(cardId, !email.trim());
+      })
+      .catch((error: unknown) => {
+        setCoachEmailEditing(cardId, true);
+        toast.error(error instanceof Error ? error.message : "We could not load the coach e-mail right now.");
+      })
+      .finally(() => {
+        setCoachEmailLoading(cardId, false);
       });
   };
 
@@ -6669,6 +7475,148 @@ const CoverageTicketWorkspace = ({
     }));
   };
 
+  const handleFollowUpFilesAdded = async (cardId: string, event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    try {
+      const nextFiles = await Promise.all(files.map(readFileAsCoverageCardAttachment));
+      setPendingFollowUpFilesByCardId((currentFiles) => ({
+        ...currentFiles,
+        [cardId]: [...(currentFiles[cardId] || []), ...nextFiles],
+      }));
+    } catch {
+      toast.error("We could not read one or more presentation files right now.");
+    }
+  };
+
+  const removePendingFollowUpFile = (cardId: string, fileId: string) => {
+    setPendingFollowUpFilesByCardId((currentFiles) => {
+      const nextFiles = (currentFiles[cardId] || []).filter((file) => file.id !== fileId);
+      if (nextFiles.length === 0) {
+        const remainingFiles = { ...currentFiles };
+        delete remainingFiles[cardId];
+        return remainingFiles;
+      }
+
+      return {
+        ...currentFiles,
+        [cardId]: nextFiles,
+      };
+    });
+  };
+
+  const clearPendingFollowUpFiles = (cardId: string) => {
+    setPendingFollowUpFilesByCardId((currentFiles) => {
+      if (!(cardId in currentFiles)) {
+        return currentFiles;
+      }
+
+      const remainingFiles = { ...currentFiles };
+      delete remainingFiles[cardId];
+      return remainingFiles;
+    });
+  };
+
+  const renderCoverageTutorFollowUpSection = (
+    cardId: string,
+    requestStatus: CoverageTutorRequestStatus,
+    pendingFollowUpFiles: CoverageCardAttachment[],
+  ) => (
+    <div className="mt-3 rounded-2xl border border-amber-200/80 bg-amber-50/55 px-4 py-3.5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-700">
+            Follow-Up Files
+          </div>
+          <p className="mt-2 text-sm text-amber-900/80">
+            {requestStatus === "accepted"
+              ? "The tutor already accepted this request. You can still forward presentation files without reopening the ticket."
+              : "The tutor request is already sent. You can forward extra presentation files any time from here."}
+          </p>
+        </div>
+        <input
+          id={`coverage-follow-up-${cardId}`}
+          type="file"
+          multiple
+          accept=".pdf,.ppt,.pptx,.odp,.key,image/*"
+          disabled={isSaving}
+          onChange={(event) => void handleFollowUpFilesAdded(cardId, event)}
+          className="sr-only"
+        />
+        <label
+          htmlFor={`coverage-follow-up-${cardId}`}
+          className={cn(
+            "inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-amber-300 bg-white px-4 py-2.5 text-sm font-semibold text-amber-700 shadow-sm transition hover:border-amber-400 hover:bg-amber-50/70",
+            isSaving && "cursor-not-allowed opacity-60",
+          )}
+        >
+          <Paperclip className="h-4 w-4" />
+          Add Follow-Up Files
+        </label>
+      </div>
+      {pendingFollowUpFiles.length > 0 ? (
+        <div className="mt-3 space-y-2">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-700">
+            Ready To Send
+          </div>
+          <div className="flex min-w-0 flex-wrap gap-2">
+            {pendingFollowUpFiles.map((file) => (
+              <div
+                key={file.id}
+                className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-full border border-amber-200 bg-white px-3 py-1.5 text-xs shadow-sm"
+              >
+                <button
+                  type="button"
+                  onClick={() => setPreviewAttachment(file)}
+                  className="truncate font-medium text-amber-700 underline-offset-4 hover:underline"
+                >
+                  {file.name}
+                </button>
+                <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                <button
+                  type="button"
+                  onClick={() => removePendingFollowUpFile(cardId, file.id)}
+                  className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition hover:bg-amber-100 hover:text-foreground"
+                  aria-label={`Remove ${file.name}`}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 text-sm text-muted-foreground">
+          PDF, PPT, PPTX, ODP, Keynote, or image files
+        </div>
+      )}
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-amber-200/80 pt-3">
+        <div className="text-xs text-amber-900/75">
+          Sending follow-up files does not change the tutor request status or SLA.
+        </div>
+        <Button
+          onClick={() => {
+            void onSendTutorFollowUpFiles(cardId, pendingFollowUpFiles).then((wasSent) => {
+              if (wasSent) {
+                clearPendingFollowUpFiles(cardId);
+              }
+            });
+          }}
+          disabled={isSaving || pendingFollowUpFiles.length === 0}
+          className="border-0 bg-amber-500 text-white hover:bg-amber-600"
+        >
+          {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+          Send Presentation Files
+        </Button>
+      </div>
+    </div>
+  );
+
   const toggleCoverageCardCollapsed = (cardId: string) => {
     setCollapsedCoverageCardIds((currentIds) => {
       const nextIds = new Set(currentIds);
@@ -6682,6 +7630,7 @@ const CoverageTicketWorkspace = ({
   };
   const coverageCardsForDisplay = sortCoverageWorkflowCardsForDisplay(draft.coverageCards);
   const hasOpenTutorChoiceDraft = draft.coverageCards.some(isOpenCoverageTutorChoiceDraft);
+  const hasCoverageFollowUpOpportunity = !isArchived && draft.coverageCards.some(canSendCoverageTutorFollowUp);
 
   return (
     <div className="space-y-4 py-4">
@@ -6779,6 +7728,8 @@ const CoverageTicketWorkspace = ({
             const cardReadOnly = readOnly || card.locked;
             const isTutorEmailEditable = editingTutorEmailCardIds.has(card.id) || !card.tutorEmail.trim();
             const isTutorEmailLoading = loadingTutorEmailCardIds.has(card.id);
+            const isCoachEmailEditable = editingCoachEmailCardIds.has(card.id) || !card.coachEmail.trim();
+            const isCoachEmailLoading = loadingCoachEmailCardIds.has(card.id);
             const canRemoveCard = !readOnly && !card.locked;
             const canCollapseCard = cardReadOnly;
             const isCardCollapsed = canCollapseCard && collapsedCoverageCardIds.has(card.id);
@@ -6807,6 +7758,10 @@ const CoverageTicketWorkspace = ({
               const tutorEmail = card.tutorEmail.trim();
               const requestTutorEmail = relatedTutorChoiceCard?.tutorEmail.trim().toLowerCase() || "";
               const hasUpdatedTutorEmail = Boolean(tutorEmail && tutorEmail.toLowerCase() !== requestTutorEmail);
+              const canSendFollowUpFiles = !isArchived && wasAccepted && Boolean(relatedTutorChoiceCard && canSendCoverageTutorFollowUp(relatedTutorChoiceCard));
+              const pendingFollowUpFiles = relatedTutorChoiceCard
+                ? pendingFollowUpFilesByCardId[relatedTutorChoiceCard.id] || []
+                : [];
 
               return (
                 <div key={card.id} className={cn("rounded-[26px] border px-4 py-3.5 shadow-soft", replyAccentClassName)}>
@@ -6883,6 +7838,16 @@ const CoverageTicketWorkspace = ({
                                     <span className="break-all text-muted-foreground">{relatedTutorChoiceCard.tutorEmail}</span>
                                   ) : null}
                                 </div>
+                                {relatedTutorChoiceCard.coach ? (
+                                  <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                                    <span className="font-medium text-foreground">{relatedTutorChoiceCard.coach}</span>
+                                    {relatedTutorChoiceCard.coachEmail ? (
+                                      <span className="break-all">{relatedTutorChoiceCard.coachEmail}</span>
+                                    ) : (
+                                      <span>Coach e-mail pending</span>
+                                    )}
+                                  </div>
+                                ) : null}
                                 <div className="mt-2 flex flex-wrap gap-2">
                                   {relatedTutorRequestSummary.moduleLine ? (
                                     <div className="rounded-full border border-primary/10 bg-white px-3 py-1 text-xs font-medium text-foreground">
@@ -6938,9 +7903,20 @@ const CoverageTicketWorkspace = ({
                                   </button>
                                 ))}
                               </div>
+                            ) : canSendFollowUpFiles ? (
+                              <div className="mt-3 rounded-xl border border-dashed border-primary/15 bg-white/70 px-3 py-2 text-sm text-muted-foreground">
+                                No presentation files have been shared with this tutor yet.
+                              </div>
                             ) : null}
                           </div>
                         </div>
+                      ) : null}
+                      {canSendFollowUpFiles && relatedTutorChoiceCard ? (
+                        renderCoverageTutorFollowUpSection(
+                          relatedTutorChoiceCard.id,
+                          normalizeCoverageTutorRequestStatus(relatedTutorChoiceCard.requestStatus),
+                          pendingFollowUpFiles,
+                        )
                       ) : null}
                     </div>
                   ) : null}
@@ -7019,12 +7995,16 @@ const CoverageTicketWorkspace = ({
             }
 
             const displayedTutorOptions = buildCoverageTutorOptionsForDisplay(tutorOptions, sameModuleTutorOptions, card.tutor);
-            const tutorChoiceStatusLabel = card.requestStatus === "draft" ? "" : getCoverageTutorRequestLabel(card.requestStatus);
+            const displayedCoachOptions = Array.from(new Set([...coachOptions, card.coach].map((value) => value.trim()).filter(Boolean)));
+            const normalizedTutorRequestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
+            const tutorChoiceStatusLabel = normalizedTutorRequestStatus === "draft" ? "" : getCoverageTutorRequestLabel(normalizedTutorRequestStatus);
             const showCompactTutorChoice = cardReadOnly;
             const compactTutorRequestSummary = summarizeCoverageTutorRequestDetails(card.sessionDetails);
             const linkedTutorReplyCard = draft.coverageCards.find((candidate) => (
               candidate.type === "tutor_reply" && candidate.relatedTutorChoiceCardId === card.id
             ));
+            const canSendFollowUpFiles = !isArchived && canSendCoverageTutorFollowUp(card);
+            const pendingFollowUpFiles = pendingFollowUpFilesByCardId[card.id] || [];
 
             if (showCompactTutorChoice && linkedTutorReplyCard) {
               return null;
@@ -7049,7 +8029,7 @@ const CoverageTicketWorkspace = ({
                       {tutorChoiceStatusLabel ? (
                         <div className={cn(
                           "rounded-full border px-2.5 py-0.5 text-[11px] font-medium",
-                          getCoverageTutorRequestBadgeClassName(card.requestStatus),
+                          getCoverageTutorRequestBadgeClassName(normalizedTutorRequestStatus),
                         )}>
                           {tutorChoiceStatusLabel}
                         </div>
@@ -7094,6 +8074,16 @@ const CoverageTicketWorkspace = ({
                               <span className="break-all text-muted-foreground">{card.tutorEmail}</span>
                             ) : null}
                           </div>
+                          {card.coach ? (
+                            <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                              <span className="font-medium text-foreground">{card.coach}</span>
+                              {card.coachEmail ? (
+                                <span className="break-all">{card.coachEmail}</span>
+                              ) : (
+                                <span>Coach e-mail pending</span>
+                              )}
+                            </div>
+                          ) : null}
                           <div className="mt-2 flex flex-wrap gap-2">
                             {compactTutorRequestSummary.moduleLine ? (
                               <div className="rounded-full border border-primary/10 bg-white px-3 py-1 text-xs font-medium text-foreground">
@@ -7153,8 +8143,15 @@ const CoverageTicketWorkspace = ({
                             </button>
                           ))}
                         </div>
+                      ) : canSendFollowUpFiles ? (
+                        <div className="mt-3 rounded-xl border border-dashed border-primary/15 bg-white/70 px-3 py-2 text-sm text-muted-foreground">
+                          No presentation files have been shared with this tutor yet.
+                        </div>
                       ) : null}
                     </div>
+                    {canSendFollowUpFiles ? (
+                      renderCoverageTutorFollowUpSection(card.id, normalizedTutorRequestStatus, pendingFollowUpFiles)
+                    ) : null}
                   </>
                 ) : showCompactTutorChoice ? null : (
                   <>
@@ -7199,7 +8196,7 @@ const CoverageTicketWorkspace = ({
                             <Input
                               type="email"
                               value={card.tutorEmail}
-                              onChange={(event) => updateCoverageCard(card.id, { tutorEmail: event.target.value })}
+                              onChange={(event) => handleTutorEmailChange(card.id, event.target.value)}
                               readOnly={!isTutorEmailEditable}
                               placeholder={card.tutor ? "Enter tutor e-mail" : "Choose tutor first"}
                               className={cn(
@@ -7232,6 +8229,76 @@ const CoverageTicketWorkspace = ({
                               : "Loaded from Tutors_Modules."
                             : "No e-mail was found in Tutors_Modules. Please enter it manually."
                           : "Choose a tutor to load the e-mail automatically."}
+                      </p>
+                      <div className="grid gap-3 md:grid-cols-2 md:items-start">
+                        <div className="space-y-2">
+                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Coach</Label>
+                          <Select
+                            value={card.coach}
+                            onValueChange={(value) => handleCoachChange(card.id, value === coverageCoachUnsetSelectValue ? "" : value)}
+                            disabled={isLoadingCoachOptions || isSaving}
+                          >
+                            <SelectTrigger>
+                              <SelectValue placeholder={isLoadingCoachOptions ? "Loading coaches..." : "Choose coach (optional)"} />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value={coverageCoachUnsetSelectValue} className="py-2 pr-3">
+                                No coach
+                              </SelectItem>
+                              {displayedCoachOptions.length === 0 ? (
+                                <div className="px-3 py-2 text-sm text-muted-foreground">
+                                  {isLoadingCoachOptions ? "Loading coaches..." : "No coaches available yet."}
+                                </div>
+                              ) : (
+                                displayedCoachOptions.map((coachName) => (
+                                  <SelectItem key={coachName} value={coachName} className="py-2 pr-3">
+                                    {coachName}
+                                  </SelectItem>
+                                ))
+                              )}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Coach E-mail</Label>
+                          <div className="relative">
+                            <Input
+                              type="email"
+                              value={card.coachEmail}
+                              onChange={(event) => handleCoachEmailChange(card.id, event.target.value)}
+                              readOnly={!isCoachEmailEditable}
+                              placeholder={card.coach ? "Enter coach e-mail" : "Choose coach first"}
+                              className={cn(
+                                "bg-background",
+                                card.coachEmail.trim() && "pr-16",
+                                card.coach && !card.coachEmail.trim() && "border-amber-300",
+                              )}
+                            />
+                            {card.coachEmail.trim() ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => setCoachEmailEditing(card.id, !isCoachEmailEditable)}
+                                className="absolute right-2 top-1/2 h-7 -translate-y-1/2 px-2 text-[11px]"
+                              >
+                                {isCoachEmailEditable ? "Done" : "Edit"}
+                              </Button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {card.coach
+                          ? isCoachEmailLoading
+                            ? "Loading coach e-mail..."
+                            : card.coachEmail.trim()
+                              ? isCoachEmailEditable
+                                ? "Edit if the coach e-mail needs a correction."
+                                : "Loaded from coach_profiles."
+                              : "No e-mail was found in coach_profiles. Please enter it manually."
+                          : "Coach is optional. Choose one to load the e-mail automatically."}
                       </p>
                     </div>
 
@@ -7292,6 +8359,9 @@ const CoverageTicketWorkspace = ({
                               ))}
                             </div>
                           ) : null}
+                          <p className="mt-3 text-xs text-muted-foreground">
+                            Presentation files are optional for the first tutor request. You can send them later as a follow-up if they are not ready yet.
+                          </p>
                           </div>
                         </div>
 
@@ -7315,7 +8385,7 @@ const CoverageTicketWorkspace = ({
                       </div>
                       <Button
                         onClick={() => void onSubmitTutorChoiceCard(card.id)}
-                        disabled={isSaving || isLoadingTutorOptions || isTutorEmailLoading || card.presentationFiles.length === 0}
+                        disabled={isSaving || isLoadingTutorOptions || isLoadingCoachOptions || isTutorEmailLoading || isCoachEmailLoading}
                         className="border-0 gradient-primary"
                       >
                         {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
@@ -7339,7 +8409,9 @@ const CoverageTicketWorkspace = ({
           {isArchived
             ? "Archived coverage tickets are view-only until restored."
             : readOnly
-              ? "Closed tickets are view-only."
+              ? hasCoverageFollowUpOpportunity
+                ? "Closed tickets are view-only, but you can still send presentation files for accepted tutor requests."
+                : "Closed tickets are view-only."
               : "Save your work or submit a tutor request. Coverage tickets close after a tutor accepts the request."}
         </div>
         <div className="flex flex-wrap justify-end gap-2">
@@ -7379,22 +8451,17 @@ const CoverageTicketWorkspace = ({
             history={history}
             readOnly={readOnly}
             isSaving={isSavingDetails}
-            notes={notes}
-            onNotesChange={onNotesChange}
             draftStatus={draftStatus}
-            onDraftStatusChange={onDraftStatusChange}
-            statusOptions={statusOptions}
             canAssignActiveTicket={canAssignActiveTicket}
             draftAgentId={draftAgentId}
             onDraftAgentChange={onDraftAgentChange}
             selectedDraftAgent={selectedDraftAgent}
-            assignableAdminAgents={assignableAdminAgents}
+            assignableTicketAgents={assignableTicketAgents}
             isActiveTicketAlreadyAssigned={isActiveTicketAlreadyAssigned}
             isSlaAutoManaged={isSlaAutoManaged}
             effectiveDraftSlaStatus={effectiveDraftSlaStatus}
             onDraftSlaStatusChange={onDraftSlaStatusChange}
             slaStatuses={slaStatuses}
-            isStatusChanging={isStatusChanging}
             canSubmitStatusChange={canSubmitStatusChange}
             onCancel={onCancel}
             onSaveDetails={onSaveDetails}
@@ -7450,6 +8517,7 @@ const CoverageTicketWorkspace = ({
           ) : null}
         </DialogContent>
       </Dialog>
+
     </div>
   );
 };
@@ -8719,6 +9787,8 @@ function createCoverageTutorChoiceCard(inquiry: string): CoverageWorkflowCard {
     note: "",
     tutor: parsedInquiry?.tutor || "",
     tutorEmail: "",
+    coach: "",
+    coachEmail: "",
     sessionDetails: buildCoverageTutorSessionDetails(inquiry),
     replyText: "",
     requestStatus: "draft",
@@ -8753,6 +9823,8 @@ function createCoverageNoteCard(): CoverageWorkflowCard {
     note: "",
     tutor: "",
     tutorEmail: "",
+    coach: "",
+    coachEmail: "",
     sessionDetails: "",
     replyText: "",
     requestStatus: "draft",
@@ -8849,6 +9921,8 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           note: card.note || "",
           tutor: card.tutor || "",
           tutorEmail: card.tutorEmail || "",
+          coach: card.coach || "",
+          coachEmail: card.coachEmail || "",
           sessionDetails: card.sessionDetails || "",
           replyText: card.replyText || "",
           requestStatus,
@@ -9038,15 +10112,7 @@ function buildCoverageTimestampLabel(createdAt: string, updatedAt: string) {
 }
 
 function buildCoverageCardTimestampLabel(createdAt: string, updatedAt: string) {
-  if (!createdAt) {
-    return "Created time unavailable";
-  }
-
-  if (hasCoverageTimestampUpdate(createdAt, updatedAt)) {
-    return `Created ${formatDateTime(createdAt)} | Edited ${formatDateTime(updatedAt)}`;
-  }
-
-  return `Created ${formatDateTime(createdAt)}`;
+  return buildCoverageTimestampLabel(createdAt, updatedAt).replace(" â€¢ ", " | ");
 }
 
 function summarizeCoverageTutorRequestDetails(sessionDetails: string) {
@@ -9160,6 +10226,15 @@ function getCoverageTutorRequestBadgeClassName(status: CoverageTutorRequestStatu
     default:
       return "border-slate-200 bg-slate-50 text-slate-700";
   }
+}
+
+function canSendCoverageTutorFollowUp(card: CoverageWorkflowCard) {
+  if (card.type !== "tutor_choice") {
+    return false;
+  }
+
+  const requestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
+  return requestStatus === "requested" || requestStatus === "accepted";
 }
 
 function getCoverageReplyOutcomeLabel(outcome: CoverageTutorReplyOutcome) {
@@ -9908,7 +10983,9 @@ function serializeConsoleChatHistory(messages: ChatHistoryItem[]) {
     .map((message) => ({
       sender: message.role === "user" ? "user" : message.role === "agent" ? "agent" : "bot",
       text: message.text,
+      clientMessageId: message.clientMessageId || String(message.id),
       timestamp: message.createdAt,
+      attachments: message.attachments || [],
     }));
 }
 
@@ -10336,8 +11413,17 @@ const activityEventLabels: Record<string, string> = {
   coverage_ticket_operations_notified: "Operations Notified",
   coverage_ticket_operations_notification_failed: "Operations Notification Failed",
   coverage_tutor_requested: "Tutor Requested",
+  coverage_tutor_follow_up_sent: "Tutor Files Sent",
+  coverage_tutor_follow_up_webhook_delivered: "Tutor Files Delivered",
+  coverage_tutor_follow_up_webhook_failed: "Tutor Files Delivery Failed",
   coverage_tutor_response: "Tutor Reply",
   coverage_session_confirmed: "Session Confirmed",
+  quick_ticket_confirmation_email_sent: "Requester Confirmation Sent",
+  quick_ticket_confirmation_email_failed: "Requester Confirmation Failed",
+  quick_ticket_closed_email_sent: "Requester Closure Sent",
+  quick_ticket_closed_email_failed: "Requester Closure Failed",
+  live_agent_unavailable_operations_notified: "Operations Alert Sent",
+  live_agent_unavailable_operations_notification_failed: "Operations Alert Failed",
   escalation_closed: "Escalation Closed",
   escalation_notified: "Escalation Notified",
   teams_call_requested: "Teams Call Requested",
@@ -10447,7 +11533,6 @@ function getActivityEventSummary(item: HistoryItem) {
   const requestedTime = getActivityPayloadTextValue(item.payload.requestedTime);
   const requesterName = getActivityPayloadTextValue(item.payload.requesterName);
   const tutor = getActivityPayloadTextValue(item.payload.tutor);
-  const sessionDetails = getActivityPayloadTextValue(item.payload.sessionDetails);
 
   switch (item.eventType) {
     case "status_changed":
@@ -10513,6 +11598,20 @@ function getActivityEventSummary(item: HistoryItem) {
       return "Operations team notification could not be delivered";
     case "coverage_tutor_requested":
       return tutor ? `Tutor request sent to ${tutor}` : "Tutor request sent";
+    case "coverage_tutor_follow_up_sent":
+      return tutor ? `Follow-up files sent to ${tutor}` : "Follow-up files sent";
+    case "quick_ticket_confirmation_email_sent":
+      return "Requester confirmation email sent";
+    case "quick_ticket_confirmation_email_failed":
+      return "Requester confirmation email could not be delivered";
+    case "quick_ticket_closed_email_sent":
+      return "Requester closure email sent";
+    case "quick_ticket_closed_email_failed":
+      return "Requester closure email could not be delivered";
+    case "live_agent_unavailable_operations_notified":
+      return "Operations team notified that live chat has no available agent";
+    case "live_agent_unavailable_operations_notification_failed":
+      return "Operations live chat alert could not be delivered";
     case "coverage_tutor_response":
       return tutor
         ? `${getActivityPayloadTextValue(item.payload.outcome) === "accepted" ? "Tutor accepted" : "Tutor rejected"}: ${tutor}`
@@ -10728,12 +11827,6 @@ function humanizeChatState(value: string) {
   return normalizedValue.charAt(0).toUpperCase() + normalizedValue.slice(1);
 }
 
-function getLatestAssistantMessage(messages: ChatHistoryItem[]) {
-  const reversedMessages = [...messages].reverse();
-  const lastAssistantMessage = reversedMessages.find((message) => message.role === "assistant" || message.role === "agent");
-  return lastAssistantMessage?.text || "";
-}
-
 function getSuggestedAiAction(ticket: TicketDetail, attachmentCount: number) {
   if (ticket.slaStatus === "Breached") {
     return "This case is outside SLA. Review the transcript, contact the learner, and escalate through the admin workflow as needed.";
@@ -10776,69 +11869,51 @@ function formatAdminRoleLabel(value: string | null | undefined) {
   return formatKnownRoleLabel(value, "Admin");
 }
 
-function deriveAccountScopeFromRole(value: string | null | undefined) {
-  const normalizedValue = (value || "").trim().toLowerCase();
-  if (normalizedValue === "requester" || normalizedValue === "staff") {
-    return normalizedValue;
-  }
-  if (normalizedValue === "user" || normalizedValue === "coach" || normalizedValue === "employer") {
-    return "requester";
-  }
-  return "staff";
-}
-
-function formatAccountScopeLabel(value: string | null | undefined) {
-  return deriveAccountScopeFromRole(value) === "requester" ? "Support Requester" : "Support Staff";
-}
-
 function formatRequesterRoleLabel(value: string | null | undefined) {
   return formatKnownRoleLabel(value, "User");
 }
 
+function getRequesterRoleBadgeLabel(role: string | null | undefined, source?: string | null) {
+  const normalizedRole = (role || "").trim().toLowerCase();
+  const normalizedSource = (source || "").trim().toLowerCase();
+
+  if (normalizedRole === "coach") {
+    return "Coach";
+  }
+
+  if (normalizedRole === "employer") {
+    return "Employer";
+  }
+
+  if (normalizedRole === "user" && normalizedSource === "kbc_users_data") {
+    return "Learner";
+  }
+
+  return "";
+}
+
 function RequesterRoleBadge({
   role,
+  source,
   className,
 }: {
   role: string | null | undefined;
+  source?: string | null;
   className?: string;
 }) {
+  const label = getRequesterRoleBadgeLabel(role, source);
+  if (!label) {
+    return null;
+  }
+
   return (
     <span className={cn(
       "inline-flex items-center rounded-full border border-primary/15 bg-primary/5 px-2.5 py-1 text-[11px] font-medium text-primary",
       className,
     )}>
-      {formatRequesterRoleLabel(role)}
+      {label}
     </span>
   );
-}
-
-function sortAgentsForDirectory(agents: AdminAgent[]) {
-  const rolePriority: Record<string, number> = {
-    superadmin: 0,
-    admin: 1,
-    coach: 2,
-    employer: 3,
-    agent: 4,
-    user: 5,
-  };
-
-  return [...agents].sort((leftAgent, rightAgent) => {
-    const leftActiveRank = leftAgent.isActive === false ? 1 : 0;
-    const rightActiveRank = rightAgent.isActive === false ? 1 : 0;
-    if (leftActiveRank !== rightActiveRank) {
-      return leftActiveRank - rightActiveRank;
-    }
-
-    const leftRoleRank = rolePriority[(leftAgent.role || "").toLowerCase()] ?? 99;
-    const rightRoleRank = rolePriority[(rightAgent.role || "").toLowerCase()] ?? 99;
-    if (leftRoleRank !== rightRoleRank) {
-      return leftRoleRank - rightRoleRank;
-    }
-
-    const leftName = (leftAgent.fullName || leftAgent.username || "").toLowerCase();
-    const rightName = (rightAgent.fullName || rightAgent.username || "").toLowerCase();
-    return leftName.localeCompare(rightName) || (leftAgent.username || "").localeCompare(rightAgent.username || "");
-  });
 }
 
 function getAssignedAgentAccent(assignedAgentId: number | null, assignedAgentName: string): AssignedAgentAccent {
@@ -10926,18 +12001,6 @@ function presenceDotClassName(status: AdminConsoleStatus) {
   if (status === "Busy") return "bg-amber-500";
   if (status === "Off") return "bg-slate-400";
   return "bg-emerald-500";
-}
-
-function consoleStatusBadgeClassName(status: AdminConsoleStatus) {
-  if (status === "Busy") return "border-amber-200 bg-amber-50 text-amber-700";
-  if (status === "Off") return "border-slate-200 bg-slate-100 text-slate-600";
-  return "border-emerald-200 bg-emerald-50 text-emerald-700";
-}
-
-function consoleStatusTextClassName(status: AdminConsoleStatus) {
-  if (status === "Busy") return "text-amber-700";
-  if (status === "Off") return "text-slate-600";
-  return "text-emerald-700";
 }
 
 function deriveDashboardSlaStatus(

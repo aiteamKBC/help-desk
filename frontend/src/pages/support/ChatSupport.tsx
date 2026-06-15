@@ -1,4 +1,4 @@
-import { type ComponentType, useEffect, useRef, useState } from "react";
+import { type ChangeEvent, type ComponentType, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
@@ -26,19 +26,36 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { StatusBadge } from "@/components/support/StatusBadge";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { type Category, type ChatMessage, type TechnicalSubcategory, type Ticket, useSupport } from "@/context/SupportContext";
+import { type Category, type ChatMessage, type TechnicalSubcategory, type Ticket } from "@/context/SupportContext";
+import { useSupport } from "@/context/useSupport";
 import { downloadChatPdf } from "@/lib/chatPdf";
-import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import {
-  getSupportResumePath,
+  fetchSupportSessionAvailability,
+  toBookingSummary,
+  type ApiBookingSummary,
+  type SupportSessionTimeOption,
+} from "@/lib/supportBooking";
+import {
+  areChatAttachmentListsEquivalent,
+  buildChatRequestBody,
+  createPendingChatAttachment,
+  getChatAttachmentOpenUrl,
+  getChatAttachmentPreviewKind,
+  revokeChatAttachmentPreviewUrl,
+  revokeChatAttachmentPreviewUrls,
+  summarizeChatAttachments,
+  supportChatAttachmentAccept,
+  type ChatAttachment,
+} from "@/lib/supportChat";
+import {
   isAwaitingMeetingTicket,
   isAwaitingSupportReviewTicket,
-  isQuickTicketOnlyRequesterRole,
   quickTicketReason,
   type SupportChatEntryAction,
   type SupportBookingLocationState,
   type SupportChatLocationState,
 } from "@/lib/supportFlow";
+import { setTicketBookingProgress } from "@/lib/supportTicketProgress";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -49,12 +66,17 @@ const supportSessionSlotIntervalMinutes = 30;
 const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
 const learnerChatPollIntervalMs = 2500;
 const chatbotClosingReason = "Closed via Chatbot";
+export const requesterClosingReason = "Closed by Requester";
 const awaitingMeetingReason = "Awaiting support meeting";
 const inactivityClosingReason = "Closed due to inactivity";
 const closedChatDescription = "If you still need help, you can start a new chat and continue with a fresh support request.";
 const legacyLiveAgentQueueWaitingMessage = "No support admins are available right now. You're in queue and we'll connect you as soon as one becomes available.";
 const previousLiveAgentQueueWaitingMessage = `${legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through booking session or quick ticket.`;
 export const liveAgentQueueWaitingMessage = `${legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through booking session or submit ticket directly.`;
+
+export function getRequesterChatClosingReason(liveChatRequested: boolean) {
+  return liveChatRequested ? requesterClosingReason : chatbotClosingReason;
+}
 
 function getIssueLabel(category: string, technicalSubcategory: string) {
   return technicalSubcategory.trim() || category.trim() || "your request";
@@ -71,11 +93,26 @@ function buildTimestamp() {
 }
 
 function buildBotMessage(text: string): ChatMessage {
+  const clientMessageId = crypto.randomUUID();
   return {
-    id: crypto.randomUUID(),
+    id: clientMessageId,
+    clientMessageId,
     sender: "bot",
     text,
     timestamp: buildTimestamp(),
+    attachments: [],
+  };
+}
+
+function buildOutgoingChatMessage(sender: ChatMessage["sender"], text: string, attachments: ChatAttachment[] = []): ChatMessage {
+  const clientMessageId = crypto.randomUUID();
+  return {
+    id: clientMessageId,
+    clientMessageId,
+    sender,
+    text,
+    timestamp: buildTimestamp(),
+    attachments,
   };
 }
 
@@ -98,18 +135,14 @@ function ensureIntroMessage(messages: ChatMessage[], introText: string) {
   }, ...messagesWithoutIntro];
 }
 
-function serializeLearnerChatHistory(messages: ChatMessage[]) {
-  return messages
-    .filter((message) => message.source !== "history_event" && message.source !== "intro")
-    .map((message) => ({
-      sender: message.sender,
-      text: message.text,
-      timestamp: message.timestamp,
-    }));
-}
-
-function isSameChatMessage(left: Pick<ChatMessage, "sender" | "text">, right: Pick<ChatMessage, "sender" | "text">) {
-  return left.sender === right.sender && left.text === right.text;
+function isSameChatMessage(
+  left: Pick<ChatMessage, "sender" | "text" | "attachments" | "clientMessageId">,
+  right: Pick<ChatMessage, "sender" | "text" | "attachments" | "clientMessageId">,
+) {
+  return left.sender === right.sender
+    && left.text === right.text
+    && (left.clientMessageId || "") === (right.clientMessageId || "")
+    && areChatAttachmentListsEquivalent(left.attachments, right.attachments);
 }
 
 function areMessageListsEquivalent(left: ChatMessage[], right: ChatMessage[]) {
@@ -221,6 +254,22 @@ function isWithinSupportSessionWindow(requestedDateTime: Date) {
   return isMinutesWithinRange(ukMinutes, ukSupportSessionStartMinutes, ukSupportSessionEndMinutes);
 }
 
+function formatAttachmentSize(size: number) {
+  if (!Number.isFinite(size) || size <= 0) {
+    return "";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  let nextSize = size;
+  let unitIndex = 0;
+  while (nextSize >= 1024 && unitIndex < units.length - 1) {
+    nextSize /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${nextSize >= 10 || unitIndex === 0 ? nextSize.toFixed(0) : nextSize.toFixed(1)} ${units[unitIndex]}`;
+}
+
 function isSupportSessionTimeAligned(requestedDateTime: Date) {
   const localMinutes = (requestedDateTime.getHours() * 60) + requestedDateTime.getMinutes();
   return localMinutes % supportSessionSlotIntervalMinutes === 0;
@@ -323,22 +372,41 @@ const ChatSupport = () => {
   const [bookingOpen, setBookingOpen] = useState(false);
   const [bookingDate, setBookingDate] = useState("");
   const [bookingTime, setBookingTime] = useState("");
+  const [bookingTimeOptions, setBookingTimeOptions] = useState<SupportSessionTimeOption[]>([]);
+  const [isLoadingAvailability, setIsLoadingAvailability] = useState(false);
   const [isClosing, setIsClosing] = useState(false);
   const [isBooking, setIsBooking] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isRequestingLiveAgent, setIsRequestingLiveAgent] = useState(false);
   const [isQuickSubmitting, setIsQuickSubmitting] = useState(false);
   const [isDownloadingTranscript, setIsDownloadingTranscript] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
+  const [previewAttachment, setPreviewAttachment] = useState<ChatAttachment | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const hasPendingOptimisticHistoryRef = useRef(false);
   const ticketRef = useRef(ticket);
   const consumedEntryActionRef = useRef<SupportChatEntryAction | null>(null);
+  const pendingAttachmentsRef = useRef<ChatAttachment[]>([]);
+  const replaceMessagesRef = useRef<(nextMessages: ChatMessage[], persistToTicket?: boolean) => void>(() => {});
+  const updateTicketRef = useRef(updateTicket);
+  const setBookingSummaryRef = useRef(setBookingSummary);
+  const handleRequestLiveAgentRef = useRef<() => Promise<void>>(async () => {});
   const isSupportReviewChatLocked = isAwaitingSupportReviewTicket(ticket);
-  const isQuickTicketOnlyFlow = isQuickTicketOnlyRequesterRole(ticket.requesterRole);
   const isMeetingChatReadOnly = Boolean(bookingSummary) || isAwaitingMeetingTicket(ticket);
   const entryAction = ((location.state as SupportChatLocationState | null)?.entryAction || null);
+  const previewAttachmentUrl = previewAttachment ? getChatAttachmentOpenUrl(previewAttachment) : "";
+  const previewAttachmentKind = getChatAttachmentPreviewKind(previewAttachment);
+
+  useEffect(() => {
+    if (!ticket.id || isMeetingChatReadOnly) {
+      return;
+    }
+
+    void setTicketBookingProgress(ticket.id, false);
+  }, [isMeetingChatReadOnly, ticket.id]);
 
   const replaceMessages = (nextMessages: ChatMessage[], persistToTicket = false) => {
     messagesRef.current = nextMessages;
@@ -347,6 +415,44 @@ const ChatSupport = () => {
     if (persistToTicket) {
       updateTicket({ chatHistory: nextMessages });
     }
+  };
+
+  const clearPendingAttachments = () => {
+    setPendingAttachments([]);
+    if (attachmentInputRef.current) {
+      attachmentInputRef.current.value = "";
+    }
+  };
+
+  const handleAttachmentPickerOpen = () => {
+    attachmentInputRef.current?.click();
+  };
+
+  const handleAttachmentInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    setPendingAttachments((currentAttachments) => [
+      ...currentAttachments,
+      ...files.map(createPendingChatAttachment),
+    ]);
+  };
+
+  const removePendingAttachment = (attachmentId: string) => {
+    setPendingAttachments((currentAttachments) => {
+      const attachmentToRemove = currentAttachments.find((attachment) => attachment.id === attachmentId);
+      if (attachmentToRemove) {
+        if (previewAttachment?.id === attachmentToRemove.id) {
+          setPreviewAttachment(null);
+        }
+        revokeChatAttachmentPreviewUrl(attachmentToRemove);
+      }
+      return currentAttachments.filter((attachment) => attachment.id !== attachmentId);
+    });
   };
 
   useEffect(() => {
@@ -358,11 +464,12 @@ const ChatSupport = () => {
   }, [messages]);
 
   useEffect(() => {
-    if (isQuickTicketOnlyFlow) {
-      navigate(getSupportResumePath(ticket, bookingSummary));
-      return;
-    }
-  }, [bookingSummary, isQuickTicketOnlyFlow, navigate, ticket]);
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
+
+  useEffect(() => () => {
+    revokeChatAttachmentPreviewUrls(pendingAttachmentsRef.current);
+  }, []);
 
   useEffect(() => {
     if (isSupportReviewChatLocked) {
@@ -460,10 +567,12 @@ const ChatSupport = () => {
               };
               chatHistory?: Array<{
                   id: string;
+                  clientMessageId?: string;
                   sender: "bot" | "user" | "agent";
                   source?: "message" | "history_event" | "intro";
                   text: string;
                   timestamp: string;
+                  attachments?: ChatAttachment[];
                 }>;
             }
           | null;
@@ -541,7 +650,8 @@ const ChatSupport = () => {
   }, [isSendingMessage, messages]);
 
   useEffect(() => {
-    if (!ticket.id || isLearnerChatClosed(ticket)) {
+    const currentTicket = ticketRef.current;
+    if (!currentTicket.id || isLearnerChatClosed(currentTicket)) {
       return;
     }
 
@@ -569,10 +679,12 @@ const ChatSupport = () => {
                 bookingSummary?: ApiBookingSummary | null;
                 chatHistory?: Array<{
                   id: string;
+                  clientMessageId?: string;
                   sender: "bot" | "user" | "agent";
                   source?: "message" | "history_event" | "intro";
                   text: string;
                   timestamp: string;
+                  attachments?: ChatAttachment[];
                 }>;
               }
             | null;
@@ -598,10 +710,10 @@ const ChatSupport = () => {
           hasPendingOptimisticHistoryRef.current = !backendCaughtUp;
 
           if (!areMessageListsEquivalent(currentMessages, decoratedMessages)) {
-            replaceMessages(decoratedMessages);
+            replaceMessagesRef.current(decoratedMessages);
           }
 
-          updateTicket({
+          updateTicketRef.current({
             chatHistory: decoratedMessages,
             status: payload.ticket.status || ticketRef.current.status,
             statusReason: payload.ticket.statusReason || ticketRef.current.statusReason,
@@ -613,7 +725,7 @@ const ChatSupport = () => {
             liveChatRequested: Boolean(payload.ticket.liveChatRequested),
           });
           if ("bookingSummary" in payload) {
-            setBookingSummary(toBookingSummary(payload.bookingSummary));
+            setBookingSummaryRef.current(toBookingSummary(payload.bookingSummary));
           }
         } catch {
           // Keep the learner chat stable; the next successful poll will sync new messages.
@@ -624,17 +736,15 @@ const ChatSupport = () => {
     return () => window.clearInterval(intervalId);
   }, [ticket.id, ticket.status, ticket.chatState, isSendingMessage, isRequestingLiveAgent]);
 
-  const pushMsg = (message: Omit<ChatMessage, "id" | "timestamp">) => {
-    const nextMessages = [
-      ...messagesRef.current,
-      { ...message, id: crypto.randomUUID(), timestamp: buildTimestamp() },
-    ];
+  const pushMsg = (message: Omit<ChatMessage, "id" | "timestamp" | "clientMessageId">) => {
+    const nextMessages = [...messagesRef.current, buildOutgoingChatMessage(message.sender, message.text, message.attachments || [])];
     replaceMessages(nextMessages, true);
   };
 
   const handleSend = async () => {
     const trimmedInput = input.trim();
-    if (!trimmedInput || isSendingMessage) {
+    const attachmentsToSend = pendingAttachments;
+    if ((!trimmedInput && attachmentsToSend.length === 0) || isSendingMessage) {
       inputRef.current?.focus();
       return;
     }
@@ -654,34 +764,36 @@ const ChatSupport = () => {
       return;
     }
 
-    const userMessage: Omit<ChatMessage, "id" | "timestamp"> = {
-      sender: "user",
-      text: trimmedInput,
-    };
     const previousMessages = messagesRef.current;
-    const nextMessages = [...previousMessages, {
-      ...userMessage,
-      id: crypto.randomUUID(),
-      timestamp: buildTimestamp(),
-    }];
+    const nextMessages = [...previousMessages, buildOutgoingChatMessage("user", trimmedInput, attachmentsToSend)];
+    const nextRequest = ticket.liveChatRequested
+      ? buildChatRequestBody(
+        {
+          status: ticket.status,
+          statusReason: ticket.statusReason,
+        },
+        nextMessages,
+      )
+      : buildChatRequestBody(
+        {
+          message: trimmedInput || summarizeChatAttachments(attachmentsToSend),
+          clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+        },
+        nextMessages,
+      );
 
     hasPendingOptimisticHistoryRef.current = true;
     replaceMessages(nextMessages, true);
     setInput("");
+    clearPendingAttachments();
     setIsSendingMessage(true);
 
     try {
       if (ticket.liveChatRequested) {
         const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            status: ticket.status,
-            statusReason: ticket.statusReason,
-            messages: serializeLearnerChatHistory(nextMessages),
-          }),
+          ...(nextRequest.headers ? { headers: nextRequest.headers } : {}),
+          body: nextRequest.body,
         });
 
         const payload = (await response.json().catch(() => null)) as {
@@ -701,6 +813,7 @@ const ChatSupport = () => {
           hasPendingOptimisticHistoryRef.current = false;
           replaceMessages(previousMessages, true);
           setInput(trimmedInput);
+          setPendingAttachments(attachmentsToSend);
           toast.error(payload?.message || "We could not send your message to the live support queue right now.");
           return;
         }
@@ -721,14 +834,8 @@ const ChatSupport = () => {
 
       const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chatbot-message`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          message: trimmedInput,
-          clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
-          messages: serializeLearnerChatHistory(nextMessages),
-        }),
+        ...(nextRequest.headers ? { headers: nextRequest.headers } : {}),
+        body: nextRequest.body,
       });
 
       const payload = (await response.json().catch(() => null)) as {
@@ -742,6 +849,7 @@ const ChatSupport = () => {
         hasPendingOptimisticHistoryRef.current = false;
         replaceMessages(previousMessages, true);
         setInput(trimmedInput);
+        setPendingAttachments(attachmentsToSend);
         toast.error(payload?.message || "We could not send your message to the chatbot right now.");
         return;
       }
@@ -749,18 +857,17 @@ const ChatSupport = () => {
       if (payload?.reply) {
         pushMsg({ sender: "bot", text: payload.reply });
       } else if (payload?.webhookConfigured === false) {
-        pushMsg({ sender: "bot", text: "I received your message, but the chatbot is not connected yet." });
         toast.error("Chatbot webhook is not configured on the server.");
       } else if (payload?.webhookDelivered === false) {
-        pushMsg({ sender: "bot", text: "I received your message, but I could not reach the chatbot right now." });
         toast.error("Your message was saved, but the chatbot webhook could not be reached.");
       } else {
-        pushMsg({ sender: "bot", text: "Your message was sent, but the chatbot did not return a reply." });
+        toast.info("Your message was saved, but the chatbot did not return a reply.");
       }
     } catch {
       hasPendingOptimisticHistoryRef.current = false;
       replaceMessages(previousMessages, true);
       setInput(trimmedInput);
+      setPendingAttachments(attachmentsToSend);
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setIsSendingMessage(false);
@@ -858,17 +965,18 @@ const ChatSupport = () => {
       } else {
         const nextMessages = ensureLiveAgentQueueStatusMessage(messagesRef.current);
         replaceMessages(nextMessages);
+        const nextRequest = buildChatRequestBody(
+          {
+            status: ticket.status,
+            statusReason: ticket.statusReason,
+          },
+          nextMessages,
+        );
 
         await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            status: ticket.status,
-            statusReason: ticket.statusReason,
-            messages: serializeLearnerChatHistory(nextMessages),
-          }),
+          ...(nextRequest.headers ? { headers: nextRequest.headers } : {}),
+          body: nextRequest.body,
         }).catch(() => null);
 
         updateTicket({
@@ -918,16 +1026,17 @@ const ChatSupport = () => {
     setIsQuickSubmitting(true);
 
     try {
-      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
+      const nextRequest = buildChatRequestBody(
+        {
           status: "Pending",
           statusReason: quickTicketReason,
-          messages: serializeLearnerChatHistory(nextMessages),
-        }),
+        },
+        nextMessages,
+      );
+      const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
+        method: "POST",
+        ...(nextRequest.headers ? { headers: nextRequest.headers } : {}),
+        body: nextRequest.body,
       });
 
       const payload = (await response.json().catch(() => null)) as
@@ -970,6 +1079,11 @@ const ChatSupport = () => {
     }
   };
 
+  replaceMessagesRef.current = replaceMessages;
+  updateTicketRef.current = updateTicket;
+  setBookingSummaryRef.current = setBookingSummary;
+  handleRequestLiveAgentRef.current = handleRequestLiveAgent;
+
   useEffect(() => {
     if (!entryAction || !ticket.id) {
       return;
@@ -1008,22 +1122,64 @@ const ChatSupport = () => {
         return;
       }
 
-      void handleRequestLiveAgent();
+      void handleRequestLiveAgentRef.current();
     }
   }, [entryAction, isMeetingChatReadOnly, navigate, ticket, ticket.id, ticket.liveChatRequested]);
 
   const minBookingDate = formatDateInputValue(new Date());
   const bookingValidationMessage = getSupportSessionValidationMessage(bookingDate, bookingTime);
-  const bookingTimeOptions = buildSupportSessionTimeOptions(bookingDate);
+
+  useEffect(() => {
+    if (!bookingDate || !ticket.id) {
+      setBookingTimeOptions([]);
+      setIsLoadingAvailability(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoadingAvailability(true);
+    setBookingTimeOptions([]);
+
+    const loadAvailability = async () => {
+      try {
+        const payload = await fetchSupportSessionAvailability(
+          ticket.id,
+          bookingDate,
+          Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        setBookingTimeOptions(payload.options || []);
+      } catch {
+        if (!cancelled) {
+          setBookingTimeOptions(buildSupportSessionTimeOptions(bookingDate));
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingAvailability(false);
+        }
+      }
+    };
+
+    void loadAvailability();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bookingDate, ticket.id]);
 
   const handleClose = async () => {
     const nextMessages = messagesRef.current;
+    const closingReason = getRequesterChatClosingReason(ticket.liveChatRequested);
 
     if (!ticket.id) {
       updateTicket({
         chatHistory: nextMessages,
         status: "Closed",
-        statusReason: chatbotClosingReason,
+        statusReason: closingReason,
       });
       navigate("/support/status");
       return;
@@ -1032,16 +1188,17 @@ const ChatSupport = () => {
     setIsClosing(true);
 
     try {
+      const nextRequest = buildChatRequestBody(
+        {
+          status: "Closed",
+          statusReason: closingReason,
+        },
+        nextMessages,
+      );
       const response = await fetch(`/api/tickets/${encodeURIComponent(ticket.id)}/chat-history`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          status: "Closed",
-          statusReason: chatbotClosingReason,
-          messages: serializeLearnerChatHistory(nextMessages),
-        }),
+        ...(nextRequest.headers ? { headers: nextRequest.headers } : {}),
+        body: nextRequest.body,
       });
 
       const payload = (await response.json().catch(() => null)) as {
@@ -1067,7 +1224,7 @@ const ChatSupport = () => {
       updateTicket({
         chatHistory: nextMessages,
         status: "Closed",
-        statusReason: payload?.ticket?.statusReason || chatbotClosingReason,
+        statusReason: payload?.ticket?.statusReason || closingReason,
         assignedTeam: payload?.ticket?.assignedTeam || ticket.assignedTeam,
         slaStatus: payload?.ticket?.slaStatus || ticket.slaStatus,
         createdAt: payload?.ticket?.createdAt || ticket.createdAt,
@@ -1108,6 +1265,7 @@ const ChatSupport = () => {
           time: bookingTime,
           scheduledAt: requestedDateTime.toISOString(),
           clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+          returnPath: "/support/chat",
         }),
       });
 
@@ -1143,6 +1301,7 @@ const ChatSupport = () => {
         ...bookingDetails,
         reservationConfirmed: Boolean(payload?.reservationConfirmed),
         meetingJoinUrl: payload?.meetingJoinUrl || null,
+        returnPath: "/support/chat",
       });
       pushMsg({
         sender: "bot",
@@ -1268,6 +1427,7 @@ const ChatSupport = () => {
                   key={message.id}
                   m={message}
                   allowLiveAgentQueueActions={isWaitingForAssignment}
+                  onAttachmentOpen={setPreviewAttachment}
                   onBookingClick={openBookingDialog}
                   onQuickTicketClick={handleSubmitQuickTicket}
                   quickTicketDisabled={isQuickSubmitting}
@@ -1316,9 +1476,53 @@ const ChatSupport = () => {
                 </div>
               </div>
             ) : (
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                <div className="flex flex-1 items-end gap-2">
-                  <Button variant="ghost" size="icon" className="shrink-0" aria-label="Attach">
+              <div className="space-y-3">
+                <input
+                  ref={attachmentInputRef}
+                  type="file"
+                  multiple
+                  accept={supportChatAttachmentAccept}
+                  onChange={handleAttachmentInputChange}
+                  className="sr-only"
+                />
+                {pendingAttachments.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {pendingAttachments.map((attachment) => (
+                      <div
+                        key={attachment.id}
+                        className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-full border border-primary/12 bg-primary/5 px-3 py-1.5 text-xs shadow-sm"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setPreviewAttachment(attachment)}
+                          className="truncate font-medium text-foreground underline-offset-4 hover:underline"
+                        >
+                          {attachment.name}
+                        </button>
+                        <span className="shrink-0 text-muted-foreground">{formatAttachmentSize(attachment.size)}</span>
+                        <button
+                          type="button"
+                          onClick={() => removePendingAttachment(attachment.id)}
+                          className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition hover:bg-primary/10 hover:text-foreground"
+                          aria-label={`Remove ${attachment.name}`}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                  <div className="flex flex-1 items-end gap-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="shrink-0"
+                    aria-label="Attach files"
+                    onClick={handleAttachmentPickerOpen}
+                    disabled={isSendingMessage}
+                  >
                     <Paperclip className="w-5 h-5" />
                   </Button>
                   <Input
@@ -1326,17 +1530,18 @@ const ChatSupport = () => {
                     value={input}
                     onChange={(event) => setInput(event.target.value)}
                     onKeyDown={(event) => event.key === "Enter" && void handleSend()}
-                    placeholder="Type your message..."
+                    placeholder="Type your message or attach files..."
                     className="h-11 flex-1"
                   />
+                  </div>
+                  <Button
+                    onClick={() => void handleSend()}
+                    className="h-11 w-full border-0 shrink-0 gradient-primary sm:w-auto"
+                    disabled={isSendingMessage || (!input.trim() && pendingAttachments.length === 0)}
+                  >
+                    <Send className="w-4 h-4" />
+                  </Button>
                 </div>
-                <Button
-                  onClick={() => void handleSend()}
-                  className="h-11 w-full border-0 shrink-0 gradient-primary sm:w-auto"
-                  disabled={isSendingMessage}
-                >
-                  <Send className="w-4 h-4" />
-                </Button>
               </div>
             )}
           </div>
@@ -1373,9 +1578,13 @@ const ChatSupport = () => {
             </div>
             <div>
               <label className="block mb-1.5 text-sm font-medium">Time</label>
-              <Select value={bookingTime} onValueChange={setBookingTime} disabled={!bookingDate || bookingTimeOptions.length === 0}>
+              <Select
+                value={bookingTime}
+                onValueChange={setBookingTime}
+                disabled={!bookingDate || isLoadingAvailability || bookingTimeOptions.length === 0}
+              >
                 <SelectTrigger className="h-11">
-                  <SelectValue placeholder={bookingDate ? "Select a time slot" : "Choose a date first"} />
+                  <SelectValue placeholder={bookingDate ? (isLoadingAvailability ? "Loading available times..." : "Select a time slot") : "Choose a date first"} />
                 </SelectTrigger>
                 <SelectContent>
                   {bookingTimeOptions.map((option) => (
@@ -1385,7 +1594,7 @@ const ChatSupport = () => {
                   ))}
                 </SelectContent>
               </Select>
-              {bookingDate && bookingTimeOptions.length === 0 ? (
+              {bookingDate && !isLoadingAvailability && bookingTimeOptions.length === 0 ? (
                 <p className="mt-1.5 text-xs text-muted-foreground">
                   No valid support session slots are available for the selected date.
                 </p>
@@ -1407,6 +1616,67 @@ const ChatSupport = () => {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={Boolean(previewAttachment)} onOpenChange={(open) => !open && setPreviewAttachment(null)}>
+        <DialogContent className="max-h-[90vh] max-w-5xl overflow-hidden">
+          <DialogHeader>
+            <DialogTitle className="truncate pr-8">{previewAttachment?.name || "Attachment Preview"}</DialogTitle>
+            <DialogDescription>
+              {previewAttachment?.mimeType || "Attachment"} {previewAttachment ? `- ${formatAttachmentSize(previewAttachment.size)}` : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {previewAttachment && previewAttachmentUrl ? (
+            previewAttachmentKind === "image" ? (
+              <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
+                <img
+                  src={previewAttachmentUrl}
+                  alt={previewAttachment.name}
+                  className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
+                />
+              </div>
+            ) : previewAttachmentKind === "pdf" ? (
+              <div className="overflow-hidden rounded-2xl border bg-secondary/10">
+                <iframe
+                  src={previewAttachmentUrl}
+                  title={previewAttachment.name}
+                  className="h-[70vh] w-full border-0"
+                />
+              </div>
+            ) : previewAttachmentKind === "video" ? (
+              <div className="overflow-hidden rounded-2xl border bg-secondary/10 p-3">
+                <video
+                  src={previewAttachmentUrl}
+                  controls
+                  className="mx-auto max-h-[70vh] w-full rounded-xl bg-black"
+                />
+              </div>
+            ) : (
+              <div className="rounded-2xl border bg-secondary/10 p-5">
+                <div className="text-sm text-foreground">
+                  Preview is not available for this file type yet.
+                </div>
+                <div className="mt-2 text-xs text-muted-foreground">
+                  You can still download the file from here without leaving the page.
+                </div>
+                <div className="mt-4">
+                  <a
+                    href={previewAttachmentUrl}
+                    download={previewAttachment.name}
+                    className="inline-flex items-center rounded-full border px-4 py-2 text-sm font-medium text-primary transition hover:bg-secondary/40"
+                  >
+                    Download File
+                  </a>
+                </div>
+              </div>
+            )
+          ) : (
+            <div className="rounded-2xl border bg-secondary/10 p-5 text-sm text-muted-foreground">
+              This attachment is not available for preview right now.
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
     </SupportLayout>
   );
 };
@@ -1414,12 +1684,14 @@ const ChatSupport = () => {
 export const MessageBubble = ({
   m,
   allowLiveAgentQueueActions = false,
+  onAttachmentOpen,
   onBookingClick,
   onQuickTicketClick,
   quickTicketDisabled = false,
 }: {
   m: ChatMessage;
   allowLiveAgentQueueActions?: boolean;
+  onAttachmentOpen?: (attachment: ChatAttachment) => void;
   onBookingClick?: () => void | Promise<void>;
   onQuickTicketClick?: () => void | Promise<void>;
   quickTicketDisabled?: boolean;
@@ -1427,6 +1699,7 @@ export const MessageBubble = ({
   const isUser = m.sender === "user";
   const isAgent = m.sender === "agent";
   const showLiveAgentQueueActions = !isUser && !isAgent && allowLiveAgentQueueActions && isLiveAgentQueueStatusMessageText(m.text);
+  const attachments = Array.isArray(m.attachments) ? m.attachments : [];
 
   return (
     <div className={cn("flex gap-2.5", isUser && "flex-row-reverse")}>
@@ -1462,30 +1735,88 @@ export const MessageBubble = ({
         >
           {showLiveAgentQueueActions ? (
             <>
-              {legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through{" "}
-              <button
-                type="button"
-                onClick={() => void onBookingClick?.()}
-                className="inline p-0 align-baseline font-medium text-primary underline underline-offset-2 transition-colors hover:text-primary/80"
-              >
-                booking session
-              </button>
-              {" "}or{" "}
-              <button
-                type="button"
-                onClick={() => void onQuickTicketClick?.()}
-                disabled={quickTicketDisabled}
-                className={cn(
-                  "inline p-0 align-baseline font-medium text-primary underline underline-offset-2 transition-colors",
-                  quickTicketDisabled ? "cursor-default opacity-60" : "hover:text-primary/80",
-                )}
-              >
-                submit ticket directly
-              </button>
-              .
+              <div>
+                {legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through{" "}
+                <button
+                  type="button"
+                  onClick={() => void onBookingClick?.()}
+                  className="inline p-0 align-baseline font-medium text-primary underline underline-offset-2 transition-colors hover:text-primary/80"
+                >
+                  booking session
+                </button>
+                {" "}or{" "}
+                <button
+                  type="button"
+                  onClick={() => void onQuickTicketClick?.()}
+                  disabled={quickTicketDisabled}
+                  className={cn(
+                    "inline p-0 align-baseline font-medium text-primary underline underline-offset-2 transition-colors",
+                    quickTicketDisabled ? "cursor-default opacity-60" : "hover:text-primary/80",
+                  )}
+                >
+                  submit ticket directly
+                </button>
+                .
+              </div>
+              {attachments.length > 0 ? (
+                <div className="mt-3 flex flex-col gap-2">
+                  {attachments.map((attachment) => (
+                    getChatAttachmentOpenUrl(attachment) ? (
+                      <button
+                        type="button"
+                        key={attachment.id}
+                        onClick={() => onAttachmentOpen?.(attachment)}
+                        className="inline-flex max-w-full items-center gap-2 rounded-xl border border-primary/15 bg-background/90 px-3 py-2 text-xs shadow-sm hover:border-primary/30"
+                      >
+                        <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate font-medium">{attachment.name}</span>
+                        <span className="shrink-0 text-muted-foreground">{formatAttachmentSize(attachment.size)}</span>
+                      </button>
+                    ) : (
+                      <div
+                        key={attachment.id}
+                        className="inline-flex max-w-full items-center gap-2 rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-xs shadow-sm opacity-80"
+                      >
+                        <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate font-medium">{attachment.name}</span>
+                        <span className="shrink-0 text-muted-foreground">{formatAttachmentSize(attachment.size)}</span>
+                      </div>
+                    )
+                  ))}
+                </div>
+              ) : null}
             </>
           ) : (
-            m.text
+            <div className="space-y-3">
+              {m.text ? <div>{m.text}</div> : null}
+              {attachments.length > 0 ? (
+                <div className="flex flex-col gap-2">
+                  {attachments.map((attachment) => (
+                    getChatAttachmentOpenUrl(attachment) ? (
+                      <button
+                        type="button"
+                        key={attachment.id}
+                        onClick={() => onAttachmentOpen?.(attachment)}
+                        className="inline-flex max-w-full items-center gap-2 rounded-xl border border-primary/15 bg-background/90 px-3 py-2 text-xs shadow-sm hover:border-primary/30"
+                      >
+                        <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate font-medium">{attachment.name}</span>
+                        <span className="shrink-0 text-muted-foreground">{formatAttachmentSize(attachment.size)}</span>
+                      </button>
+                    ) : (
+                      <div
+                        key={attachment.id}
+                        className="inline-flex max-w-full items-center gap-2 rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-xs shadow-sm opacity-80"
+                      >
+                        <Paperclip className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate font-medium">{attachment.name}</span>
+                        <span className="shrink-0 text-muted-foreground">{formatAttachmentSize(attachment.size)}</span>
+                      </div>
+                    )
+                  ))}
+                </div>
+              ) : null}
+            </div>
           )}
         </div>
       </div>

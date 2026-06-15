@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MessageBubble, liveAgentQueueWaitingMessage } from "@/pages/support/ChatSupport";
+import {
+  getRequesterChatClosingReason,
+  requesterClosingReason,
+  MessageBubble,
+  liveAgentQueueWaitingMessage,
+} from "@/pages/support/ChatSupport";
 
 describe("MessageBubble live agent queue actions", () => {
   afterEach(() => {
@@ -47,5 +52,15 @@ describe("MessageBubble live agent queue actions", () => {
     expect(screen.queryByRole("button", { name: /booking session/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /submit ticket directly/i })).not.toBeInTheDocument();
     expect(screen.getByText(liveAgentQueueWaitingMessage)).toBeInTheDocument();
+  });
+});
+
+describe("getRequesterChatClosingReason", () => {
+  it("returns requester closing reason after a live chat request", () => {
+    expect(getRequesterChatClosingReason(true)).toBe(requesterClosingReason);
+  });
+
+  it("keeps chatbot closing reason for regular chatbot chats", () => {
+    expect(getRequesterChatClosingReason(false)).toBe("Closed via Chatbot");
   });
 });

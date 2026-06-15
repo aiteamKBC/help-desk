@@ -28,7 +28,7 @@ describe("SupportOptions", () => {
     window.localStorage.clear();
   });
 
-  it("renders the quick call / direct ticket options for coach requests", async () => {
+  it("renders all support paths plus Teams call for coach requests", async () => {
     window.localStorage.setItem(
       supportStorageKey,
       JSON.stringify({
@@ -63,10 +63,13 @@ describe("SupportOptions", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText("Choose quick call or submit ticket directly")).toBeInTheDocument();
+    expect(screen.getByText("Choose how you want to continue")).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByText("Call on Microsoft Teams")).toBeInTheDocument();
     });
+    expect(screen.getByRole("button", { name: /chatbot/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /live chat/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /booking session/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /submit ticket directly/i })).toBeInTheDocument();
   });
 
@@ -110,5 +113,6 @@ describe("SupportOptions", () => {
     expect(screen.getByRole("button", { name: /live chat/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /booking session/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /submit ticket directly/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /call on microsoft teams/i })).not.toBeInTheDocument();
   });
 });

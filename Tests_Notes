@@ -75,20 +75,52 @@ Requested by Eng. Ayman:
 ->Make support ticket in view similar to Coverage ticket [Done]
 -> session details and preffered  in e-mail notification [Done]
 ->COVERAGE: Only one active choice card / archive [Done]
-======================================
-Modifications/Features To Do:
 ->Change Learner to Requester as in ticket details
-->Add Delete in Archive + deleting log
-->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no Action 
-->Coverage ticket, automatic sent to all replacements, if one accepted --> Tutor accepted, and all other tutors are informed if tried to accept or refuse
-->Add attachments in documentation  
-->Add Direct Call for coaches
-->Check All support methods flows and test all
--------
+============================================================================
+============================================================================
+Modifications/Features To Do:
+*Support Portal:
+->Update the ticket creator on his ticket via e-mail [done]
+->Check All support methods flows and test all [DONE]
+->Add Direct Call for coaches [done]
+->attachment in live chat, agent and user [DONE]
+
+->Open all methods for coaches [done]
+->Category: Portal:Bugs // Portal: Suggestions and Requests
+
+
+[To Diyaa]
+->Chatbot history log to revisit and relearn from
+[To Lutfi]
+->book session from 8 -> 3
+---------------------------------------
+*Coverage:
+->In coverage: allow submit without ppt [Done]
+->In coverage add a send presentation/ppt button in same request card even after just requesting or acceptance [Done]
+->CC for coach
+
+->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)]
+
+->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no Action [Done->Testing]
+
+
+->Add Delete in Archive [super admin only by Eng.Ayman] + deleting log?!
+ ->Coverage ticket, automatic sent to all replacements, if one accepted --> Tutor accepted, and all other tutors are informed if tried to accept or refuse
 ->Tutor e-mail field bug
 ->check assignment in case for more than one member editing coverage ticket.
-->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)] 
+
+--------------------------------------
+*Ticket:
+->Add attachments in documentation
+--------------------------------------
+*Knowledge base:
+->Revise "open" format
+->Edit attachements for links view
+->Edit Resources to have added blocks?!
+
+-------
 ->Change Coverage Category -> Operations not Technical
+->Create a "follow up" ticket in categories and link with old ticket. to create a transaction flow
 
 
 

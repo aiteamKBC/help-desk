@@ -19,8 +19,8 @@ import {
   type RequesterRole,
   type RequesterSource,
   type Ticket,
-  useSupport,
 } from "@/context/SupportContext";
+import { useSupport } from "@/context/useSupport";
 import { getSupportResumePath, isAwaitingSupportReviewTicket } from "@/lib/supportFlow";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import { adminPortalReturnQueryParam, clearAdminPortalReturnFlag } from "@/lib/adminSession";
@@ -148,7 +148,7 @@ const EmailVerification = () => {
     if (params.get(adminPortalReturnQueryParam) !== "1") {
       clearAdminPortalReturnFlag();
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!prefillEmail || autoSubmittedRef.current) return;

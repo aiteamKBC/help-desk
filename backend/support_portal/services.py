@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import re
 import threading
@@ -29,6 +30,7 @@ from .roles import (
     ACCOUNT_SCOPES,
     ADMIN_ACCESS_GROUP_NAME,
     ADMIN_ACCESS_ROLES,
+    COACH_ACCESS_GROUP_NAME,
     DEFAULT_ACCOUNT_ROLE,
     OPERATIONS_ACCESS_GROUP_NAME,
     PUBLIC_SUPPORT_ACCOUNT_ROLE_SET,
@@ -44,6 +46,7 @@ from .roles import (
     SUPPORT_PORTAL_ACCESS_ROLES,
 )
 
+logger = logging.getLogger(__name__)
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
@@ -63,6 +66,7 @@ TICKET_PRIORITY_RANKS = {
 ACTIVE_PRIORITY_TICKET_STATUSES = {"Open", "Pending"}
 STATUS_REASON_CLOSED_DUE_TO_INACTIVITY = "Closed due to inactivity"
 STATUS_REASON_CLOSING_BY_CHATBOT = "Closed via Chatbot"
+STATUS_REASON_CLOSED_BY_REQUESTER = "Closed by Requester"
 STATUS_REASON_CLOSED_BY_AGENT = "Closed via Agent"
 STATUS_REASON_AWAITING_MEETING = "Awaiting support meeting"
 STATUS_REASON_ESCALATION = "Escalation"
@@ -72,6 +76,8 @@ STATUS_REASON_TUTOR_ACCEPTED = "Tutor Accepted"
 STATUS_REASON_TUTOR_REJECTED = "Tutor Rejected"
 STATUS_REASON_TUTOR_REFUSED = "Tutor Refused"
 STATUS_REASON_REREQUESTING = "Rerequesting"
+SUPPORT_FLOW_STAGE_METADATA_KEY = "support_flow_stage"
+SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS = "booking_in_progress"
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION = "Awaiting Resolution"
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND = "Awaiting resolution"
 STATUS_REASON_AWAITING_RESOLUTION = LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND
@@ -94,6 +100,7 @@ ALLOWED_STATUS_REASONS_BY_STATUS = {
     "Closed": {
         STATUS_REASON_CLOSED_DUE_TO_INACTIVITY,
         STATUS_REASON_CLOSING_BY_CHATBOT,
+        STATUS_REASON_CLOSED_BY_REQUESTER,
         STATUS_REASON_CLOSED_BY_AGENT,
     },
     "Pending": {
@@ -117,6 +124,7 @@ UK_SUPPORT_SESSION_START_MINUTES = 8 * 60
 UK_SUPPORT_SESSION_END_MINUTES = 16 * 60
 SUPPORT_SESSION_LEAD_TIME_SECONDS = 24 * 60 * 60
 WEBHOOK_RESPONSE_WRAPPER_KEYS = ("data", "body", "result", "payload", "json", "content", "booking", "meeting", "event", "error")
+CHATBOT_WEBHOOK_TIMEOUT_SECONDS = 45
 AGENT_SESSION_TIMEOUT = timedelta(minutes=60)
 DEFAULT_AGENT_CONSOLE_STATUS = "Off"
 AGENT_CONSOLE_STATUSES = {"Available", "Busy", "Off"}
@@ -131,6 +139,27 @@ PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY = "pending_coverage_ticket_not
 TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
 LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
 LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY = "latest_coverage_tutor_response"
+QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_confirmation_email_sent_at"
+QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_closed_email_sent_at"
+LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailable_operations_notified_at"
+SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
+SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
+SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
+SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
+SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
+    SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
+        "quick_ticket_confirmation_email_sent",
+        "quick_ticket_confirmation_email_failed",
+    ),
+    SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED: (
+        "quick_ticket_closed_email_sent",
+        "quick_ticket_closed_email_failed",
+    ),
+    SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE: (
+        "live_agent_unavailable_operations_notified",
+        "live_agent_unavailable_operations_notification_failed",
+    ),
+}
 MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0"
 MICROSOFT_GRAPH_BETA_BASE_URL = "https://graph.microsoft.com/beta"
 MICROSOFT_GRAPH_SCOPE = "https://graph.microsoft.com/.default"
@@ -183,9 +212,19 @@ ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS = {
 ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES = {"application/pdf"}
 ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
+CHAT_MESSAGE_ID_METADATA_KEY = "client_message_id"
+CHAT_ATTACHMENTS_METADATA_KEY = "attachments"
+CHAT_ATTACHMENT_STORAGE_SEGMENT = "chat"
 COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 30
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS = 8
+COVERAGE_SLA_STAGE_WARNING = "warning"
+COVERAGE_SLA_STAGE_ESCALATED = "escalated"
+COVERAGE_SLA_STAGES = {COVERAGE_SLA_STAGE_WARNING, COVERAGE_SLA_STAGE_ESCALATED}
+COVERAGE_SLA_STATE_METADATA_KEY = "coverage_sla_state"
+COVERAGE_SLA_BREACH_LEAD_TIME = timedelta(days=3)
+COVERAGE_SLA_ESCALATION_AFTER = timedelta(days=1)
+SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE = "coverage_session_deadline"
 _open_ticket_inactivity_sync_lock = threading.Lock()
 _last_open_ticket_inactivity_sync_started_monotonic = 0.0
 _ticket_background_sync_lock = threading.Lock()
@@ -325,6 +364,20 @@ def build_admin_ticket_attachment_download_url(public_id: str, attachment_id: in
     return f"/api/admin/tickets/{urllib_parse.quote(public_id)}/attachments/{attachment_id}/download"
 
 
+def build_ticket_chat_attachment_download_url(public_id: str, client_attachment_id: str) -> str:
+    return (
+        f"/api/tickets/{urllib_parse.quote(public_id)}/chat-attachments/"
+        f"{urllib_parse.quote(sanitize_text(client_attachment_id))}/download"
+    )
+
+
+def build_admin_ticket_chat_attachment_download_url(public_id: str, client_attachment_id: str) -> str:
+    return (
+        f"/api/admin/tickets/{urllib_parse.quote(public_id)}/chat-attachments/"
+        f"{urllib_parse.quote(sanitize_text(client_attachment_id))}/download"
+    )
+
+
 def normalize_ticket_attachment_row_payload(file: dict[str, Any]) -> dict[str, Any]:
     metadata = normalize_json_object(file.get("metadata"))
     return {
@@ -334,6 +387,33 @@ def normalize_ticket_attachment_row_payload(file: dict[str, Any]) -> dict[str, A
         "storageKey": sanitize_text(file.get("storageKey")) or sanitize_text(file.get("storageUrl")) or None,
         "metadata": metadata or file,
     }
+
+
+def normalize_chat_attachment_row_payload(file: dict[str, Any]) -> dict[str, Any]:
+    metadata = normalize_json_object(file.get("metadata"))
+    size_value = file.get("size")
+    try:
+        normalized_size = int(size_value) if size_value not in (None, "") else None
+    except (TypeError, ValueError):
+        normalized_size = None
+
+    return {
+        "clientAttachmentId": sanitize_text(file.get("clientAttachmentId") or file.get("id")),
+        "name": sanitize_support_attachment_name(file.get("name")),
+        "mimeType": sanitize_text(file.get("mimeType")) or None,
+        "size": normalized_size,
+        "storageUrl": sanitize_chat_attachment_storage_reference(file.get("storageUrl") or file.get("storageKey")),
+        "metadata": metadata or file,
+    }
+
+
+def sanitize_chat_attachment_storage_reference(value: Any) -> str | None:
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return None
+    if normalized_value.startswith("/api/") or "://" in normalized_value:
+        return None
+    return normalized_value
 
 
 def store_uploaded_ticket_attachment(ticket_public_id: str, uploaded_file: Any) -> dict[str, Any]:
@@ -385,6 +465,10 @@ def store_uploaded_ticket_attachments(ticket_public_id: str, uploaded_files: lis
     return stored_attachments
 
 
+def store_uploaded_message_attachment(ticket_public_id: str, uploaded_file: Any) -> dict[str, Any]:
+    return store_uploaded_ticket_attachment(f"{sanitize_text(ticket_public_id)}/{CHAT_ATTACHMENT_STORAGE_SEGMENT}", uploaded_file)
+
+
 def list_ticket_attachment_storage_keys(ticket_id: int) -> list[str]:
     rows = run_query(
         """
@@ -414,6 +498,45 @@ def get_admin_ticket_attachment_file(public_id: str, attachment_id: int) -> dict
         LIMIT 1
         """,
         [public_id, attachment_id],
+    )
+
+    if not attachment:
+        raise ApiError(404, "Attachment not found.")
+
+    storage_key = sanitize_text(attachment.get("storage_url"))
+    if not storage_key:
+        raise ApiError(404, "Attachment file is unavailable.")
+
+    attachment_path = resolve_support_attachment_path(storage_key)
+    if not attachment_path.exists() or not attachment_path.is_file():
+        raise ApiError(404, "Attachment file is unavailable.")
+
+    return {
+        "fileName": sanitize_support_attachment_name(attachment.get("file_name")),
+        "mimeType": sanitize_text(attachment.get("mime_type")) or None,
+        "path": attachment_path,
+    }
+
+
+def get_ticket_chat_attachment_file(public_id: str, client_attachment_id: str) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    normalized_client_attachment_id = sanitize_text(client_attachment_id)
+    if not normalized_client_attachment_id:
+        raise ApiError(400, "Attachment id is required.")
+
+    attachment = run_query_one(
+        """
+        SELECT ma.file_name, ma.mime_type, ma.storage_url
+        FROM message_attachments ma
+        JOIN tickets t
+          ON t.conversation_id = ma.conversation_id
+        WHERE t.public_id = %s
+          AND ma.client_attachment_id = %s
+        LIMIT 1
+        """,
+        [public_id, normalized_client_attachment_id],
     )
 
     if not attachment:
@@ -838,6 +961,44 @@ def get_latest_coverage_tutor_response(metadata: Any) -> dict[str, Any] | None:
     return normalize_latest_coverage_tutor_response(normalize_json_object(metadata).get(LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY))
 
 
+def normalize_coverage_sla_state(value: Any) -> dict[str, Any] | None:
+    payload = normalize_json_object(value)
+    if not payload:
+        return None
+
+    stage = sanitize_text(payload.get("stage")).lower()
+    if stage not in COVERAGE_SLA_STAGES:
+        stage = ""
+
+    session_start_at = serialize_datetime_value(coerce_datetime(payload.get("sessionStartAt")))
+    breach_deadline_at = serialize_datetime_value(coerce_datetime(payload.get("breachDeadlineAt")))
+    breached_at = serialize_datetime_value(coerce_datetime(payload.get("breachedAt")))
+    warning_triggered_at = serialize_datetime_value(coerce_datetime(payload.get("warningTriggeredAt")))
+    escalated_at = serialize_datetime_value(coerce_datetime(payload.get("escalatedAt")))
+
+    if not stage:
+        if escalated_at:
+            stage = COVERAGE_SLA_STAGE_ESCALATED
+        elif warning_triggered_at or breached_at:
+            stage = COVERAGE_SLA_STAGE_WARNING
+
+    if not stage and not session_start_at and not breach_deadline_at and not breached_at:
+        return None
+
+    return {
+        "stage": stage,
+        "sessionStartAt": session_start_at,
+        "breachDeadlineAt": breach_deadline_at,
+        "breachedAt": breached_at,
+        "warningTriggeredAt": warning_triggered_at,
+        "escalatedAt": escalated_at,
+    }
+
+
+def get_coverage_sla_state(metadata: Any) -> dict[str, Any] | None:
+    return normalize_coverage_sla_state(normalize_json_object(metadata).get(COVERAGE_SLA_STATE_METADATA_KEY))
+
+
 def normalize_console_status(value: Any) -> str:
     normalized_value = sanitize_text(value).title()
     if normalized_value in AGENT_CONSOLE_STATUSES:
@@ -884,15 +1045,6 @@ def verify_agent_password(agent: dict[str, Any] | None, password: str) -> bool:
 
     shared_password = settings.SUPPORT_PORTAL_PASSWORD or ""
     return bool(shared_password) and password == shared_password
-
-
-def normalize_account_role(value: Any, *, default: str = DEFAULT_ACCOUNT_ROLE) -> str:
-    normalized_value = sanitize_text(value).lower()
-    if not normalized_value:
-        return default
-    if normalized_value not in ACCOUNT_ROLES:
-        raise ApiError(400, "Select a valid role.")
-    return normalized_value
 
 
 def normalize_account_scope(value: Any, *, fallback_role: Any = None, default: str = ACCOUNT_SCOPE_STAFF) -> str:
@@ -1126,6 +1278,8 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "note": sanitize_text(source.get("note")),
                 "tutor": sanitize_text(source.get("tutor")),
                 "tutorEmail": sanitize_text(source.get("tutorEmail")),
+                "coach": sanitize_text(source.get("coach")),
+                "coachEmail": sanitize_text(source.get("coachEmail")),
                 "sessionDetails": sanitize_text(source.get("sessionDetails")),
                 "replyText": sanitize_text(source.get("replyText")),
                 "requestStatus": request_status,
@@ -1271,6 +1425,130 @@ def freeze_coverage_documentation_snapshot(
         "coverageNotes": existing.get("coverageNotes") if has_existing_saved_snapshot else requested.get("coverageNotes") or "",
         "coverageCards": frozen_cards,
     }
+
+
+def parse_coverage_session_date_label(value: Any):
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return None
+
+    for pattern in ("%A %d %b %Y", "%a %d %b %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized_value, pattern).date()
+        except ValueError:
+            continue
+
+    fallback_datetime = coerce_datetime(normalized_value)
+    return fallback_datetime.date() if fallback_datetime else None
+
+
+def parse_coverage_time_start_parts(value: Any) -> tuple[int, int] | None:
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return None
+
+    time_match = re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?", normalized_value)
+    if not time_match:
+        return None
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2))
+    meridiem = sanitize_text(time_match.group(3)).lower()
+
+    if meridiem:
+        if hour == 12:
+            hour = 0
+        if meridiem == "pm":
+            hour += 12
+
+    if hour > 23 or minute > 59:
+        return None
+
+    return hour, minute
+
+
+def resolve_coverage_session_start_from_inquiry(inquiry: Any, *, now: datetime | None = None) -> datetime | None:
+    parsed_inquiry = parse_coverage_inquiry_details(inquiry)
+    if not parsed_inquiry:
+        return None
+
+    session_dates = [
+        parsed_date
+        for parsed_date in (
+            parse_coverage_session_date_label(raw_date)
+            for raw_date in parsed_inquiry.get("sessionDates") or []
+        )
+        if parsed_date
+    ]
+    if not session_dates:
+        return None
+
+    time_parts = parse_coverage_time_start_parts(parsed_inquiry.get("time"))
+    start_hour, start_minute = time_parts if time_parts else (0, 0)
+    session_timezone = ZoneInfo(UK_SUPPORT_TIMEZONE)
+    candidate_datetimes = [
+        datetime(
+            session_date.year,
+            session_date.month,
+            session_date.day,
+            start_hour,
+            start_minute,
+            tzinfo=session_timezone,
+        ).astimezone(timezone.utc)
+        for session_date in sorted(set(session_dates))
+    ]
+
+    comparison_now = now or datetime.now(timezone.utc)
+    upcoming_candidates = [candidate for candidate in candidate_datetimes if candidate >= comparison_now]
+    if upcoming_candidates:
+        return min(upcoming_candidates)
+
+    return min(candidate_datetimes) if candidate_datetimes else None
+
+
+def has_submitted_coverage_tutor_request(cards: list[dict[str, Any]]) -> bool:
+    for card in cards:
+        normalized_card = normalize_json_object(card)
+        if sanitize_text(normalized_card.get("type")) != "tutor_choice":
+            continue
+
+        if (
+            sanitize_text(normalized_card.get("submittedAt"))
+            or sanitize_text(normalized_card.get("requestStatus")).lower() in {"requested", "accepted", "refused"}
+            or parse_assigned_agent_id(normalized_card.get("requestSubmittedByAgentId"))
+        ):
+            return True
+
+    return False
+
+
+def is_coverage_ticket_waiting_for_initial_action(row: dict[str, Any]) -> bool:
+    if not is_coverage_ticket_record(row):
+        return False
+
+    if sanitize_text(row.get("status")) != "Pending":
+        return False
+
+    normalized_status_reason = sanitize_text(row.get("status_reason"))
+    if normalized_status_reason and normalized_status_reason != "Coverage Ticket":
+        return False
+
+    metadata = normalize_json_object(row.get("metadata"))
+    if get_latest_coverage_tutor_response(metadata):
+        return False
+
+    documentation = normalize_admin_documentation(
+        metadata.get("admin_documentation"),
+        fallback_inquiry=sanitize_text(row.get("inquiry")),
+        fallback_ticket_id=sanitize_text(row.get("public_id")),
+    )
+    coverage_cards = list(documentation.get("coverageCards") or [])
+    if any(sanitize_text(card.get("type")) == "tutor_reply" for card in coverage_cards):
+        return False
+    if any(sanitize_text(card.get("confirmedAt")) for card in coverage_cards):
+        return False
+
+    return not has_submitted_coverage_tutor_request(coverage_cards)
 
 
 def derive_sla_state(status: Any, created_at: Any, current_sla_status: Any) -> tuple[str, bool, str | None]:
@@ -1917,14 +2195,69 @@ def get_coverage_tutor_email(tutor: Any) -> str:
     return ""
 
 
+def list_coverage_coach_options() -> list[str]:
+    rows = run_communication_centre_query(
+        """
+        SELECT coach_name
+        FROM (
+          SELECT DISTINCT NULLIF(TRIM(name), '') AS coach_name
+          FROM public.coach_profiles
+          WHERE COALESCE(is_active, TRUE) = TRUE
+        ) coverage_coaches
+        WHERE coach_name IS NOT NULL
+        ORDER BY LOWER(coach_name), coach_name
+        """
+    )
+    coach_names_by_key: dict[str, str] = {}
+
+    for row in rows:
+        coach_name = sanitize_text(row.get("coach_name"))
+        if coach_name:
+            coach_names_by_key.setdefault(coach_name.lower(), coach_name)
+
+    return [coach_names_by_key[key] for key in sorted(coach_names_by_key)]
+
+
+def get_coverage_coach_email(coach: Any) -> str:
+    normalized_coach = sanitize_text(coach).lower()
+    if not normalized_coach:
+        return ""
+
+    rows = run_communication_centre_query(
+        """
+        SELECT NULLIF(TRIM(email), '') AS coach_email
+        FROM public.coach_profiles
+        WHERE COALESCE(is_active, TRUE) = TRUE
+          AND (
+            LOWER(TRIM(name)) = %s
+            OR LOWER(TRIM(normalized_name)) = %s
+          )
+        ORDER BY
+          CASE WHEN LOWER(TRIM(name)) = %s THEN 0 ELSE 1 END,
+          NULLIF(TRIM(email), '') DESC NULLS LAST
+        """,
+        [normalized_coach, normalized_coach, normalized_coach],
+    )
+
+    for row in rows:
+        email = normalize_email(row.get("coach_email"))
+        if is_valid_email(email):
+            return email
+
+    return ""
+
+
 def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
     option_type = sanitize_text(payload.get("type")).lower()
     tutor = payload.get("tutor")
+    coach = payload.get("coach")
     module = payload.get("module")
     time_label = payload.get("time")
 
     if option_type == "tutors":
         options = list_coverage_tutor_options(module)
+    elif option_type == "coaches":
+        options = list_coverage_coach_options()
     elif option_type == "modules":
         options = list_coverage_module_options(tutor)
     elif option_type == "times":
@@ -1936,6 +2269,11 @@ def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "type": option_type,
             "value": get_coverage_tutor_email(tutor),
+        }
+    elif option_type == "coach-email":
+        return {
+            "type": option_type,
+            "value": get_coverage_coach_email(coach),
         }
     else:
         raise ApiError(400, "Please choose a valid coverage option type.")
@@ -1949,6 +2287,10 @@ def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 def get_coverage_tutor_request_webhook_url() -> str:
     return sanitize_text(getattr(settings, "MAIL_WEBHOOK_URL", ""))
+
+
+def get_support_notification_webhook_url() -> str:
+    return sanitize_text(getattr(settings, "SUPPORT_NOTIFICATION_WEBHOOK_URL", ""))
 
 
 def get_coverage_ticket_operations_webhook_url() -> str:
@@ -2088,6 +2430,10 @@ def build_coverage_tutor_request_webhook_payload(
             "name": card.get("tutor"),
             "email": card.get("tutorEmail"),
         },
+        "coach": {
+            "name": card.get("coach"),
+            "email": card.get("coachEmail"),
+        },
         "learner": {
             "name": ticket.get("learner_name"),
             "email": ticket.get("learner_email"),
@@ -2119,6 +2465,61 @@ def build_coverage_tutor_request_webhook_payload(
                 "acceptUrl": accept_result_url,
                 "refuseUrl": refuse_result_url,
             },
+        },
+    }
+
+
+def build_coverage_tutor_follow_up_webhook_payload(
+    ticket: dict[str, Any],
+    documentation: dict[str, Any],
+    card: dict[str, Any],
+    follow_up_files: list[dict[str, Any]],
+    actor_row: dict[str, Any],
+    *,
+    sent_at: str = "",
+) -> dict[str, Any]:
+    public_base_url = get_support_portal_public_base_url("")
+    dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
+
+    return {
+        "event": "coverage_tutor_follow_up",
+        "source": "support_portal",
+        "ticketId": ticket["public_id"],
+        "cardId": card["id"],
+        "dashboardUrl": dashboard_url,
+        "tutor": {
+            "name": card.get("tutor"),
+            "email": card.get("tutorEmail"),
+        },
+        "coach": {
+            "name": card.get("coach"),
+            "email": card.get("coachEmail"),
+        },
+        "learner": {
+            "name": ticket.get("learner_name"),
+            "email": ticket.get("learner_email"),
+        },
+        "request": {
+            "category": ticket.get("category"),
+            "technicalSubcategory": ticket.get("technical_subcategory"),
+            "inquiry": ticket.get("inquiry"),
+            "requestStatus": sanitize_text(card.get("requestStatus")) or "requested",
+            "requestedAt": card.get("submittedAt") or "",
+            "respondedAt": card.get("respondedAt") or "",
+            "sessionDetails": card.get("sessionDetails"),
+            "notes": documentation.get("coverageNotes") or "",
+            "presentationFiles": card.get("presentationFiles") or [],
+        },
+        "followUp": {
+            "sentAt": sent_at,
+            "fileCount": len(follow_up_files),
+            "presentationFiles": follow_up_files,
+        },
+        "sentBy": {
+            "agentId": int(actor_row["id"]),
+            "agentName": actor_row.get("full_name") or actor_row["username"],
+            "agentUsername": actor_row["username"],
+            "agentEmail": actor_row.get("email") or "",
         },
     }
 
@@ -2185,6 +2586,47 @@ def queue_coverage_tutor_request_webhook_delivery(
     thread.start()
 
 
+def queue_coverage_tutor_follow_up_webhook_delivery(
+    *,
+    ticket_id: int,
+    ticket_public_id: str,
+    card_id: str,
+    payload: dict[str, Any],
+) -> None:
+    if not get_coverage_tutor_request_webhook_url():
+        return
+
+    def deliver() -> None:
+        result = send_coverage_tutor_request_webhook(payload)
+        event_type = (
+            "coverage_tutor_follow_up_webhook_delivered"
+            if result.get("delivered")
+            else "coverage_tutor_follow_up_webhook_failed"
+        )
+        try:
+            insert_history_event(
+                ticket_id,
+                event_type,
+                {"role": "system", "label": "System"},
+                {
+                    "ticketId": ticket_public_id,
+                    "cardId": card_id,
+                    "webhookConfigured": bool(result.get("configured")),
+                    "webhookDelivered": bool(result.get("delivered")),
+                    "webhookStatus": result.get("status"),
+                },
+            )
+        except Exception:
+            return
+
+    thread = threading.Thread(
+        target=deliver,
+        name=f"coverage-tutor-follow-up-webhook-{ticket_public_id}-{card_id}",
+        daemon=True,
+    )
+    thread.start()
+
+
 def build_coverage_tutor_refusal_mail_webhook_payload(
     *,
     ticket: dict[str, Any],
@@ -2217,6 +2659,8 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
         "request": {
             "cardId": tutor_choice_card.get("id"),
             "requestedAt": tutor_choice_card.get("submittedAt"),
+            "coach": sanitize_text(tutor_choice_card.get("coach")),
+            "coachEmail": sanitize_text(tutor_choice_card.get("coachEmail")),
             "sessionDetails": session_details,
             "presentationFiles": tutor_choice_card.get("presentationFiles") or [],
         },
@@ -2405,6 +2849,8 @@ def build_coverage_tutor_response_payload(
         "ticketId": ticket_public_id,
         "tutor": sanitize_text(response_payload.get("tutor")) or tutor_choice_card.get("tutor"),
         "tutorEmail": sanitize_text(response_payload.get("tutorEmail")) or tutor_choice_card.get("tutorEmail"),
+        "coach": sanitize_text(response_payload.get("coach")) or tutor_choice_card.get("coach"),
+        "coachEmail": sanitize_text(response_payload.get("coachEmail")) or tutor_choice_card.get("coachEmail"),
         "cardId": sanitize_text(response_payload.get("cardId")),
         "relatedTutorChoiceCardId": tutor_choice_card.get("id"),
         "requestedAt": tutor_choice_card.get("submittedAt"),
@@ -2445,6 +2891,8 @@ def build_coverage_tutor_reply_card(
         "note": reply_text,
         "tutor": sanitize_text(response_payload.get("tutor")) or tutor_choice_card.get("tutor") or "",
         "tutorEmail": sanitize_text(response_payload.get("tutorEmail")) or tutor_choice_card.get("tutorEmail") or "",
+        "coach": sanitize_text(response_payload.get("coach")) or tutor_choice_card.get("coach") or "",
+        "coachEmail": sanitize_text(response_payload.get("coachEmail")) or tutor_choice_card.get("coachEmail") or "",
         "sessionDetails": session_details,
         "replyText": reply_text,
         "requestStatus": "accepted" if outcome == "accepted" else "refused",
@@ -2706,6 +3154,248 @@ def notify_coverage_ticket_operations_team(ticket_id: int, payload: dict[str, An
     return webhook_result
 
 
+def build_support_notification_webhook_payload(
+    event: str,
+    ticket: dict[str, Any],
+    *,
+    status: str | None = None,
+    status_reason: str | None = None,
+    requested_at: Any = None,
+    closed_at: Any = None,
+) -> dict[str, Any]:
+    public_base_url = get_support_portal_public_base_url("")
+    dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
+    recipient_type = "operations" if event == SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE else "requester"
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    requester_role = get_ticket_requester_role(ticket_metadata)
+    requester_source = get_ticket_requester_source(
+        ticket_metadata,
+        learner_source=ticket.get("learner_source"),
+        learner_metadata=ticket.get("learner_metadata"),
+    )
+    requester_email = normalize_email(ticket.get("learner_email") or ticket.get("email") or "")
+    requester_name = (
+        sanitize_text(ticket.get("learner_name"))
+        or sanitize_text(ticket.get("requester_name"))
+        or requester_email
+    )
+    notification_status = status or sanitize_text(ticket.get("status"))
+    notification_status_reason = status_reason if status_reason is not None else sanitize_text(ticket.get("status_reason"))
+
+    return {
+        "event": event,
+        "source": "support_portal",
+        "recipientType": recipient_type,
+        "ticket": {
+            "id": ticket.get("public_id"),
+            "status": notification_status,
+            "statusReason": notification_status_reason,
+            "category": ticket.get("category"),
+            "technicalSubcategory": ticket.get("technical_subcategory") or "",
+            "priority": ticket.get("priority") or "",
+            "assignedTeam": ticket.get("assigned_team") or "Unassigned",
+            "slaStatus": ticket.get("sla_status") or "",
+            "createdAt": serialize_datetime_value(ticket.get("created_at")),
+            "dashboardUrl": dashboard_url,
+        },
+        "requester": {
+            "name": requester_name,
+            "email": requester_email,
+            "role": requester_role,
+            "source": requester_source,
+        },
+        "liveChat": {
+            "requestedAt": serialize_datetime_value(requested_at) if requested_at else "",
+            "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
+            "assignedAgentName": ticket.get("assigned_agent_name") or "",
+            "assignedAgentUsername": ticket.get("assigned_agent_username") or "",
+        },
+        "closure": {
+            "closedAt": serialize_datetime_value(closed_at) if closed_at else "",
+        },
+    }
+
+
+def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    configured, delivered, status, response_payload = post_json_webhook(
+        get_support_notification_webhook_url(),
+        payload,
+        timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
+    )
+    return {
+        "configured": configured,
+        "delivered": delivered,
+        "status": status,
+        "response": response_payload,
+    }
+
+
+def queue_support_notification_delivery(
+    *,
+    ticket_id: int,
+    ticket_public_id: str,
+    event: str,
+    payload: dict[str, Any],
+    sent_metadata_key: str,
+) -> None:
+    if not get_support_notification_webhook_url():
+        return
+
+    delivered_event_type, failed_event_type = SUPPORT_NOTIFICATION_HISTORY_EVENTS.get(
+        event,
+        ("support_notification_delivered", "support_notification_failed"),
+    )
+
+    def deliver() -> None:
+        try:
+            result = send_support_notification_webhook(payload)
+        except Exception:
+            result = {"configured": True, "delivered": False, "status": None, "response": None}
+
+        delivered_at = datetime.now(timezone.utc)
+        delivered = bool(result.get("delivered"))
+        if delivered and sent_metadata_key:
+            try:
+                persist_ticket_metadata_patch(ticket_id, {sent_metadata_key: serialize_datetime_value(delivered_at)})
+            except Exception:
+                logger.warning(
+                    "Failed to persist support notification metadata for ticket %s",
+                    ticket_public_id,
+                    exc_info=True,
+                )
+
+        try:
+            insert_history_event(
+                ticket_id,
+                delivered_event_type if delivered else failed_event_type,
+                {"role": "system", "label": "support_notification"},
+                {
+                    "event": event,
+                    "ticketId": ticket_public_id,
+                    "recipientType": payload.get("recipientType"),
+                    "requesterName": payload.get("requester", {}).get("name"),
+                    "requesterEmail": payload.get("requester", {}).get("email"),
+                    "webhookConfigured": bool(result.get("configured")),
+                    "webhookDelivered": delivered,
+                    "webhookStatus": result.get("status"),
+                    "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record support notification history for ticket %s",
+                ticket_public_id,
+                exc_info=True,
+            )
+
+    thread = threading.Thread(
+        target=deliver,
+        name=f"support-notification-{event}-{ticket_public_id}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def should_notify_quick_ticket_submitted(
+    ticket: dict[str, Any],
+    *,
+    previous_status: Any,
+    previous_status_reason: Any,
+    next_status: Any,
+    next_status_reason: Any,
+) -> bool:
+    if is_coverage_ticket_record(ticket):
+        return False
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    if metadata.get(QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+
+    was_quick_ticket = sanitize_text(previous_status) == "Pending" and is_quick_ticket_status_reason(previous_status_reason)
+    is_now_quick_ticket = sanitize_text(next_status) == "Pending" and is_quick_ticket_status_reason(next_status_reason)
+    return is_now_quick_ticket and not was_quick_ticket
+
+
+def should_notify_quick_ticket_closed(
+    ticket: dict[str, Any],
+    *,
+    previous_status: Any,
+    previous_status_reason: Any,
+    next_status: Any,
+) -> bool:
+    if is_coverage_ticket_record(ticket):
+        return False
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    if metadata.get(QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+
+    return (
+        sanitize_text(previous_status) != "Closed"
+        and sanitize_text(next_status) == "Closed"
+        and is_quick_ticket_status_reason(previous_status_reason)
+    )
+
+
+def queue_quick_ticket_submitted_notification(ticket: dict[str, Any], *, status: str, status_reason: str) -> None:
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+        ticket,
+        status=status,
+        status_reason=status_reason,
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+        payload=payload,
+        sent_metadata_key=QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
+
+
+def queue_quick_ticket_closed_notification(ticket: dict[str, Any], *, status: str, status_reason: str, closed_at: Any = None) -> None:
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED,
+        ticket,
+        status=status,
+        status_reason=status_reason,
+        closed_at=closed_at or datetime.now(timezone.utc),
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED,
+        payload=payload,
+        sent_metadata_key=QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
+
+
+def should_notify_live_agent_unavailable(ticket: dict[str, Any], *, assigned_agent_id: Any) -> bool:
+    if assigned_agent_id:
+        return False
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    if metadata.get(LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+
+    return True
+
+
+def queue_live_agent_unavailable_notification(ticket: dict[str, Any], *, requested_at: Any) -> None:
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE,
+        ticket,
+        requested_at=requested_at,
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE,
+        payload=payload,
+        sent_metadata_key=LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
+
+
 def build_derived_coverage_tutor_choice_card(
     *,
     ticket_public_id: str,
@@ -2730,6 +3420,8 @@ def build_derived_coverage_tutor_choice_card(
         "note": "",
         "tutor": parsed_inquiry.get("tutor") or "",
         "tutorEmail": "",
+        "coach": "",
+        "coachEmail": "",
         "sessionDetails": build_coverage_session_details_from_inquiry(inquiry),
         "replyText": "",
         "requestStatus": "requested",
@@ -2806,14 +3498,6 @@ def does_coverage_reply_card_match_outcome(card: dict[str, Any], outcome: str) -
     return False
 
 
-def get_coverage_reply_card_outcome(card: dict[str, Any]) -> str:
-    if does_coverage_reply_card_match_outcome(card, "accepted"):
-        return "accepted"
-    if does_coverage_reply_card_match_outcome(card, "rejected"):
-        return "rejected"
-    return ""
-
-
 def find_latest_submitted_coverage_tutor_choice_card(cards: list[dict[str, Any]]) -> dict[str, Any] | None:
     tutor_choice_cards = [
         normalize_json_object(card)
@@ -2854,28 +3538,6 @@ def find_coverage_reply_card_for_tutor_choice(
             sanitize_text(normalize_json_object(card).get("type")) == "tutor_reply"
             and sanitize_text(normalize_json_object(card).get("relatedTutorChoiceCardId")) == normalized_related_id
             and does_coverage_reply_card_match_outcome(normalize_json_object(card), outcome)
-        )
-    ]
-    if not reply_cards:
-        return None
-
-    return max(
-        reply_cards,
-        key=lambda card: (
-            get_coverage_workflow_card_sort_timestamp(card),
-            sanitize_text(card.get("id")),
-        ),
-    )
-
-
-def find_latest_coverage_reply_card_for_tutor_choice(cards: list[dict[str, Any]], related_tutor_choice_card_id: Any) -> dict[str, Any] | None:
-    normalized_related_id = sanitize_text(related_tutor_choice_card_id)
-    reply_cards = [
-        normalize_json_object(card)
-        for card in cards
-        if (
-            sanitize_text(normalize_json_object(card).get("type")) == "tutor_reply"
-            and sanitize_text(normalize_json_object(card).get("relatedTutorChoiceCardId")) == normalized_related_id
         )
     ]
     if not reply_cards:
@@ -3023,6 +3685,12 @@ def derive_coverage_tutor_response_state(
     tutor_email = (
         sanitize_text(latest_response.get("tutorEmail")) if latest_response_matches_current and latest_response else ""
     ) or sanitize_text(existing_reply_card.get("tutorEmail") if existing_reply_card else "") or sanitize_text(tutor_choice_card.get("tutorEmail"))
+    coach = (
+        sanitize_text(latest_response.get("coach")) if latest_response_matches_current and latest_response else ""
+    ) or sanitize_text(existing_reply_card.get("coach") if existing_reply_card else "") or sanitize_text(tutor_choice_card.get("coach"))
+    coach_email = (
+        sanitize_text(latest_response.get("coachEmail")) if latest_response_matches_current and latest_response else ""
+    ) or sanitize_text(existing_reply_card.get("coachEmail") if existing_reply_card else "") or sanitize_text(tutor_choice_card.get("coachEmail"))
     effective_reply_card_id = sanitize_text(existing_reply_card.get("id") if existing_reply_card else "") or build_derived_coverage_tutor_reply_card_id(
         related_tutor_choice_card_id,
         outcome,
@@ -3034,6 +3702,8 @@ def derive_coverage_tutor_response_state(
         "cardId": effective_reply_card_id,
         "tutor": tutor,
         "tutorEmail": tutor_email,
+        "coach": coach,
+        "coachEmail": coach_email,
         "sessionDetails": session_details,
         "replyText": reply_text,
         "sessionStartAt": session_start_at,
@@ -3068,6 +3738,8 @@ def derive_coverage_tutor_response_state(
         "updatedAt": responded_at,
         "tutor": tutor,
         "tutorEmail": tutor_email,
+        "coach": coach,
+        "coachEmail": coach_email,
         "sessionDetails": session_details or sanitize_text(tutor_choice_card.get("sessionDetails")),
         "sessionStartAt": session_start_at or serialize_datetime_value(coerce_datetime(tutor_choice_card.get("sessionStartAt"))),
         "sessionEndAt": session_end_at or serialize_datetime_value(coerce_datetime(tutor_choice_card.get("sessionEndAt"))),
@@ -3213,6 +3885,8 @@ def reconcile_coverage_tutor_requests_from_request_history(
                     "note": "",
                     "tutor": sanitize_text(payload.get("tutor")),
                     "tutorEmail": sanitize_text(payload.get("tutorEmail")),
+                    "coach": sanitize_text(payload.get("coach")),
+                    "coachEmail": sanitize_text(payload.get("coachEmail")),
                     "sessionDetails": sanitize_text(payload.get("sessionDetails")),
                     "replyText": "",
                     "requestStatus": "requested",
@@ -3274,6 +3948,8 @@ def reconcile_coverage_tutor_requests_from_request_history(
             **normalized_card,
             "tutor": sanitize_text(normalized_card.get("tutor")) or sanitize_text(payload.get("tutor")),
             "tutorEmail": sanitize_text(normalized_card.get("tutorEmail")) or sanitize_text(payload.get("tutorEmail")),
+            "coach": sanitize_text(normalized_card.get("coach")) or sanitize_text(payload.get("coach")),
+            "coachEmail": sanitize_text(normalized_card.get("coachEmail")) or sanitize_text(payload.get("coachEmail")),
             "sessionDetails": sanitize_text(normalized_card.get("sessionDetails")) or sanitize_text(payload.get("sessionDetails")),
             "locked": True,
             "requestStatus": current_request_status if current_request_status in {"accepted", "refused"} else "requested",
@@ -3628,6 +4304,44 @@ def fetch_legacy_support_user_by_id(user_id: Any) -> dict[str, Any] | None:
     return _fetch_legacy_support_user_by_lookup(str(user_id), lookup_kind="id")
 
 
+def legacy_auth_user_has_group_by_email(email: Any, group_name: Any) -> bool:
+    normalized_email = normalize_email(email)
+    normalized_group_name = sanitize_text(group_name).lower()
+    auth_database_url = get_support_auth_database_url()
+    if not normalized_email or not normalized_group_name or not auth_database_url:
+        return False
+
+    with psycopg.connect(auth_database_url) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM auth_user u
+                INNER JOIN auth_user_groups ug
+                  ON ug.user_id = u.id
+                INNER JOIN auth_group g
+                  ON g.id = ug.group_id
+                WHERE LOWER(TRIM(u.email)) = %s
+                  AND LOWER(TRIM(g.name)) = %s
+                  AND u.is_active = TRUE
+                LIMIT 1
+                """,
+                [normalized_email, normalized_group_name],
+            )
+            return bool(cursor.fetchone())
+
+
+def has_public_requester_coach_access(email: Any) -> bool:
+    return legacy_auth_user_has_group_by_email(email, COACH_ACCESS_GROUP_NAME)
+
+
+def apply_public_requester_role_overrides(email: Any, requester_role: Any) -> str:
+    normalized_role = normalize_public_requester_role(requester_role)
+    if normalized_role == ROLE_USER and has_public_requester_coach_access(email):
+        return ROLE_COACH
+    return normalized_role
+
+
 def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None:
     (
         user_id,
@@ -3941,15 +4655,6 @@ def find_learner_by_email(email: str) -> dict[str, Any] | None:
     )
 
 
-def is_kbc_learner_record(learner: dict[str, Any] | None) -> bool:
-    if not learner:
-        return False
-
-    source = sanitize_text(learner.get("source")).lower()
-    metadata = normalize_json_object(learner.get("metadata"))
-    return source == "legacy_kbc_users_data" or sanitize_text(metadata.get("legacy_source")).lower() == "kbc_users_data"
-
-
 def find_kbc_learner_by_email(email: str) -> dict[str, Any] | None:
     legacy_learner = fetch_legacy_learner_by_email(email)
     if not legacy_learner:
@@ -4010,13 +4715,44 @@ def get_ticket_requester_role(ticket_metadata: Any, *, default: str = ROLE_USER)
     return normalize_public_requester_role(normalized_metadata.get("requester_role"), default=default)
 
 
-def is_quick_ticket_only_requester_role(value: Any) -> bool:
+def promote_ticket_requester_role_if_needed(
+    ticket: dict[str, Any],
+    *,
+    requester_email: Any,
+    default_role: Any = ROLE_USER,
+) -> tuple[dict[str, Any], str]:
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    current_role = get_ticket_requester_role(ticket_metadata, default=default_role)
+    effective_role = apply_public_requester_role_overrides(requester_email, current_role)
+    normalized_default_role = normalize_public_requester_role(default_role, default=current_role)
+    if current_role == ROLE_USER and normalized_default_role != ROLE_USER:
+        effective_role = normalized_default_role
+    if effective_role != ROLE_COACH or current_role == ROLE_COACH:
+        return ticket, effective_role
+
+    ticket_id = parse_int(ticket.get("id"), 0)
+    if ticket_id <= 0:
+        return ticket, effective_role
+
+    updated_metadata = dict(ticket_metadata)
+    updated_metadata["requester_role"] = ROLE_COACH
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tickets
+            SET metadata = %s::jsonb,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            [json.dumps(updated_metadata), ticket_id],
+        )
+
+    return {**ticket, "metadata": updated_metadata}, effective_role
+
+
+def is_coach_requester_role(value: Any) -> bool:
     return sanitize_text(value).lower() == ROLE_COACH
-
-
-def ensure_ticket_allows_chat_features(ticket_metadata: Any) -> None:
-    if is_quick_ticket_only_requester_role(get_ticket_requester_role(ticket_metadata)):
-        raise ApiError(403, "Coach accounts can only submit quick tickets or quick calls from the support portal.")
 
 
 def serialize_requested_date(value: Any) -> str:
@@ -4031,6 +4767,11 @@ def serialize_requested_time(value: Any) -> str:
         return value.strftime("%H:%M")
     normalized_value = sanitize_text(value)
     return normalized_value[:5] if normalized_value else ""
+
+
+def normalize_support_booking_return_path(value: Any) -> str:
+    normalized_value = sanitize_text(value)
+    return normalized_value if normalized_value in {"/support/chat", "/support/options"} else ""
 
 
 def get_latest_ticket_booking_summary(ticket_id: int) -> dict[str, Any] | None:
@@ -4056,16 +4797,21 @@ def get_latest_ticket_booking_summary(ticket_id: int) -> dict[str, Any] | None:
     requested_time = serialize_requested_time(booking_row.get("requested_time"))
     reservation_confirmed = normalize_bool(metadata.get("reservation_confirmed")) or sanitize_text(booking_row.get("status")).lower() == "scheduled"
     meeting_join_url = sanitize_text(metadata.get("meeting_join_url")) or None
+    return_path = normalize_support_booking_return_path(metadata.get("return_path"))
 
     if not requested_date or not requested_time:
         return None
 
-    return {
+    booking_summary = {
         "requestedDate": requested_date,
         "requestedTime": requested_time,
         "reservationConfirmed": reservation_confirmed,
         "meetingJoinUrl": meeting_join_url,
     }
+    if return_path:
+        booking_summary["returnPath"] = return_path
+
+    return booking_summary
 
 
 def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | None:
@@ -4194,6 +4940,67 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         ) if is_active and is_staff_account else "Off",
         "selectedConsoleStatus": selected_console_status,
     }
+
+
+def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+    if not account:
+        return False
+
+    is_active = normalize_bool(account.get("is_active")) if "is_active" in account else True
+    if not is_active:
+        return False
+
+    account_scope = normalize_account_scope(account.get("account_scope"), fallback_role=account.get("role"))
+    if account_scope != ACCOUNT_SCOPE_STAFF:
+        return False
+
+    metadata = normalize_json_object(account.get("metadata"))
+    return normalize_bool(metadata.get("legacy_support_access"))
+
+
+def is_booking_in_progress_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    if not ticket:
+        return False
+
+    if normalize_bool(ticket.get("is_archived")):
+        return False
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return (
+        sanitize_text(ticket.get("status")) == "Open"
+        and sanitize_text(metadata.get(SUPPORT_FLOW_STAGE_METADATA_KEY)) == SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS
+    )
+
+
+def is_cancelled_direct_booking_waiting_for_support_route(ticket: dict[str, Any] | None) -> bool:
+    if not ticket:
+        return False
+
+    if normalize_bool(ticket.get("is_archived")):
+        return False
+
+    if sanitize_text(ticket.get("status")) != "Open":
+        return False
+
+    if sanitize_text(ticket.get("status_reason")):
+        return False
+
+    if is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")):
+        return False
+
+    latest_session_status = sanitize_text(ticket.get("latest_session_request_status")).lower()
+    latest_session_metadata = normalize_json_object(ticket.get("latest_session_request_metadata"))
+    return (
+        latest_session_status == "cancelled"
+        and normalize_support_booking_return_path(latest_session_metadata.get("return_path")) == "/support/options"
+    )
+
+
+def is_admin_hidden_support_flow_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    return (
+        is_booking_in_progress_ticket_record(ticket)
+        or is_cancelled_direct_booking_waiting_for_support_route(ticket)
+    )
 
 
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
@@ -4429,6 +5236,9 @@ def build_chat_history_event_notice(event_type: Any, payload: Any) -> str:
 def build_chat_timeline_entries(
     message_rows: list[dict[str, Any]],
     history_rows: list[dict[str, Any]],
+    *,
+    ticket_public_id: str = "",
+    admin_view: bool = False,
 ) -> list[dict[str, Any]]:
     timeline_entries: list[dict[str, Any]] = []
     assignment_notice_texts = {
@@ -4440,6 +5250,7 @@ def build_chat_timeline_entries(
 
     for row in message_rows:
         message_metadata = normalize_json_object(row.get("metadata"))
+        client_message_id = sanitize_text(message_metadata.get(CHAT_MESSAGE_ID_METADATA_KEY)) or f"message-{row['id']}"
         is_bot_message = (
             sanitize_text(row.get("role")).lower() == "assistant"
             and sanitize_text(message_metadata.get("original_sender")).lower() == "bot"
@@ -4450,10 +5261,16 @@ def build_chat_timeline_entries(
         timeline_entries.append(
             {
                 "id": str(row["id"]),
+                "clientMessageId": client_message_id,
                 "role": row["role"],
                 "metadata": message_metadata,
                 "source": "intro" if str(row.get("id", "")).startswith("intro-") else "message",
                 "text": row["content"],
+                "attachments": serialize_chat_message_attachments_from_metadata(
+                    ticket_public_id,
+                    message_metadata,
+                    admin_view=admin_view,
+                ),
                 "timestamp": sanitize_text(message_metadata.get("client_timestamp"))
                 or format_chat_message_timestamp(row.get("created_at")),
                 "created_at": row.get("created_at"),
@@ -4469,10 +5286,12 @@ def build_chat_timeline_entries(
         timeline_entries.append(
             {
                 "id": f"history-{row['id']}",
+                "clientMessageId": None,
                 "role": "assistant",
                 "metadata": {"original_sender": "bot", "source_event": sanitize_text(row.get("event_type")).lower()},
                 "source": "history_event",
                 "text": notice_text,
+                "attachments": [],
                 "timestamp": format_chat_message_timestamp(row.get("created_at")),
                 "created_at": row.get("created_at"),
                 "sort_priority": 1,
@@ -4507,18 +5326,70 @@ def build_chat_timeline_entries(
     return deduped_entries
 
 
+def serialize_chat_message_attachments_from_metadata(
+    public_id: str,
+    metadata: Any,
+    *,
+    admin_view: bool = False,
+) -> list[dict[str, Any]]:
+    attachment_payloads = normalize_json_object(metadata).get(CHAT_ATTACHMENTS_METADATA_KEY)
+    if not isinstance(attachment_payloads, list):
+        return []
+
+    serialized_attachments: list[dict[str, Any]] = []
+    seen_attachment_ids: set[str] = set()
+    for attachment_payload in attachment_payloads:
+        if not isinstance(attachment_payload, dict):
+            continue
+
+        attachment = normalize_chat_attachment_row_payload(attachment_payload)
+        client_attachment_id = attachment["clientAttachmentId"]
+        if not client_attachment_id or client_attachment_id in seen_attachment_ids:
+            continue
+
+        seen_attachment_ids.add(client_attachment_id)
+        storage_url = attachment.get("storageUrl")
+        serialized_attachments.append(
+            {
+                "id": client_attachment_id,
+                "clientAttachmentId": client_attachment_id,
+                "name": attachment["name"],
+                "mimeType": attachment.get("mimeType"),
+                "size": attachment.get("size") or 0,
+                "storageUrl": (
+                    build_admin_ticket_chat_attachment_download_url(public_id, client_attachment_id)
+                    if admin_view and storage_url
+                    else (
+                        build_ticket_chat_attachment_download_url(public_id, client_attachment_id)
+                        if storage_url
+                        else None
+                    )
+                ),
+            }
+        )
+
+    return serialized_attachments
+
+
 def serialize_chat_timeline_rows(
+    public_id: str,
     message_rows: list[dict[str, Any]],
     history_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    timeline_entries = build_chat_timeline_entries(message_rows, history_rows)
+    timeline_entries = build_chat_timeline_entries(
+        message_rows,
+        history_rows,
+        ticket_public_id=public_id,
+    )
 
     return [
         {
             "id": entry["id"],
+            "clientMessageId": entry.get("clientMessageId"),
             "sender": map_role_to_sender(entry["role"], entry.get("metadata")),
             "source": entry.get("source") or "message",
             "text": entry["text"],
+            "attachments": entry.get("attachments") or [],
             "timestamp": entry["timestamp"],
         }
         for entry in timeline_entries
@@ -4526,18 +5397,26 @@ def serialize_chat_timeline_rows(
 
 
 def serialize_admin_chat_timeline_rows(
+    public_id: str,
     message_rows: list[dict[str, Any]],
     history_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    timeline_entries = build_chat_timeline_entries(message_rows, history_rows)
+    timeline_entries = build_chat_timeline_entries(
+        message_rows,
+        history_rows,
+        ticket_public_id=public_id,
+        admin_view=True,
+    )
 
     return [
         {
             "id": int(entry["id"]) if isinstance(entry.get("id"), int) else str(entry.get("id")),
+            "clientMessageId": entry.get("clientMessageId"),
             "role": entry["role"],
             "source": entry.get("source") or "message",
             "senderLabel": to_sender_label(entry["role"], entry.get("metadata")),
             "text": entry["text"],
+            "attachments": entry.get("attachments") or [],
             "createdAt": entry["created_at"],
         }
         for entry in timeline_entries
@@ -4879,13 +5758,26 @@ def get_microsoft_booking_staff_availability(
     requested_datetime: datetime,
     duration_minutes: int,
 ) -> tuple[bool, bool, int | None, Any]:
+    return get_microsoft_booking_staff_availability_window(
+        access_token,
+        staff_ids,
+        requested_datetime,
+        requested_datetime + timedelta(minutes=duration_minutes),
+    )
+
+
+def get_microsoft_booking_staff_availability_window(
+    access_token: str,
+    staff_ids: list[str],
+    window_start: datetime,
+    window_end: datetime,
+) -> tuple[bool, bool, int | None, Any]:
     business_id = urllib_parse.quote(sanitize_text(settings.BOOKING_BUSINESS_ID), safe="")
     availability_url = f"{MICROSOFT_GRAPH_V1_BASE_URL}/solutions/bookingBusinesses/{business_id}/getStaffAvailability"
-    booking_end = requested_datetime + timedelta(minutes=duration_minutes)
     payload = {
         "staffIds": staff_ids,
-        "startDateTime": build_microsoft_graph_date_time_time_zone(requested_datetime, MICROSOFT_GRAPH_BOOKINGS_TIMEZONE),
-        "endDateTime": build_microsoft_graph_date_time_time_zone(booking_end, MICROSOFT_GRAPH_BOOKINGS_TIMEZONE),
+        "startDateTime": build_microsoft_graph_date_time_time_zone(window_start, MICROSOFT_GRAPH_BOOKINGS_TIMEZONE),
+        "endDateTime": build_microsoft_graph_date_time_time_zone(window_end, MICROSOFT_GRAPH_BOOKINGS_TIMEZONE),
     }
     return post_json_request(
         availability_url,
@@ -5030,6 +5922,184 @@ def get_microsoft_booking_service_details(access_token: str) -> tuple[bool, bool
     return execute_http_request(request)
 
 
+def resolve_support_session_client_timezone(client_time_zone: Any) -> ZoneInfo:
+    normalized_time_zone = sanitize_text(client_time_zone) or settings.TIME_ZONE
+    try:
+        return ZoneInfo(normalized_time_zone)
+    except Exception:
+        return ZoneInfo(settings.TIME_ZONE)
+
+
+def format_support_session_time_label(value: datetime) -> str:
+    hour = value.hour
+    minute = value.minute
+    period = "AM" if hour < 12 else "PM"
+    hour_12 = hour % 12 or 12
+    return f"{hour_12}:{minute:02d} {period}"
+
+
+def build_support_session_candidate_slots(
+    date_value: str,
+    client_time_zone: Any = "",
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", sanitize_text(date_value)):
+        return []
+
+    slot_interval = max(int(settings.SUPPORT_SESSION_SLOT_INTERVAL_MINUTES or 30), 1)
+    client_zone = resolve_support_session_client_timezone(client_time_zone)
+    current_time = now or datetime.now(tz=ZoneInfo(settings.TIME_ZONE))
+    candidates: list[dict[str, Any]] = []
+
+    for minutes in range(0, 24 * 60, slot_interval):
+        hours = minutes // 60
+        mins = minutes % 60
+        value = f"{hours:02d}:{mins:02d}"
+        parsed_datetime = parse_local_datetime(date_value, value)
+
+        if not parsed_datetime:
+            continue
+
+        requested_datetime = parsed_datetime.replace(tzinfo=client_zone)
+        if (requested_datetime - current_time).total_seconds() <= SUPPORT_SESSION_LEAD_TIME_SECONDS:
+            continue
+
+        if not is_within_support_session_window(requested_datetime):
+            continue
+
+        candidates.append(
+            {
+                "value": value,
+                "label": format_support_session_time_label(requested_datetime),
+                "requestedDateTime": requested_datetime,
+            }
+        )
+
+    return candidates
+
+
+def serialize_support_session_time_options(candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {
+            "value": sanitize_text(candidate.get("value")),
+            "label": sanitize_text(candidate.get("label")),
+        }
+        for candidate in candidates
+        if sanitize_text(candidate.get("value")) and sanitize_text(candidate.get("label"))
+    ]
+
+
+def get_microsoft_booking_available_time_options(
+    date_value: str,
+    client_time_zone: Any = "",
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, str]] | None:
+    if not is_direct_microsoft_booking_configured():
+        return None
+
+    _, token_delivered, _, token_payload = request_microsoft_graph_access_token()
+    access_token = (
+        sanitize_text(token_payload.get("access_token"))
+        if token_delivered and isinstance(token_payload, dict)
+        else ""
+    )
+    if not access_token:
+        return None
+
+    _, service_delivered, _, service_payload = get_microsoft_booking_service_details(access_token)
+    if not service_delivered or not isinstance(service_payload, dict):
+        return None
+
+    staff_ids = [sanitize_text(staff_id) for staff_id in (service_payload.get("staffMemberIds") or []) if sanitize_text(staff_id)]
+    if not staff_ids:
+        return None
+
+    duration_minutes = get_direct_booking_duration_minutes(service_payload)
+    candidates = build_support_session_candidate_slots(date_value, client_time_zone, now=now)
+    if not candidates:
+        return []
+
+    window_start = candidates[0]["requestedDateTime"]
+    window_end = candidates[-1]["requestedDateTime"] + timedelta(minutes=duration_minutes)
+    _, availability_delivered, _, availability_payload = get_microsoft_booking_staff_availability_window(
+        access_token,
+        staff_ids,
+        window_start,
+        window_end,
+    )
+    if not availability_delivered or not isinstance(availability_payload, dict):
+        return None
+
+    available_candidates: list[dict[str, Any]] = []
+    staff_availability_items = [
+        availability_item
+        for staff_item in (availability_payload.get("value") or [])
+        if isinstance(staff_item, dict)
+        for availability_item in (staff_item.get("availabilityItems") or [])
+    ]
+
+    for candidate in candidates:
+        requested_datetime = candidate["requestedDateTime"]
+        slot_start = parse_microsoft_graph_local_datetime(
+            build_microsoft_graph_date_time_time_zone(requested_datetime, MICROSOFT_GRAPH_BOOKINGS_TIMEZONE)["dateTime"]
+        )
+        slot_end = parse_microsoft_graph_local_datetime(
+            build_microsoft_graph_date_time_time_zone(
+                requested_datetime + timedelta(minutes=duration_minutes),
+                MICROSOFT_GRAPH_BOOKINGS_TIMEZONE,
+            )["dateTime"]
+        )
+
+        if slot_start and slot_end and any(
+            availability_window_covers_slot(availability_item, slot_start, slot_end)
+            for availability_item in staff_availability_items
+        ):
+            available_candidates.append(candidate)
+
+    return serialize_support_session_time_options(available_candidates)
+
+
+def get_support_session_availability_response(public_id: str, date_value: str, client_time_zone: str = "") -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    normalized_date = sanitize_text(date_value)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", normalized_date):
+        raise ApiError(400, "Please choose a valid session date.")
+
+    ticket = run_query_one(
+        """
+        SELECT id, public_id
+        FROM tickets
+        WHERE public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    graph_options = get_microsoft_booking_available_time_options(normalized_date, client_time_zone)
+    if graph_options is not None:
+        return {
+            "ok": True,
+            "date": normalized_date,
+            "source": "microsoft_graph",
+            "options": graph_options,
+        }
+
+    return {
+        "ok": True,
+        "date": normalized_date,
+        "source": "fallback",
+        "options": serialize_support_session_time_options(
+            build_support_session_candidate_slots(normalized_date, client_time_zone)
+        ),
+    }
+
+
 def should_retry_with_microsoft_graph_beta(status: int | None, response_payload: Any) -> bool:
     if status != 500 or not isinstance(response_payload, dict):
         return False
@@ -5138,26 +6208,274 @@ def update_support_session_request_record(
         )
 
 
+def serialize_chat_message_attachment_metadata_payload(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "clientAttachmentId": sanitize_text(attachment.get("client_attachment_id")),
+            "name": sanitize_support_attachment_name(attachment.get("name")),
+            "mimeType": sanitize_text(attachment.get("mime_type")) or None,
+            "size": int(attachment["size"]) if isinstance(attachment.get("size"), int) else None,
+            "storageUrl": sanitize_text(attachment.get("storage_url")) or None,
+            "metadata": normalize_json_object(attachment.get("metadata")),
+        }
+        for attachment in attachments
+        if sanitize_text(attachment.get("client_attachment_id"))
+    ]
+
+
+def normalize_chat_message_attachments(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    normalized_attachments: list[dict[str, Any]] = []
+    seen_attachment_ids: set[str] = set()
+    for attachment in value:
+        if not isinstance(attachment, dict):
+            continue
+
+        normalized_attachment = normalize_chat_attachment_row_payload(attachment)
+        client_attachment_id = normalized_attachment["clientAttachmentId"]
+        if not client_attachment_id or client_attachment_id in seen_attachment_ids:
+            continue
+
+        seen_attachment_ids.add(client_attachment_id)
+        normalized_attachments.append(
+            {
+                "client_attachment_id": client_attachment_id,
+                "name": normalized_attachment["name"],
+                "mime_type": normalized_attachment.get("mimeType"),
+                "size": normalized_attachment.get("size"),
+                "storage_url": normalized_attachment.get("storageUrl"),
+                "metadata": normalize_json_object(normalized_attachment.get("metadata")),
+            }
+        )
+
+    return normalized_attachments
+
+
 def normalize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
 
     for message in messages or []:
         content = sanitize_text(message.get("text"))
-        if not content:
+        attachments = normalize_chat_message_attachments(message.get("attachments"))
+        if not content and not attachments:
             continue
+
+        client_message_id = sanitize_text(message.get("clientMessageId") or message.get("id")) or f"message-{uuid4().hex}"
+        metadata = {
+            "original_sender": sanitize_text(message.get("sender")),
+            "client_timestamp": sanitize_text(message.get("timestamp")),
+            CHAT_MESSAGE_ID_METADATA_KEY: client_message_id,
+        }
+        if attachments:
+            metadata[CHAT_ATTACHMENTS_METADATA_KEY] = serialize_chat_message_attachment_metadata_payload(attachments)
 
         normalized.append(
             {
+                "client_message_id": client_message_id,
                 "role": map_sender_to_role(sanitize_text(message.get("sender"))),
                 "content": content,
-                "metadata": {
-                    "original_sender": sanitize_text(message.get("sender")),
-                    "client_timestamp": sanitize_text(message.get("timestamp")),
-                },
+                "attachments": attachments,
+                "metadata": metadata,
             }
         )
 
     return normalized
+
+
+def sync_chat_message_attachments(
+    ticket_public_id: str,
+    conversation_id: int,
+    normalized_messages: list[dict[str, Any]],
+    uploaded_files: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    uploaded_files = list(uploaded_files or [])
+    attachment_specs: list[dict[str, Any]] = []
+    attachment_owner_by_id: dict[str, str] = {}
+
+    for message in normalized_messages:
+        client_message_id = sanitize_text(message.get("client_message_id"))
+        message_attachments: list[dict[str, Any]] = []
+        for attachment in message.get("attachments") or []:
+            client_attachment_id = sanitize_text(attachment.get("client_attachment_id"))
+            if not client_attachment_id:
+                continue
+
+            previous_owner = attachment_owner_by_id.get(client_attachment_id)
+            if previous_owner and previous_owner != client_message_id:
+                raise ApiError(400, "Each chat attachment must belong to only one message.")
+
+            attachment_owner_by_id[client_attachment_id] = client_message_id
+            attachment_spec = {
+                "client_message_id": client_message_id,
+                "client_attachment_id": client_attachment_id,
+                "name": sanitize_support_attachment_name(attachment.get("name")),
+                "mime_type": sanitize_text(attachment.get("mime_type")) or None,
+                "size": int(attachment["size"]) if isinstance(attachment.get("size"), int) else None,
+                "storage_url": sanitize_text(attachment.get("storage_url")) or None,
+                "metadata": normalize_json_object(attachment.get("metadata")),
+            }
+            message_attachments.append(attachment_spec)
+            attachment_specs.append(attachment_spec)
+
+        message["attachments"] = message_attachments
+
+    pending_attachment_specs = [
+        attachment
+        for attachment in attachment_specs
+        if not sanitize_text(attachment.get("storage_url"))
+    ]
+    if len(pending_attachment_specs) != len(uploaded_files):
+        raise ApiError(400, "Chat attachment upload data is incomplete. Please try attaching the files again.")
+
+    stored_storage_keys: list[str] = []
+    try:
+        for attachment_spec, uploaded_file in zip(pending_attachment_specs, uploaded_files):
+            stored_attachment = store_uploaded_message_attachment(ticket_public_id, uploaded_file)
+            stored_storage_key = sanitize_text(stored_attachment.get("storageKey"))
+            if stored_storage_key:
+                stored_storage_keys.append(stored_storage_key)
+
+            attachment_spec["name"] = stored_attachment["name"]
+            attachment_spec["mime_type"] = stored_attachment.get("mimeType")
+            attachment_spec["size"] = stored_attachment.get("size")
+            attachment_spec["storage_url"] = stored_storage_key or None
+            attachment_spec["metadata"] = {
+                **normalize_json_object(attachment_spec.get("metadata")),
+                **normalize_json_object(stored_attachment.get("metadata")),
+            }
+
+        existing_rows = run_query(
+            """
+            SELECT client_message_id, client_attachment_id, file_name, mime_type, file_size, storage_url, metadata
+            FROM message_attachments
+            WHERE conversation_id = %s
+            ORDER BY created_at ASC, id ASC
+            """,
+            [conversation_id],
+        )
+        existing_rows_by_attachment_id = {
+            sanitize_text(row.get("client_attachment_id")): row
+            for row in existing_rows
+            if sanitize_text(row.get("client_attachment_id"))
+        }
+
+        prepared_attachment_rows: list[dict[str, Any]] = []
+        referenced_attachment_ids: set[str] = set()
+        for attachment_spec in attachment_specs:
+            client_attachment_id = sanitize_text(attachment_spec.get("client_attachment_id"))
+            if not client_attachment_id or client_attachment_id in referenced_attachment_ids:
+                continue
+
+            referenced_attachment_ids.add(client_attachment_id)
+            existing_row = existing_rows_by_attachment_id.get(client_attachment_id) or {}
+            storage_url = sanitize_text(attachment_spec.get("storage_url")) or sanitize_text(existing_row.get("storage_url"))
+            if not storage_url:
+                raise ApiError(400, "One or more chat attachments are missing an uploaded file.")
+
+            existing_size = existing_row.get("file_size")
+            prepared_attachment_rows.append(
+                {
+                    "client_message_id": sanitize_text(attachment_spec.get("client_message_id")),
+                    "client_attachment_id": client_attachment_id,
+                    "file_name": sanitize_support_attachment_name(attachment_spec.get("name") or existing_row.get("file_name")),
+                    "mime_type": sanitize_text(attachment_spec.get("mime_type") or existing_row.get("mime_type")) or None,
+                    "file_size": (
+                        int(attachment_spec["size"])
+                        if isinstance(attachment_spec.get("size"), int)
+                        else (
+                            int(existing_size)
+                            if isinstance(existing_size, (int, float))
+                            else None
+                        )
+                    ),
+                    "storage_url": storage_url,
+                    "metadata": {
+                        **normalize_json_object(existing_row.get("metadata")),
+                        **normalize_json_object(attachment_spec.get("metadata")),
+                        "clientMessageId": sanitize_text(attachment_spec.get("client_message_id")),
+                        "clientAttachmentId": client_attachment_id,
+                    },
+                }
+            )
+
+        attachments_by_message_id: dict[str, list[dict[str, Any]]] = {}
+        for attachment_row in prepared_attachment_rows:
+            attachments_by_message_id.setdefault(sanitize_text(attachment_row.get("client_message_id")), []).append(attachment_row)
+
+        for message in normalized_messages:
+            client_message_id = sanitize_text(message.get("client_message_id"))
+            message_attachments = attachments_by_message_id.get(client_message_id, [])
+            if message_attachments:
+                message["attachments"] = message_attachments
+                message["metadata"][CHAT_ATTACHMENTS_METADATA_KEY] = serialize_chat_message_attachment_metadata_payload(message_attachments)
+            else:
+                message["attachments"] = []
+                message["metadata"].pop(CHAT_ATTACHMENTS_METADATA_KEY, None)
+
+        replaced_storage_keys: set[str] = set()
+        pending_storage_keys_by_attachment_id = {
+            sanitize_text(attachment.get("client_attachment_id")): sanitize_text(attachment.get("storage_url"))
+            for attachment in pending_attachment_specs
+            if sanitize_text(attachment.get("client_attachment_id")) and sanitize_text(attachment.get("storage_url"))
+        }
+        for row in existing_rows:
+            client_attachment_id = sanitize_text(row.get("client_attachment_id"))
+            existing_storage_key = sanitize_text(row.get("storage_url"))
+            if not client_attachment_id or not existing_storage_key:
+                continue
+
+            if client_attachment_id not in referenced_attachment_ids:
+                replaced_storage_keys.add(existing_storage_key)
+                continue
+
+            replacement_storage_key = pending_storage_keys_by_attachment_id.get(client_attachment_id)
+            if replacement_storage_key and replacement_storage_key != existing_storage_key:
+                replaced_storage_keys.add(existing_storage_key)
+
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM message_attachments WHERE conversation_id = %s", [conversation_id])
+            for attachment_row in prepared_attachment_rows:
+                cursor.execute(
+                    """
+                    INSERT INTO message_attachments (
+                      conversation_id,
+                      client_message_id,
+                      client_attachment_id,
+                      file_name,
+                      mime_type,
+                      file_size,
+                      storage_url,
+                      metadata
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    [
+                        conversation_id,
+                        attachment_row["client_message_id"],
+                        attachment_row["client_attachment_id"],
+                        attachment_row["file_name"],
+                        attachment_row["mime_type"],
+                        attachment_row["file_size"],
+                        attachment_row["storage_url"],
+                        json.dumps(attachment_row["metadata"]),
+                    ],
+                )
+
+        if replaced_storage_keys:
+            transaction.on_commit(
+                lambda keys=tuple(replaced_storage_keys): [
+                    delete_support_attachment_file(storage_key)
+                    for storage_key in keys
+                ]
+            )
+    except Exception:
+        for storage_key in stored_storage_keys:
+            delete_support_attachment_file(storage_key)
+        raise
+
+    return normalized_messages
 
 
 def sync_conversation_messages(
@@ -5165,10 +6483,17 @@ def sync_conversation_messages(
     status: str,
     messages: list[dict[str, Any]],
     *,
+    ticket_public_id: str,
+    uploaded_files: list[Any] | None = None,
     conversation_metadata_patch: dict[str, Any] | None = None,
     reference_time: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    filtered_messages = normalize_chat_messages(messages)
+    filtered_messages = sync_chat_message_attachments(
+        ticket_public_id,
+        conversation_id,
+        normalize_chat_messages(messages),
+        uploaded_files=uploaded_files,
+    )
     persisted_at = reference_time or datetime.now(timezone.utc)
     conversation_metadata = {"synced_messages": len(filtered_messages), **(conversation_metadata_patch or {})}
 
@@ -5221,6 +6546,8 @@ def apply_ticket_chat_history_sync(
     status: str,
     status_reason: str | None,
     messages: list[dict[str, Any]],
+    ticket_public_id: str,
+    uploaded_files: list[Any] | None = None,
     conversation_metadata_patch: dict[str, Any] | None = None,
     reference_time: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], str, str, bool]:
@@ -5230,6 +6557,8 @@ def apply_ticket_chat_history_sync(
         int(ticket["conversation_id"]),
         status,
         messages,
+        ticket_public_id=ticket_public_id,
+        uploaded_files=uploaded_files,
         conversation_metadata_patch=conversation_metadata_patch,
         reference_time=persisted_at,
     )
@@ -5424,6 +6753,7 @@ def process_ticket_chat_inactivity(
             status="Closed",
             status_reason=STATUS_REASON_CLOSED_DUE_TO_INACTIVITY,
             messages=next_messages,
+            ticket_public_id=ticket["public_id"],
             conversation_metadata_patch={
                 INACTIVITY_WAITING_SINCE_METADATA_KEY: None,
                 INACTIVITY_REMINDER_SENT_AT_METADATA_KEY: None,
@@ -5446,6 +6776,7 @@ def process_ticket_chat_inactivity(
             status="Open",
             status_reason=ticket.get("status_reason") or "",
             messages=next_messages,
+            ticket_public_id=ticket["public_id"],
             conversation_metadata_patch={
                 INACTIVITY_WAITING_SINCE_METADATA_KEY: serialize_datetime_value(waiting_since),
                 INACTIVITY_REMINDER_SENT_AT_METADATA_KEY: serialize_datetime_value(reference_now),
@@ -5545,7 +6876,7 @@ def fetch_actor_by_username(username: str) -> dict[str, Any] | None:
 
     return run_query_one(
         """
-        SELECT id, username, full_name, role
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
         FROM support_accounts
         WHERE LOWER(username) = %s
         LIMIT 1
@@ -6084,9 +7415,10 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
     if local_learner:
         managed_account = fetch_public_requester_account_by_email(email)
         if managed_account and not is_auto_synced_learner_requester_account(managed_account):
+            requester_role = apply_public_requester_role_overrides(email, managed_account.get("role"))
             return {
                 "email": email,
-                "role": normalize_public_requester_role(managed_account.get("role")),
+                "role": requester_role,
                 "account": managed_account,
                 "learner": local_learner,
                 "display_name": (
@@ -6099,7 +7431,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
 
         return {
             "email": email,
-            "role": ROLE_USER,
+            "role": apply_public_requester_role_overrides(email, ROLE_USER),
             "account": None,
             "learner": local_learner,
             "display_name": sanitize_text(local_learner.get("full_name")) or email,
@@ -6112,7 +7444,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
 
     return {
         "email": email,
-        "role": ROLE_USER,
+        "role": apply_public_requester_role_overrides(email, ROLE_USER),
         "account": None,
         "learner": fetch_local_learner_by_email(email),
         "display_name": sanitize_text(entra_user.get("displayName")) or email,
@@ -6207,6 +7539,22 @@ def persist_agent_metadata(agent_id: int, metadata: dict[str, Any]) -> None:
             WHERE id = %s
             """,
             [json.dumps(metadata or {}), agent_id],
+        )
+
+
+def persist_ticket_metadata_patch(ticket_id: int, metadata_patch: dict[str, Any]) -> None:
+    if not metadata_patch:
+        return
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tickets
+            SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            [json.dumps(metadata_patch), ticket_id],
         )
 
 
@@ -7072,6 +8420,8 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           c.metadata AS conversation_metadata,
           c.chat_duration_minutes,
           c.last_message_at,
+          latest_session_request.status AS latest_session_request_status,
+          latest_session_request.metadata AS latest_session_request_metadata,
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
@@ -7085,6 +8435,13 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           ON l.id = t.learner_id
         LEFT JOIN conversations c
           ON c.id = t.conversation_id
+        LEFT JOIN LATERAL (
+          SELECT ssr.status, ssr.metadata
+          FROM support_session_requests ssr
+          WHERE ssr.ticket_id = t.id
+          ORDER BY ssr.created_at DESC, ssr.id DESC
+          LIMIT 1
+        ) latest_session_request ON TRUE
         LEFT JOIN support_accounts a
           ON a.id = t.assigned_agent_id
         LEFT JOIN support_accounts archived_by
@@ -7160,7 +8517,7 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
 
     return {
         "ticket": serialize_ticket_detail(ticket),
-        "chatHistory": serialize_admin_chat_timeline_rows(messages, chat_history_events),
+        "chatHistory": serialize_admin_chat_timeline_rows(ticket["public_id"], messages, chat_history_events),
         "attachments": [
             {
                 "id": int(row["id"]),
@@ -7246,6 +8603,11 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not existing_ticket:
         return response
 
+    existing_ticket, existing_ticket_requester_role = promote_ticket_requester_role_if_needed(
+        existing_ticket,
+        requester_email=email,
+        default_role=requester_role,
+    )
     existing_ticket_metadata = normalize_json_object(existing_ticket.get("metadata"))
     existing_ticket_requester_source = get_ticket_requester_source(
         existing_ticket_metadata,
@@ -7256,7 +8618,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         "learnerName": requester.get("display_name") or learner.get("full_name") or "",
         "requesterName": requester.get("display_name") or learner.get("full_name") or "",
         "email": learner["email"],
-        "requesterRole": get_ticket_requester_role(existing_ticket_metadata, default=requester_role),
+        "requesterRole": existing_ticket_requester_role,
         "category": existing_ticket["category"],
         "technicalSubcategory": existing_ticket.get("technical_subcategory") or "",
         "inquiry": existing_ticket.get("inquiry") or "",
@@ -8107,6 +9469,8 @@ def list_admin_tickets() -> dict[str, Any]:
           c.metadata AS conversation_metadata,
           c.chat_duration_minutes,
           c.last_message_at,
+          latest_session_request.status AS latest_session_request_status,
+          latest_session_request.metadata AS latest_session_request_metadata,
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
@@ -8120,6 +9484,13 @@ def list_admin_tickets() -> dict[str, Any]:
           ON l.id = t.learner_id
         LEFT JOIN conversations c
           ON c.id = t.conversation_id
+        LEFT JOIN LATERAL (
+          SELECT ssr.status, ssr.metadata
+          FROM support_session_requests ssr
+          WHERE ssr.ticket_id = t.id
+          ORDER BY ssr.created_at DESC, ssr.id DESC
+          LIMIT 1
+        ) latest_session_request ON TRUE
         LEFT JOIN support_accounts a
           ON a.id = t.assigned_agent_id
         LEFT JOIN support_accounts archived_by
@@ -8136,6 +9507,7 @@ def list_admin_tickets() -> dict[str, Any]:
         """
     )
 
+    tickets = [ticket for ticket in tickets if not is_admin_hidden_support_flow_ticket_record(ticket)]
     tickets = [apply_ticket_sla_policy(ticket) for ticket in tickets]
     tickets = sort_tickets_by_priority_and_recency(tickets)
     return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
@@ -8384,8 +9756,8 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
 
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         requester_role = get_ticket_requester_role(ticket_metadata)
-        if not is_quick_ticket_only_requester_role(requester_role):
-            raise ApiError(403, "Coach accounts can only submit quick tickets or quick calls from the support portal.")
+        if not is_coach_requester_role(requester_role):
+            raise ApiError(403, "Only coach accounts can request a direct Microsoft Teams support call from the support portal.")
 
         pending_notification = get_pending_teams_call_notification(ticket_metadata)
         already_notified = bool(pending_notification)
@@ -9190,6 +10562,8 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
 
         tutor = sanitize_text(target_card.get("tutor"))
         tutor_email = normalize_email(target_card.get("tutorEmail"))
+        coach = sanitize_text(target_card.get("coach"))
+        coach_email = normalize_email(target_card.get("coachEmail")) if coach else ""
         session_details = sanitize_text(target_card.get("sessionDetails"))
         if not tutor:
             raise ApiError(400, "Choose a tutor before submitting the request.")
@@ -9197,6 +10571,10 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
             tutor_email = get_coverage_tutor_email(tutor)
         if not tutor_email or not is_valid_email(tutor_email):
             raise ApiError(400, "Please enter a valid tutor e-mail before submitting the request.")
+        if coach and (not coach_email or not is_valid_email(coach_email)):
+            coach_email = get_coverage_coach_email(coach)
+        if coach and (not coach_email or not is_valid_email(coach_email)):
+            raise ApiError(400, "Please enter a valid coach e-mail before submitting the request.")
         if not session_details:
             raise ApiError(400, "Add the session details before submitting the request.")
         ensure_coverage_tutor_request_webhook_configured()
@@ -9226,6 +10604,8 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
         updated_target_card = {
             **target_card,
             "tutorEmail": tutor_email,
+            "coach": coach,
+            "coachEmail": coach_email,
             "locked": True,
             "requestStatus": "requested",
             "submittedAt": sanitize_text(target_card.get("submittedAt")) or timestamp,
@@ -9353,6 +10733,8 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
                 "cardId": updated_target_card["id"],
                 "tutor": tutor,
                 "tutorEmail": tutor_email,
+                "coach": coach,
+                "coachEmail": coach_email,
                 "requestedAt": updated_target_card["submittedAt"],
                 "sessionDetails": session_details,
             },
@@ -9360,6 +10742,173 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
 
     if webhook_delivery:
         queue_coverage_tutor_request_webhook_delivery(**webhook_delivery)
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def send_coverage_tutor_follow_up_files(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+    raw_follow_up_files = payload.get("presentationFiles") if isinstance(payload.get("presentationFiles"), list) else []
+    webhook_delivery: dict[str, Any] | None = None
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    follow_up_files: list[dict[str, Any]] = []
+    for attachment in raw_follow_up_files:
+        normalized_attachment = normalize_coverage_card_attachment(attachment)
+        if normalized_attachment:
+            follow_up_files.append(normalized_attachment)
+
+    if not follow_up_files:
+        raise ApiError(400, "Add at least one presentation file before sending the follow-up.")
+
+    ensure_coverage_tutor_request_webhook_configured()
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.category,
+              t.technical_subcategory,
+              t.inquiry,
+              t.status,
+              t.status_reason,
+              t.sla_status,
+              t.metadata,
+              t.is_archived,
+              l.full_name AS learner_name,
+              l.email AS learner_email
+            FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not is_coverage_ticket_record(ticket):
+            raise ApiError(409, "This ticket is not a coverage ticket.")
+        if normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Restore this ticket before editing it.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation = normalize_admin_documentation(
+            ticket_metadata.get("admin_documentation"),
+            fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+            fallback_ticket_id=ticket["public_id"],
+        )
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(target_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "Only tutor choice cards can receive follow-up files.")
+
+        request_status = sanitize_text(target_card.get("requestStatus")).lower()
+        if request_status == "pending":
+            request_status = "requested"
+        if request_status not in {"requested", "accepted"}:
+            raise ApiError(409, "Follow-up files can only be sent for requested or accepted tutor requests.")
+
+        existing_files = [
+            normalized_attachment
+            for attachment in target_card.get("presentationFiles") or []
+            if (normalized_attachment := normalize_coverage_card_attachment(attachment))
+        ]
+        existing_file_ids = {
+            sanitize_text(existing_file.get("id"))
+            for existing_file in existing_files
+            if sanitize_text(existing_file.get("id"))
+        }
+        new_follow_up_files = [
+            follow_up_file
+            for follow_up_file in follow_up_files
+            if sanitize_text(follow_up_file.get("id")) not in existing_file_ids
+        ]
+        if not new_follow_up_files:
+            raise ApiError(400, "Add at least one new presentation file before sending the follow-up.")
+
+        timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+        updated_target_card = {
+            **target_card,
+            "presentationFiles": [*existing_files, *new_follow_up_files],
+            "updatedAt": timestamp,
+        }
+        coverage_cards[card_index] = updated_target_card
+        documentation["coverageCards"] = coverage_cards
+
+        updated_ticket_metadata = normalize_json_object(ticket_metadata)
+        updated_ticket_metadata["admin_documentation"] = documentation
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(updated_ticket_metadata), ticket["id"]],
+            )
+
+        actor = {
+            "id": actor_row["id"],
+            "role": actor_row["role"],
+            "label": actor_row.get("full_name") or actor_row["username"],
+        }
+        insert_history_event(
+            ticket["id"],
+            "coverage_tutor_follow_up_sent",
+            actor,
+            {
+                "ticketId": ticket["public_id"],
+                "cardId": updated_target_card["id"],
+                "tutor": sanitize_text(updated_target_card.get("tutor")),
+                "tutorEmail": sanitize_text(updated_target_card.get("tutorEmail")),
+                "requestStatus": request_status,
+                "sentAt": timestamp,
+                "fileCount": len(new_follow_up_files),
+                "fileNames": [sanitize_text(file.get("name")) or "attachment" for file in new_follow_up_files],
+            },
+        )
+
+        webhook_delivery = {
+            "ticket_id": int(ticket["id"]),
+            "ticket_public_id": ticket["public_id"],
+            "card_id": updated_target_card["id"],
+            "payload": build_coverage_tutor_follow_up_webhook_payload(
+                ticket,
+                documentation,
+                updated_target_card,
+                new_follow_up_files,
+                actor_row,
+                sent_at=timestamp,
+            ),
+        }
+
+    if webhook_delivery:
+        queue_coverage_tutor_follow_up_webhook_delivery(**webhook_delivery)
 
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:
@@ -10503,6 +12052,48 @@ def get_ticket_booking_context_response(public_id: str) -> dict[str, Any]:
     }
 
 
+def set_ticket_booking_progress(public_id: str, *, active: bool) -> dict[str, Any]:
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    ticket = run_query_one(
+        """
+        SELECT id, public_id, status, metadata
+        FROM tickets
+        WHERE public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    metadata_patch = {
+        SUPPORT_FLOW_STAGE_METADATA_KEY: SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS if active else None,
+        "booking_started_at": serialize_datetime_value(datetime.now(timezone.utc)) if active else None,
+    }
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE tickets
+            SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            [json.dumps(metadata_patch), ticket["id"]],
+        )
+
+    return {
+        "ok": True,
+        "ticket": {
+            "id": ticket["public_id"],
+            "bookingInProgress": bool(active),
+        },
+    }
+
+
 def get_ticket_conversation_history(conversation_id: Any) -> list[dict[str, Any]]:
     try:
         normalized_conversation_id = int(conversation_id)
@@ -10625,7 +12216,7 @@ def get_ticket_chat_history_response(public_id: str) -> dict[str, Any]:
             "chatState": derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status")),
             "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
         },
-        "chatHistory": serialize_chat_timeline_rows(messages, history_rows),
+        "chatHistory": serialize_chat_timeline_rows(ticket["public_id"], messages, history_rows),
         "bookingSummary": booking_summary,
         "historyCount": len(messages) + len(history_rows),
     }
@@ -10674,11 +12265,19 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
               t.public_id,
               t.status,
               t.status_reason,
+              t.category,
+              t.technical_subcategory,
+              t.priority,
               t.metadata,
+              t.created_at,
+              t.assigned_team,
               t.conversation_id,
               t.assigned_agent_id,
               c.status AS conversation_status,
-              l.email AS learner_email
+              l.full_name AS learner_name,
+              l.email AS learner_email,
+              l.source AS learner_source,
+              l.metadata AS learner_metadata
             FROM tickets t
             JOIN learners l
               ON l.id = t.learner_id
@@ -10694,7 +12293,6 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
             raise ApiError(404, "Ticket not found.")
         if not ticket.get("conversation_id"):
             raise ApiError(400, "This ticket is not linked to a conversation.")
-        ensure_ticket_allows_chat_features(ticket.get("metadata"))
         if is_chat_locked_for_learner(ticket.get("status"), ticket.get("status_reason")):
             raise ApiError(409, "Chat is unavailable while a support meeting is active. Cancel the meeting to continue in chat.")
         if is_ticket_chat_closed(ticket.get("status"), ticket.get("conversation_status")):
@@ -10769,6 +12367,20 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
             """,
             [ticket["id"]],
         )
+        refreshed_assigned_agent_id = refreshed_ticket.get("assigned_agent_id") if refreshed_ticket else None
+        notification_ticket = {
+            **ticket,
+            "assigned_agent_id": refreshed_assigned_agent_id,
+            "assigned_agent_name": refreshed_ticket.get("assigned_agent_name") if refreshed_ticket else None,
+            "assigned_agent_username": refreshed_ticket.get("assigned_agent_username") if refreshed_ticket else None,
+        }
+        should_queue_live_agent_unavailable_notification = should_notify_live_agent_unavailable(
+            notification_ticket,
+            assigned_agent_id=refreshed_assigned_agent_id,
+        )
+
+    if should_queue_live_agent_unavailable_notification:
+        queue_live_agent_unavailable_notification(notification_ticket, requested_at=request_time)
 
     return {
         "ok": True,
@@ -10817,7 +12429,6 @@ def get_ticket_chat_context_response(public_id: str) -> dict[str, Any]:
 
     if not ticket:
         raise ApiError(404, "Ticket not found.")
-    ensure_ticket_allows_chat_features(ticket.get("metadata"))
     if is_chat_locked_for_learner(ticket.get("status"), ticket.get("status_reason")):
         raise ApiError(409, "Chat is unavailable while a support meeting is active. Cancel the meeting to continue in chat.")
 
@@ -10900,10 +12511,16 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
               t.created_at,
               t.closed_at,
               t.conversation_id,
+              l.full_name AS learner_name,
+              l.email AS learner_email,
+              l.source AS learner_source,
+              l.metadata AS learner_metadata,
               c.metadata AS conversation_metadata,
               a.username AS assigned_agent_username,
               a.full_name AS assigned_agent_name
             FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
             LEFT JOIN support_accounts a
               ON a.id = t.assigned_agent_id
             LEFT JOIN conversations c
@@ -10950,10 +12567,10 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
         if requested_assignment_changed:
             actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
-            if actor_role != ROLE_SUPERADMIN:
-                raise ApiError(403, "Only superadmins can assign tickets.")
+            if actor_role not in ADMIN_ACCESS_ROLES:
+                raise ApiError(403, "Only admins and superadmins can assign tickets.")
             if parsed_assigned_agent_id is None:
-                raise ApiError(400, "Select an admin before assigning this ticket.")
+                raise ApiError(400, "Select an agent with ticket access before assigning this ticket.")
 
         escalation_target_agent = None
         if has_escalation_agent_input and parsed_escalation_agent_id is not None:
@@ -10974,17 +12591,18 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
         if has_assigned_agent_input and parsed_assigned_agent_id is not None:
             assigned_agent = run_query_one(
                 """
-                SELECT id, username, full_name, email, role
+                SELECT id, username, full_name, email, account_scope, role, is_active, metadata
                 FROM support_accounts
                 WHERE id = %s
                   AND is_active = TRUE
-                  AND role = %s
+                  AND account_scope = %s
+                  AND (metadata->>'legacy_support_access')::boolean = TRUE
                 LIMIT 1
                 """,
-                [parsed_assigned_agent_id, ROLE_ADMIN],
+                [parsed_assigned_agent_id, ACCOUNT_SCOPE_STAFF],
             )
-            if not assigned_agent:
-                raise ApiError(400, "The selected admin does not exist.")
+            if not is_ticket_receiving_staff_account(assigned_agent):
+                raise ApiError(400, "The selected agent does not receive tickets.")
         elif not has_assigned_agent_input and ticket.get("assigned_agent_id"):
             assigned_agent = {
                 "id": ticket["assigned_agent_id"],
@@ -10999,6 +12617,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             and current_assigned_agent_id is None
             and actor_row
             and sanitize_text(actor_row.get("role")).lower() in {ROLE_ADMIN, ROLE_SUPERADMIN}
+            and is_ticket_receiving_staff_account(actor_row)
         ):
             auto_assigned_actor = {
                 "id": int(actor_row["id"]),
@@ -11233,6 +12852,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                 },
             )
 
+        should_queue_admin_quick_closed_notification = should_notify_quick_ticket_closed(
+            ticket,
+            previous_status=ticket.get("status"),
+            previous_status_reason=ticket.get("status_reason"),
+            next_status=next_status,
+        )
+
         follow_up_public_id = ""
         if should_create_follow_up_ticket:
             follow_up_public_id = create_follow_up_ticket_from_source_ticket(
@@ -11247,6 +12873,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                 actor_row=actor_row,
                 requested_inquiry=requested_follow_up_inquiry,
             )
+
+    if should_queue_admin_quick_closed_notification:
+        queue_quick_ticket_closed_notification(
+            ticket,
+            status=next_status,
+            status_reason=next_status_reason,
+        )
 
     detail_public_id = follow_up_public_id or public_id
     detail = fetch_admin_ticket_detail(detail_public_id)
@@ -11328,6 +12961,135 @@ def update_admin_ticket_archive_state(public_id: str, payload: dict[str, Any]) -
         raise ApiError(404, "Ticket not found.")
 
     return detail
+
+
+def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_public_id = sanitize_text(public_id).upper()
+    if not normalized_public_id:
+        raise ApiError(400, "Ticket id is required.")
+
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    confirm_ticket_id = sanitize_text(payload.get("confirmTicketId")).upper()
+    if not confirm_ticket_id or confirm_ticket_id != normalized_public_id:
+        raise ApiError(400, "Type the ticket ID to confirm permanent deletion.")
+
+    actor_row = fetch_actor_by_username(actor_username) if actor_username else None
+    actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
+    if actor_role != ROLE_SUPERADMIN:
+        raise ApiError(403, "Only superadmins can permanently delete archived tickets.")
+
+    attachment_storage_keys: list[str] = []
+    conversation_deleted = False
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.is_archived,
+              t.conversation_id,
+              c.metadata AS conversation_metadata
+            FROM tickets t
+            LEFT JOIN conversations c
+              ON c.id = t.conversation_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [normalized_public_id],
+        )
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        if not normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Archive this ticket before deleting it permanently.")
+
+        ticket_id = int(ticket["id"])
+        attachment_storage_keys = list_ticket_attachment_storage_keys(ticket_id)
+
+        try:
+            conversation_id = int(ticket["conversation_id"]) if ticket.get("conversation_id") else None
+        except (TypeError, ValueError):
+            conversation_id = None
+
+        remaining_conversation_tickets: list[dict[str, Any]] = []
+        if conversation_id is not None:
+            remaining_conversation_tickets = run_query(
+                """
+                SELECT id, public_id, metadata, created_at
+                FROM tickets
+                WHERE conversation_id = %s
+                  AND id <> %s
+                ORDER BY created_at ASC, id ASC
+                """,
+                [conversation_id, ticket_id],
+            )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM tickets
+                WHERE id = %s
+                """,
+                [ticket_id],
+            )
+
+            if conversation_id is not None:
+                if remaining_conversation_tickets:
+                    latest_remaining_ticket = remaining_conversation_tickets[-1]
+                    latest_remaining_public_id = sanitize_text(latest_remaining_ticket.get("public_id"))
+                    previous_remaining_public_id = (
+                        sanitize_text(remaining_conversation_tickets[-2].get("public_id"))
+                        if len(remaining_conversation_tickets) > 1
+                        else latest_remaining_public_id
+                    )
+                    updated_conversation_metadata = {
+                        **normalize_json_object(ticket.get("conversation_metadata")),
+                        "latest_ticket_public_id": latest_remaining_public_id or None,
+                        "parent_ticket_public_id": previous_remaining_public_id or latest_remaining_public_id or None,
+                    }
+                    updated_conversation_metadata["chat_public_id"] = (
+                        build_public_chat_id(
+                            latest_remaining_public_id,
+                            conversation_id,
+                            updated_conversation_metadata,
+                        )
+                        or None
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE conversations
+                        SET metadata = %s::jsonb
+                        WHERE id = %s
+                        """,
+                        [json.dumps(updated_conversation_metadata), conversation_id],
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        DELETE FROM conversations
+                        WHERE id = %s
+                        """,
+                        [conversation_id],
+                    )
+                    conversation_deleted = True
+
+    for storage_key in attachment_storage_keys:
+        try:
+            delete_support_attachment_file(storage_key)
+        except OSError:
+            logger.warning(
+                "Failed to delete attachment file for permanently deleted ticket %s",
+                normalized_public_id,
+                exc_info=True,
+            )
+
+    return {
+        "ok": True,
+        "ticketId": normalized_public_id,
+        "conversationDeleted": conversation_deleted,
+        "message": "Ticket deleted permanently.",
+    }
 
 
 def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
@@ -11786,7 +13548,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
     }
 
 
-def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
     status = sanitize_text(payload.get("status")) or "Open"
     status_reason = sanitize_text(payload.get("statusReason")) if "statusReason" in payload else None
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
@@ -11805,6 +13567,9 @@ def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]
               t.id,
               t.public_id,
               t.conversation_id,
+              t.category,
+              t.technical_subcategory,
+              t.priority,
               t.status,
               t.status_reason,
               t.assigned_agent_id,
@@ -11812,10 +13577,16 @@ def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]
               t.sla_status,
               t.metadata,
               t.created_at,
+              l.full_name AS learner_name,
+              l.email AS learner_email,
+              l.source AS learner_source,
+              l.metadata AS learner_metadata,
               c.status AS conversation_status,
               a.full_name AS assigned_agent_name,
               a.username AS assigned_agent_username
             FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
             LEFT JOIN conversations c
               ON c.id = t.conversation_id
             LEFT JOIN support_accounts a
@@ -11848,18 +13619,45 @@ def save_chat_history(public_id: str, payload: dict[str, Any]) -> dict[str, Any]
         if not is_ticket_chat_closed(ticket.get("status"), ticket.get("conversation_status")) and map_conversation_status(status) != "closed":
             mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
         persisted_at = datetime.now(timezone.utc)
+        previous_status = ticket.get("status")
+        previous_status_reason = ticket.get("status_reason")
         preview_messages = normalize_chat_messages(messages)
         filtered_messages, next_status_reason, next_sla_status, next_sla_attention_required = apply_ticket_chat_history_sync(
             ticket,
             status=status,
             status_reason=status_reason,
             messages=messages,
+            ticket_public_id=ticket["public_id"],
+            uploaded_files=uploaded_files,
             conversation_metadata_patch=build_inactivity_metadata_patch_for_messages(
                 status,
                 preview_messages,
                 reference_time=persisted_at,
             ),
             reference_time=persisted_at,
+        )
+        should_queue_quick_submitted_notification = should_notify_quick_ticket_submitted(
+            ticket,
+            previous_status=previous_status,
+            previous_status_reason=previous_status_reason,
+            next_status=status,
+            next_status_reason=next_status_reason,
+        )
+        should_queue_quick_closed_notification = should_notify_quick_ticket_closed(
+            ticket,
+            previous_status=previous_status,
+            previous_status_reason=previous_status_reason,
+            next_status=status,
+        )
+
+    if should_queue_quick_submitted_notification:
+        queue_quick_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
+    if should_queue_quick_closed_notification:
+        queue_quick_ticket_closed_notification(
+            ticket,
+            status=status,
+            status_reason=next_status_reason,
+            closed_at=persisted_at,
         )
 
     return {
@@ -12364,24 +14162,47 @@ def send_support_session_booking(
 
 
 def send_chatbot_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, response_payload = post_json_webhook(settings.CHATBOT_WEBHOOK_URL, payload)
+    configured, delivered, status, response_payload = post_json_webhook(
+        settings.CHATBOT_WEBHOOK_URL,
+        payload,
+        timeout_seconds=CHATBOT_WEBHOOK_TIMEOUT_SECONDS,
+    )
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
-        "reply": extract_chatbot_reply(response_payload),
+        "reply": extract_chatbot_reply(response_payload) if delivered else "",
     }
 
 
-def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    message = sanitize_text(payload.get("message"))
+def build_chat_attachment_fallback_message(attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return ""
+
+    if len(attachments) == 1:
+        attachment_name = sanitize_support_attachment_name(attachments[0].get("name"))
+        return f"Shared attachment: {attachment_name}." if attachment_name else "Shared one attachment."
+
+    return f"Shared {len(attachments)} attachments."
+
+
+def send_chatbot_message(public_id: str, payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
+    uploaded_files = list(uploaded_files or [])
+    raw_messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    normalized_messages = normalize_chat_messages(raw_messages)
+    latest_normalized_message = normalized_messages[-1] if normalized_messages else None
+    latest_attachments = list(latest_normalized_message.get("attachments") or []) if latest_normalized_message else []
+    message = (
+        sanitize_text(payload.get("message"))
+        or (sanitize_text(latest_normalized_message.get("content")) if latest_normalized_message else "")
+    )
+    webhook_message = message or build_chat_attachment_fallback_message(latest_attachments)
     client_time_zone = sanitize_text(payload.get("clientTimeZone"))
-    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
-    if not message:
-        raise ApiError(400, "Message text is required.")
+    if not webhook_message and not latest_attachments:
+        raise ApiError(400, "Message text or attachment is required.")
 
     sync_open_ticket_inactivity(public_id=public_id, allow_reminder=False)
     ticket = run_query_one(
@@ -12416,7 +14237,6 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
 
     if not ticket:
         raise ApiError(404, "Ticket not found.")
-    ensure_ticket_allows_chat_features(ticket.get("metadata"))
     if is_chat_locked_for_learner(ticket.get("status"), ticket.get("status_reason")):
         raise ApiError(409, "Chat is unavailable while a support meeting is active. Cancel the meeting to continue in chat.")
     if is_ticket_chat_closed(ticket.get("status"), ticket.get("conversation_status")):
@@ -12426,19 +14246,20 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
 
     recent_messages = [
         {
-            "sender": sanitize_text(entry.get("sender")),
-            "text": sanitize_text(entry.get("text")),
-            "timestamp": sanitize_text(entry.get("timestamp")),
+            "sender": sanitize_text(entry.get("metadata", {}).get("original_sender")) or map_role_to_sender(entry.get("role")),
+            "text": sanitize_text(entry.get("content")),
+            "timestamp": sanitize_text(entry.get("metadata", {}).get("client_timestamp")),
+            "attachments": serialize_chat_message_attachment_metadata_payload(list(entry.get("attachments") or [])),
         }
-        for entry in messages[-12:]
-        if sanitize_text(entry.get("text"))
+        for entry in normalized_messages[-12:]
+        if sanitize_text(entry.get("content")) or entry.get("attachments")
     ]
 
     webhook_result = send_chatbot_webhook(
         {
             "event": "support_chat_message",
             "source": "support_portal",
-            "message": message,
+            "message": webhook_message,
             "clientTimeZone": client_time_zone or None,
             "category": ticket["category"],
             "technicalSubcategory": ticket.get("technical_subcategory"),
@@ -12466,27 +14287,26 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any]) -> dict[str, A
     if ticket.get("conversation_id"):
         persisted_at = datetime.now(timezone.utc)
         synced_messages = (
-            messages
+            raw_messages
             + [{"sender": "bot", "text": webhook_result["reply"], "timestamp": format_chat_message_timestamp(persisted_at)}]
             if webhook_result.get("reply")
-            else messages
+            else raw_messages
         )
 
-        try:
-            with transaction.atomic():
-                sync_conversation_messages(
-                    int(ticket["conversation_id"]),
+        with transaction.atomic():
+            sync_conversation_messages(
+                int(ticket["conversation_id"]),
+                ticket["status"],
+                synced_messages,
+                ticket_public_id=ticket["public_id"],
+                uploaded_files=uploaded_files,
+                conversation_metadata_patch=build_inactivity_metadata_patch_for_messages(
                     ticket["status"],
-                    synced_messages,
-                    conversation_metadata_patch=build_inactivity_metadata_patch_for_messages(
-                        ticket["status"],
-                        normalize_chat_messages(synced_messages),
-                        reference_time=persisted_at,
-                    ),
+                    normalize_chat_messages(synced_messages),
                     reference_time=persisted_at,
-                )
-        except Exception:
-            pass
+                ),
+                reference_time=persisted_at,
+            )
 
     return {
         "ok": True,
@@ -12502,6 +14322,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
     requested_time = sanitize_text(payload.get("time"))
     scheduled_at = sanitize_text(payload.get("scheduledAt"))
     client_time_zone = sanitize_text(payload.get("clientTimeZone"))
+    return_path = normalize_support_booking_return_path(payload.get("returnPath"))
 
     if not public_id or not requested_date or not requested_time:
         raise ApiError(400, "Ticket id, date and time are required.")
@@ -12545,8 +14366,6 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
 
         if not ticket:
             raise ApiError(404, "Ticket not found.")
-        ensure_ticket_allows_chat_features(ticket.get("metadata"))
-
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -12568,6 +14387,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                             "source": "support_portal",
                             "scheduled_at": scheduled_at or None,
                             "client_time_zone": client_time_zone or None,
+                            "return_path": return_path or None,
                         }
                     ),
                 ],
@@ -12588,6 +14408,11 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             ticket["sla_status"],
         )
         sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
+        session_ticket_metadata_patch = {
+            **sla_metadata_patch,
+            SUPPORT_FLOW_STAGE_METADATA_KEY: None,
+            "booking_started_at": None,
+        }
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -12604,7 +14429,13 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                     END
                 WHERE id = %s
                 """,
-                ["Pending", STATUS_REASON_AWAITING_MEETING, next_sla_status, json.dumps(sla_metadata_patch), ticket["id"]],
+                [
+                    "Pending",
+                    STATUS_REASON_AWAITING_MEETING,
+                    next_sla_status,
+                    json.dumps(session_ticket_metadata_patch),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):

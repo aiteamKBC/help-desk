@@ -123,6 +123,7 @@ const KnowledgeBaseWorkspace = () => {
 
   useEffect(() => {
     void loadArticles({ silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Run the initial article bootstrap once on mount.
   }, []);
 
   useEffect(() => {

@@ -9,6 +9,7 @@ ACCOUNT_SCOPE_REQUESTER = "requester"
 SUPPORT_ACCESS_GROUP_NAME = "support access"
 ADMIN_ACCESS_GROUP_NAME = "admin access"
 OPERATIONS_ACCESS_GROUP_NAME = "operations access"
+COACH_ACCESS_GROUP_NAME = "coach access"
 
 ACCOUNT_ROLES = (
     ROLE_USER,

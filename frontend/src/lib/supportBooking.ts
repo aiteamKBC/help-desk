@@ -5,6 +5,42 @@ export interface ApiBookingSummary {
   requestedTime?: string;
   reservationConfirmed?: boolean;
   meetingJoinUrl?: string | null;
+  returnPath?: string | null;
+}
+
+export interface SupportSessionTimeOption {
+  value: string;
+  label: string;
+}
+
+export interface SupportSessionAvailabilityResponse {
+  ok?: boolean;
+  date?: string;
+  source?: "microsoft_graph" | "fallback";
+  options?: SupportSessionTimeOption[];
+  message?: string;
+}
+
+export async function fetchSupportSessionAvailability(
+  ticketId: string,
+  dateValue: string,
+  clientTimeZone: string,
+) {
+  const params = new URLSearchParams({
+    date: dateValue,
+    clientTimeZone,
+  });
+  const response = await fetch(`/api/tickets/${encodeURIComponent(ticketId)}/session-availability?${params.toString()}`);
+  const payload = (await response.json().catch(() => null)) as SupportSessionAvailabilityResponse | null;
+
+  if (!response.ok || !payload) {
+    throw new Error(payload?.message || "We could not load support session availability.");
+  }
+
+  return {
+    ...payload,
+    options: Array.isArray(payload.options) ? payload.options : [],
+  };
 }
 
 function parseLocalDateTime(dateValue: string, timeValue: string) {
@@ -49,16 +85,26 @@ export function formatBookingSummaryLabels(dateValue: string, timeValue: string)
   };
 }
 
+function normalizeBookingReturnPath(value: unknown): BookingSummary["returnPath"] {
+  return value === "/support/chat" || value === "/support/options" ? value : undefined;
+}
+
 export function toBookingSummary(summary: ApiBookingSummary | null | undefined): BookingSummary | null {
   if (!summary?.requestedDate || !summary?.requestedTime) {
     return null;
   }
 
   const labels = formatBookingSummaryLabels(summary.requestedDate, summary.requestedTime);
+  const returnPath = normalizeBookingReturnPath(summary.returnPath);
 
-  return {
+  const bookingSummary: BookingSummary = {
     ...labels,
     reservationConfirmed: Boolean(summary.reservationConfirmed),
     meetingJoinUrl: summary.meetingJoinUrl || null,
   };
+  if (returnPath) {
+    bookingSummary.returnPath = returnPath;
+  }
+
+  return bookingSummary;
 }

@@ -1,4 +1,6 @@
-import { createContext, useContext, useEffect, useState, ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { type ChatAttachment } from "@/lib/supportChat";
+import { SupportContext } from "@/context/support-context-value";
 
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
@@ -9,10 +11,12 @@ export type RequesterSource = "kbc_users_data" | "microsoft_entra" | "support_po
 
 export interface ChatMessage {
   id: string;
+  clientMessageId?: string;
   sender: "bot" | "user" | "agent";
   source?: "message" | "history_event" | "intro";
   text: string;
   timestamp: string;
+  attachments?: ChatAttachment[];
 }
 
 export interface EvidenceFile {
@@ -50,6 +54,7 @@ export interface BookingSummary {
   timeLabel: string;
   reservationConfirmed: boolean;
   meetingJoinUrl: string | null;
+  returnPath?: "/support/chat" | "/support/options";
 }
 
 interface PersistedSupportState {
@@ -258,18 +263,6 @@ function readPersistedSupportState() {
   }
 }
 
-interface SupportCtx {
-  ticket: Ticket;
-  bookingSummary: BookingSummary | null;
-  setTicket: (t: Ticket) => void;
-  updateTicket: (patch: Partial<Ticket>) => void;
-  setBookingSummary: (booking: BookingSummary | null) => void;
-  clearBookingSummary: () => void;
-  resetTicket: () => void;
-}
-
-const Ctx = createContext<SupportCtx | null>(null);
-
 export const SupportProvider = ({ children }: { children: ReactNode }) => {
   const persistedState = readPersistedSupportState();
   const [ticket, setTicketState] = useState<Ticket>(persistedState.ticket);
@@ -306,16 +299,10 @@ export const SupportProvider = ({ children }: { children: ReactNode }) => {
   }, [ticket]);
 
   return (
-    <Ctx.Provider
+    <SupportContext.Provider
       value={{ ticket, bookingSummary, setTicket, updateTicket, setBookingSummary, clearBookingSummary, resetTicket }}
     >
       {children}
-    </Ctx.Provider>
+    </SupportContext.Provider>
   );
-};
-
-export const useSupport = () => {
-  const ctx = useContext(Ctx);
-  if (!ctx) throw new Error("useSupport must be inside SupportProvider");
-  return ctx;
 };

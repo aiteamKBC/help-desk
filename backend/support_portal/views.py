@@ -36,9 +36,11 @@ from .services import (
     create_follow_up_ticket,
     create_support_session_request,
     create_ticket,
+    delete_admin_ticket_permanently,
     get_admin_login_response,
     get_admin_microsoft_login_response,
     get_admin_ticket_attachment_file,
+    get_ticket_chat_attachment_file,
     list_admin_notifications,
     get_admin_ticket_detail_response,
     get_coverage_options_response,
@@ -46,6 +48,7 @@ from .services import (
     heartbeat_agent_session,
     build_microsoft_admin_authorize_url,
     get_support_booking_url,
+    get_support_session_availability_response,
     get_support_teams_call_context_response,
     get_ticket_booking_context_response,
     get_ticket_chat_history_response,
@@ -64,6 +67,8 @@ from .services import (
     send_chatbot_message,
     serialize_agent,
     serve_frontend_asset,
+    set_ticket_booking_progress,
+    send_coverage_tutor_follow_up_files,
     submit_coverage_tutor_request,
     update_admin_ticket,
     update_admin_ticket_archive_state,
@@ -259,6 +264,24 @@ def parse_public_ticket_submission_request(request) -> tuple[dict, list]:
     return parse_json_body(request), []
 
 
+def parse_chat_submission_request(request, *, file_field_name: str = "attachmentFiles") -> tuple[dict, list]:
+    content_type = (request.content_type or "").strip().lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        payload: dict[str, object] = {}
+        for key, value in request.POST.items():
+            if key == "messages":
+                try:
+                    payload[key] = json.loads(value) if value else []
+                except json.JSONDecodeError as error:
+                    raise ApiError(400, "Invalid chat message payload.") from error
+                continue
+            payload[key] = value
+
+        return payload, list(request.FILES.getlist(file_field_name))
+
+    return parse_json_body(request), []
+
+
 def normalize_request_session_instance_id(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
@@ -308,12 +331,17 @@ def require_request_admin_session(request, *, allowed_roles: set[str] | None = S
     return actor, request.session[ADMIN_SESSION_KEY]
 
 
-def build_session_bound_admin_payload(request, *, allowed_roles: set[str] | None = SUPPORT_PORTAL_ACCESS_ROLES) -> dict:
+def build_session_bound_admin_payload(
+    request,
+    *,
+    allowed_roles: set[str] | None = SUPPORT_PORTAL_ACCESS_ROLES,
+    payload: dict | None = None,
+) -> dict:
     actor, session_payload = require_request_admin_session(request, allowed_roles=allowed_roles)
-    payload = parse_json_body(request)
-    payload["actorUsername"] = actor["username"]
-    payload["instanceId"] = session_payload["instanceId"]
-    return payload
+    session_bound_payload = dict(payload or parse_json_body(request))
+    session_bound_payload["actorUsername"] = actor["username"]
+    session_bound_payload["instanceId"] = session_payload["instanceId"]
+    return session_bound_payload
 
 
 def build_admin_session_response(actor: dict, session_payload: dict) -> dict:
@@ -644,6 +672,15 @@ def admin_ticket_archive(request, public_id: str):
         return handle_api_error(error)
 
 
+@require_http_methods(["POST"])
+def admin_ticket_permanent_delete(request, public_id: str):
+    try:
+        require_request_admin_session(request)
+        return JsonResponse(delete_admin_ticket_permanently(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @require_http_methods(["GET"])
 def admin_ticket_attachment_download(request, public_id: str, attachment_id: int):
     try:
@@ -661,10 +698,34 @@ def admin_ticket_attachment_download(request, public_id: str, attachment_id: int
         return handle_api_error(error)
 
 
+@require_http_methods(["GET"])
+def admin_ticket_chat_attachment_download(request, public_id: str, client_attachment_id: str):
+    try:
+        require_request_admin_session(request)
+        attachment = get_ticket_chat_attachment_file(public_id, client_attachment_id)
+        response = FileResponse(
+            attachment["path"].open("rb"),
+            as_attachment=False,
+            filename=attachment["fileName"],
+            content_type=attachment.get("mimeType") or "application/octet-stream",
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @require_http_methods(["POST"])
 def admin_ticket_chat_history(request, public_id: str):
     try:
-        return JsonResponse(save_chat_history(public_id, build_session_bound_admin_payload(request)))
+        payload, uploaded_files = parse_chat_submission_request(request)
+        return JsonResponse(
+            save_chat_history(
+                public_id,
+                build_session_bound_admin_payload(request, payload=payload),
+                uploaded_files=uploaded_files,
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 
@@ -750,6 +811,14 @@ def admin_ticket_coverage_tutor_request(request, public_id: str):
 
 
 @require_http_methods(["POST"])
+def admin_ticket_coverage_tutor_follow_up(request, public_id: str):
+    try:
+        return JsonResponse(send_coverage_tutor_follow_up_files(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
 def admin_ticket_coverage_tutor_response_acknowledge(request, public_id: str):
     try:
         return JsonResponse(acknowledge_coverage_tutor_response(public_id, build_session_bound_admin_payload(request)))
@@ -799,7 +868,8 @@ def ticket_chat_history(request, public_id: str):
     try:
         if request.method == "GET":
             return JsonResponse(get_ticket_chat_history_response(public_id))
-        return JsonResponse(save_chat_history(public_id, parse_json_body(request)))
+        payload, uploaded_files = parse_chat_submission_request(request)
+        return JsonResponse(save_chat_history(public_id, payload, uploaded_files=uploaded_files))
     except Exception as error:
         return handle_api_error(error)
 
@@ -808,7 +878,25 @@ def ticket_chat_history(request, public_id: str):
 @require_http_methods(["POST"])
 def ticket_chatbot_message(request, public_id: str):
     try:
-        return JsonResponse(send_chatbot_message(public_id, parse_json_body(request)))
+        payload, uploaded_files = parse_chat_submission_request(request)
+        return JsonResponse(send_chatbot_message(public_id, payload, uploaded_files=uploaded_files))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def ticket_chat_attachment_download(request, public_id: str, client_attachment_id: str):
+    try:
+        attachment = get_ticket_chat_attachment_file(public_id, client_attachment_id)
+        response = FileResponse(
+            attachment["path"].open("rb"),
+            as_attachment=False,
+            filename=attachment["fileName"],
+            content_type=attachment.get("mimeType") or "application/octet-stream",
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
     except Exception as error:
         return handle_api_error(error)
 
@@ -826,6 +914,30 @@ def ticket_live_chat_request(request, public_id: str):
 def ticket_booking_context(request, public_id: str):
     try:
         return JsonResponse(get_ticket_booking_context_response(public_id))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def ticket_booking_progress(request, public_id: str):
+    try:
+        payload = parse_json_body(request)
+        return JsonResponse(set_ticket_booking_progress(public_id, active=bool(payload.get("active"))))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def ticket_session_availability(request, public_id: str):
+    try:
+        return JsonResponse(
+            get_support_session_availability_response(
+                public_id,
+                request.GET.get("date", ""),
+                request.GET.get("clientTimeZone", ""),
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 

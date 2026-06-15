@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/dialog";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
-import { useSupport } from "@/context/SupportContext";
+import { useSupport } from "@/context/useSupport";
 import { canReturnToChat, getSupportResumePath, isAwaitingMeetingTicket, isAwaitingSupportReviewTicket, quickTicketReason, shouldShowStatusStep } from "@/lib/supportFlow";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import { toast } from "sonner";
@@ -152,6 +152,13 @@ const TicketStatus = () => {
         return;
       }
 
+      const cancelledTicket = {
+        ...ticket,
+        status: (payload.ticket.status || "Open") as typeof ticket.status,
+        statusReason: payload.ticket.statusReason || "",
+      };
+      const cancellationReturnPath = bookingSummary?.returnPath || getSupportResumePath(cancelledTicket, null);
+
       clearBookingSummary();
       updateTicket({
         status: payload.ticket.status || "Open",
@@ -162,7 +169,7 @@ const TicketStatus = () => {
       });
       setCancelMeetingOpen(false);
       toast.success(payload?.message || "Your support meeting has been cancelled.");
-      navigate(getSupportResumePath({ ...ticket, status: payload.ticket.status || "Open", statusReason: payload.ticket.statusReason || "" }, null));
+      navigate(cancellationReturnPath);
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
@@ -257,7 +264,7 @@ const TicketStatus = () => {
           <DialogHeader>
             <DialogTitle>Cancel Support Meeting</DialogTitle>
             <DialogDescription>
-              This will cancel the current support session and reopen your support request so you can continue in chat or book a different slot later.
+              This will cancel the current support session and reopen your support request so you can choose another support route or book a different slot later.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="flex-col gap-2 sm:flex-row">

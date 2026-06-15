@@ -8,7 +8,7 @@ export interface CoverageDetails {
   sessionSubject: string;
 }
 
-export type CoverageOptionType = "tutors" | "modules" | "times" | "session-dates";
+export type CoverageOptionType = "tutors" | "coaches" | "modules" | "times" | "session-dates";
 
 export interface CoverageTimeOption {
   label: string;
@@ -142,6 +142,29 @@ export async function fetchCoverageTutorEmail(tutor: string) {
 
   if (!response.ok) {
     throw new Error(payload?.message || "We could not load the tutor e-mail right now.");
+  }
+
+  return typeof payload?.value === "string" ? payload.value.trim() : "";
+}
+
+export async function fetchCoverageCoachEmail(coach: string) {
+  const query = new URLSearchParams({
+    type: "coach-email",
+    coach,
+  });
+
+  const response = await fetch(`/api/coverage-options?${query.toString()}`, {
+    cache: "no-store",
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | {
+        message?: string;
+        value?: string;
+      }
+    | null;
+
+  if (!response.ok) {
+    throw new Error(payload?.message || "We could not load the coach e-mail right now.");
   }
 
   return typeof payload?.value === "string" ? payload.value.trim() : "";

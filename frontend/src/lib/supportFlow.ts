@@ -22,9 +22,9 @@ const coveragePendingReasons = [
   coverageRerequestingReason,
 ] as const;
 
-type TicketFlowState = Pick<Ticket, "id" | "status" | "statusReason" | "requesterRole">;
+type TicketFlowState = Pick<Ticket, "id" | "status" | "statusReason" | "requesterRole" | "liveChatRequested">;
 
-export const isQuickTicketOnlyRequesterRole = (role: RequesterRole | string | null | undefined) =>
+export const isCoachRequesterRole = (role: RequesterRole | string | null | undefined) =>
   (role || "").trim().toLowerCase() === "coach";
 
 export const isAwaitingMeetingTicket = (ticket: TicketFlowState) =>
@@ -35,8 +35,7 @@ export const isAwaitingSupportReviewTicket = (ticket: TicketFlowState) =>
   && [quickTicketReason, ...legacyQuickTicketReasons, ...coveragePendingReasons].includes(ticket.statusReason);
 
 export const canReturnToChat = (ticket: TicketFlowState) =>
-  !isQuickTicketOnlyRequesterRole(ticket.requesterRole)
-  && !isAwaitingSupportReviewTicket(ticket);
+  !isAwaitingSupportReviewTicket(ticket) && ticket.liveChatRequested;
 
 export const shouldShowStatusStep = (
   ticket: Pick<Ticket, "id" | "status">,
@@ -51,7 +50,7 @@ export const getSupportResumePath = (
     return "/support/status";
   }
 
-  if (isQuickTicketOnlyRequesterRole(ticket.requesterRole)) {
+  if (isCoachRequesterRole(ticket.requesterRole)) {
     return ticket.id ? "/support/options" : "/";
   }
 
