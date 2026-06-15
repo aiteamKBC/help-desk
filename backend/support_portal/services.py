@@ -5517,13 +5517,51 @@ def is_minutes_within_range(minutes: int, start_minutes: int, end_minutes: int) 
     return start_minutes <= minutes <= end_minutes
 
 
-def is_within_support_session_window(requested_datetime: datetime) -> bool:
-    uk_minutes = get_time_in_timezone_minutes(requested_datetime, UK_SUPPORT_TIMEZONE)
+def get_support_session_buffer_minutes() -> int:
+    try:
+        return max(int(settings.SUPPORT_SESSION_BUFFER_MINUTES or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
-    return is_minutes_within_range(
-        uk_minutes,
-        UK_SUPPORT_SESSION_START_MINUTES,
-        UK_SUPPORT_SESSION_END_MINUTES,
+
+def normalize_session_datetime_for_comparison(value: datetime) -> datetime:
+    return (value if value.tzinfo else value.replace(tzinfo=ZoneInfo(settings.TIME_ZONE))).astimezone(timezone.utc)
+
+
+def get_support_session_block_end(
+    requested_datetime: datetime,
+    duration_minutes: int,
+    *,
+    include_buffer: bool = False,
+) -> datetime:
+    safe_duration_minutes = max(int(duration_minutes or settings.SUPPORT_SESSION_DURATION_MINUTES), 1)
+    buffer_minutes = get_support_session_buffer_minutes() if include_buffer else 0
+    return requested_datetime + timedelta(minutes=safe_duration_minutes + buffer_minutes)
+
+
+def is_within_support_session_window(requested_datetime: datetime, duration_minutes: int | None = None) -> bool:
+    uk_zone = ZoneInfo(UK_SUPPORT_TIMEZONE)
+    session_start = requested_datetime if requested_datetime.tzinfo else requested_datetime.replace(tzinfo=ZoneInfo(settings.TIME_ZONE))
+    localized_start = session_start.astimezone(uk_zone)
+    start_minutes = (localized_start.hour * 60) + localized_start.minute
+
+    if duration_minutes is None:
+        return is_minutes_within_range(
+            start_minutes,
+            UK_SUPPORT_SESSION_START_MINUTES,
+            UK_SUPPORT_SESSION_END_MINUTES,
+        )
+
+    localized_end = get_support_session_block_end(
+        session_start,
+        duration_minutes,
+        include_buffer=False,
+    ).astimezone(uk_zone)
+    end_minutes = (localized_end.hour * 60) + localized_end.minute
+    return (
+        localized_start.date() == localized_end.date()
+        and start_minutes >= UK_SUPPORT_SESSION_START_MINUTES
+        and end_minutes <= UK_SUPPORT_SESSION_END_MINUTES
     )
 
 
@@ -5532,6 +5570,114 @@ def is_support_session_time_aligned(requested_datetime: datetime) -> bool:
     localized_datetime = requested_datetime.astimezone(ZoneInfo(settings.TIME_ZONE))
     total_minutes = (localized_datetime.hour * 60) + localized_datetime.minute
     return total_minutes % slot_interval == 0
+
+
+def support_session_blocks_overlap(
+    left_start: datetime,
+    left_end: datetime,
+    right_start: datetime,
+    right_end: datetime,
+) -> bool:
+    return left_start < right_end and left_end > right_start
+
+
+def get_support_session_request_bounds(
+    session_request: dict[str, Any],
+    *,
+    default_duration_minutes: int | None = None,
+) -> tuple[datetime, datetime] | None:
+    metadata = normalize_json_object(session_request.get("metadata"))
+    try:
+        duration_minutes = int(metadata.get("duration_minutes") or default_duration_minutes or settings.SUPPORT_SESSION_DURATION_MINUTES)
+    except (TypeError, ValueError):
+        duration_minutes = int(default_duration_minutes or settings.SUPPORT_SESSION_DURATION_MINUTES)
+    session_start = coerce_datetime(metadata.get("requested_start_at")) or coerce_datetime(metadata.get("scheduled_at"))
+    session_end = coerce_datetime(metadata.get("requested_end_at"))
+
+    if not session_start:
+        requested_date = session_request.get("requested_date")
+        requested_time = session_request.get("requested_time")
+        if hasattr(requested_date, "strftime") and hasattr(requested_time, "strftime"):
+            session_start = datetime.combine(requested_date, requested_time).replace(tzinfo=ZoneInfo(settings.TIME_ZONE))
+
+    if not session_start:
+        return None
+
+    if not session_end:
+        session_end = session_start + timedelta(minutes=max(duration_minutes, 1))
+
+    return (
+        normalize_session_datetime_for_comparison(session_start),
+        normalize_session_datetime_for_comparison(session_end),
+    )
+
+
+def list_active_support_session_request_rows() -> list[dict[str, Any]]:
+    return run_query(
+        """
+        SELECT id, ticket_id, requested_date, requested_time, status, metadata
+        FROM support_session_requests
+        WHERE status IN ('requested', 'scheduled')
+        ORDER BY created_at ASC, id ASC
+        """
+    )
+
+
+def is_support_session_slot_available_against_rows(
+    requested_datetime: datetime,
+    duration_minutes: int,
+    session_requests: list[dict[str, Any]],
+) -> bool:
+    requested_start = normalize_session_datetime_for_comparison(requested_datetime)
+    requested_end = normalize_session_datetime_for_comparison(
+        get_support_session_block_end(requested_datetime, duration_minutes, include_buffer=True)
+    )
+    buffer_minutes = get_support_session_buffer_minutes()
+
+    for session_request in session_requests:
+        bounds = get_support_session_request_bounds(
+            session_request,
+            default_duration_minutes=duration_minutes,
+        )
+        if not bounds:
+            continue
+
+        existing_start, existing_end = bounds
+        existing_block_end = existing_end + timedelta(minutes=buffer_minutes)
+        if support_session_blocks_overlap(requested_start, requested_end, existing_start, existing_block_end):
+            return False
+
+    return True
+
+
+def is_support_session_slot_locally_available(requested_datetime: datetime, duration_minutes: int) -> bool:
+    return is_support_session_slot_available_against_rows(
+        requested_datetime,
+        duration_minutes,
+        list_active_support_session_request_rows(),
+    )
+
+
+def filter_locally_available_support_session_candidates(
+    candidates: list[dict[str, Any]],
+    duration_minutes: int,
+) -> list[dict[str, Any]]:
+    session_requests = list_active_support_session_request_rows()
+    return [
+        candidate
+        for candidate in candidates
+        if is_support_session_slot_available_against_rows(
+            candidate["requestedDateTime"],
+            duration_minutes,
+            session_requests,
+        )
+    ]
+
+
+def lock_support_session_booking_date(requested_datetime: datetime) -> None:
+    lock_date = requested_datetime.astimezone(ZoneInfo(UK_SUPPORT_TIMEZONE)).date().isoformat()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [f"support-session-date:{lock_date}"])
 
 
 def validate_support_session_request(
@@ -5549,8 +5695,8 @@ def validate_support_session_request(
     if (requested_datetime - current_time).total_seconds() <= SUPPORT_SESSION_LEAD_TIME_SECONDS:
         return "Support sessions must be booked more than 24 hours in advance."
 
-    if not is_within_support_session_window(requested_datetime):
-        return "Support sessions must be between 8:00 AM and 4:00 PM UK time."
+    if not is_within_support_session_window(requested_datetime, settings.SUPPORT_SESSION_DURATION_MINUTES):
+        return "Support sessions must fit between 8:00 AM and 4:00 PM UK time."
 
     if not is_support_session_time_aligned(requested_datetime):
         return f"Support sessions must start on {settings.SUPPORT_SESSION_SLOT_INTERVAL_MINUTES}-minute intervals."
@@ -5635,6 +5781,7 @@ def build_support_session_webhook_payload(
         "bookingProvider": "microsoft_teams",
         "reserveSlot": True,
         "durationMinutes": settings.SUPPORT_SESSION_DURATION_MINUTES,
+        "bufferMinutes": get_support_session_buffer_minutes(),
         "ticketId": ticket["public_id"],
         "learnerId": int(ticket["learner_id"]),
         "learnerName": ticket.get("learner_full_name"),
@@ -5877,7 +6024,7 @@ def build_microsoft_booking_appointment_payload(
     customer_phone = sanitize_text(ticket.get("learner_phone"))
     customer_time_zone = to_microsoft_graph_timezone(client_time_zone)
     service_name = sanitize_text(service_payload.get("displayName")) or sanitize_text(settings.BOOKING_SERVICE_ID)
-    maximum_attendees_count = max(int(service_payload.get("maximumAttendeesCount") or 1), 1)
+    maximum_attendees_count = 1
 
     payload = {
         "@odata.type": "#microsoft.graph.bookingAppointment",
@@ -5942,12 +6089,14 @@ def build_support_session_candidate_slots(
     date_value: str,
     client_time_zone: Any = "",
     *,
+    duration_minutes: int | None = None,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", sanitize_text(date_value)):
         return []
 
     slot_interval = max(int(settings.SUPPORT_SESSION_SLOT_INTERVAL_MINUTES or 30), 1)
+    session_duration_minutes = int(duration_minutes or settings.SUPPORT_SESSION_DURATION_MINUTES)
     client_zone = resolve_support_session_client_timezone(client_time_zone)
     current_time = now or datetime.now(tz=ZoneInfo(settings.TIME_ZONE))
     candidates: list[dict[str, Any]] = []
@@ -5965,7 +6114,7 @@ def build_support_session_candidate_slots(
         if (requested_datetime - current_time).total_seconds() <= SUPPORT_SESSION_LEAD_TIME_SECONDS:
             continue
 
-        if not is_within_support_session_window(requested_datetime):
+        if not is_within_support_session_window(requested_datetime, session_duration_minutes):
             continue
 
         candidates.append(
@@ -6017,7 +6166,12 @@ def get_microsoft_booking_available_time_options(
         return None
 
     duration_minutes = get_direct_booking_duration_minutes(service_payload)
-    candidates = build_support_session_candidate_slots(date_value, client_time_zone, now=now)
+    candidates = build_support_session_candidate_slots(
+        date_value,
+        client_time_zone,
+        duration_minutes=duration_minutes,
+        now=now,
+    )
     if not candidates:
         return []
 
@@ -6058,7 +6212,12 @@ def get_microsoft_booking_available_time_options(
         ):
             available_candidates.append(candidate)
 
-    return serialize_support_session_time_options(available_candidates)
+    return serialize_support_session_time_options(
+        filter_locally_available_support_session_candidates(
+            available_candidates,
+            duration_minutes,
+        )
+    )
 
 
 def get_support_session_availability_response(public_id: str, date_value: str, client_time_zone: str = "") -> dict[str, Any]:
@@ -6090,13 +6249,20 @@ def get_support_session_availability_response(public_id: str, date_value: str, c
             "options": graph_options,
         }
 
+    fallback_candidates = filter_locally_available_support_session_candidates(
+        build_support_session_candidate_slots(
+            normalized_date,
+            client_time_zone,
+            duration_minutes=settings.SUPPORT_SESSION_DURATION_MINUTES,
+        ),
+        settings.SUPPORT_SESSION_DURATION_MINUTES,
+    )
+
     return {
         "ok": True,
         "date": normalized_date,
         "source": "fallback",
-        "options": serialize_support_session_time_options(
-            build_support_session_candidate_slots(normalized_date, client_time_zone)
-        ),
+        "options": serialize_support_session_time_options(fallback_candidates),
     }
 
 
@@ -14366,6 +14532,23 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
 
         if not ticket:
             raise ApiError(404, "Ticket not found.")
+
+        lock_support_session_booking_date(requested_datetime)
+        guard_duration_minutes = int(settings.SUPPORT_SESSION_DURATION_MINUTES)
+        if not is_support_session_slot_locally_available(requested_datetime, guard_duration_minutes):
+            raise ApiError(409, "This Teams slot is no longer available. Please choose a different time.")
+
+        requested_end_at = requested_datetime + timedelta(minutes=guard_duration_minutes)
+        initial_session_metadata = {
+            "source": "support_portal",
+            "scheduled_at": scheduled_at or None,
+            "client_time_zone": client_time_zone or None,
+            "return_path": return_path or None,
+            "requested_start_at": requested_datetime.isoformat(),
+            "requested_end_at": requested_end_at.isoformat(),
+            "duration_minutes": guard_duration_minutes,
+            "buffer_minutes": get_support_session_buffer_minutes(),
+        }
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -14382,14 +14565,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                     ticket["id"],
                     requested_date,
                     requested_time,
-                    json.dumps(
-                        {
-                            "source": "support_portal",
-                            "scheduled_at": scheduled_at or None,
-                            "client_time_zone": client_time_zone or None,
-                            "return_path": return_path or None,
-                        }
-                    ),
+                    json.dumps(initial_session_metadata),
                 ],
             )
             created_session_request = dictfetchone(cursor)
@@ -14485,6 +14661,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
         "requested_start_at": requested_datetime.isoformat(),
         "requested_end_at": (requested_datetime + timedelta(minutes=booking_duration_minutes)).isoformat(),
         "duration_minutes": booking_duration_minutes,
+        "buffer_minutes": get_support_session_buffer_minutes(),
         "reservation_confirmed": booking_result["reservationConfirmed"],
         "slot_unavailable": booking_result["slotUnavailable"],
         "calendar_event_id": booking_result["calendarEventId"],

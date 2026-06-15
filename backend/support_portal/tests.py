@@ -2060,6 +2060,7 @@ class SupportSessionValidationTests(SimpleTestCase):
                 "get_microsoft_booking_staff_availability_window",
                 return_value=(True, True, 200, availability_payload),
             ),
+            patch.object(services, "list_active_support_session_request_rows", return_value=[]),
         ):
             response = services.get_support_session_availability_response(
                 "KBC-000077",
@@ -2076,6 +2077,7 @@ class SupportSessionValidationTests(SimpleTestCase):
         with (
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "is_direct_microsoft_booking_configured", return_value=False),
+            patch.object(services, "list_active_support_session_request_rows", return_value=[]),
         ):
             response = services.get_support_session_availability_response(
                 "KBC-000077",
@@ -2085,6 +2087,55 @@ class SupportSessionValidationTests(SimpleTestCase):
 
         self.assertEqual(response["source"], "fallback")
         self.assertIn({"value": "08:00", "label": "8:00 AM"}, response["options"])
+
+    def test_filter_locally_available_support_session_candidates_respects_buffer(self):
+        candidates = [
+            {
+                "value": "10:30",
+                "label": "10:30 AM",
+                "requestedDateTime": datetime(2099, 1, 7, 10, 30, tzinfo=ZoneInfo("Europe/London")),
+            },
+            {
+                "value": "11:00",
+                "label": "11:00 AM",
+                "requestedDateTime": datetime(2099, 1, 7, 11, 0, tzinfo=ZoneInfo("Europe/London")),
+            },
+            {
+                "value": "11:30",
+                "label": "11:30 AM",
+                "requestedDateTime": datetime(2099, 1, 7, 11, 30, tzinfo=ZoneInfo("Europe/London")),
+            },
+        ]
+        existing_session = {
+            "id": 31,
+            "ticket_id": 77,
+            "status": "scheduled",
+            "metadata": {
+                "requested_start_at": "2099-01-07T10:00:00+00:00",
+                "requested_end_at": "2099-01-07T11:00:00+00:00",
+                "duration_minutes": 60,
+            },
+        }
+
+        with (
+            patch.object(services.settings, "SUPPORT_SESSION_BUFFER_MINUTES", 30),
+            patch.object(services, "list_active_support_session_request_rows", return_value=[existing_session]),
+        ):
+            result = services.filter_locally_available_support_session_candidates(candidates, 60)
+
+        self.assertEqual([candidate["value"] for candidate in result], ["11:30"])
+
+    def test_build_support_session_candidate_slots_requires_session_to_finish_inside_support_hours(self):
+        with patch.object(services.settings, "SUPPORT_SESSION_DURATION_MINUTES", 60):
+            slots = services.build_support_session_candidate_slots(
+                "2099-01-07",
+                "Europe/London",
+                now=datetime(2099, 1, 1, 9, 0, tzinfo=ZoneInfo("Europe/London")),
+            )
+
+        self.assertIn("15:00", [slot["value"] for slot in slots])
+        self.assertNotIn("15:30", [slot["value"] for slot in slots])
+        self.assertNotIn("16:00", [slot["value"] for slot in slots])
 
     def test_extract_booking_webhook_result_marks_teams_reservation_as_confirmed(self):
         result = services.extract_booking_webhook_result(
@@ -2138,7 +2189,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             "isCustomerAllowedToManageBooking": False,
             "isLocationOnline": True,
             "smsNotificationsEnabled": False,
-            "maximumAttendeesCount": 1,
+            "maximumAttendeesCount": 5,
         }
 
         with (
@@ -2158,6 +2209,8 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertEqual(payload["customerEmailAddress"], "ali@example.com")
         self.assertEqual(payload["customerTimeZone"], "Egypt Standard Time")
         self.assertEqual(payload["staffMemberIds"], ["staff-1"])
+        self.assertEqual(payload["maximumAttendeesCount"], 1)
+        self.assertEqual(payload["filledAttendeesCount"], 1)
         self.assertEqual(payload["start"]["timeZone"], "GMT Standard Time")
         self.assertEqual(payload["start"]["dateTime"], "2026-05-11T15:22:00")
         self.assertEqual(payload["end"]["dateTime"], "2026-05-11T17:22:00")
@@ -2566,6 +2619,8 @@ class SupportSessionValidationTests(SimpleTestCase):
             patch.object(services, "insert_history_event"),
             patch.object(services, "apply_ticket_sla_policy"),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "lock_support_session_booking_date"),
+            patch.object(services, "is_support_session_slot_locally_available", return_value=True),
             patch.object(services, "send_support_session_booking", return_value=booking_result),
             patch.object(services, "update_support_session_request_record"),
             patch.object(services, "connection", mock_connection),
@@ -2583,7 +2638,11 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertTrue(response["ok"])
         self.assertTrue(response["reservationConfirmed"])
         self.assertEqual(response["ticket"]["status"], "Pending")
-        insert_params = cursor.execute.call_args_list[0].args[1]
+        insert_call = next(
+            call for call in cursor.execute.call_args_list
+            if "INSERT INTO support_session_requests" in call.args[0]
+        )
+        insert_params = insert_call.args[1]
         self.assertEqual(json.loads(insert_params[3])["return_path"], "/support/options")
 
     def test_cancel_support_session_request_reopens_ticket_after_cancellation(self):
