@@ -2835,6 +2835,273 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertTrue(attention_required)
         self.assertEqual(attention_reason, services.SLA_ATTENTION_REASON_PENDING_OVERDUE)
 
+    def test_apply_ticket_sla_policy_does_not_breach_waiting_coverage_ticket_by_age(self):
+        old_created_at = datetime.now(timezone.utc) - timedelta(days=6)
+        ticket = {
+            "id": 51,
+            "public_id": "KBC-000051",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Nathan\nModule: Martech\nPreferred Time: 10:00 AM\nSession Date: Wednesday 24 Jun 2026",
+            "status": "Pending",
+            "status_reason": "Coverage Ticket",
+            "sla_status": "On Track",
+            "metadata": {"technical_subcategory": "Coverage"},
+            "created_at": old_created_at,
+        }
+
+        result = services.apply_ticket_sla_policy(ticket, persist=True)
+
+        self.assertEqual(result["sla_status"], "On Track")
+        self.assertFalse(result["sla_attention_required"])
+
+    def test_apply_ticket_sla_policy_restores_legacy_quick_coverage_ticket(self):
+        old_created_at = datetime.now(timezone.utc) - timedelta(days=6)
+        ticket = {
+            "id": 511,
+            "public_id": "KBC-000511",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Juliane\nModule: Marketing Impact\nPreferred Time: 09:00 AM\nSession Date: Wednesday 01 Jul 2026",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "sla_status": "Breached",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "sla_attention_required": True,
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_PENDING_OVERDUE,
+            },
+            "created_at": old_created_at,
+        }
+
+        result = services.apply_ticket_sla_policy(ticket)
+
+        self.assertEqual(result["sla_status"], "On Track")
+        self.assertFalse(result["sla_attention_required"])
+        self.assertFalse(result["metadata"]["sla_attention_required"])
+        self.assertIsNone(result["metadata"]["sla_attention_reason"])
+
+    def test_apply_ticket_sla_policy_preserves_coverage_deadline_breach(self):
+        old_created_at = datetime.now(timezone.utc) - timedelta(days=6)
+        ticket = {
+            "id": 513,
+            "public_id": "KBC-000513",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Juliane\nModule: Marketing Impact\nPreferred Time: 09:00 AM\nSession Date: Wednesday 17 Jun 2026",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "sla_status": "Breached",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "sla_attention_required": True,
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+            },
+            "created_at": old_created_at,
+        }
+
+        result = services.apply_ticket_sla_policy(ticket)
+
+        self.assertEqual(result["sla_status"], "Breached")
+        self.assertTrue(result["sla_attention_required"])
+        self.assertEqual(result["metadata"]["sla_attention_reason"], services.SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
+
+    def test_apply_ticket_sla_policy_repairs_coverage_state_breach_metadata(self):
+        old_created_at = datetime.now(timezone.utc) - timedelta(days=6)
+        ticket = {
+            "id": 514,
+            "public_id": "KBC-000514",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Juliane\nModule: Marketing Impact\nPreferred Time: 09:00 AM\nSession Date: Wednesday 17 Jun 2026",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "sla_status": "On Track",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "sla_attention_required": False,
+                "sla_attention_reason": None,
+                "coverage_sla_state": {
+                    "stage": "warning",
+                    "sessionStartAt": "2026-06-17T08:00:00+00:00",
+                    "breachDeadlineAt": "2026-06-14T08:00:00+00:00",
+                    "breachedAt": "2026-06-15T09:00:00+00:00",
+                    "warningTriggeredAt": "2026-06-15T09:00:00+00:00",
+                    "escalatedAt": None,
+                },
+            },
+            "created_at": old_created_at,
+        }
+
+        result = services.apply_ticket_sla_policy(ticket)
+
+        self.assertEqual(result["sla_status"], "Breached")
+        self.assertTrue(result["sla_attention_required"])
+        self.assertEqual(result["metadata"]["sla_attention_reason"], services.SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
+        self.assertEqual(result["metadata"]["coverage_sla_state"]["stage"], "warning")
+
+    def test_sync_coverage_ticket_sla_alerts_restores_legacy_quick_ticket_before_deadline(self):
+        reference_now = datetime(2026, 6, 15, 15, 0, tzinfo=timezone.utc)
+        ticket = {
+            "id": 512,
+            "public_id": "KBC-000512",
+            "learner_name": "Ella",
+            "learner_email": "ella@example.com",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Juliane\nModule: Marketing Impact\nPreferred Time: 09:00 AM\nSession Date: Wednesday 01 Jul 2026",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "sla_status": "Breached",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "sla_attention_required": True,
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_PENDING_OVERDUE,
+            },
+            "created_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+        }
+        cursor = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.object(services, "run_query", return_value=[ticket]),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "send_coverage_sla_alert_webhook") as send_webhook,
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.sync_coverage_ticket_sla_alerts(reference_now)
+
+        self.assertEqual(result, {"scanned": 1, "updated": 1, "warnings": 0, "escalations": 0, "breached": 0, "attentionRequired": 0})
+        update_params = cursor.execute.call_args.args[1]
+        self.assertEqual(update_params[0], "On Track")
+        persisted_metadata = json.loads(update_params[1])
+        self.assertFalse(persisted_metadata["sla_attention_required"])
+        self.assertIsNone(persisted_metadata["sla_attention_reason"])
+        self.assertNotIn("coverage_sla_state", persisted_metadata)
+        send_webhook.assert_not_called()
+        insert_history_event.assert_not_called()
+
+    def test_sync_coverage_ticket_sla_alerts_sends_warning_at_three_day_deadline(self):
+        reference_now = datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
+        ticket = {
+            "id": 52,
+            "public_id": "KBC-000052",
+            "learner_name": "Ella",
+            "learner_email": "ella@example.com",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Nathan\nModule: Martech\nPreferred Time: 10:00 AM\nSession Date: Wednesday 24 Jun 2026",
+            "status": "Pending",
+            "status_reason": "Coverage Ticket",
+            "sla_status": "On Track",
+            "metadata": {"technical_subcategory": "Coverage"},
+            "created_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+        }
+        cursor = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.object(services, "run_query", return_value=[ticket]),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "send_coverage_sla_alert_webhook", return_value={"configured": True, "delivered": True, "status": 200}) as send_webhook,
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.sync_coverage_ticket_sla_alerts(reference_now)
+
+        self.assertEqual(result, {"scanned": 1, "updated": 1, "warnings": 1, "escalations": 0, "breached": 1, "attentionRequired": 1})
+        update_params = cursor.execute.call_args.args[1]
+        self.assertEqual(update_params[0], "Breached")
+        persisted_metadata = json.loads(update_params[1])
+        self.assertEqual(persisted_metadata["sla_attention_reason"], services.SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
+        self.assertEqual(persisted_metadata["coverage_sla_state"]["stage"], services.COVERAGE_SLA_STAGE_WARNING)
+        send_webhook.assert_called_once()
+        self.assertEqual(send_webhook.call_args.args[0]["alertLevel"], "warning")
+        insert_history_event.assert_called_once()
+
+    def test_sync_coverage_ticket_sla_alerts_escalates_one_day_after_warning(self):
+        reference_now = datetime(2026, 6, 22, 9, 1, tzinfo=timezone.utc)
+        ticket = {
+            "id": 53,
+            "public_id": "KBC-000053",
+            "learner_name": "Ella",
+            "learner_email": "ella@example.com",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Nathan\nModule: Martech\nPreferred Time: 10:00 AM\nSession Date: Wednesday 24 Jun 2026",
+            "status": "Pending",
+            "status_reason": "Coverage Ticket",
+            "sla_status": "Breached",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "sla_attention_required": True,
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+                "coverage_sla_state": {
+                    "stage": "warning",
+                    "sessionStartAt": "2026-06-24T09:00:00+00:00",
+                    "breachDeadlineAt": "2026-06-21T09:00:00+00:00",
+                    "breachedAt": "2026-06-21T09:00:00+00:00",
+                    "warningTriggeredAt": "2026-06-21T09:00:00+00:00",
+                },
+            },
+            "created_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+        }
+        cursor = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value.__enter__.return_value = cursor
+
+        with (
+            patch.object(services, "run_query", return_value=[ticket]),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "send_coverage_sla_alert_webhook", return_value={"configured": True, "delivered": True, "status": 200}) as send_webhook,
+            patch.object(services, "insert_history_event"),
+        ):
+            result = services.sync_coverage_ticket_sla_alerts(reference_now)
+
+        self.assertEqual(result["escalations"], 1)
+        update_params = cursor.execute.call_args.args[1]
+        persisted_metadata = json.loads(update_params[1])
+        self.assertEqual(persisted_metadata["coverage_sla_state"]["stage"], services.COVERAGE_SLA_STAGE_ESCALATED)
+        self.assertTrue(persisted_metadata["coverage_sla_state"]["escalatedAt"])
+        send_webhook.assert_called_once()
+        self.assertEqual(send_webhook.call_args.args[0]["alertLevel"], "escalated")
+
+    def test_sync_coverage_ticket_sla_alerts_does_not_duplicate_warning(self):
+        reference_now = datetime(2026, 6, 21, 12, 0, tzinfo=timezone.utc)
+        ticket = {
+            "id": 54,
+            "public_id": "KBC-000054",
+            "learner_name": "Ella",
+            "learner_email": "ella@example.com",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Tutor: Nathan\nModule: Martech\nPreferred Time: 10:00 AM\nSession Date: Wednesday 24 Jun 2026",
+            "status": "Pending",
+            "status_reason": "Coverage Ticket",
+            "sla_status": "Breached",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "sla_attention_required": True,
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+                "coverage_sla_state": {
+                    "stage": "warning",
+                    "sessionStartAt": "2026-06-24T09:00:00+00:00",
+                    "breachDeadlineAt": "2026-06-21T09:00:00+00:00",
+                    "breachedAt": "2026-06-21T09:00:00+00:00",
+                    "warningTriggeredAt": "2026-06-21T09:00:00+00:00",
+                },
+            },
+            "created_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 6, 12, 16, 45, tzinfo=timezone.utc),
+        }
+
+        with (
+            patch.object(services, "run_query", return_value=[ticket]),
+            patch.object(services, "send_coverage_sla_alert_webhook") as send_webhook,
+            patch.object(services, "insert_history_event"),
+        ):
+            result = services.sync_coverage_ticket_sla_alerts(reference_now)
+
+        self.assertEqual(result["warnings"], 0)
+        self.assertEqual(result["escalations"], 0)
+        send_webhook.assert_not_called()
+
     def test_to_sender_label_accepts_string_metadata_payload(self):
         label = services.to_sender_label("assistant", '{"original_sender":"bot"}')
 
@@ -4041,6 +4308,21 @@ class SlaSyncCommandTests(SimpleTestCase):
 
         self.assertIn("SLA sync completed. Scanned 7 ticket(s), updated 3, breached 2, attention required 2.", output.getvalue())
         sync_auto_managed_ticket_sla_statuses.assert_called_once_with()
+
+    def test_sync_coverage_sla_alerts_command_reports_summary(self):
+        output = StringIO()
+
+        with patch(
+            "support_portal.management.commands.sync_coverage_sla_alerts.sync_coverage_ticket_sla_alerts",
+            return_value={"scanned": 4, "updated": 2, "warnings": 1, "escalations": 1, "breached": 2, "attentionRequired": 2},
+        ) as sync_coverage_ticket_sla_alerts:
+            call_command("sync_coverage_sla_alerts", stdout=output)
+
+        self.assertIn(
+            "Coverage SLA sync completed. Scanned 4 ticket(s), updated 2, warnings 1, escalations 1, breached 2, attention required 2.",
+            output.getvalue(),
+        )
+        sync_coverage_ticket_sla_alerts.assert_called_once_with()
 
 
 class SyncLearnersToSupportAccountsCommandTests(SimpleTestCase):

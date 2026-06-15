@@ -71,6 +71,7 @@ STATUS_REASON_CLOSED_BY_AGENT = "Closed via Agent"
 STATUS_REASON_AWAITING_MEETING = "Awaiting support meeting"
 STATUS_REASON_ESCALATION = "Escalation"
 STATUS_REASON_QUICK_TICKET = "Quick Ticket"
+STATUS_REASON_COVERAGE_TICKET = "Coverage Ticket"
 STATUS_REASON_TUTOR_REQUESTED = "Tutor Requested"
 STATUS_REASON_TUTOR_ACCEPTED = "Tutor Accepted"
 STATUS_REASON_TUTOR_REJECTED = "Tutor Rejected"
@@ -87,6 +88,10 @@ QUICK_TICKET_STATUS_REASONS = {
     LEGACY_STATUS_REASON_AWAITING_RESOLUTION,
     LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND,
     LEGACY_STATUS_REASON_AWAITING_SUPPORT_REVIEW,
+}
+INITIAL_COVERAGE_STATUS_REASONS = {
+    STATUS_REASON_COVERAGE_TICKET,
+    *QUICK_TICKET_STATUS_REASONS,
 }
 COVERAGE_TUTOR_STATUS_REASONS = {
     STATUS_REASON_TUTOR_REQUESTED,
@@ -106,6 +111,7 @@ ALLOWED_STATUS_REASONS_BY_STATUS = {
     "Pending": {
         STATUS_REASON_AWAITING_MEETING,
         STATUS_REASON_ESCALATION,
+        STATUS_REASON_COVERAGE_TICKET,
         *QUICK_TICKET_STATUS_REASONS,
         *COVERAGE_TUTOR_STATUS_REASONS,
     },
@@ -218,6 +224,7 @@ CHAT_ATTACHMENTS_METADATA_KEY = "attachments"
 CHAT_ATTACHMENT_STORAGE_SEGMENT = "chat"
 COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 30
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
+COVERAGE_SLA_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_SLA_STAGE_WARNING = "warning"
 COVERAGE_SLA_STAGE_ESCALATED = "escalated"
@@ -1531,7 +1538,7 @@ def is_coverage_ticket_waiting_for_initial_action(row: dict[str, Any]) -> bool:
         return False
 
     normalized_status_reason = sanitize_text(row.get("status_reason"))
-    if normalized_status_reason and normalized_status_reason != "Coverage Ticket":
+    if normalized_status_reason and normalized_status_reason not in INITIAL_COVERAGE_STATUS_REASONS:
         return False
 
     metadata = normalize_json_object(row.get("metadata"))
@@ -1633,6 +1640,65 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
     current_attention_required = normalize_bool(metadata.get("sla_attention_required"))
     current_attention_reason = sanitize_text(metadata.get("sla_attention_reason")) or None
 
+    if is_coverage_ticket_waiting_for_initial_action(row):
+        coverage_sla_state = get_coverage_sla_state(metadata)
+        if current_attention_reason == SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE or coverage_sla_state:
+            next_sla_status = "Breached"
+            metadata_patch = build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
+            next_metadata = {**metadata, **metadata_patch}
+            row["sla_status"] = next_sla_status
+            row["sla_attention_required"] = True
+            row["metadata"] = next_metadata
+            if (
+                persist
+                and row.get("id")
+                and (
+                    current_sla_status != next_sla_status
+                    or not current_attention_required
+                    or current_attention_reason != SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
+                )
+            ):
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE tickets
+                        SET sla_status = %s,
+                            metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        [next_sla_status, json.dumps(metadata_patch), row["id"]],
+                    )
+            return row
+
+        next_sla_status = "On Track"
+        metadata_patch = build_sla_metadata_patch(False, None)
+        next_metadata = {**metadata, **metadata_patch}
+        row["sla_status"] = next_sla_status
+        row["sla_attention_required"] = False
+        row["metadata"] = next_metadata
+        if (
+            persist
+            and row.get("id")
+            and (
+                current_sla_status != next_sla_status
+                or current_attention_required
+                or current_attention_reason is not None
+            )
+        ):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET sla_status = %s,
+                        metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [next_sla_status, json.dumps(metadata_patch), row["id"]],
+                )
+        return row
+
     next_sla_status, attention_required, attention_reason = derive_sla_state(
         row.get("status"),
         row.get("created_at"),
@@ -1671,7 +1737,7 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
 def sync_auto_managed_ticket_sla_statuses() -> dict[str, int]:
     tickets = run_query(
         """
-        SELECT id, status, sla_status, metadata, created_at
+        SELECT id, public_id, category, technical_subcategory, inquiry, status, status_reason, sla_status, metadata, created_at
         FROM tickets
         WHERE status = ANY(%s)
         ORDER BY id ASC
@@ -1713,6 +1779,283 @@ def sync_auto_managed_ticket_sla_statuses() -> dict[str, int]:
     return {
         "scanned": scanned_count,
         "updated": updated_count,
+        "breached": breached_count,
+        "attentionRequired": attention_required_count,
+    }
+
+
+def build_coverage_sla_alert_webhook_payload(
+    ticket: dict[str, Any],
+    *,
+    alert_level: str,
+    session_start_at: datetime,
+    breach_deadline_at: datetime,
+    breached_at: datetime,
+) -> dict[str, Any]:
+    normalized_alert_level = sanitize_text(alert_level).lower() or COVERAGE_SLA_STAGE_WARNING
+    parsed_inquiry = parse_coverage_inquiry_details(ticket.get("inquiry")) or {}
+    public_base_url = get_support_portal_public_base_url("")
+    dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
+
+    return {
+        "event": "coverage_sla",
+        "alertLevel": normalized_alert_level,
+        "source": "support_portal",
+        "ticket": {
+            "id": ticket.get("public_id") or "",
+            "status": ticket.get("status") or "",
+            "statusReason": ticket.get("status_reason") or "",
+            "slaStatus": "Breached",
+            "sessionStartAt": serialize_datetime_value(session_start_at),
+            "breachDeadlineAt": serialize_datetime_value(breach_deadline_at),
+            "breachedAt": serialize_datetime_value(breached_at),
+            "dashboardUrl": dashboard_url,
+        },
+        "requester": {
+            "name": ticket.get("learner_name") or ticket.get("learner_email") or "",
+            "email": ticket.get("learner_email") or "",
+        },
+        "coverage": {
+            "tutor": parsed_inquiry.get("tutor") or "",
+            "module": parsed_inquiry.get("module") or "",
+            "preferredTime": parsed_inquiry.get("time") or "",
+            "sessionDates": parsed_inquiry.get("sessionDates") or [],
+            "sessionNumbers": parsed_inquiry.get("sessionNumbers") or [],
+            "sessionSubjects": parsed_inquiry.get("sessionSubjects") or [],
+            "sessions": build_coverage_session_items_from_inquiry_details(parsed_inquiry),
+        },
+    }
+
+
+def send_coverage_sla_alert_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    configured, delivered, status, response_payload = post_json_webhook(
+        get_coverage_sla_alerts_webhook_url(),
+        payload,
+        timeout_seconds=COVERAGE_SLA_WEBHOOK_TIMEOUT_SECONDS,
+    )
+    return {
+        "configured": configured,
+        "delivered": delivered,
+        "status": status,
+        "response": response_payload,
+    }
+
+
+def build_coverage_sla_state(
+    *,
+    stage: str,
+    session_start_at: datetime,
+    breach_deadline_at: datetime,
+    breached_at: datetime | None = None,
+    warning_triggered_at: datetime | None = None,
+    escalated_at: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "sessionStartAt": serialize_datetime_value(session_start_at),
+        "breachDeadlineAt": serialize_datetime_value(breach_deadline_at),
+        "breachedAt": serialize_datetime_value(breached_at),
+        "warningTriggeredAt": serialize_datetime_value(warning_triggered_at),
+        "escalatedAt": serialize_datetime_value(escalated_at),
+    }
+
+
+def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> dict[str, int]:
+    comparison_now = reference_now or datetime.now(timezone.utc)
+    if comparison_now.tzinfo is None:
+        comparison_now = comparison_now.replace(tzinfo=timezone.utc)
+
+    tickets = run_query(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          l.full_name AS learner_name,
+          l.email AS learner_email,
+          t.category,
+          t.technical_subcategory,
+          t.inquiry,
+          t.status,
+          t.status_reason,
+          t.sla_status,
+          t.metadata,
+          t.created_at,
+          t.updated_at
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        WHERE t.status = 'Pending'
+          AND COALESCE(t.is_archived, FALSE) = FALSE
+          AND (
+            LOWER(TRIM(COALESCE(t.technical_subcategory, ''))) = 'coverage'
+            OR LOWER(TRIM(COALESCE(t.metadata ->> 'technical_subcategory', ''))) = 'coverage'
+          )
+        ORDER BY t.id ASC
+        """
+    )
+
+    scanned_count = 0
+    updated_count = 0
+    warning_count = 0
+    escalation_count = 0
+    breached_count = 0
+    attention_required_count = 0
+
+    for ticket in tickets:
+        scanned_count += 1
+        if not is_coverage_ticket_waiting_for_initial_action(ticket):
+            continue
+
+        metadata = normalize_json_object(ticket.get("metadata"))
+        documentation = normalize_admin_documentation(
+            metadata.get("admin_documentation"),
+            fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+            fallback_ticket_id=sanitize_text(ticket.get("public_id")),
+        )
+        effective_inquiry = sanitize_text(ticket.get("inquiry")) or sanitize_text(documentation.get("inquiry"))
+        ticket["inquiry"] = effective_inquiry
+        session_start_at = resolve_coverage_session_start_from_inquiry(effective_inquiry, now=comparison_now)
+        coverage_sla_state = get_coverage_sla_state(metadata)
+
+        if not session_start_at:
+            next_metadata = {**metadata, **build_sla_metadata_patch(False, None)}
+            next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
+            if (
+                sanitize_text(ticket.get("sla_status")) != "On Track"
+                or normalize_bool(metadata.get("sla_attention_required"))
+                or coverage_sla_state is not None
+            ):
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE tickets
+                        SET sla_status = %s,
+                            metadata = %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        ["On Track", json.dumps(next_metadata), ticket["id"]],
+                    )
+                updated_count += 1
+            continue
+
+        breach_deadline_at = session_start_at - COVERAGE_SLA_BREACH_LEAD_TIME
+        if comparison_now < breach_deadline_at:
+            next_metadata = {**metadata, **build_sla_metadata_patch(False, None)}
+            next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
+            if (
+                sanitize_text(ticket.get("sla_status")) != "On Track"
+                or normalize_bool(metadata.get("sla_attention_required"))
+                or coverage_sla_state is not None
+            ):
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE tickets
+                        SET sla_status = %s,
+                            metadata = %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        ["On Track", json.dumps(next_metadata), ticket["id"]],
+                    )
+                updated_count += 1
+            continue
+
+        previous_warning_triggered_at = coerce_datetime((coverage_sla_state or {}).get("warningTriggeredAt"))
+        previous_breached_at = coerce_datetime((coverage_sla_state or {}).get("breachedAt"))
+        previous_escalated_at = coerce_datetime((coverage_sla_state or {}).get("escalatedAt"))
+        alert_level = ""
+
+        if not previous_warning_triggered_at:
+            alert_level = COVERAGE_SLA_STAGE_WARNING
+            breached_at = comparison_now
+            warning_triggered_at = comparison_now
+            escalated_at = None
+        else:
+            breached_at = previous_breached_at or previous_warning_triggered_at
+            warning_triggered_at = previous_warning_triggered_at
+            escalation_due_at = breached_at + COVERAGE_SLA_ESCALATION_AFTER
+            if not previous_escalated_at and comparison_now >= escalation_due_at:
+                alert_level = COVERAGE_SLA_STAGE_ESCALATED
+                escalated_at = comparison_now
+            else:
+                escalated_at = previous_escalated_at
+
+        stage = COVERAGE_SLA_STAGE_ESCALATED if (previous_escalated_at or alert_level == COVERAGE_SLA_STAGE_ESCALATED) else COVERAGE_SLA_STAGE_WARNING
+        next_state = build_coverage_sla_state(
+            stage=stage,
+            session_start_at=session_start_at,
+            breach_deadline_at=breach_deadline_at,
+            breached_at=breached_at,
+            warning_triggered_at=warning_triggered_at,
+            escalated_at=escalated_at,
+        )
+        next_metadata = {
+            **metadata,
+            **build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE),
+            COVERAGE_SLA_STATE_METADATA_KEY: next_state,
+        }
+
+        should_persist = (
+            sanitize_text(ticket.get("sla_status")) != "Breached"
+            or not normalize_bool(metadata.get("sla_attention_required"))
+            or sanitize_text(metadata.get("sla_attention_reason")) != SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
+            or normalize_coverage_sla_state(coverage_sla_state) != normalize_coverage_sla_state(next_state)
+        )
+
+        if should_persist:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET sla_status = %s,
+                        metadata = %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    ["Breached", json.dumps(next_metadata), ticket["id"]],
+                )
+            updated_count += 1
+
+        if alert_level:
+            if alert_level == COVERAGE_SLA_STAGE_WARNING:
+                warning_count += 1
+            elif alert_level == COVERAGE_SLA_STAGE_ESCALATED:
+                escalation_count += 1
+
+            alert_payload = build_coverage_sla_alert_webhook_payload(
+                {**ticket, "sla_status": "Breached"},
+                alert_level=alert_level,
+                session_start_at=session_start_at,
+                breach_deadline_at=breach_deadline_at,
+                breached_at=breached_at,
+            )
+            webhook_result = send_coverage_sla_alert_webhook(alert_payload)
+            insert_history_event(
+                ticket["id"],
+                "coverage_sla_alert",
+                {"role": "system", "label": "System"},
+                {
+                    "ticketId": ticket.get("public_id"),
+                    "alertLevel": alert_level,
+                    "sessionStartAt": serialize_datetime_value(session_start_at),
+                    "breachDeadlineAt": serialize_datetime_value(breach_deadline_at),
+                    "breachedAt": serialize_datetime_value(breached_at),
+                    "webhookConfigured": bool(webhook_result.get("configured")),
+                    "webhookDelivered": bool(webhook_result.get("delivered")),
+                    "webhookStatus": webhook_result.get("status"),
+                },
+            )
+
+        breached_count += 1
+        attention_required_count += 1
+
+    return {
+        "scanned": scanned_count,
+        "updated": updated_count,
+        "warnings": warning_count,
+        "escalations": escalation_count,
         "breached": breached_count,
         "attentionRequired": attention_required_count,
     }
@@ -2306,6 +2649,10 @@ def get_support_notification_webhook_url() -> str:
 
 def get_coverage_ticket_operations_webhook_url() -> str:
     return sanitize_text(getattr(settings, "COVERAGE_TICKET_WEBHOOK_URL", ""))
+
+
+def get_coverage_sla_alerts_webhook_url() -> str:
+    return sanitize_text(getattr(settings, "COVERAGE_SLA_WEBHOOK_URL", ""))
 
 
 def get_coverage_tutor_response_mail_webhook_url() -> str:
