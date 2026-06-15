@@ -2773,7 +2773,7 @@ const AgentDashboard = () => {
     }
 
     if (!targetCard.tutor.trim()) {
-      toast.error("Choose a tutor before submitting the request.");
+      toast.error("Choose a tutor or coach before submitting the request.");
       return;
     }
 
@@ -2783,12 +2783,12 @@ const AgentDashboard = () => {
     }
 
     if (!targetCard.tutorEmail.trim()) {
-      toast.error("Add the tutor e-mail before submitting the request.");
+      toast.error("Add the recipient e-mail before submitting the request.");
       return;
     }
 
     if (!isValidCoverageTutorEmail(targetCard.tutorEmail)) {
-      toast.error("Please enter a valid tutor e-mail before submitting the request.");
+      toast.error("Please enter a valid recipient e-mail before submitting the request.");
       return;
     }
 
@@ -2824,7 +2824,7 @@ const AgentDashboard = () => {
         if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
           return;
         }
-        toast.error(payload?.message || "We could not submit this tutor request right now.");
+        toast.error(payload?.message || "We could not submit this coverage request right now.");
         return;
       }
 
@@ -2912,7 +2912,7 @@ const AgentDashboard = () => {
         if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
           return;
         }
-        toast.error(payload?.message || "We could not confirm this tutor session right now.");
+        toast.error(payload?.message || "We could not confirm this coverage session right now.");
         return;
       }
 
@@ -3439,7 +3439,7 @@ const AgentDashboard = () => {
         if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
           return;
         }
-        toast.error(payload?.message || "We could not clear this tutor update right now.");
+        toast.error(payload?.message || "We could not clear this coverage update right now.");
         return;
       }
 
@@ -7380,6 +7380,13 @@ const CoverageTicketWorkspace = ({
 
     setTutorEmailLoading(cardId, true);
     void fetchCoverageTutorEmail(tutor)
+      .then(async (email) => {
+        if (email.trim()) {
+          return email;
+        }
+
+        return fetchCoverageCoachEmail(tutor).catch(() => "");
+      })
       .then((email) => {
         const currentCard = draftRef.current.coverageCards.find((card) => card.id === cardId);
         if (!currentCard || currentCard.tutor !== tutor || currentCard.tutorEmail.trim()) {
@@ -7391,7 +7398,7 @@ const CoverageTicketWorkspace = ({
       })
       .catch((error: unknown) => {
         setTutorEmailEditing(cardId, true);
-        toast.error(error instanceof Error ? error.message : "We could not load the tutor e-mail right now.");
+        toast.error(error instanceof Error ? error.message : "We could not load the recipient e-mail right now.");
       })
       .finally(() => {
         setTutorEmailLoading(cardId, false);
@@ -7703,7 +7710,7 @@ const CoverageTicketWorkspace = ({
                   Coverage Cards
                 </div>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Track tutor outreach, responses, and follow-up actions in one place.
+                  Track tutor or coach outreach, responses, and follow-up actions in one place.
                 </p>
               </div>
               {!readOnly ? (
@@ -7712,9 +7719,9 @@ const CoverageTicketWorkspace = ({
                     className="border-0 gradient-primary text-white shadow-[0_16px_30px_rgba(82,54,188,0.22)]"
                     onClick={addTutorChoiceCard}
                     disabled={isSaving || hasOpenTutorChoiceDraft}
-                    title={hasOpenTutorChoiceDraft ? "Submit or remove the current tutor choice first." : undefined}
+                    title={hasOpenTutorChoiceDraft ? "Submit or remove the current recipient card first." : undefined}
                   >
-                    Add Tutor Choice Card
+                    Add Tutor / Coach Card
                   </Button>
                   <Button className="border-0 bg-violet-600 text-white shadow-[0_16px_30px_rgba(109,40,217,0.18)] hover:bg-violet-700" onClick={addNoteCard} disabled={isSaving}>
                     Add Note Card
@@ -7804,7 +7811,7 @@ const CoverageTicketWorkspace = ({
                     <div className="mt-3 space-y-2 text-sm">
                     {hasUpdatedTutorEmail ? (
                       <div className={cn("flex flex-wrap gap-x-2 gap-y-1", replyMutedTextClassName)}>
-                        <span className="font-medium">Tutor E-mail:</span>
+                        <span className="font-medium">Recipient E-mail:</span>
                         <span className="text-foreground break-all">{tutorEmail}</span>
                       </div>
                     ) : null}
@@ -7905,7 +7912,7 @@ const CoverageTicketWorkspace = ({
                               </div>
                             ) : canSendFollowUpFiles ? (
                               <div className="mt-3 rounded-xl border border-dashed border-primary/15 bg-white/70 px-3 py-2 text-sm text-muted-foreground">
-                                No presentation files have been shared with this tutor yet.
+                                No presentation files have been shared with this recipient yet.
                               </div>
                             ) : null}
                           </div>
@@ -7994,8 +8001,9 @@ const CoverageTicketWorkspace = ({
               );
             }
 
-            const displayedTutorOptions = buildCoverageTutorOptionsForDisplay(tutorOptions, sameModuleTutorOptions, card.tutor);
+            const displayedTutorOptions = buildCoverageTutorOptionsForDisplay(tutorOptions, sameModuleTutorOptions, coachOptions, card.tutor);
             const displayedCoachOptions = Array.from(new Set([...coachOptions, card.coach].map((value) => value.trim()).filter(Boolean)));
+            const isLoadingCoverageRecipientOptions = isLoadingTutorOptions || isLoadingCoachOptions;
             const normalizedTutorRequestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
             const tutorChoiceStatusLabel = normalizedTutorRequestStatus === "draft" ? "" : getCoverageTutorRequestLabel(normalizedTutorRequestStatus);
             const showCompactTutorChoice = cardReadOnly;
@@ -8024,7 +8032,7 @@ const CoverageTicketWorkspace = ({
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <div className="text-sm font-semibold text-foreground">
-                        {showCompactTutorChoice ? "Tutor Request" : "Tutor Choice"}
+                        {showCompactTutorChoice ? "Coverage Request" : "Coverage Recipient"}
                       </div>
                       {tutorChoiceStatusLabel ? (
                         <div className={cn(
@@ -8069,7 +8077,7 @@ const CoverageTicketWorkspace = ({
                       <div className="flex flex-wrap items-start justify-between gap-3">
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-foreground">
-                            <span className="font-medium">{card.tutor || "Tutor"}</span>
+                            <span className="font-medium">{card.tutor || "Recipient"}</span>
                             {card.tutorEmail ? (
                               <span className="break-all text-muted-foreground">{card.tutorEmail}</span>
                             ) : null}
@@ -8145,7 +8153,7 @@ const CoverageTicketWorkspace = ({
                         </div>
                       ) : canSendFollowUpFiles ? (
                         <div className="mt-3 rounded-xl border border-dashed border-primary/15 bg-white/70 px-3 py-2 text-sm text-muted-foreground">
-                          No presentation files have been shared with this tutor yet.
+                          No presentation files have been shared with this recipient yet.
                         </div>
                       ) : null}
                     </div>
@@ -8158,30 +8166,37 @@ const CoverageTicketWorkspace = ({
                     <div className="mt-3 grid gap-3">
                       <div className="grid gap-3 md:grid-cols-2 md:items-start">
                         <div className="space-y-2">
-                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Tutor</Label>
+                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Tutor / Coach</Label>
                           <Select
                             value={card.tutor}
                             onValueChange={(value) => handleTutorChange(card.id, value)}
-                            disabled={isLoadingTutorOptions || isSaving}
+                            disabled={isLoadingCoverageRecipientOptions || isSaving}
                           >
                             <SelectTrigger>
-                              <SelectValue placeholder={isLoadingTutorOptions ? "Loading tutors..." : "Choose tutor"} />
+                              <SelectValue placeholder={isLoadingCoverageRecipientOptions ? "Loading recipients..." : "Choose tutor or coach"} />
                             </SelectTrigger>
                             <SelectContent>
                               {displayedTutorOptions.length === 0 ? (
                                 <div className="px-3 py-2 text-sm text-muted-foreground">
-                                  {isLoadingTutorOptions ? "Loading tutors..." : "No tutors available."}
+                                  {isLoadingCoverageRecipientOptions ? "Loading recipients..." : "No tutors or coaches available."}
                                 </div>
                               ) : (
                                 displayedTutorOptions.map((option) => (
                                   <SelectItem key={option.name} value={option.name} className="py-2 pr-3">
                                     <div className="grid w-[calc(var(--radix-select-trigger-width)-2.75rem)] grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                                       <span className="truncate">{option.name}</span>
-                                      {option.isSameModule ? (
-                                        <span className="shrink-0 rounded-full border border-primary/15 bg-primary/[0.08] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-primary">
-                                          Same module
-                                        </span>
-                                      ) : null}
+                                      <span className="flex shrink-0 flex-wrap justify-end gap-1">
+                                        {option.isSameModule ? (
+                                          <span className="rounded-full border border-primary/15 bg-primary/[0.08] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-primary">
+                                            Same module
+                                          </span>
+                                        ) : null}
+                                        {option.isCoach ? (
+                                          <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-700">
+                                            Coach
+                                          </span>
+                                        ) : null}
+                                      </span>
                                     </div>
                                   </SelectItem>
                                 ))
@@ -8191,14 +8206,14 @@ const CoverageTicketWorkspace = ({
                         </div>
 
                         <div className="space-y-2">
-                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Tutor E-mail</Label>
+                          <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Recipient E-mail</Label>
                           <div className="relative">
                             <Input
                               type="email"
                               value={card.tutorEmail}
                               onChange={(event) => handleTutorEmailChange(card.id, event.target.value)}
                               readOnly={!isTutorEmailEditable}
-                              placeholder={card.tutor ? "Enter tutor e-mail" : "Choose tutor first"}
+                              placeholder={card.tutor ? "Enter recipient e-mail" : "Choose tutor or coach first"}
                               className={cn(
                                 "bg-background",
                                 card.tutorEmail.trim() && "pr-16",
@@ -8222,13 +8237,13 @@ const CoverageTicketWorkspace = ({
                       <p className="text-xs text-muted-foreground">
                         {card.tutor
                           ? isTutorEmailLoading
-                            ? "Loading tutor e-mail..."
+                            ? "Loading recipient e-mail..."
                             : card.tutorEmail.trim()
                             ? isTutorEmailEditable
-                              ? "Edit if the tutor e-mail needs a correction."
-                              : "Loaded from Tutors_Modules."
-                            : "No e-mail was found in Tutors_Modules. Please enter it manually."
-                          : "Choose a tutor to load the e-mail automatically."}
+                              ? "Edit if the recipient e-mail needs a correction."
+                              : "Loaded from Tutors_Modules or Aptem owner data."
+                            : "No e-mail was found in Tutors_Modules or Aptem owner data. Please enter it manually."
+                          : "Choose a tutor or coach to load the e-mail automatically."}
                       </p>
                       <div className="grid gap-3 md:grid-cols-2 md:items-start">
                         <div className="space-y-2">
@@ -8296,8 +8311,8 @@ const CoverageTicketWorkspace = ({
                             : card.coachEmail.trim()
                               ? isCoachEmailEditable
                                 ? "Edit if the coach e-mail needs a correction."
-                                : "Loaded from coach_profiles."
-                              : "No e-mail was found in coach_profiles. Please enter it manually."
+                                : "Loaded from Aptem owner data."
+                              : "No e-mail was found in Aptem owner data. Please enter it manually."
                           : "Coach is optional. Choose one to load the e-mail automatically."}
                       </p>
                     </div>
@@ -8389,7 +8404,7 @@ const CoverageTicketWorkspace = ({
                         className="border-0 gradient-primary"
                       >
                         {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
-                        Submit to Tutor
+                        Submit Request
                       </Button>
                     </div>
                   </>
@@ -10188,28 +10203,43 @@ function normalizeCoverageTutorOptionKey(value: string) {
 function buildCoverageTutorOptionsForDisplay(
   allTutorOptions: string[],
   sameModuleTutorOptions: string[],
+  coachOptions: string[],
   currentTutor: string,
 ) {
   const sameModuleTutorKeys = new Set(sameModuleTutorOptions.map(normalizeCoverageTutorOptionKey));
-  const seenTutorKeys = new Set<string>();
-  const options: Array<{ name: string; isSameModule: boolean }> = [];
+  const coachKeys = new Set(coachOptions.map(normalizeCoverageTutorOptionKey));
+  const optionIndexesByKey = new Map<string, number>();
+  const options: Array<{ name: string; isSameModule: boolean; isCoach: boolean }> = [];
 
   const addTutorOption = (name: string) => {
     const normalizedName = name.trim();
     const optionKey = normalizeCoverageTutorOptionKey(normalizedName);
-    if (!normalizedName || seenTutorKeys.has(optionKey)) {
+    if (!normalizedName) {
       return;
     }
 
-    seenTutorKeys.add(optionKey);
+    const existingIndex = optionIndexesByKey.get(optionKey);
+    if (existingIndex !== undefined) {
+      const existingOption = options[existingIndex];
+      options[existingIndex] = {
+        ...existingOption,
+        isSameModule: existingOption.isSameModule || sameModuleTutorKeys.has(optionKey),
+        isCoach: existingOption.isCoach || coachKeys.has(optionKey),
+      };
+      return;
+    }
+
+    optionIndexesByKey.set(optionKey, options.length);
     options.push({
       name: normalizedName,
       isSameModule: sameModuleTutorKeys.has(optionKey),
+      isCoach: coachKeys.has(optionKey),
     });
   };
 
   sameModuleTutorOptions.forEach(addTutorOption);
   allTutorOptions.forEach(addTutorOption);
+  coachOptions.forEach(addTutorOption);
   addTutorOption(currentTutor);
 
   return options;
@@ -11477,7 +11507,7 @@ const activityPayloadLabels: Record<string, string> = {
   sessionDetails: "Session Details",
   sessionCount: "Session Count",
   tutor: "Tutor",
-  tutorEmail: "Tutor E-mail",
+  tutorEmail: "Recipient E-mail",
   targetLabel: "Teams Target",
   toAgentUsername: "To Username",
   webhookDelivered: "Webhook Delivered",

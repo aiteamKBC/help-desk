@@ -678,41 +678,45 @@ class CoverageOptionsTests(SimpleTestCase):
         self.assertIn('FROM public."Tutors_Modules"', sql)
         self.assertEqual(params, ["nathan", "nathan", "nathan"])
 
-    def test_list_coverage_coach_options_returns_active_names(self):
+    def test_list_coverage_coach_options_returns_aptem_owner_names(self):
         with patch.object(
             services,
-            "run_communication_centre_query",
+            "run_aptem_auto_extracting_query",
             return_value=[
                 {"coach_name": "Mona Adel"},
                 {"coach_name": "mona adel"},
                 {"coach_name": "Youssef Samir"},
+                {"coach_name": "Default Owner"},
+                {"coach_name": "Enrolment Team"},
                 {"coach_name": ""},
             ],
-        ) as run_communication_centre_query:
+        ) as run_aptem_auto_extracting_query:
             response = services.list_coverage_coach_options()
 
         self.assertEqual(response, ["Mona Adel", "Youssef Samir"])
-        run_communication_centre_query.assert_called_once()
-        sql = run_communication_centre_query.call_args.args[0]
-        self.assertIn("FROM public.coach_profiles", sql)
+        run_aptem_auto_extracting_query.assert_called_once()
+        sql = run_aptem_auto_extracting_query.call_args.args[0]
+        self.assertIn("FROM public.aptem_auto_extracting", sql)
+        self.assertIn('"OwnerName"', sql)
 
     def test_get_coverage_coach_email_prefers_valid_match(self):
         with patch.object(
             services,
-            "run_communication_centre_query",
+            "run_aptem_auto_extracting_query",
             return_value=[
                 {"coach_email": ""},
                 {"coach_email": "Mona.Adel@kentbusinesscollege.com"},
             ],
-        ) as run_communication_centre_query:
+        ) as run_aptem_auto_extracting_query:
             response = services.get_coverage_coach_email("Mona Adel")
 
         self.assertEqual(response, "mona.adel@kentbusinesscollege.com")
-        run_communication_centre_query.assert_called_once()
-        sql = run_communication_centre_query.call_args.args[0]
-        params = run_communication_centre_query.call_args.args[1]
-        self.assertIn("FROM public.coach_profiles", sql)
-        self.assertEqual(params, ["mona adel", "mona adel", "mona adel"])
+        run_aptem_auto_extracting_query.assert_called_once()
+        sql = run_aptem_auto_extracting_query.call_args.args[0]
+        params = run_aptem_auto_extracting_query.call_args.args[1]
+        self.assertIn("FROM public.aptem_auto_extracting", sql)
+        self.assertIn('"OwnerEmail"', sql)
+        self.assertEqual(params, ["mona adel"])
 
     def test_get_coverage_options_response_formats_and_deduplicates_times(self):
         with patch.object(
@@ -8685,6 +8689,71 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         persisted_metadata = json.loads(update_params[5])
         persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
         self.assertEqual(persisted_card["tutorEmail"], "andrew.millington@kentbusinesscollege.com")
+
+    def test_submit_coverage_tutor_request_falls_back_to_aptem_owner_email_for_recipient(self):
+        ticket = {
+            "id": 143,
+            "public_id": "KBC-000143",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "inquiry": "Coverage request",
+                    "ticketId": "KBC-000143",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Mona Adel",
+                            "tutorEmail": "",
+                            "sessionDetails": "Module: APM",
+                            "presentationFiles": [],
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "get_coverage_tutor_email", return_value="") as get_coverage_tutor_email,
+            patch.object(services, "get_coverage_coach_email", return_value="mona.adel@kentbusinesscollege.com") as get_coverage_coach_email,
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000143"}}),
+        ):
+            response = services.submit_coverage_tutor_request(
+                "KBC-000143",
+                {"actorUsername": "ahmed", "cardId": "card-1"},
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000143")
+        get_coverage_tutor_email.assert_called_once_with("Mona Adel")
+        get_coverage_coach_email.assert_called_once_with("Mona Adel")
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(webhook_payload["tutor"]["email"], "mona.adel@kentbusinesscollege.com")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        persisted_metadata = json.loads(update_params[5])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["tutorEmail"], "mona.adel@kentbusinesscollege.com")
 
     def test_submit_coverage_tutor_request_falls_back_to_database_coach_email_lookup(self):
         ticket = {

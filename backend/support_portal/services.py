@@ -130,6 +130,7 @@ DEFAULT_AGENT_CONSOLE_STATUS = "Off"
 AGENT_CONSOLE_STATUSES = {"Available", "Busy", "Off"}
 SELECTABLE_AGENT_CONSOLE_STATUSES = {"Available", "Off"}
 NON_ASSIGNABLE_AGENT_CONSOLE_STATUSES = {"Off"}
+EXCLUDED_APTEM_OWNER_NAMES = {"default owner", "enrolment team"}
 PENDING_TRANSFER_REQUEST_METADATA_KEY = "pending_transfer_request"
 LATEST_TRANSFER_DECISION_METADATA_KEY = "latest_transfer_decision"
 PENDING_ESCALATION_NOTIFICATION_METADATA_KEY = "pending_escalation_notification"
@@ -1871,6 +1872,20 @@ def run_communication_centre_query(
             return dictfetchall(cursor)
 
 
+def run_aptem_auto_extracting_query(
+    sql: str,
+    params: list[Any] | tuple[Any, ...] | None = None,
+) -> list[dict[str, Any]]:
+    aptem_auto_extracting_url = sanitize_text(getattr(settings, "APTEM_AUTO_EXTRACTING_DATABASE_URL", ""))
+    if not aptem_auto_extracting_url:
+        raise ApiError(503, "Aptem coach options are not configured on the server.")
+
+    with psycopg.connect(aptem_auto_extracting_url) as source_connection:
+        with source_connection.cursor() as cursor:
+            cursor.execute(sql, params or [])
+            return dictfetchall(cursor)
+
+
 def format_coverage_time_option_label(
     week_day: Any,
     start_time: Any,
@@ -2196,23 +2211,24 @@ def get_coverage_tutor_email(tutor: Any) -> str:
 
 
 def list_coverage_coach_options() -> list[str]:
-    rows = run_communication_centre_query(
+    rows = run_aptem_auto_extracting_query(
         """
         SELECT coach_name
         FROM (
-          SELECT DISTINCT NULLIF(TRIM(name), '') AS coach_name
-          FROM public.coach_profiles
-          WHERE COALESCE(is_active, TRUE) = TRUE
+          SELECT DISTINCT NULLIF(TRIM("OwnerName"), '') AS coach_name
+          FROM public.aptem_auto_extracting
         ) coverage_coaches
         WHERE coach_name IS NOT NULL
+          AND LOWER(coach_name) <> ALL(%s)
         ORDER BY LOWER(coach_name), coach_name
-        """
+        """,
+        [sorted(EXCLUDED_APTEM_OWNER_NAMES)],
     )
     coach_names_by_key: dict[str, str] = {}
 
     for row in rows:
         coach_name = sanitize_text(row.get("coach_name"))
-        if coach_name:
+        if coach_name and coach_name.lower() not in EXCLUDED_APTEM_OWNER_NAMES:
             coach_names_by_key.setdefault(coach_name.lower(), coach_name)
 
     return [coach_names_by_key[key] for key in sorted(coach_names_by_key)]
@@ -2223,20 +2239,15 @@ def get_coverage_coach_email(coach: Any) -> str:
     if not normalized_coach:
         return ""
 
-    rows = run_communication_centre_query(
+    rows = run_aptem_auto_extracting_query(
         """
-        SELECT NULLIF(TRIM(email), '') AS coach_email
-        FROM public.coach_profiles
-        WHERE COALESCE(is_active, TRUE) = TRUE
-          AND (
-            LOWER(TRIM(name)) = %s
-            OR LOWER(TRIM(normalized_name)) = %s
-          )
+        SELECT DISTINCT NULLIF(TRIM("OwnerEmail"), '') AS coach_email
+        FROM public.aptem_auto_extracting
+        WHERE LOWER(TRIM("OwnerName")) = %s
         ORDER BY
-          CASE WHEN LOWER(TRIM(name)) = %s THEN 0 ELSE 1 END,
-          NULLIF(TRIM(email), '') DESC NULLS LAST
+          NULLIF(TRIM("OwnerEmail"), '') DESC NULLS LAST
         """,
-        [normalized_coach, normalized_coach, normalized_coach],
+        [normalized_coach],
     )
 
     for row in rows:
@@ -10732,11 +10743,13 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
         coach_email = normalize_email(target_card.get("coachEmail")) if coach else ""
         session_details = sanitize_text(target_card.get("sessionDetails"))
         if not tutor:
-            raise ApiError(400, "Choose a tutor before submitting the request.")
+            raise ApiError(400, "Choose a tutor or coach before submitting the request.")
         if (not tutor_email or not is_valid_email(tutor_email)) and tutor:
             tutor_email = get_coverage_tutor_email(tutor)
+        if (not tutor_email or not is_valid_email(tutor_email)) and tutor:
+            tutor_email = get_coverage_coach_email(tutor)
         if not tutor_email or not is_valid_email(tutor_email):
-            raise ApiError(400, "Please enter a valid tutor e-mail before submitting the request.")
+            raise ApiError(400, "Please enter a valid recipient e-mail before submitting the request.")
         if coach and (not coach_email or not is_valid_email(coach_email)):
             coach_email = get_coverage_coach_email(coach)
         if coach and (not coach_email or not is_valid_email(coach_email)):
