@@ -84,34 +84,54 @@ Modifications/Features To Do:
 ->Check All support methods flows and test all [DONE]
 ->Add Direct Call for coaches [done]
 ->attachment in live chat, agent and user [DONE]
-
 ->Open all methods for coaches [done]
-->Category: Portal:Bugs // Portal: Suggestions and Requests
-
-
+->Category: Portal:Bugs // Portal: Suggestions and Requests []
+->Look Notes 
 [To Diyaa]
 ->Chatbot history log to revisit and relearn from
 [To Lutfi]
 ->book session from 8 -> 3
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+[->Chatbot: 
+1.Needs to keep chat bubbles preserved, sometimes they diappear whil chatbot is preparing an answer
+you can test by navigating back and forth after a question 
+2.Give chatbot access to inquiry (evidence_2)
+3.Request time out [Solution is with hammamo] (evidence_2 , 3)
+4.Chatbot message: facing Technical issue [Solution: Diaa should change model and pass chat history to it] (evidence_4)
+5.Could't Guide To Meeting Options Directly [Solution: more data, more visuals] (evidence_5)
+6.Gives not working links + No hyperlink [solution: Diaa + hamamo?!]
+->Booking: 1. Time: 8->3 + Meeting duration is 30min. can be extended to 1 Hr. (evidence_6)
+2.Remove "view chat" at status page (evidence_7)[done]
+->Submit ticket: Change Status to "Pending"
+->Live chat: 1.chatbot intro messages are messed up (evidence_8)
+2.In agent side, after agent sends message, it takes too long to be able to send again, even when the message has already arrived on Requester side,
+ also text field is frozen while sending, agent should be free and quick in replying. (evidence_10)
+3.ًwhile sending from agent side, message can keep appearing and disappearing in chat until sent, why?
+4.When requester Closes Chat, the chat in agent side keeps appearing and disappearing, this should be fixed: Agent should get a message that Requester closed chat, 
+and his chatbox should be frozen, but he still get to document the case and change its status as he sees fit.
+5.When requester closes chat, the status shown shouldnot be Closed via chatbot, remove it or change to proper reason (evidence_11)]
 ---------------------------------------
 *Coverage:
 ->In coverage: allow submit without ppt [Done]
 ->In coverage add a send presentation/ppt button in same request card even after just requesting or acceptance [Done]
-->CC for coach
+->Changed Coverage dasboard outlay to meet operation requirements (removed or combined columns + showed session dates + allowed order by priority dependent on closest session) [Done]
+->Tutor e-mail field bug [Done]
+->CC for coach choice in card [Done]
 
-->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)]
-
-->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no Action [Done->Testing]
-
-
+->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no Action [Done][Connect to n8n]
+->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)] [Connect to n8n]
 ->Add Delete in Archive [super admin only by Eng.Ayman] + deleting log?!
- ->Coverage ticket, automatic sent to all replacements, if one accepted --> Tutor accepted, and all other tutors are informed if tried to accept or refuse
-->Tutor e-mail field bug
+->Coverage ticket, automatic sent to all replacements, if one accepted --> Tutor accepted, and all other tutors are informed if tried to accept or refuse
 ->check assignment in case for more than one member editing coverage ticket.
-
+=> change sender to tutor in N8N, currently it is the student@Kent...org mail.
+->Make sure that SLA is deactivated in archive
 --------------------------------------
 *Ticket:
 ->Add attachments in documentation
+->Order things when it comes to assignment
+->Order things when it comes to Transfer, unify logic
+->When closed ticket only leave one card in history. fix that.
+--------------------------------------
 --------------------------------------
 *Knowledge base:
 ->Revise "open" format

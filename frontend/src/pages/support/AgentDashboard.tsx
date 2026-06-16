@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   ArrowRightLeft,
   Bell,
+  CalendarDays,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -78,7 +79,6 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { SupportLayout } from "@/components/support/SupportLayout";
@@ -93,7 +93,15 @@ import {
   setAdminSessionOnWindow,
   type AdminSession,
 } from "@/lib/adminSession";
-import { fetchCoverageCoachEmail, fetchCoverageOptions, fetchCoverageTutorEmail, parseCoverageInquiry } from "@/lib/coverageSupport";
+import {
+  fetchCoverageCoachEmail,
+  fetchCoverageOptions,
+  fetchCoverageTutorAvailability,
+  fetchCoverageTutorEmail,
+  parseCoverageInquiry,
+  type CoverageTutorAvailabilityItem,
+  type CoverageTutorAvailabilityStatus,
+} from "@/lib/coverageSupport";
 import { buildCsrfHeaders } from "@/lib/csrf";
 import {
   buildChatRequestBody,
@@ -340,7 +348,12 @@ interface CoverageCardAttachment {
   name: string;
   mimeType: string;
   size: number;
-  dataUrl: string;
+  dataUrl?: string;
+  storageUrl?: string;
+  storageKey?: string;
+  attachmentId?: number | null;
+  objectUrl?: string;
+  file?: File;
 }
 
 type CoverageWorkflowCardType = "tutor_choice" | "tutor_reply" | "note";
@@ -522,6 +535,11 @@ type LearningPlanTeamSection = "coverage" | "others";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type CoverageWorkspaceTab = "documentation" | "details";
 const coverageCoachUnsetSelectValue = "__coverage_no_coach__";
+const coveragePresentationMaxFileBytes = 50 * 1024 * 1024;
+
+function getDefaultDashboardSortOrder(isLearningPlanCoverageSection: boolean): DashboardSortOrder {
+  return isLearningPlanCoverageSection ? "priorityDesc" : "newest";
+}
 
 function buildAdminJsonHeaders() {
   return buildCsrfHeaders({
@@ -566,13 +584,16 @@ const AgentDashboard = () => {
   const consolePendingAttachmentsRef = useRef<ChatAttachment[]>([]);
   const [consoleAiInput, setConsoleAiInput] = useState("");
   const [dashboardTicketFilter, setDashboardTicketFilter] = useState<DashboardTicketFilter>("all");
-  const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>("newest");
+  const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>(() => (
+    getDefaultDashboardSortOrder(initialConsoleDeepLink.view === "coverage")
+  ));
   const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
   const [dashboardArchiveScope, setDashboardArchiveScope] = useState<DashboardArchiveScope>("active");
   const [learningPlanTeamSection, setLearningPlanTeamSection] = useState<LearningPlanTeamSection>("coverage");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
+  const activeDocumentationBaselineRef = useRef<{ ticketId: string; value: string } | null>(null);
   const [documentationStep, setDocumentationStep] = useState(1);
   const [documentationTicketStatus, setDocumentationTicketStatus] = useState<DocumentationWorkflowStatus | "">("");
   const [documentationStatusReason, setDocumentationStatusReason] = useState("");
@@ -633,6 +654,7 @@ const AgentDashboard = () => {
   const isConsoleView = adminView === "console";
   const isCoverageDashboardView = adminView === "coverage";
   const isLearningPlanCoverageSection = isCoverageDashboardView && learningPlanTeamSection === "coverage";
+  const defaultDashboardSortOrder = getDefaultDashboardSortOrder(isLearningPlanCoverageSection);
   const isDashboardLikeView = adminView === "dashboard" || adminView === "coverage";
   const useCompactAdminSidebar = !isStackedAdminLayout && isAdminSidebarCollapsed;
   const trimmedNotes = notes.trim();
@@ -815,7 +837,7 @@ const AgentDashboard = () => {
   }
 
   useEffect(() => {
-    if (typeof window === "undefined") {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
       return;
     }
 
@@ -842,6 +864,25 @@ const AgentDashboard = () => {
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || isStackedAdminLayout) {
+      return;
+    }
+
+    const htmlElement = document.documentElement;
+    const bodyElement = document.body;
+    const previousHtmlOverflowY = htmlElement.style.overflowY;
+    const previousBodyOverflowY = bodyElement.style.overflowY;
+
+    htmlElement.style.overflowY = "hidden";
+    bodyElement.style.overflowY = "hidden";
+
+    return () => {
+      htmlElement.style.overflowY = previousHtmlOverflowY;
+      bodyElement.style.overflowY = previousBodyOverflowY;
+    };
+  }, [isStackedAdminLayout]);
 
   useEffect(() => {
     if (!session?.username || !browserDesktopNotificationsSupported()) {
@@ -933,6 +974,7 @@ const AgentDashboard = () => {
     }
 
     setAdminView("dashboard");
+    setDashboardSortOrder(getDefaultDashboardSortOrder(false));
     setIsTransferNotificationsOpen(true);
   }
 
@@ -1020,6 +1062,7 @@ const AgentDashboard = () => {
     dashboardAssignedFilter,
     dashboardSessionAgentId,
   );
+  const coveragePriorityReferenceDate = new Date();
   const quickResolutionTickets = dashboardAssignmentScopedTickets.filter(isDashboardQuickResolutionTicket);
   const scopedDashboardTickets = filterDashboardTickets(dashboardAssignmentScopedTickets, dashboardTicketFilter);
   const visibleDashboardTickets = [...scopedDashboardTickets]
@@ -1049,6 +1092,17 @@ const AgentDashboard = () => {
         const lifecycleDifference = compareTicketLifecycleRank(leftTicket, rightTicket);
         if (lifecycleDifference !== 0) {
           return lifecycleDifference;
+        }
+
+        if (isLearningPlanCoverageSection) {
+          const sessionPriorityDifference = compareCoverageTicketUpcomingSessionPriority(
+            leftTicket,
+            rightTicket,
+            coveragePriorityReferenceDate,
+          );
+          if (sessionPriorityDifference !== 0) {
+            return sessionPriorityDifference;
+          }
         }
 
         const priorityDifference = compareTicketPriority(leftTicket, rightTicket);
@@ -1088,13 +1142,14 @@ const AgentDashboard = () => {
       : `Archived ${dashboardActiveTableTitle}`
     : dashboardActiveTableTitle;
   const isArchiveMode = dashboardArchiveScope === "archived";
-  const useCompactArchiveDashboardTable = dashboardArchiveScope === "archived";
-  const dashboardTableHeadings = useCompactArchiveDashboardTable
+  const useCompactDashboardTable = true;
+  const dashboardTableHeadings = useCompactDashboardTable
     ? ["Ticket", "Requester", "Category", "Status", "Assigned Agent", "Created", "SLA", "Actions"]
     : ["Chat ID", "Ticket ID", "Requester", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"];
+  const dashboardCellClassName = useCompactDashboardTable ? "px-3 py-3 align-middle" : "px-4 py-3";
   const hasDashboardViewOverrides = (
     dashboardTicketFilter !== "all"
-    || dashboardSortOrder !== "newest"
+    || dashboardSortOrder !== defaultDashboardSortOrder
     || dashboardArchiveScope !== "active"
   );
   const dashboardResetActionLabel = isArchiveMode ? "Back to Active" : "Reset Filters";
@@ -1488,16 +1543,31 @@ const AgentDashboard = () => {
 
   useEffect(() => {
     if (!activeDetail) {
+      activeDocumentationBaselineRef.current = null;
       setActiveDocumentationDraft(null);
       return;
     }
 
-    if (isCoverageTicket(activeDetail.ticket)) {
-      setActiveDocumentationDraft(buildCoverageDocumentationDraft(activeDetail.ticket));
-      return;
-    }
+    const nextDraft = isCoverageTicket(activeDetail.ticket)
+      ? buildCoverageDocumentationDraft(activeDetail.ticket)
+      : buildStandardDocumentationDraft(activeDetail.ticket);
+    const nextBaseline = JSON.stringify(nextDraft);
+    const previousBaseline = activeDocumentationBaselineRef.current;
 
-    setActiveDocumentationDraft(buildStandardDocumentationDraft(activeDetail.ticket));
+    setActiveDocumentationDraft((currentDraft) => {
+      const hasLocalDraftChanges = Boolean(
+        currentDraft
+        && currentDraft.ticketId === nextDraft.ticketId
+        && previousBaseline?.ticketId === nextDraft.ticketId
+        && JSON.stringify(currentDraft) !== previousBaseline.value,
+      );
+
+      return hasLocalDraftChanges ? currentDraft : nextDraft;
+    });
+    activeDocumentationBaselineRef.current = {
+      ticketId: nextDraft.ticketId,
+      value: nextBaseline,
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Keep the active documentation draft in sync with the tracked ticket fields only.
   }, [activeDetail?.ticket.id, activeDetail?.ticket.updatedAt, activeDetail?.ticket.technicalSubcategory]);
 
@@ -1578,6 +1648,7 @@ const AgentDashboard = () => {
   useEffect(() => {
     if (!canManageUsers && adminView === "management") {
       setAdminView("dashboard");
+      setDashboardSortOrder(getDefaultDashboardSortOrder(false));
     }
   }, [adminView, canManageUsers]);
 
@@ -2478,6 +2549,9 @@ const AgentDashboard = () => {
     // dashboard whenever the current route has no query string.
     if (!location.search) {
       processedConsoleDeepLinkRef.current = "";
+      if (adminView !== "dashboard") {
+        setDashboardSortOrder(getDefaultDashboardSortOrder(false));
+      }
       setAdminView((currentView) => (currentView === "dashboard" ? currentView : "dashboard"));
       return;
     }
@@ -2866,17 +2940,25 @@ const AgentDashboard = () => {
 
     const currentDraft = activeDocumentationDraft || buildCoverageDocumentationDraft(activeDetail.ticket);
     const targetCard = currentDraft.coverageCards.find((card) => card.id === cardId && card.type === "tutor_choice");
-    const lightweightDocumentation: AdminDocumentation = {
-      ...currentDraft,
-      coverageCards: currentDraft.coverageCards.map((card) => ({
-        ...card,
-        presentationFiles: [],
-      })),
-    };
 
     if (!targetCard) {
       return;
     }
+
+    const presentationFileMetadata = targetCard.presentationFiles
+      .filter((file) => !file.file)
+      .map(serializeCoverageCardAttachmentForRequest);
+    const compactTargetCard: CoverageWorkflowCard = {
+      ...targetCard,
+      presentationFiles: presentationFileMetadata,
+    };
+    const lightweightDocumentation: AdminDocumentation = {
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => ({
+        ...card,
+        presentationFiles: card.id === cardId ? presentationFileMetadata : [],
+      })),
+    };
 
     if (!targetCard.tutor.trim()) {
       toast.error("Choose a tutor or coach before submitting the request.");
@@ -2910,17 +2992,23 @@ const AgentDashboard = () => {
 
     setIsSavingActiveDocumentation(true);
     try {
+      const formData = new FormData();
+      formData.append("cardId", cardId);
+      formData.append("origin", window.location.origin);
+      formData.append("card", JSON.stringify(compactTargetCard));
+      formData.append("documentation", JSON.stringify(lightweightDocumentation));
+      targetCard.presentationFiles.forEach((file) => {
+        if (file.file) {
+          formData.append("presentationFiles", file.file, file.name || "attachment");
+        }
+      });
+
       const response = await fetch(
         `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-request`,
         {
           method: "POST",
-          headers: buildAdminJsonHeaders(),
-          body: JSON.stringify({
-            cardId,
-            origin: window.location.origin,
-            card: targetCard,
-            documentation: lightweightDocumentation,
-          }),
+          headers: buildCsrfHeaders(),
+          body: formData,
         },
       );
 
@@ -2960,15 +3048,36 @@ const AgentDashboard = () => {
 
     setIsSavingActiveDocumentation(true);
     try {
+      const formData = new FormData();
+      const metadataOnlyFiles: CoverageCardAttachment[] = [];
+      formData.append("cardId", cardId);
+      presentationFiles.forEach((file) => {
+        if (file.file) {
+          formData.append("presentationFiles", file.file, file.name || "attachment");
+          return;
+        }
+
+        metadataOnlyFiles.push({
+          id: file.id,
+          name: file.name,
+          mimeType: file.mimeType,
+          size: file.size,
+          dataUrl: file.dataUrl,
+          storageUrl: file.storageUrl,
+          storageKey: file.storageKey,
+          attachmentId: file.attachmentId,
+        });
+      });
+      if (metadataOnlyFiles.length > 0) {
+        formData.append("presentationFileMetadata", JSON.stringify(metadataOnlyFiles));
+      }
+
       const response = await fetch(
         `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-follow-up`,
         {
           method: "POST",
-          headers: buildAdminJsonHeaders(),
-          body: JSON.stringify({
-            cardId,
-            presentationFiles,
-          }),
+          headers: buildCsrfHeaders(),
+          body: formData,
         },
       );
 
@@ -3957,6 +4066,7 @@ const AgentDashboard = () => {
                   type="button"
                   onClick={() => {
                     setLearningPlanTeamSection(section.value);
+                    setDashboardSortOrder(getDefaultDashboardSortOrder(section.value === "coverage"));
                     if (section.value === "others" && dashboardTicketFilter === "coverage") {
                       setDashboardTicketFilter("all");
                     }
@@ -4033,10 +4143,12 @@ const AgentDashboard = () => {
           ) : null}
         </div>
 
-        <div className={cn(
+        <div
+          className={cn(
           "bg-card overflow-hidden rounded-2xl border shadow-card transition-colors",
           isArchiveMode && "border-amber-200/80",
-        )}>
+          )}
+        >
           <div className="border-b px-4 py-4 sm:px-5">
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
@@ -4078,7 +4190,7 @@ const AgentDashboard = () => {
                       )}
                       onClick={() => {
                         setDashboardTicketFilter("all");
-                        setDashboardSortOrder("newest");
+                        setDashboardSortOrder(defaultDashboardSortOrder);
                         setDashboardArchiveScope("active");
                       }}
                     >
@@ -4273,12 +4385,33 @@ const AgentDashboard = () => {
               {dashboardEmptyMessage}
             </div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+            <div className="overflow-hidden">
+              <table className="w-full table-fixed text-sm">
+                {useCompactDashboardTable ? (
+                  <colgroup>
+                    <col style={{ width: "16%" }} />
+                    <col style={{ width: "18%" }} />
+                    <col style={{ width: "13%" }} />
+                    <col style={{ width: "11%" }} />
+                    <col style={{ width: "18%" }} />
+                    <col style={{ width: "8%" }} />
+                    <col style={{ width: "7%" }} />
+                    <col style={{ width: "9%" }} />
+                  </colgroup>
+                ) : null}
                 <thead className="bg-secondary/50 text-muted-foreground">
                   <tr className="text-left">
                     {dashboardTableHeadings.map((heading) => (
-                      <th key={heading} className="px-4 py-3 font-medium whitespace-nowrap">{heading}</th>
+                      <th
+                        key={heading}
+                        className={cn(
+                          dashboardCellClassName,
+                          "font-medium",
+                          useCompactDashboardTable ? "whitespace-normal" : "whitespace-nowrap",
+                        )}
+                      >
+                        {heading}
+                      </th>
                     ))}
                   </tr>
                 </thead>
@@ -4288,6 +4421,11 @@ const AgentDashboard = () => {
                       ticket,
                       { preferCoverageInquiry: isLearningPlanCoverageSection },
                     );
+                    const createdAtLabel = formatDateTime(ticket.createdAt);
+                    const [createdDateLabel, createdTimeLabel = ""] = createdAtLabel.split(", ");
+                    const coverageSessionDateLabel = isLearningPlanCoverageSection
+                      ? getCoverageTicketNextSessionDateInfo(ticket, coveragePriorityReferenceDate)?.label || ""
+                      : "";
 
                     return (
                       <tr
@@ -4308,29 +4446,67 @@ const AgentDashboard = () => {
                           getTicketTransferRowClassName(ticket),
                         )}
                       >
-                        {useCompactArchiveDashboardTable ? (
-                          <td className="px-4 py-3 min-w-[170px]">
+                        {useCompactDashboardTable ? (
+                          <td className={dashboardCellClassName}>
                             <div className="font-mono font-medium whitespace-nowrap">{ticket.id}</div>
-                            <div className="mt-1 text-xs font-mono text-muted-foreground">
+                            <div className="mt-1 truncate text-xs font-mono text-muted-foreground" title={getDisplayedChatReference(ticket)}>
                               {getDisplayedChatReference(ticket)}
                             </div>
+                            {isLearningPlanCoverageSection ? (
+                              <div
+                                className="mt-2 grid max-w-full grid-cols-[auto_auto_minmax(0,1fr)] items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-4 text-muted-foreground"
+                                aria-label={coverageSessionDateLabel ? `Date ${coverageSessionDateLabel}` : "Date not set"}
+                                title={coverageSessionDateLabel ? `Date ${coverageSessionDateLabel}` : "Date not set"}
+                              >
+                                <CalendarDays className="h-3.5 w-3.5 shrink-0 text-primary/70" />
+                                <span className="shrink-0 font-medium text-foreground/75">Date</span>
+                                <span className="min-w-0 whitespace-normal break-words">
+                                  {coverageSessionDateLabel || "Not set"}
+                                </span>
+                              </div>
+                            ) : null}
                           </td>
                         ) : (
                           <>
-                            <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{getDisplayedChatReference(ticket)}</td>
-                            <td className="px-4 py-3 font-mono font-medium whitespace-nowrap">{ticket.id}</td>
+                            <td className={cn(dashboardCellClassName, "font-mono font-medium whitespace-nowrap")}>{getDisplayedChatReference(ticket)}</td>
+                            <td className={cn(dashboardCellClassName, "font-mono font-medium whitespace-nowrap")}>{ticket.id}</td>
                           </>
                         )}
-                        <td className={cn("px-4 py-3", useCompactArchiveDashboardTable ? "min-w-[200px]" : "min-w-[240px]")}>
-                          <div className="font-medium">{requesterColumnSummary.primaryText}</div>
-                          <div className="text-xs text-muted-foreground">{requesterColumnSummary.secondaryText}</div>
-                          <div className="mt-2">
-                            <RequesterRoleBadge role={ticket.requesterRole} source={ticket.requesterSource} />
+                        <td className={cn(dashboardCellClassName, !useCompactDashboardTable && "min-w-[240px]")}>
+                          <div className="min-w-0 overflow-hidden">
+                            <div className="truncate font-medium" title={requesterColumnSummary.primaryText}>
+                              {requesterColumnSummary.primaryText}
+                            </div>
+                            <div className="mt-1 truncate text-xs text-muted-foreground" title={requesterColumnSummary.secondaryText}>
+                              {requesterColumnSummary.secondaryText}
+                            </div>
+                          </div>
+                          <div className="mt-2 overflow-hidden">
+                            <RequesterRoleBadge
+                              role={ticket.requesterRole}
+                              source={ticket.requesterSource}
+                              className="max-w-full overflow-hidden text-ellipsis whitespace-nowrap"
+                            />
                           </div>
                         </td>
-                        <td className="px-4 py-3">{formatCategoryLabel(ticket.category, ticket.technicalSubcategory)}</td>
-                        {useCompactArchiveDashboardTable ? (
-                          <td className="px-4 py-3 min-w-[150px]">
+                        <td className={dashboardCellClassName}>
+                          {useCompactDashboardTable ? (
+                            <div className="min-w-0 overflow-hidden">
+                              <div className="truncate font-medium" title={ticket.category || "-"}>
+                                {ticket.category || "-"}
+                              </div>
+                              {ticket.technicalSubcategory ? (
+                                <div className="mt-1 truncate text-xs text-muted-foreground" title={ticket.technicalSubcategory}>
+                                  {ticket.technicalSubcategory}
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : (
+                            formatCategoryLabel(ticket.category, ticket.technicalSubcategory)
+                          )}
+                        </td>
+                        {useCompactDashboardTable ? (
+                          <td className={dashboardCellClassName}>
                             <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
                             <div className="mt-2 text-xs text-muted-foreground">
                               {getDisplayedTicketStatusReason(ticket)}
@@ -4338,11 +4514,11 @@ const AgentDashboard = () => {
                           </td>
                         ) : (
                           <>
-                            <td className="px-4 py-3"><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
-                            <td className="px-4 py-3 text-muted-foreground">{getDisplayedTicketStatusReason(ticket)}</td>
+                            <td className={dashboardCellClassName}><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
+                            <td className={cn(dashboardCellClassName, "text-muted-foreground")}>{getDisplayedTicketStatusReason(ticket)}</td>
                           </>
                         )}
-                        <td className="px-4 py-3">
+                        <td className={dashboardCellClassName}>
                           <AssignedAgentBadge
                             assignedAgentId={ticket.assignedAgentId}
                             assignedAgentName={ticket.assignedAgentName}
@@ -4353,14 +4529,23 @@ const AgentDashboard = () => {
                             latestTransferDecision={ticket.latestTransferDecision}
                           />
                         </td>
-                        <td className="px-4 py-3 whitespace-nowrap">{formatDateTime(ticket.createdAt)}</td>
-                        <td className="px-4 py-3">
+                        <td className={cn(dashboardCellClassName, useCompactDashboardTable ? "text-xs align-middle" : "whitespace-nowrap")}>
+                          {useCompactDashboardTable ? (
+                            <>
+                              <div className="whitespace-nowrap">{createdDateLabel}</div>
+                              <div className="mt-1 whitespace-nowrap text-muted-foreground">{createdTimeLabel}</div>
+                            </>
+                          ) : (
+                            createdAtLabel
+                          )}
+                        </td>
+                        <td className={dashboardCellClassName}>
                           <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
                             {ticket.slaStatus}
                           </span>
                         </td>
-                        <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
-                          <div className="flex items-center justify-end gap-2">
+                        <td className={dashboardCellClassName} onClick={(event) => event.stopPropagation()}>
+                          <div className={cn("flex items-center justify-end gap-2", useCompactDashboardTable && "flex-col items-stretch")}>
                             {canAssignTickets && !isArchivedTicket(ticket) ? (
                               <TeamTransferMenu
                                 ticketId={ticket.id}
@@ -4368,13 +4553,17 @@ const AgentDashboard = () => {
                                 disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
                                 isLoading={teamTransferTicketId === ticket.id}
                                 onTransfer={(nextAssignedTeam) => void handleTeamTransfer(ticket, nextAssignedTeam)}
+                                className={useCompactDashboardTable ? "w-full justify-center px-3" : undefined}
                               />
                             ) : null}
                             <Button
                               type="button"
                               size="sm"
                               variant="outline"
-                              className="h-8 whitespace-nowrap rounded-full"
+                              className={cn(
+                                "h-8 rounded-full",
+                                useCompactDashboardTable ? "w-full justify-center px-3 text-xs" : "whitespace-nowrap",
+                              )}
                               onClick={(event) => {
                                 event.stopPropagation();
                                 void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
@@ -4429,7 +4618,11 @@ const AgentDashboard = () => {
       fullWidth
       showHeader={!isConsoleView}
       right={undefined}
-      mainClassName={isConsoleView ? "h-[100dvh] px-0 py-0 md:px-0 md:py-0" : undefined}
+      mainClassName={isConsoleView
+        ? "h-[100dvh] overflow-hidden px-0 py-0 md:px-0 md:py-0"
+        : !isStackedAdminLayout
+          ? "h-[calc(100dvh-84px)] overflow-hidden py-4"
+          : undefined}
     >
       <Tabs
         value={adminView}
@@ -4439,6 +4632,7 @@ const AgentDashboard = () => {
             closePanel();
           }
           setAdminView(nextView);
+          setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
         }}
         className={cn(
           "min-h-0",
@@ -4446,7 +4640,7 @@ const AgentDashboard = () => {
             ? "h-full min-h-[100dvh]"
             : isStackedAdminLayout
               ? "h-auto"
-              : "h-[calc(100vh-112px)] min-h-[calc(100vh-112px)]",
+              : "h-full",
         )}
       >
         <div className={cn("flex min-h-0 gap-4", isStackedAdminLayout ? "h-auto flex-col" : "h-full flex-row")}>
@@ -4704,18 +4898,6 @@ const AgentDashboard = () => {
                   <MessageSquareText className="h-4 w-4 shrink-0" />
                   {!useCompactAdminSidebar ? <span>Chat Console</span> : null}
                 </TabsTrigger>
-                {canManageUsers ? (
-                  <TabsTrigger
-                    value="management"
-                    className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
-                    )}
-                  >
-                    <Settings2 className="h-4 w-4 shrink-0" />
-                    {!useCompactAdminSidebar ? <span>Manage Agents</span> : null}
-                  </TabsTrigger>
-                ) : null}
               </TabsList>
 
               {!useCompactAdminSidebar && adminView === "console" ? (
@@ -4781,6 +4963,24 @@ const AgentDashboard = () => {
                     </>
                   ) : null}
                 </div>
+              ) : null}
+
+              {canManageUsers ? (
+                <TabsList className={cn(
+                  "grid h-auto w-full grid-cols-1 bg-transparent p-0",
+                  useCompactAdminSidebar && "justify-items-center",
+                )}>
+                  <TabsTrigger
+                    value="management"
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <Settings2 className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span>Manage Agents</span> : null}
+                  </TabsTrigger>
+                </TabsList>
               ) : null}
 
               <div className={cn("mt-auto flex gap-2", isStackedAdminLayout ? "flex-row flex-wrap" : "flex-col")}>
@@ -7323,6 +7523,7 @@ const CoverageTicketWorkspace = ({
   const [tutorOptions, setTutorOptions] = useState<string[]>([]);
   const [coachOptions, setCoachOptions] = useState<string[]>([]);
   const [sameModuleTutorOptions, setSameModuleTutorOptions] = useState<string[]>([]);
+  const [tutorAvailabilityItems, setTutorAvailabilityItems] = useState<CoverageTutorAvailabilityItem[]>([]);
   const [coverageTutorError, setCoverageTutorError] = useState("");
   const [isLoadingTutorOptions, setIsLoadingTutorOptions] = useState(false);
   const [isLoadingCoachOptions, setIsLoadingCoachOptions] = useState(false);
@@ -7333,16 +7534,37 @@ const CoverageTicketWorkspace = ({
   const [loadingCoachEmailCardIds, setLoadingCoachEmailCardIds] = useState<Set<string>>(new Set());
   const [collapsedCoverageCardIds, setCollapsedCoverageCardIds] = useState<Set<string>>(new Set());
   const [pendingFollowUpFilesByCardId, setPendingFollowUpFilesByCardId] = useState<Record<string, CoverageCardAttachment[]>>({});
+  const pendingFollowUpFilesRef = useRef<Record<string, CoverageCardAttachment[]>>({});
   const [workspaceTab, setWorkspaceTab] = useState<CoverageWorkspaceTab>("documentation");
   const hasSavedCoverageSnapshot = Boolean(ticket.documentation?.coverageCards?.length || ticket.documentation?.coverageNotes?.trim());
   const previewAttachmentKind = getCoverageAttachmentPreviewKind(previewAttachment);
+  const previewAttachmentSource = getCoverageAttachmentSource(previewAttachment);
   const parsedCoverageInquiry = parseCoverageInquiry(draft.inquiry);
   const coverageInquiryModule = parsedCoverageInquiry?.module?.trim() || "";
+  const coverageInquiryTime = parsedCoverageInquiry?.time?.trim() || "";
+  const coverageInquirySessionDates = parsedCoverageInquiry?.sessionDates || [];
+  const coverageInquirySessionDateKey = coverageInquirySessionDates.join("|");
+  const tutorAvailabilityByKey = new Map(
+    tutorAvailabilityItems.map((item) => [normalizeCoverageTutorOptionKey(item.tutor), item]),
+  );
   const draftRef = useRef(draft);
 
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
+
+  useEffect(() => {
+    pendingFollowUpFilesRef.current = pendingFollowUpFilesByCardId;
+  }, [pendingFollowUpFilesByCardId]);
+
+  useEffect(() => (
+    () => {
+      Object.values(pendingFollowUpFilesRef.current)
+        .flat()
+        .forEach(revokeCoverageAttachmentObjectUrl);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Revoke only the current pending object URLs when the panel unmounts.
+  ), []);
 
   useEffect(() => {
     setWorkspaceTab("documentation");
@@ -7399,6 +7621,36 @@ const CoverageTicketWorkspace = ({
       cancelled = true;
     };
   }, [coverageInquiryModule, ticket.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!coverageInquiryTime || coverageInquirySessionDates.length === 0) {
+      setTutorAvailabilityItems([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void fetchCoverageTutorAvailability({
+      time: coverageInquiryTime,
+      sessionDates: coverageInquirySessionDates,
+    })
+      .then((items) => {
+        if (!cancelled) {
+          setTutorAvailabilityItems(items);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTutorAvailabilityItems([]);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [coverageInquiryTime, coverageInquirySessionDateKey, ticket.id]);
 
   const expandCoverageHistoryCards = () => {
     setCollapsedCoverageCardIds(new Set());
@@ -7621,9 +7873,15 @@ const CoverageTicketWorkspace = ({
       return;
     }
 
+    const oversizedFiles = getOversizedCoveragePresentationFiles(files);
+    if (oversizedFiles.length > 0) {
+      toast.error(`Each presentation file must be ${formatBytes(coveragePresentationMaxFileBytes)} or smaller.`);
+      return;
+    }
+
     try {
       expandCoverageHistoryCards();
-      const nextFiles = await Promise.all(files.map(readFileAsCoverageCardAttachment));
+      const nextFiles = files.map(createPendingCoverageCardAttachment);
       onDraftUpdate((currentDraft) => ({
         ...currentDraft,
         coverageCards: currentDraft.coverageCards.map((card) => (
@@ -7665,8 +7923,14 @@ const CoverageTicketWorkspace = ({
       return;
     }
 
+    const oversizedFiles = getOversizedCoveragePresentationFiles(files);
+    if (oversizedFiles.length > 0) {
+      toast.error(`Each follow-up file must be ${formatBytes(coveragePresentationMaxFileBytes)} or smaller.`);
+      return;
+    }
+
     try {
-      const nextFiles = await Promise.all(files.map(readFileAsCoverageCardAttachment));
+      const nextFiles = files.map(createPendingCoverageCardAttachment);
       setPendingFollowUpFilesByCardId((currentFiles) => ({
         ...currentFiles,
         [cardId]: [...(currentFiles[cardId] || []), ...nextFiles],
@@ -7678,7 +7942,11 @@ const CoverageTicketWorkspace = ({
 
   const removePendingFollowUpFile = (cardId: string, fileId: string) => {
     setPendingFollowUpFilesByCardId((currentFiles) => {
-      const nextFiles = (currentFiles[cardId] || []).filter((file) => file.id !== fileId);
+      const currentCardFiles = currentFiles[cardId] || [];
+      currentCardFiles
+        .filter((file) => file.id === fileId)
+        .forEach(revokeCoverageAttachmentObjectUrl);
+      const nextFiles = currentCardFiles.filter((file) => file.id !== fileId);
       if (nextFiles.length === 0) {
         const remainingFiles = { ...currentFiles };
         delete remainingFiles[cardId];
@@ -7698,6 +7966,7 @@ const CoverageTicketWorkspace = ({
         return currentFiles;
       }
 
+      (currentFiles[cardId] || []).forEach(revokeCoverageAttachmentObjectUrl);
       const remainingFiles = { ...currentFiles };
       delete remainingFiles[cardId];
       return remainingFiles;
@@ -7774,7 +8043,7 @@ const CoverageTicketWorkspace = ({
         </div>
       ) : (
         <div className="mt-3 text-sm text-muted-foreground">
-          PDF, PPT, PPTX, ODP, Keynote, or image files
+          PDF, PPT, PPTX, ODP, Keynote, or image files up to {formatBytes(coveragePresentationMaxFileBytes)} each
         </div>
       )}
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-amber-200/80 pt-3">
@@ -8176,7 +8445,14 @@ const CoverageTicketWorkspace = ({
               );
             }
 
-            const displayedTutorOptions = buildCoverageTutorOptionsForDisplay(tutorOptions, sameModuleTutorOptions, coachOptions, card.tutor);
+            const displayedTutorOptions = buildCoverageTutorOptionsForDisplay(
+              tutorOptions,
+              sameModuleTutorOptions,
+              coachOptions,
+              card.tutor,
+              tutorAvailabilityByKey,
+              tutorAvailabilityItems.length > 0,
+            );
             const displayedCoachOptions = Array.from(new Set([...coachOptions, card.coach].map((value) => value.trim()).filter(Boolean)));
             const isLoadingCoverageRecipientOptions = isLoadingTutorOptions || isLoadingCoachOptions;
             const normalizedTutorRequestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
@@ -8364,6 +8640,17 @@ const CoverageTicketWorkspace = ({
                                         {option.isSameModule ? (
                                           <span className="rounded-full border border-primary/15 bg-primary/[0.08] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-primary">
                                             Same module
+                                          </span>
+                                        ) : null}
+                                        {option.availability ? (
+                                          <span
+                                            className={cn(
+                                              "rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em]",
+                                              getCoverageTutorAvailabilityBadgeClassName(option.availability.status),
+                                            )}
+                                            title={option.availability.summary}
+                                          >
+                                            {option.availability.label}
                                           </span>
                                         ) : null}
                                         {option.isCoach ? (
@@ -8672,7 +8959,7 @@ const CoverageTicketWorkspace = ({
             previewAttachmentKind === "image" ? (
               <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
                 <img
-                  src={previewAttachment.dataUrl}
+                  src={previewAttachmentSource}
                   alt={previewAttachment.name}
                   className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
                 />
@@ -8680,7 +8967,7 @@ const CoverageTicketWorkspace = ({
             ) : previewAttachmentKind === "pdf" ? (
               <div className="overflow-hidden rounded-2xl border bg-secondary/10">
                 <iframe
-                  src={previewAttachment.dataUrl}
+                  src={previewAttachmentSource}
                   title={previewAttachment.name}
                   className="h-[70vh] w-full border-0"
                 />
@@ -8695,7 +8982,7 @@ const CoverageTicketWorkspace = ({
                 </div>
                 <div className="mt-4">
                   <a
-                    href={previewAttachment.dataUrl}
+                    href={previewAttachmentSource}
                     download={previewAttachment.name}
                     className="inline-flex items-center rounded-full border px-4 py-2 text-sm font-medium text-primary transition hover:bg-secondary/40"
                   >
@@ -10130,7 +10417,11 @@ function isOpenCoverageTutorChoiceDraft(card: CoverageWorkflowCard) {
 }
 
 function normalizeCoverageCardAttachment(attachment: CoverageCardAttachment | null | undefined): CoverageCardAttachment | null {
-  if (!attachment?.dataUrl?.startsWith("data:")) {
+  const dataUrl = attachment?.dataUrl?.startsWith("data:") ? attachment.dataUrl : "";
+  const storageUrl = attachment?.storageUrl || "";
+  const storageKey = attachment?.storageKey || "";
+  const objectUrl = attachment?.objectUrl || "";
+  if (!dataUrl && !storageUrl && !storageKey && !objectUrl) {
     return null;
   }
 
@@ -10139,7 +10430,25 @@ function normalizeCoverageCardAttachment(attachment: CoverageCardAttachment | nu
     name: attachment.name || "attachment",
     mimeType: attachment.mimeType || "application/octet-stream",
     size: Number(attachment.size || 0),
-    dataUrl: attachment.dataUrl,
+    dataUrl,
+    storageUrl,
+    storageKey,
+    attachmentId: attachment.attachmentId ?? null,
+    objectUrl,
+    ...(attachment.file ? { file: attachment.file } : {}),
+  };
+}
+
+function serializeCoverageCardAttachmentForRequest(attachment: CoverageCardAttachment): CoverageCardAttachment {
+  return {
+    id: attachment.id || createCoverageCardId(),
+    name: attachment.name || "attachment",
+    mimeType: attachment.mimeType || "application/octet-stream",
+    size: Number(attachment.size || 0),
+    dataUrl: attachment.dataUrl?.startsWith("data:") ? attachment.dataUrl : "",
+    storageUrl: attachment.storageUrl || "",
+    storageKey: attachment.storageKey || "",
+    attachmentId: attachment.attachmentId ?? null,
   };
 }
 
@@ -10349,15 +10658,19 @@ function freezeDocumentationCardsForSave(documentation: AdminDocumentation): Adm
   };
 }
 
-function getCoverageAttachmentPreviewKind(file: Pick<CoverageCardAttachment, "mimeType" | "dataUrl"> | null | undefined) {
-  const mimeType = (file?.mimeType || "").toLowerCase();
-  const dataUrl = (file?.dataUrl || "").toLowerCase();
+function getCoverageAttachmentSource(file: Pick<CoverageCardAttachment, "dataUrl" | "objectUrl" | "storageUrl"> | null | undefined) {
+  return file?.dataUrl || file?.objectUrl || file?.storageUrl || "";
+}
 
-  if (mimeType.startsWith("image/") || dataUrl.startsWith("data:image/")) {
+function getCoverageAttachmentPreviewKind(file: Pick<CoverageCardAttachment, "mimeType" | "dataUrl" | "objectUrl" | "storageUrl"> | null | undefined) {
+  const mimeType = (file?.mimeType || "").toLowerCase();
+  const source = getCoverageAttachmentSource(file).toLowerCase();
+
+  if (mimeType.startsWith("image/") || source.startsWith("data:image/")) {
     return "image";
   }
 
-  if (mimeType === "application/pdf" || dataUrl.startsWith("data:application/pdf")) {
+  if (mimeType === "application/pdf" || source.startsWith("data:application/pdf")) {
     return "pdf";
   }
 
@@ -10463,11 +10776,19 @@ function buildCoverageTutorOptionsForDisplay(
   sameModuleTutorOptions: string[],
   coachOptions: string[],
   currentTutor: string,
+  tutorAvailabilityByKey: Map<string, CoverageTutorAvailabilityItem>,
+  showMissingTutorAvailability: boolean,
 ) {
   const sameModuleTutorKeys = new Set(sameModuleTutorOptions.map(normalizeCoverageTutorOptionKey));
+  const tutorOptionKeys = new Set([...allTutorOptions, ...sameModuleTutorOptions].map(normalizeCoverageTutorOptionKey));
   const coachKeys = new Set(coachOptions.map(normalizeCoverageTutorOptionKey));
   const optionIndexesByKey = new Map<string, number>();
-  const options: Array<{ name: string; isSameModule: boolean; isCoach: boolean }> = [];
+  const options: Array<{
+    name: string;
+    isSameModule: boolean;
+    isCoach: boolean;
+    availability?: CoverageTutorAvailabilityItem;
+  }> = [];
 
   const addTutorOption = (name: string) => {
     const normalizedName = name.trim();
@@ -10483,15 +10804,29 @@ function buildCoverageTutorOptionsForDisplay(
         ...existingOption,
         isSameModule: existingOption.isSameModule || sameModuleTutorKeys.has(optionKey),
         isCoach: existingOption.isCoach || coachKeys.has(optionKey),
+        availability: existingOption.availability || tutorAvailabilityByKey.get(optionKey),
       };
       return;
     }
 
     optionIndexesByKey.set(optionKey, options.length);
+    const availability = tutorAvailabilityByKey.get(optionKey)
+      || (showMissingTutorAvailability && tutorOptionKeys.has(optionKey)
+        ? {
+            tutor: normalizedName,
+            status: "no_plan" as CoverageTutorAvailabilityStatus,
+            label: "No plan data",
+            summary: "No Training_plan rows were returned for this tutor.",
+            conflictCount: 0,
+            conflicts: [],
+            modules: [],
+          }
+        : undefined);
     options.push({
       name: normalizedName,
       isSameModule: sameModuleTutorKeys.has(optionKey),
       isCoach: coachKeys.has(optionKey),
+      availability,
     });
   };
 
@@ -10501,6 +10836,19 @@ function buildCoverageTutorOptionsForDisplay(
   addTutorOption(currentTutor);
 
   return options;
+}
+
+function getCoverageTutorAvailabilityBadgeClassName(status: CoverageTutorAvailabilityStatus) {
+  switch (status) {
+    case "available":
+      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    case "busy":
+      return "border-rose-200 bg-rose-50 text-rose-700";
+    case "no_plan":
+      return "border-slate-200 bg-slate-50 text-slate-600";
+    default:
+      return "border-amber-200 bg-amber-50 text-amber-700";
+  }
 }
 
 function getCoverageTutorRequestBadgeClassName(status: CoverageTutorRequestStatus) {
@@ -11238,6 +11586,136 @@ function compareTicketPriority(
   return leftPriorityRank - rightPriorityRank;
 }
 
+const coverageSessionMonthIndexByName: Record<string, number> = {
+  jan: 0,
+  january: 0,
+  feb: 1,
+  february: 1,
+  mar: 2,
+  march: 2,
+  apr: 3,
+  april: 3,
+  may: 4,
+  jun: 5,
+  june: 5,
+  jul: 6,
+  july: 6,
+  aug: 7,
+  august: 7,
+  sep: 8,
+  sept: 8,
+  september: 8,
+  oct: 9,
+  october: 9,
+  nov: 10,
+  november: 10,
+  dec: 11,
+  december: 11,
+};
+
+function getStartOfLocalDayTimestamp(value: Date) {
+  return new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+}
+
+function parseCoverageSessionDateTimestamp(value: string) {
+  const normalizedValue = value.trim().replace(/,/g, " ");
+  if (!normalizedValue) {
+    return null;
+  }
+
+  const parsedTimestamp = Date.parse(normalizedValue);
+  if (!Number.isNaN(parsedTimestamp)) {
+    const parsedDate = new Date(parsedTimestamp);
+    return new Date(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate()).getTime();
+  }
+
+  const normalizedParts = normalizedValue.split(/\s+/).filter(Boolean);
+  const dateParts = normalizedParts.length >= 4 ? normalizedParts.slice(-3) : normalizedParts;
+  if (dateParts.length !== 3) {
+    return null;
+  }
+
+  const [dayValue, monthValue, yearValue] = dateParts;
+  const day = Number.parseInt(dayValue, 10);
+  const year = Number.parseInt(yearValue, 10);
+  const monthIndex = coverageSessionMonthIndexByName[monthValue.toLowerCase()];
+
+  if (!Number.isInteger(day) || !Number.isInteger(year) || monthIndex === undefined) {
+    return null;
+  }
+
+  const parsedDate = new Date(year, monthIndex, day);
+  return Number.isNaN(parsedDate.getTime()) ? null : parsedDate.getTime();
+}
+
+function formatCoverageSessionDateLabel(value: string) {
+  return value.trim().replace(/,/g, " ").replace(/\s+/g, " ");
+}
+
+function getCoverageTicketNextSessionDateInfo(
+  ticket: Pick<TicketSummary, "technicalSubcategory" | "documentation">,
+  referenceDate: Date,
+) {
+  if (!isCoverageTicket(ticket)) {
+    return null;
+  }
+
+  const parsedInquiry = parseCoverageInquiry(ticket.documentation?.inquiry || "");
+  const sessionDates = parsedInquiry?.sessionDates || [];
+  if (sessionDates.length === 0) {
+    return null;
+  }
+
+  const todayTimestamp = getStartOfLocalDayTimestamp(referenceDate);
+  let nearestUpcomingSession: { timestamp: number; label: string } | null = null;
+
+  for (const sessionDate of sessionDates) {
+    const sessionTimestamp = parseCoverageSessionDateTimestamp(sessionDate);
+    if (sessionTimestamp === null || sessionTimestamp < todayTimestamp) {
+      continue;
+    }
+
+    if (nearestUpcomingSession === null || sessionTimestamp < nearestUpcomingSession.timestamp) {
+      nearestUpcomingSession = {
+        timestamp: sessionTimestamp,
+        label: formatCoverageSessionDateLabel(sessionDate),
+      };
+    }
+  }
+
+  return nearestUpcomingSession;
+}
+
+function getCoverageTicketNextSessionPriorityKey(
+  ticket: Pick<TicketSummary, "technicalSubcategory" | "documentation">,
+  referenceDate: Date,
+) {
+  return getCoverageTicketNextSessionDateInfo(ticket, referenceDate)?.timestamp ?? null;
+}
+
+function compareCoverageTicketUpcomingSessionPriority(
+  leftTicket: Pick<TicketSummary, "technicalSubcategory" | "documentation">,
+  rightTicket: Pick<TicketSummary, "technicalSubcategory" | "documentation">,
+  referenceDate: Date,
+) {
+  const leftSessionTimestamp = getCoverageTicketNextSessionPriorityKey(leftTicket, referenceDate);
+  const rightSessionTimestamp = getCoverageTicketNextSessionPriorityKey(rightTicket, referenceDate);
+
+  if (leftSessionTimestamp === null && rightSessionTimestamp === null) {
+    return 0;
+  }
+
+  if (leftSessionTimestamp === null) {
+    return 1;
+  }
+
+  if (rightSessionTimestamp === null) {
+    return -1;
+  }
+
+  return leftSessionTimestamp - rightSessionTimestamp;
+}
+
 function shouldPrioritizeTicketByStatus(ticket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested">) {
   return isDashboardOpenTicket(ticket) || ticket.status === "Pending";
 }
@@ -11300,29 +11778,28 @@ function buildInitialAiMessage(ticket: TicketDetail, workflowConfigured: boolean
   );
 }
 
-function readFileAsCoverageCardAttachment(file: File): Promise<CoverageCardAttachment> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
+function createPendingCoverageCardAttachment(file: File): CoverageCardAttachment {
+  const objectUrl = typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+    ? URL.createObjectURL(file)
+    : "";
+  return {
+    id: createCoverageCardId(),
+    name: file.name || "attachment",
+    mimeType: file.type || "application/octet-stream",
+    size: file.size,
+    objectUrl,
+    file,
+  };
+}
 
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      if (!result.startsWith("data:")) {
-        reject(new Error("Invalid file format."));
-        return;
-      }
+function revokeCoverageAttachmentObjectUrl(file: CoverageCardAttachment) {
+  if (file.objectUrl?.startsWith("blob:") && typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+    URL.revokeObjectURL(file.objectUrl);
+  }
+}
 
-      resolve({
-        id: createCoverageCardId(),
-        name: file.name,
-        mimeType: file.type || "application/octet-stream",
-        size: file.size,
-        dataUrl: result,
-      });
-    };
-
-    reader.onerror = () => reject(new Error("Could not read file."));
-    reader.readAsDataURL(file);
-  });
+function getOversizedCoveragePresentationFiles(files: File[]) {
+  return files.filter((file) => file.size > coveragePresentationMaxFileBytes);
 }
 
 function readImageFileAsDocumentationImage(file: File): Promise<DocumentationImage> {

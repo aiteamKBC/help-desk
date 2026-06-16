@@ -155,6 +155,26 @@ describe("InquiryDetails", () => {
     expect(screen.getAllByText("Others").length).toBeGreaterThan(0);
   });
 
+  it("accepts PowerPoint files as supporting evidence", async () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={["/support/inquiry"]}>
+        <SupportProvider>
+          <InquiryDetails />
+        </SupportProvider>
+      </MemoryRouter>,
+    );
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).toBeInTheDocument();
+
+    const presentationFile = new File(["slides"], "coverage-plan.pptx", {
+      type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    });
+
+    fireEvent.change(fileInput!, { target: { files: [presentationFile] } });
+
+    expect(await screen.findByText("coverage-plan.pptx")).toBeInTheDocument();
+  });
+
   it("renders the coverage-specific fields when Coverage is selected", async () => {
     window.localStorage.setItem(
       supportStorageKey,

@@ -81,7 +81,7 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 SUPPORT_ATTACHMENT_ROOT = BASE_DIR / "media" / "support_attachments"
 SUPPORT_ATTACHMENT_MAX_FILE_BYTES = max(
-    int(get_env("SUPPORT_ATTACHMENT_MAX_FILE_BYTES", str(25 * 1024 * 1024)) or str(25 * 1024 * 1024)),
+    int(get_env("SUPPORT_ATTACHMENT_MAX_FILE_BYTES", str(50 * 1024 * 1024)) or str(50 * 1024 * 1024)),
     1024,
 )
 
@@ -114,6 +114,10 @@ COVERAGE_SLA_WEBHOOK_URL = get_env(
 COVERAGE_TUTOR_RESPONSE_MAIL_WEBHOOK_URL = get_env(
     "N8N_RESPONSE_MAIL_WEBHOOK_URL",
     get_env("N8N_ResponseMAIL_WEBHOOK_URL", ""),
+)
+COVERAGE_TUTOR_ATTACHMENT_REPLY_WEBHOOK_URL = get_env(
+    "N8N_ATTACHMENT_EMAIL_REPLY_WEBHOOK_URL",
+    get_env("N8N_Attachment_EMAIL_REPLY_WEBHOOK_URL", ""),
 )
 SUPPORT_PORTAL_PUBLIC_BASE_URL = get_env("SUPPORT_PORTAL_PUBLIC_BASE_URL", "https://technicalsupport.kentbusinesscollege.net")
 LEGACY_DATABASE_URL = get_env("LEGACY_DATABASE_URL")

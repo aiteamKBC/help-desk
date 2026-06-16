@@ -3,6 +3,8 @@ import json
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -868,6 +870,76 @@ class CoverageOptionsTests(SimpleTestCase):
             "Wednesday 09:00 - 11:00 | G1 - Wed - 9AM | Jun 2026",
         )
 
+    def test_get_coverage_options_response_returns_tutor_availability_from_training_plan(self):
+        with patch.object(
+            services,
+            "run_communication_centre_query",
+            return_value=[
+                {
+                    "tutor_name": "Ray",
+                    "module_name": "APM",
+                    "session_week_day": "Thursday",
+                    "session_start_time": "09:00",
+                    "session_end_time": "11:00",
+                    "group_name": "G1",
+                    "cohort_name": "Jun 2026",
+                    "start_date": "2026-06-04",
+                    "end_date": "2026-06-25",
+                    "sessions_number": "4",
+                },
+                {
+                    "tutor_name": "Amgad",
+                    "module_name": "Martech",
+                    "session_week_day": "Friday",
+                    "session_start_time": "09:00",
+                    "session_end_time": "11:00",
+                    "group_name": "G2",
+                    "cohort_name": "Jun 2026",
+                    "start_date": "2026-06-05",
+                    "end_date": "2026-06-26",
+                    "sessions_number": "4",
+                },
+            ],
+        ):
+            response = services.get_coverage_options_response(
+                {
+                    "type": "tutor-availability",
+                    "time": "Thursday 09:00 - 11:00 | G1 - Thu - 9AM",
+                    "sessionDates": "Thursday 18 Jun 2026",
+                }
+            )
+
+        items_by_tutor = {item["tutor"]: item for item in response["items"]}
+        self.assertEqual(items_by_tutor["Ray"]["status"], "busy")
+        self.assertEqual(items_by_tutor["Ray"]["label"], "Busy")
+        self.assertEqual(items_by_tutor["Ray"]["conflicts"][0]["moduleName"], "APM")
+        self.assertEqual(items_by_tutor["Ray"]["conflicts"][0]["date"], "2026-06-18")
+        self.assertEqual(items_by_tutor["Amgad"]["status"], "available")
+
+    def test_tutor_availability_uses_sessions_number_when_end_date_is_missing(self):
+        items = services.build_coverage_tutor_availability_items(
+            [
+                {
+                    "tutor_name": "Andrew",
+                    "module_name": "EVM",
+                    "session_week_day": "Thursday",
+                    "session_start_time": "09:00",
+                    "session_end_time": "11:00",
+                    "group_name": "G1",
+                    "cohort_name": "Jun 2026",
+                    "start_date": "2026-06-04",
+                    "end_date": "",
+                    "sessions_number": "3",
+                }
+            ],
+            time_label="Thursday 09:00 - 11:00",
+            session_dates="Thursday 18 Jun 2026",
+        )
+
+        self.assertEqual(items[0]["tutor"], "Andrew")
+        self.assertEqual(items[0]["status"], "busy")
+        self.assertEqual(items[0]["conflicts"][0]["endDate"], "2026-06-18")
+
     def test_get_coverage_options_response_returns_tutor_email_value(self):
         with patch.object(
             services,
@@ -1605,6 +1677,24 @@ class TicketAttachmentUploadTests(SimpleTestCase):
 
 class SupportSessionValidationTests(SimpleTestCase):
     databases = {"default"}
+
+    def test_uploaded_ticket_attachments_accept_powerpoint_files(self):
+        uploaded_file = SimpleUploadedFile(
+            "coverage-plan.pptx",
+            b"pptx",
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+
+        with TemporaryDirectory() as temp_dir, patch.object(services, "get_support_attachment_root", return_value=Path(temp_dir)):
+            attachment = services.store_uploaded_ticket_attachment("KBC-000071", uploaded_file)
+
+            self.assertEqual(attachment["name"], "coverage-plan.pptx")
+            self.assertEqual(
+                attachment["mimeType"],
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+            self.assertTrue(attachment["storageKey"].endswith(".pptx"))
+            self.assertTrue((Path(temp_dir) / attachment["storageKey"]).exists())
 
     def test_create_ticket_persists_uploaded_attachment_storage_key(self):
         requester = {
@@ -7963,7 +8053,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
 
-    def test_send_coverage_tutor_request_webhook_preserves_file_data_urls_in_json_payload(self):
+    def test_send_coverage_tutor_request_webhook_uses_multipart_when_files_are_present(self):
         payload = {
             "ticketId": "KBC-000001",
             "request": {
@@ -7986,21 +8076,70 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                 "post_json_webhook",
                 return_value=(True, True, 200, {"ok": True}),
             ) as post_json_webhook,
-            patch.object(services, "post_multipart_webhook") as post_multipart_webhook,
+            patch.object(
+                services,
+                "post_multipart_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_multipart_webhook,
         ):
             response = services.send_coverage_tutor_request_webhook(payload)
 
         self.assertTrue(response["delivered"])
-        post_multipart_webhook.assert_not_called()
-        post_json_webhook.assert_called_once_with(
+        post_json_webhook.assert_not_called()
+        post_multipart_webhook.assert_called_once()
+        self.assertEqual(post_multipart_webhook.call_args.args[0], "https://n8n.example/webhook")
+        self.assertEqual(post_multipart_webhook.call_args.args[2], payload["request"]["presentationFiles"])
+        sent_payload = post_multipart_webhook.call_args.args[1]
+        self.assertNotIn("dataUrl", sent_payload["request"]["presentationFiles"][0])
+        post_multipart_webhook.assert_called_once_with(
             "https://n8n.example/webhook",
-            payload,
+            sent_payload,
+            payload["request"]["presentationFiles"],
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
-        sent_payload = post_json_webhook.call_args.args[1]
-        self.assertEqual(
-            sent_payload["request"]["presentationFiles"][0]["dataUrl"],
-            "data:application/pdf;base64,ZmFrZQ==",
+
+    def test_send_coverage_tutor_follow_up_webhook_uses_attachment_reply_url(self):
+        payload = {
+            "event": "coverage_tutor_follow_up",
+            "ticketId": "KBC-000045",
+            "followUp": {
+                "presentationFiles": [
+                    {
+                        "id": "file-2",
+                        "name": "slides-2.pdf",
+                        "mimeType": "application/pdf",
+                        "size": 256,
+                        "dataUrl": "data:application/pdf;base64,Zm9sbG93LXVw",
+                    }
+                ]
+            },
+        }
+
+        with (
+            patch.object(
+                services,
+                "get_coverage_tutor_attachment_reply_webhook_url",
+                return_value="https://n8n.example/attachment-reply",
+            ),
+            patch.object(
+                services,
+                "post_multipart_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_follow_up_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_called_once()
+        self.assertEqual(post_multipart_webhook.call_args.args[0], "https://n8n.example/attachment-reply")
+        self.assertEqual(post_multipart_webhook.call_args.args[2], payload["followUp"]["presentationFiles"])
+        sent_payload = post_multipart_webhook.call_args.args[1]
+        self.assertNotIn("dataUrl", sent_payload["followUp"]["presentationFiles"][0])
+        post_multipart_webhook.assert_called_once_with(
+            "https://n8n.example/attachment-reply",
+            sent_payload,
+            payload["followUp"]["presentationFiles"],
+            timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
 
     def test_queue_coverage_tutor_request_webhook_delivery_starts_background_thread(self):
@@ -8019,6 +8158,29 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
 
         thread_class.assert_called_once()
         self.assertTrue(thread_class.call_args.kwargs["daemon"])
+        thread.start.assert_called_once()
+
+    def test_queue_coverage_tutor_follow_up_webhook_delivery_uses_attachment_reply_url(self):
+        thread = MagicMock()
+
+        with (
+            patch.object(
+                services,
+                "get_coverage_tutor_attachment_reply_webhook_url",
+                return_value="https://n8n.example/attachment-reply",
+            ),
+            patch.object(services.threading, "Thread", return_value=thread) as thread_class,
+        ):
+            services.queue_coverage_tutor_follow_up_webhook_delivery(
+                ticket_id=45,
+                ticket_public_id="KBC-000045",
+                card_id="card-1",
+                payload={"event": "coverage_tutor_follow_up"},
+            )
+
+        thread_class.assert_called_once()
+        self.assertTrue(thread_class.call_args.kwargs["daemon"])
+        self.assertIn("coverage-tutor-follow-up-webhook-KBC-000045-card-1", thread_class.call_args.kwargs["name"])
         thread.start.assert_called_once()
 
     def test_build_coverage_tutor_request_webhook_payload_includes_result_urls(self):
@@ -8907,6 +9069,106 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
         self.assertEqual(len(persisted_card["presentationFiles"]), 1)
 
+    def test_submit_coverage_tutor_request_stores_uploaded_presentation_files(self):
+        ticket = {
+            "id": 45,
+            "public_id": "KBC-000045",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {"technical_subcategory": "Coverage", "admin_documentation": {}},
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        card_payload = {
+            "id": "card-uploaded",
+            "type": "tutor_choice",
+            "tutor": "Ray",
+            "tutorEmail": "ray@example.com",
+            "sessionDetails": "Module: PMP",
+            "presentationFiles": [],
+        }
+        uploaded_file = SimpleUploadedFile(
+            "coverage-plan.pptx",
+            b"slides",
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        stored_request_file = {
+            "name": "coverage-plan.pptx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "size": 6,
+            "storageKey": "KBC-000045/2026/06/coverage-plan.pptx",
+            "metadata": {"originalName": "coverage-plan.pptx", "storage": "local_filesystem"},
+        }
+        mock_connection, cursor = self.build_mock_connection()
+        cursor.fetchone.return_value = (101,)
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_request_file]),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000045"}}),
+        ):
+            services.submit_coverage_tutor_request(
+                "KBC-000045",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-uploaded",
+                    "card": card_payload,
+                    "documentation": {
+                        "inquiry": "Coverage request",
+                        "ticketId": "KBC-000045",
+                        "coverageCards": [{**card_payload, "presentationFiles": []}],
+                    },
+                },
+                uploaded_files=[uploaded_file],
+            )
+
+        queue_webhook.assert_called_once()
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(len(webhook_payload["request"]["presentationFiles"]), 1)
+        self.assertEqual(webhook_payload["request"]["presentationFiles"][0]["attachmentId"], 101)
+        self.assertEqual(
+            webhook_payload["request"]["presentationFiles"][0]["storageUrl"],
+            "/api/admin/tickets/KBC-000045/attachments/101/download",
+        )
+
+        insert_attachment_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        self.assertIn("RETURNING id", insert_attachment_call.args[0])
+        insert_metadata = json.loads(insert_attachment_call.args[1][5])
+        self.assertEqual(insert_metadata["source"], "coverage_tutor_request")
+        self.assertEqual(insert_metadata["coverageCardId"], "card-uploaded")
+
+        update_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0]
+        )
+        persisted_metadata = json.loads(update_call.args[1][5])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(len(persisted_card["presentationFiles"]), 1)
+        self.assertEqual(persisted_card["presentationFiles"][0]["attachmentId"], 101)
+        self.assertEqual(persisted_card["presentationFiles"][0]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/101/download")
+        self.assertFalse(persisted_card["presentationFiles"][0]["dataUrl"])
+
     def test_submit_coverage_tutor_request_falls_back_to_database_email_lookup(self):
         ticket = {
             "id": 42,
@@ -9191,6 +9453,13 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             "is_archived": False,
             "learner_name": "Ayman",
             "learner_email": "ayman@example.com",
+            "tutor_emails": {
+                "Nathan@Example.com": {
+                    "sent_at": "2026-06-04T10:11:00+00:00",
+                    "gmail_thread_id": "gmail-thread-1",
+                    "gmail_message_id": "gmail-message-1",
+                },
+            },
             "metadata": {
                 "technical_subcategory": "Coverage",
                 "admin_documentation": {
@@ -9205,6 +9474,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                             "sessionDetails": "Module: APM",
                             "requestStatus": "requested",
                             "locked": True,
+                            "responseToken": "response-token-1",
                             "submittedAt": "2026-06-04T10:10:00Z",
                             "presentationFiles": [
                                 {
@@ -9221,20 +9491,27 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             },
         }
         actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
-        follow_up_file = {
-            "id": "file-2",
-            "name": "slides-2.pdf",
-            "mimeType": "application/pdf",
-            "size": 256,
-            "dataUrl": "data:application/pdf;base64,Zm9sbG93LXVw",
+        uploaded_file = SimpleUploadedFile(
+            "slides-2.pptx",
+            b"follow-up",
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        stored_follow_up_file = {
+            "name": "slides-2.pptx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "size": 9,
+            "storageKey": "KBC-000045/2026/06/slides-2.pptx",
+            "metadata": {"originalName": "slides-2.pptx", "storage": "local_filesystem"},
         }
         mock_connection, cursor = self.build_mock_connection()
+        cursor.fetchone.return_value = (101,)
 
         with (
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "ensure_coverage_tutor_follow_up_webhook_configured"),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_follow_up_file]),
             patch.object(services, "queue_coverage_tutor_follow_up_webhook_delivery") as queue_webhook,
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event") as insert_history,
@@ -9245,26 +9522,58 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                 {
                     "actorUsername": "ahmed",
                     "cardId": "card-1",
-                    "presentationFiles": [follow_up_file],
                 },
+                uploaded_files=[uploaded_file],
             )
 
         self.assertEqual(response["ticket"]["id"], "KBC-000045")
         queue_webhook.assert_called_once()
         webhook_payload = queue_webhook.call_args.kwargs["payload"]
         self.assertEqual(webhook_payload["event"], "coverage_tutor_follow_up")
+        self.assertEqual(webhook_payload["responseToken"], "response-token-1")
+        self.assertEqual(webhook_payload["tutorName"], "Nathan")
+        self.assertEqual(webhook_payload["tutorEmail"], "nathan@example.com")
+        self.assertEqual(webhook_payload["gmailThreadId"], "gmail-thread-1")
+        self.assertEqual(webhook_payload["gmailMessageId"], "gmail-message-1")
+        self.assertEqual(webhook_payload["attachments"][0]["attachmentId"], 101)
+        self.assertEqual(webhook_payload["attachments"][0]["storageKey"], "KBC-000045/2026/06/slides-2.pptx")
+        self.assertEqual(webhook_payload["attachments"][0]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/101/download")
+        self.assertNotIn("dataUrl", {key: value for key, value in webhook_payload["attachments"][0].items() if value})
         self.assertEqual(webhook_payload["request"]["requestStatus"], "requested")
+        self.assertEqual(
+            webhook_payload["originalEmail"],
+            {
+                "recipientEmail": "nathan@example.com",
+                "sentAt": "2026-06-04T10:11:00+00:00",
+                "gmailThreadId": "gmail-thread-1",
+                "gmailMessageId": "gmail-message-1",
+                "canReplyToExistingThread": True,
+            },
+        )
         self.assertEqual(webhook_payload["followUp"]["fileCount"], 1)
         self.assertEqual(len(webhook_payload["followUp"]["presentationFiles"]), 1)
         self.assertEqual(len(webhook_payload["request"]["presentationFiles"]), 2)
 
-        update_sql = cursor.execute.call_args_list[0].args[0]
-        update_params = cursor.execute.call_args_list[0].args[1]
+        insert_attachment_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        self.assertIn("RETURNING id", insert_attachment_call.args[0])
+        update_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0]
+        )
+        update_sql = update_call.args[0]
+        update_params = update_call.args[1]
         self.assertIn("SET metadata = %s::jsonb", update_sql)
         persisted_metadata = json.loads(update_params[0])
         persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
         self.assertEqual(persisted_card["requestStatus"], "requested")
         self.assertEqual(len(persisted_card["presentationFiles"]), 2)
+        self.assertEqual(persisted_card["presentationFiles"][1]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/101/download")
+        self.assertFalse(persisted_card["presentationFiles"][1]["dataUrl"])
         self.assertEqual(insert_history.call_args.args[1], "coverage_tutor_follow_up_sent")
 
     def test_send_coverage_tutor_follow_up_files_allows_accepted_closed_ticket(self):
@@ -9309,7 +9618,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "ensure_coverage_tutor_follow_up_webhook_configured"),
             patch.object(services, "queue_coverage_tutor_follow_up_webhook_delivery") as queue_webhook,
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
@@ -9383,7 +9692,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "ensure_coverage_tutor_follow_up_webhook_configured"),
         ):
             with self.assertRaises(services.ApiError) as raised_error:
                 services.send_coverage_tutor_follow_up_files(

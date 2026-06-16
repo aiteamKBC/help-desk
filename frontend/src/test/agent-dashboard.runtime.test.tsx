@@ -124,6 +124,7 @@ const dashboardPayload = {
             "Coverage session request",
             "Tutor: Sara Ahmed",
             "Module: Digital Marketing",
+            "Session Date: Saturday 19 Jun 2099",
           ].join("\n"),
           symptoms: "",
           errors: "",
@@ -216,6 +217,75 @@ const dashboardPayload = {
         archivedByUsername: "",
         createdAt: "2026-06-14T12:00:00.000Z",
         updatedAt: "2026-06-14T12:00:00.000Z",
+      },
+      {
+        id: "KBC-000004",
+        learnerName: "Sooner Coverage",
+        requesterName: "Sooner Coverage",
+        email: "sooner.coverage@kentbusinesscollege.com",
+        learnerPhone: "",
+        requesterRole: "coach",
+        requesterSource: "microsoft_entra",
+        priority: "Normal",
+        category: "Technical",
+        technicalSubcategory: "Coverage",
+        inquiryPreview: "Upcoming coverage session request",
+        status: "Pending",
+        statusReason: "Coverage Ticket",
+        assignedAgentId: 27,
+        assignedAgentName: "Ayman Badewi",
+        assignedAgentUsername: "ayman.badewi",
+        assignedTeam: "Support Desk",
+        chatId: "CHAT-000004",
+        chatIsActive: false,
+        liveChatRequested: false,
+        liveChatRequestedAt: null,
+        queueAssignedAt: null,
+        chatDurationMinutes: 0,
+        chatState: "closed",
+        lastMessageAt: null,
+        pendingTransferRequest: null,
+        pendingEscalationNotification: null,
+        pendingTeamsCallNotification: null,
+        pendingCoverageTicketNotification: null,
+        teamsCallRequested: false,
+        latestEscalationClosure: null,
+        latestTransferDecision: null,
+        latestCoverageTutorResponse: null,
+        documentation: {
+          inquiry: [
+            "Coverage session request",
+            "Tutor: Mona Adel",
+            "Module: Project Planning",
+            "Session Date: Friday 18 Jun 2099",
+          ].join("\n"),
+          symptoms: "",
+          errors: "",
+          steps: "",
+          resources: "",
+          chatId: "CHAT-000004",
+          ticketId: "KBC-000004",
+          ticketStatus: "",
+          statusReason: "",
+          issuesAddressed: "",
+          escalationAgentId: null,
+          escalationAgentName: "",
+          escalationNote: "",
+          coverageNotes: "",
+          coverageCards: [],
+          documentationCards: [],
+          errorImages: [],
+        },
+        slaStatus: "On Track",
+        slaAttentionRequired: false,
+        evidenceCount: 0,
+        isArchived: false,
+        archivedAt: null,
+        archivedById: null,
+        archivedByName: "",
+        archivedByUsername: "",
+        createdAt: "2026-06-14T09:00:00.000Z",
+        updatedAt: "2026-06-14T09:00:00.000Z",
       },
     ],
   },
@@ -361,6 +431,34 @@ describe("AgentDashboard runtime", () => {
 
     expect(within(learningPlanPanel).getByText("KBC-000003")).toBeInTheDocument();
     expect(within(learningPlanPanel).queryByText("KBC-000002")).not.toBeInTheDocument();
+  });
+
+  it("defaults Learning Plan Team coverage tickets to Highest Priority session-date sorting", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin?view=coverage"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    const learningPlanPanel = await screen.findByRole("tabpanel");
+    const getCoverageRows = () => (
+      within(learningPlanPanel)
+        .getAllByRole("button")
+        .filter((row) => /KBC-\d+/.test(row.textContent || ""))
+    );
+    const getCoverageRow = (ticketId: string) => {
+      const row = getCoverageRows().find((candidate) => within(candidate).queryByText(ticketId));
+      if (!row) {
+        throw new Error(`Coverage row ${ticketId} was not found.`);
+      }
+
+      return row;
+    };
+    const getCoverageRowIndex = (ticketId: string) => getCoverageRows().indexOf(getCoverageRow(ticketId));
+
+    expect(within(learningPlanPanel).getByLabelText("Sort tickets")).toHaveTextContent("Highest Priority");
+    expect(getCoverageRowIndex("KBC-000004")).toBeLessThan(getCoverageRowIndex("KBC-000002"));
+    expect(within(getCoverageRow("KBC-000004")).getByLabelText("Date Friday 18 Jun 2099")).toBeInTheDocument();
   });
 
   it("shows only Learning Plan Team when a support desk ticket is transferred", async () => {

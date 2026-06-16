@@ -25,3 +25,15 @@ if (!Element.prototype.setPointerCapture) {
 if (!Element.prototype.releasePointerCapture) {
   Element.prototype.releasePointerCapture = () => {};
 }
+
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
+if (!URL.createObjectURL) {
+  URL.createObjectURL = () => "blob:mock-object-url";
+}
+
+if (!URL.revokeObjectURL) {
+  URL.revokeObjectURL = () => {};
+}

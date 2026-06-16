@@ -213,24 +213,7 @@ MICROSOFT_GRAPH_STAFF_ROLE_PRIORITY = {
 MANAGED_PUBLIC_REQUESTER_SOURCE = "support_portal_requester"
 KBC_USERS_DATA_REQUESTER_SOURCE = "kbc_users_data"
 MICROSOFT_ENTRA_REQUESTER_SOURCE = "microsoft_entra"
-ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".webp",
-    ".bmp",
-    ".svg",
-    ".pdf",
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".mkv",
-    ".webm",
-}
-ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES = {"application/pdf"}
-ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES = ("image/", "video/")
-DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 25 * 1024 * 1024
+DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 CHAT_MESSAGE_ID_METADATA_KEY = "client_message_id"
 CHAT_ATTACHMENTS_METADATA_KEY = "attachments"
 CHAT_ATTACHMENT_STORAGE_SEGMENT = "chat"
@@ -317,20 +300,6 @@ def get_ticket_background_sync_min_interval_seconds() -> int:
 
 def get_support_attachment_extension(file_name: str) -> str:
     return Path(file_name).suffix.lower()
-
-
-def is_allowed_support_attachment_type(*, file_name: str, mime_type: str) -> bool:
-    extension = get_support_attachment_extension(file_name)
-    if extension not in ALLOWED_SUPPORT_ATTACHMENT_EXTENSIONS:
-        return False
-
-    if not mime_type:
-        return True
-
-    if mime_type in ALLOWED_SUPPORT_ATTACHMENT_MIME_TYPES:
-        return True
-
-    return mime_type.startswith(ALLOWED_SUPPORT_ATTACHMENT_MIME_PREFIXES)
 
 
 def build_support_attachment_storage_key(ticket_public_id: str, file_name: str) -> str:
@@ -427,6 +396,78 @@ def normalize_chat_attachment_row_payload(file: dict[str, Any]) -> dict[str, Any
     }
 
 
+def extract_returned_database_id(row: Any) -> int | None:
+    value = None
+    if isinstance(row, dict):
+        value = row.get("id")
+    elif isinstance(row, (list, tuple)) and row:
+        value = row[0]
+
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def insert_ticket_attachment_rows(
+    ticket_id: int,
+    ticket_public_id: str,
+    attachment_rows: list[dict[str, Any]],
+    *,
+    metadata_overrides: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    inserted_attachments: list[dict[str, Any]] = []
+
+    with connection.cursor() as cursor:
+        for attachment_row in attachment_rows:
+            normalized_file = normalize_ticket_attachment_row_payload(attachment_row)
+            metadata = {
+                **normalize_json_object(normalized_file.get("metadata")),
+                **normalize_json_object(metadata_overrides),
+            }
+            cursor.execute(
+                """
+                INSERT INTO ticket_attachments (
+                  ticket_id,
+                  file_name,
+                  mime_type,
+                  file_size,
+                  storage_url,
+                  metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                RETURNING id
+                """,
+                [
+                    ticket_id,
+                    normalized_file["name"],
+                    normalized_file["mimeType"],
+                    normalized_file["size"],
+                    normalized_file["storageKey"],
+                    json.dumps(metadata),
+                ],
+            )
+            attachment_id = extract_returned_database_id(cursor.fetchone())
+            inserted_attachments.append(
+                {
+                    "id": sanitize_text(attachment_row.get("id")) or f"ticket-attachment-{attachment_id or uuid4().hex}",
+                    "attachmentId": attachment_id,
+                    "name": normalized_file["name"],
+                    "mimeType": normalized_file["mimeType"] or "application/octet-stream",
+                    "size": int(normalized_file["size"] or 0),
+                    "storageKey": normalized_file["storageKey"],
+                    "storageUrl": (
+                        build_admin_ticket_attachment_download_url(ticket_public_id, attachment_id)
+                        if attachment_id
+                        else ""
+                    ),
+                    "dataUrl": "",
+                }
+            )
+
+    return inserted_attachments
+
+
 def sanitize_chat_attachment_storage_reference(value: Any) -> str | None:
     normalized_value = sanitize_text(value)
     if not normalized_value:
@@ -445,9 +486,6 @@ def store_uploaded_ticket_attachment(ticket_public_id: str, uploaded_file: Any) 
         raise ApiError(400, "Uploaded attachments must not be empty.")
     if file_size > get_support_attachment_max_file_bytes():
         raise ApiError(400, "Uploaded attachments exceed the maximum allowed size.")
-    if not is_allowed_support_attachment_type(file_name=file_name, mime_type=mime_type):
-        raise ApiError(400, "Unsupported attachment type. Please upload an image, PDF, or video file.")
-
     storage_key = build_support_attachment_storage_key(ticket_public_id, file_name)
     attachment_path = resolve_support_attachment_path(storage_key)
     attachment_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1248,8 +1286,19 @@ def is_live_chat_requested(ticket_metadata: Any, conversation_metadata: Any = No
 def normalize_coverage_card_attachment(value: Any) -> dict[str, Any] | None:
     source = normalize_json_object(value)
     data_url = sanitize_text(source.get("dataUrl"))
-    if not data_url.startswith("data:"):
+    storage_url = sanitize_text(source.get("storageUrl"))
+    storage_key = sanitize_text(source.get("storageKey"))
+    if data_url and not data_url.startswith("data:"):
+        data_url = ""
+    if not data_url and not storage_url and not storage_key:
         return None
+
+    attachment_id = None
+    try:
+        raw_attachment_id = source.get("attachmentId")
+        attachment_id = int(raw_attachment_id) if raw_attachment_id not in (None, "") else None
+    except (TypeError, ValueError):
+        attachment_id = None
 
     return {
         "id": sanitize_text(source.get("id")),
@@ -1257,6 +1306,9 @@ def normalize_coverage_card_attachment(value: Any) -> dict[str, Any] | None:
         "mimeType": sanitize_text(source.get("mimeType")) or "application/octet-stream",
         "size": int(source.get("size") or 0),
         "dataUrl": data_url,
+        "storageUrl": storage_url,
+        "storageKey": storage_key,
+        "attachmentId": attachment_id,
     }
 
 
@@ -2317,6 +2369,112 @@ def format_coverage_session_date_option_label(value) -> str:
     return value.strftime("%A %d %b %Y")
 
 
+def parse_coverage_session_date_label(value: Any):
+    normalized_value = sanitize_text(value).replace(",", " ")
+    normalized_value = re.sub(r"\s+", " ", normalized_value).strip()
+    if not normalized_value:
+        return None
+
+    for date_format in ("%A %d %b %Y", "%A %d %B %Y", "%d %b %Y", "%d %B %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized_value, date_format).date()
+        except ValueError:
+            continue
+
+    return parse_coverage_plan_date(normalized_value)
+
+
+def parse_coverage_session_date_values(value: Any) -> list:
+    raw_values = value if isinstance(value, list) else sanitize_text(value).split(";")
+    parsed_dates = []
+    seen_dates = set()
+
+    for raw_value in raw_values:
+        parsed_date = parse_coverage_session_date_label(raw_value)
+        if not parsed_date or parsed_date in seen_dates:
+            continue
+        seen_dates.add(parsed_date)
+        parsed_dates.append(parsed_date)
+
+    return parsed_dates
+
+
+def parse_coverage_time_value_to_minutes(value: str) -> int | None:
+    normalized_value = sanitize_text(value).lower()
+    if not normalized_value:
+        return None
+
+    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", normalized_value)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    meridiem = match.group(3)
+    if meridiem == "pm" and hour < 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def parse_coverage_time_range(value: Any) -> tuple[int, int] | None:
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return None
+
+    time_matches = re.findall(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)?", normalized_value, flags=re.IGNORECASE)
+    if len(time_matches) < 2:
+        return None
+
+    start_minutes = parse_coverage_time_value_to_minutes(time_matches[0])
+    end_minutes = parse_coverage_time_value_to_minutes(time_matches[1])
+    if start_minutes is None or end_minutes is None or start_minutes >= end_minutes:
+        return None
+
+    return start_minutes, end_minutes
+
+
+def get_coverage_plan_effective_end_date(row: dict[str, Any], start_date):
+    end_date = parse_coverage_plan_date(row.get("end_date"))
+    if end_date or not start_date:
+        return end_date
+
+    try:
+        sessions_number = int(sanitize_text(row.get("sessions_number")))
+    except ValueError:
+        sessions_number = 0
+
+    if sessions_number > 0:
+        return start_date + timedelta(days=7 * (sessions_number - 1))
+
+    return None
+
+
+def coverage_plan_row_occurs_on_date(row: dict[str, Any], session_date) -> bool:
+    start_date = parse_coverage_plan_date(row.get("start_date"))
+    if not start_date:
+        return False
+
+    weekday_index = get_coverage_weekday_index(row.get("session_week_day"))
+    if weekday_index is None:
+        return False
+
+    effective_end_date = get_coverage_plan_effective_end_date(row, start_date)
+    if session_date < start_date or (effective_end_date and session_date > effective_end_date):
+        return False
+
+    first_occurrence = start_date + timedelta(days=(weekday_index - start_date.weekday()) % 7)
+    return session_date >= first_occurrence and (session_date - first_occurrence).days % 7 == 0
+
+
+def coverage_time_ranges_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
 def list_coverage_time_rows(tutor: Any, module: Any) -> list[dict[str, Any]]:
     normalized_tutor = sanitize_text(tutor).lower()
     normalized_module = sanitize_text(module).lower()
@@ -2391,6 +2549,147 @@ def list_coverage_tutor_options(module: Any = None) -> list[str]:
             tutor_names_by_key.setdefault(tutor_name.lower(), tutor_name)
 
     return [tutor_names_by_key[key] for key in sorted(tutor_names_by_key)]
+
+
+def list_coverage_tutor_availability_plan_rows() -> list[dict[str, Any]]:
+    return run_communication_centre_query(
+        """
+        SELECT DISTINCT
+          NULLIF(TRIM("Tutor_name"), '') AS tutor_name,
+          NULLIF(TRIM("module_name"), '') AS module_name,
+          NULLIF(TRIM("session_week_day"), '') AS session_week_day,
+          NULLIF(TRIM("session_start_time"), '') AS session_start_time,
+          NULLIF(TRIM("session_end_time"), '') AS session_end_time,
+          NULLIF(TRIM("group_name"), '') AS group_name,
+          NULLIF(TRIM("Cohort_name"), '') AS cohort_name,
+          NULLIF(TRIM("start_date"), '') AS start_date,
+          NULLIF(TRIM("end_date"), '') AS end_date,
+          NULLIF(TRIM("sessions_number"), '') AS sessions_number
+        FROM public."Training_plan"
+        WHERE NULLIF(TRIM("Tutor_name"), '') IS NOT NULL
+        ORDER BY tutor_name, module_name, session_week_day, session_start_time, start_date
+        """
+    )
+
+
+def summarize_coverage_tutor_plan_module(row: dict[str, Any]) -> dict[str, Any]:
+    start_date = parse_coverage_plan_date(row.get("start_date"))
+    effective_end_date = get_coverage_plan_effective_end_date(row, start_date)
+    return {
+        "moduleName": sanitize_text(row.get("module_name")),
+        "timeLabel": format_coverage_time_option_label(
+            row.get("session_week_day"),
+            row.get("session_start_time"),
+            row.get("session_end_time"),
+            row.get("group_name"),
+            row.get("cohort_name"),
+        ),
+        "startDate": start_date.isoformat() if start_date else "",
+        "endDate": effective_end_date.isoformat() if effective_end_date else "",
+    }
+
+
+def build_coverage_tutor_availability_items(
+    rows: list[dict[str, Any]],
+    *,
+    time_label: Any,
+    session_dates: Any,
+) -> list[dict[str, Any]]:
+    requested_dates = parse_coverage_session_date_values(session_dates)
+    requested_time_range = parse_coverage_time_range(time_label)
+    rows_by_tutor_key: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        raw_tutor_name = sanitize_text(row.get("tutor_name"))
+        if not raw_tutor_name:
+            continue
+
+        for tutor_name_part in raw_tutor_name.split("+"):
+            tutor_name = sanitize_text(tutor_name_part)
+            if not tutor_name:
+                continue
+
+            tutor_key = tutor_name.lower()
+            tutor_payload = rows_by_tutor_key.setdefault(tutor_key, {"tutor": tutor_name, "rows": []})
+            tutor_payload["rows"].append(row)
+
+    items = []
+    for tutor_key in sorted(rows_by_tutor_key):
+        tutor_payload = rows_by_tutor_key[tutor_key]
+        tutor_rows = tutor_payload["rows"]
+        module_summaries_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        conflicts: list[dict[str, Any]] = []
+
+        for row in tutor_rows:
+            module_summary = summarize_coverage_tutor_plan_module(row)
+            module_key = (
+                module_summary["moduleName"].lower(),
+                module_summary["timeLabel"].lower(),
+                module_summary["startDate"],
+            )
+            if module_summary["moduleName"] or module_summary["timeLabel"]:
+                module_summaries_by_key.setdefault(module_key, module_summary)
+
+            row_time_range = parse_coverage_time_range(
+                f"{sanitize_text(row.get('session_start_time'))} - {sanitize_text(row.get('session_end_time'))}"
+            )
+            if not requested_dates or not requested_time_range or not row_time_range:
+                continue
+
+            for requested_date in requested_dates:
+                if (
+                    coverage_plan_row_occurs_on_date(row, requested_date)
+                    and coverage_time_ranges_overlap(requested_time_range, row_time_range)
+                ):
+                    conflicts.append(
+                        {
+                            **module_summary,
+                            "date": requested_date.isoformat(),
+                            "dateLabel": format_coverage_session_date_option_label(requested_date),
+                        }
+                    )
+                    break
+
+        if not requested_dates or not requested_time_range:
+            status = "unknown"
+            label = "Need date/time"
+            summary = "Choose the coverage date and time to check this tutor's training plan availability."
+        elif conflicts:
+            status = "busy"
+            label = "Busy"
+            first_conflict = conflicts[0]
+            conflict_module = sanitize_text(first_conflict.get("moduleName")) or "another module"
+            summary = f"Busy with {conflict_module} on {first_conflict.get('dateLabel') or first_conflict.get('date')}."
+        elif tutor_rows:
+            status = "available"
+            label = "Available"
+            summary = "No Training_plan conflict was found for the selected coverage date and time."
+        else:
+            status = "no_plan"
+            label = "No plan data"
+            summary = "No Training_plan rows were found for this tutor."
+
+        items.append(
+            {
+                "tutor": tutor_payload["tutor"],
+                "status": status,
+                "label": label,
+                "summary": summary,
+                "conflictCount": len(conflicts),
+                "conflicts": conflicts[:3],
+                "modules": list(module_summaries_by_key.values())[:6],
+            }
+        )
+
+    return items
+
+
+def list_coverage_tutor_availability_items(time_label: Any, session_dates: Any) -> list[dict[str, Any]]:
+    return build_coverage_tutor_availability_items(
+        list_coverage_tutor_availability_plan_rows(),
+        time_label=time_label,
+        session_dates=session_dates,
+    )
 
 
 def list_coverage_module_options(tutor: Any) -> list[str]:
@@ -2619,9 +2918,13 @@ def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
     coach = payload.get("coach")
     module = payload.get("module")
     time_label = payload.get("time")
+    session_dates = payload.get("sessionDates")
 
     if option_type == "tutors":
         options = list_coverage_tutor_options(module)
+    elif option_type == "tutor-availability":
+        items = list_coverage_tutor_availability_items(time_label, session_dates)
+        options = [item["tutor"] for item in items]
     elif option_type == "coaches":
         options = list_coverage_coach_options()
     elif option_type == "modules":
@@ -2647,7 +2950,7 @@ def get_coverage_options_response(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": option_type,
         "options": options,
-        **({"items": items} if option_type == "times" else {}),
+        **({"items": items} if option_type in {"times", "tutor-availability"} else {}),
     }
 
 
@@ -2669,6 +2972,13 @@ def get_coverage_sla_alerts_webhook_url() -> str:
 
 def get_coverage_tutor_response_mail_webhook_url() -> str:
     return sanitize_text(getattr(settings, "COVERAGE_TUTOR_RESPONSE_MAIL_WEBHOOK_URL", ""))
+
+
+def get_coverage_tutor_attachment_reply_webhook_url() -> str:
+    return (
+        sanitize_text(getattr(settings, "COVERAGE_TUTOR_ATTACHMENT_REPLY_WEBHOOK_URL", ""))
+        or get_coverage_tutor_request_webhook_url()
+    )
 
 
 def normalize_support_portal_public_base_url(value: Any) -> str:
@@ -2839,6 +3149,41 @@ def build_coverage_tutor_request_webhook_payload(
     }
 
 
+def build_coverage_tutor_original_email_payload(tutor_emails: Any, tutor_email: Any) -> dict[str, Any]:
+    normalized_tutor_email = normalize_email(tutor_email)
+    if not normalized_tutor_email:
+        return {
+            "recipientEmail": "",
+            "sentAt": "",
+            "gmailThreadId": "",
+            "gmailMessageId": "",
+            "canReplyToExistingThread": False,
+        }
+
+    email_records = normalize_json_object(tutor_emails)
+    original_email_record = normalize_json_object(email_records.get(normalized_tutor_email))
+    if not original_email_record:
+        for email_key, value in email_records.items():
+            if normalize_email(email_key) == normalized_tutor_email:
+                original_email_record = normalize_json_object(value)
+                break
+
+    gmail_thread_id = sanitize_text(
+        original_email_record.get("gmail_thread_id") or original_email_record.get("gmailThreadId")
+    )
+    gmail_message_id = sanitize_text(
+        original_email_record.get("gmail_message_id") or original_email_record.get("gmailMessageId")
+    )
+
+    return {
+        "recipientEmail": normalized_tutor_email,
+        "sentAt": sanitize_text(original_email_record.get("sent_at") or original_email_record.get("sentAt")),
+        "gmailThreadId": gmail_thread_id,
+        "gmailMessageId": gmail_message_id,
+        "canReplyToExistingThread": bool(gmail_thread_id or gmail_message_id),
+    }
+
+
 def build_coverage_tutor_follow_up_webhook_payload(
     ticket: dict[str, Any],
     documentation: dict[str, Any],
@@ -2850,13 +3195,29 @@ def build_coverage_tutor_follow_up_webhook_payload(
 ) -> dict[str, Any]:
     public_base_url = get_support_portal_public_base_url("")
     dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
+    original_email_payload = build_coverage_tutor_original_email_payload(
+        ticket.get("tutor_emails"),
+        card.get("tutorEmail"),
+    )
 
     return {
         "event": "coverage_tutor_follow_up",
         "source": "support_portal",
         "ticketId": ticket["public_id"],
         "cardId": card["id"],
+        "responseToken": card.get("responseToken"),
         "dashboardUrl": dashboard_url,
+        "originalEmail": original_email_payload,
+        # Keep top-level aliases for automation workflows that do not read nested payloads.
+        "tutorName": card.get("tutor"),
+        "tutorEmail": card.get("tutorEmail"),
+        "coachName": card.get("coach"),
+        "coachEmail": card.get("coachEmail"),
+        "note": documentation.get("coverageNotes") or "",
+        "attachments": follow_up_files,
+        "gmailThreadId": original_email_payload.get("gmailThreadId"),
+        "gmailMessageId": original_email_payload.get("gmailMessageId"),
+        "canReplyToExistingThread": original_email_payload.get("canReplyToExistingThread"),
         "tutor": {
             "name": card.get("tutor"),
             "email": card.get("tutorEmail"),
@@ -2894,11 +3255,53 @@ def build_coverage_tutor_follow_up_webhook_payload(
     }
 
 
+def strip_webhook_attachment_binary_fields(value: Any) -> Any:
+    if isinstance(value, list):
+        return [strip_webhook_attachment_binary_fields(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: strip_webhook_attachment_binary_fields(item)
+            for key, item in value.items()
+            if key not in {"dataUrl", "storageKey"}
+        }
+    return value
+
+
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_request_webhook_url()
-    configured, delivered, status, response_payload = post_json_webhook(
+    request_payload = normalize_json_object(payload.get("request"))
+    files = request_payload.get("presentationFiles") if isinstance(request_payload.get("presentationFiles"), list) else []
+    if files:
+        configured, delivered, status, response_payload = post_multipart_webhook(
+            url,
+            strip_webhook_attachment_binary_fields(payload),
+            files,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+    else:
+        configured, delivered, status, response_payload = post_json_webhook(
+            url,
+            payload,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+    return {
+        "configured": configured,
+        "delivered": delivered,
+        "status": status,
+        "response": response_payload,
+    }
+
+
+def send_coverage_tutor_follow_up_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    url = get_coverage_tutor_attachment_reply_webhook_url()
+    follow_up_payload = normalize_json_object(payload.get("followUp"))
+    files = follow_up_payload.get("presentationFiles") if isinstance(follow_up_payload.get("presentationFiles"), list) else []
+    if not files and isinstance(payload.get("attachments"), list):
+        files = payload["attachments"]
+    configured, delivered, status, response_payload = post_multipart_webhook(
         url,
-        payload,
+        strip_webhook_attachment_binary_fields(payload),
+        files,
         timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
     )
     return {
@@ -2912,6 +3315,11 @@ def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, An
 def ensure_coverage_tutor_request_webhook_configured() -> None:
     if not get_coverage_tutor_request_webhook_url():
         raise ApiError(503, "The tutor request webhook is not configured on the server.")
+
+
+def ensure_coverage_tutor_follow_up_webhook_configured() -> None:
+    if not get_coverage_tutor_attachment_reply_webhook_url():
+        raise ApiError(503, "The tutor follow-up files webhook is not configured on the server.")
 
 
 def queue_coverage_tutor_request_webhook_delivery(
@@ -2963,11 +3371,11 @@ def queue_coverage_tutor_follow_up_webhook_delivery(
     card_id: str,
     payload: dict[str, Any],
 ) -> None:
-    if not get_coverage_tutor_request_webhook_url():
+    if not get_coverage_tutor_attachment_reply_webhook_url():
         return
 
     def deliver() -> None:
-        result = send_coverage_tutor_request_webhook(payload)
+        result = send_coverage_tutor_follow_up_webhook(payload)
         event_type = (
             "coverage_tutor_follow_up_webhook_delivered"
             if result.get("delivered")
@@ -11015,13 +11423,21 @@ def acknowledge_ticket_escalation_closure(public_id: str, payload: dict[str, Any
     return detail
 
 
-def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def submit_coverage_tutor_request(
+    public_id: str,
+    payload: dict[str, Any],
+    *,
+    uploaded_files: list[Any] | None = None,
+) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     card_id = sanitize_text(payload.get("cardId"))
     callback_origin = sanitize_text(payload.get("origin")).rstrip("/")
     requested_documentation = payload.get("documentation")
     requested_card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else None
+    raw_request_files = payload.get("presentationFiles") if isinstance(payload.get("presentationFiles"), list) else []
+    uploaded_request_files = list(uploaded_files or [])
     webhook_delivery: dict[str, Any] | None = None
+    stored_attachment_keys: list[str] = []
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -11033,6 +11449,17 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
     actor_row = fetch_actor_by_username(actor_username)
     if not actor_row:
         raise ApiError(403, "Admin sign-in is required.")
+
+    if requested_card_payload is not None and raw_request_files:
+        requested_card_files = (
+            requested_card_payload.get("presentationFiles")
+            if isinstance(requested_card_payload.get("presentationFiles"), list)
+            else []
+        )
+        requested_card_payload = {
+            **requested_card_payload,
+            "presentationFiles": [*requested_card_files, *raw_request_files],
+        }
 
     with transaction.atomic():
         ticket = run_query_one(
@@ -11141,6 +11568,39 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
         if not session_details:
             raise ApiError(400, "Add the session details before submitting the request.")
         ensure_coverage_tutor_request_webhook_configured()
+
+        existing_presentation_files = [
+            normalized_attachment
+            for attachment in target_card.get("presentationFiles") or []
+            if (normalized_attachment := normalize_coverage_card_attachment(attachment))
+        ]
+        uploaded_presentation_files: list[dict[str, Any]] = []
+        if uploaded_request_files:
+            try:
+                stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_request_files)
+                stored_attachment_keys = [
+                    attachment.get("storageKey")
+                    for attachment in stored_attachment_rows
+                    if sanitize_text(attachment.get("storageKey"))
+                ]
+                uploaded_presentation_files = insert_ticket_attachment_rows(
+                    int(ticket["id"]),
+                    ticket["public_id"],
+                    stored_attachment_rows,
+                    metadata_overrides={
+                        "source": "coverage_tutor_request",
+                        "coverageCardId": card_id,
+                    },
+                )
+            except Exception:
+                for storage_key in stored_attachment_keys:
+                    delete_support_attachment_file(storage_key)
+                raise
+        if uploaded_presentation_files:
+            target_card = {
+                **target_card,
+                "presentationFiles": [*existing_presentation_files, *uploaded_presentation_files],
+            }
 
         current_assigned_agent_id = parse_assigned_agent_id(ticket.get("assigned_agent_id"))
         next_assigned_agent_id = current_assigned_agent_id or int(actor_row["id"])
@@ -11313,11 +11773,18 @@ def submit_coverage_tutor_request(public_id: str, payload: dict[str, Any]) -> di
     return detail
 
 
-def send_coverage_tutor_follow_up_files(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def send_coverage_tutor_follow_up_files(
+    public_id: str,
+    payload: dict[str, Any],
+    *,
+    uploaded_files: list[Any] | None = None,
+) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     card_id = sanitize_text(payload.get("cardId"))
     raw_follow_up_files = payload.get("presentationFiles") if isinstance(payload.get("presentationFiles"), list) else []
+    uploaded_follow_up_files = list(uploaded_files or [])
     webhook_delivery: dict[str, Any] | None = None
+    stored_attachment_keys: list[str] = []
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -11336,139 +11803,164 @@ def send_coverage_tutor_follow_up_files(public_id: str, payload: dict[str, Any])
         if normalized_attachment:
             follow_up_files.append(normalized_attachment)
 
-    if not follow_up_files:
+    if not follow_up_files and not uploaded_follow_up_files:
         raise ApiError(400, "Add at least one presentation file before sending the follow-up.")
 
-    ensure_coverage_tutor_request_webhook_configured()
+    ensure_coverage_tutor_follow_up_webhook_configured()
 
-    with transaction.atomic():
-        ticket = run_query_one(
-            """
-            SELECT
-              t.id,
-              t.public_id,
-              t.category,
-              t.technical_subcategory,
-              t.inquiry,
-              t.status,
-              t.status_reason,
-              t.sla_status,
-              t.metadata,
-              t.is_archived,
-              l.full_name AS learner_name,
-              l.email AS learner_email
-            FROM tickets t
-            JOIN learners l
-              ON l.id = t.learner_id
-            WHERE t.public_id = %s
-            LIMIT 1
-            """,
-            [public_id],
-        )
-
-        if not ticket:
-            raise ApiError(404, "Ticket not found.")
-        if not is_coverage_ticket_record(ticket):
-            raise ApiError(409, "This ticket is not a coverage ticket.")
-        if normalize_bool(ticket.get("is_archived")):
-            raise ApiError(409, "Restore this ticket before editing it.")
-
-        ticket_metadata = normalize_json_object(ticket.get("metadata"))
-        documentation = normalize_admin_documentation(
-            ticket_metadata.get("admin_documentation"),
-            fallback_inquiry=sanitize_text(ticket.get("inquiry")),
-            fallback_ticket_id=ticket["public_id"],
-        )
-        coverage_cards = list(documentation.get("coverageCards") or [])
-        card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
-        if card_index is None:
-            raise ApiError(404, "Coverage card not found.")
-
-        target_card = normalize_json_object(coverage_cards[card_index])
-        if sanitize_text(target_card.get("type")) != "tutor_choice":
-            raise ApiError(409, "Only tutor choice cards can receive follow-up files.")
-
-        request_status = sanitize_text(target_card.get("requestStatus")).lower()
-        if request_status == "pending":
-            request_status = "requested"
-        if request_status not in {"requested", "accepted"}:
-            raise ApiError(409, "Follow-up files can only be sent for requested or accepted tutor requests.")
-
-        existing_files = [
-            normalized_attachment
-            for attachment in target_card.get("presentationFiles") or []
-            if (normalized_attachment := normalize_coverage_card_attachment(attachment))
-        ]
-        existing_file_ids = {
-            sanitize_text(existing_file.get("id"))
-            for existing_file in existing_files
-            if sanitize_text(existing_file.get("id"))
-        }
-        new_follow_up_files = [
-            follow_up_file
-            for follow_up_file in follow_up_files
-            if sanitize_text(follow_up_file.get("id")) not in existing_file_ids
-        ]
-        if not new_follow_up_files:
-            raise ApiError(400, "Add at least one new presentation file before sending the follow-up.")
-
-        timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
-        updated_target_card = {
-            **target_card,
-            "presentationFiles": [*existing_files, *new_follow_up_files],
-            "updatedAt": timestamp,
-        }
-        coverage_cards[card_index] = updated_target_card
-        documentation["coverageCards"] = coverage_cards
-
-        updated_ticket_metadata = normalize_json_object(ticket_metadata)
-        updated_ticket_metadata["admin_documentation"] = documentation
-
-        with connection.cursor() as cursor:
-            cursor.execute(
+    try:
+        with transaction.atomic():
+            ticket = run_query_one(
                 """
-                UPDATE tickets
-                SET metadata = %s::jsonb,
-                    updated_at = NOW()
-                WHERE id = %s
+                SELECT
+                  t.id,
+                  t.public_id,
+                  t.category,
+                  t.technical_subcategory,
+                  t.inquiry,
+                  t.status,
+                  t.status_reason,
+                  t.sla_status,
+                  t.metadata,
+                  t.tutor_emails,
+                  t.is_archived,
+                  l.full_name AS learner_name,
+                  l.email AS learner_email
+                FROM tickets t
+                JOIN learners l
+                  ON l.id = t.learner_id
+                WHERE t.public_id = %s
+                LIMIT 1
                 """,
-                [json.dumps(updated_ticket_metadata), ticket["id"]],
+                [public_id],
             )
 
-        actor = {
-            "id": actor_row["id"],
-            "role": actor_row["role"],
-            "label": actor_row.get("full_name") or actor_row["username"],
-        }
-        insert_history_event(
-            ticket["id"],
-            "coverage_tutor_follow_up_sent",
-            actor,
-            {
-                "ticketId": ticket["public_id"],
-                "cardId": updated_target_card["id"],
-                "tutor": sanitize_text(updated_target_card.get("tutor")),
-                "tutorEmail": sanitize_text(updated_target_card.get("tutorEmail")),
-                "requestStatus": request_status,
-                "sentAt": timestamp,
-                "fileCount": len(new_follow_up_files),
-                "fileNames": [sanitize_text(file.get("name")) or "attachment" for file in new_follow_up_files],
-            },
-        )
+            if not ticket:
+                raise ApiError(404, "Ticket not found.")
+            if not is_coverage_ticket_record(ticket):
+                raise ApiError(409, "This ticket is not a coverage ticket.")
+            if normalize_bool(ticket.get("is_archived")):
+                raise ApiError(409, "Restore this ticket before editing it.")
 
-        webhook_delivery = {
-            "ticket_id": int(ticket["id"]),
-            "ticket_public_id": ticket["public_id"],
-            "card_id": updated_target_card["id"],
-            "payload": build_coverage_tutor_follow_up_webhook_payload(
-                ticket,
-                documentation,
-                updated_target_card,
-                new_follow_up_files,
-                actor_row,
-                sent_at=timestamp,
-            ),
-        }
+            ticket_metadata = normalize_json_object(ticket.get("metadata"))
+            documentation = normalize_admin_documentation(
+                ticket_metadata.get("admin_documentation"),
+                fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+                fallback_ticket_id=ticket["public_id"],
+            )
+            coverage_cards = list(documentation.get("coverageCards") or [])
+            card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+            if card_index is None:
+                raise ApiError(404, "Coverage card not found.")
+
+            target_card = normalize_json_object(coverage_cards[card_index])
+            if sanitize_text(target_card.get("type")) != "tutor_choice":
+                raise ApiError(409, "Only tutor choice cards can receive follow-up files.")
+
+            request_status = sanitize_text(target_card.get("requestStatus")).lower()
+            if request_status == "pending":
+                request_status = "requested"
+            if request_status not in {"requested", "accepted"}:
+                raise ApiError(409, "Follow-up files can only be sent for requested or accepted tutor requests.")
+
+            if uploaded_follow_up_files:
+                stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_follow_up_files)
+                stored_attachment_keys = [
+                    attachment.get("storageKey")
+                    for attachment in stored_attachment_rows
+                    if sanitize_text(attachment.get("storageKey"))
+                ]
+                follow_up_files.extend(
+                    insert_ticket_attachment_rows(
+                        int(ticket["id"]),
+                        ticket["public_id"],
+                        stored_attachment_rows,
+                        metadata_overrides={
+                            "source": "coverage_tutor_follow_up",
+                            "coverageCardId": card_id,
+                        },
+                    )
+                )
+
+            existing_files = [
+                normalized_attachment
+                for attachment in target_card.get("presentationFiles") or []
+                if (normalized_attachment := normalize_coverage_card_attachment(attachment))
+            ]
+            existing_file_ids = {
+                sanitize_text(existing_file.get("id"))
+                for existing_file in existing_files
+                if sanitize_text(existing_file.get("id"))
+            }
+            new_follow_up_files = [
+                follow_up_file
+                for follow_up_file in follow_up_files
+                if sanitize_text(follow_up_file.get("id")) not in existing_file_ids
+            ]
+            if not new_follow_up_files:
+                raise ApiError(400, "Add at least one new presentation file before sending the follow-up.")
+
+            timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+            updated_target_card = {
+                **target_card,
+                "presentationFiles": [*existing_files, *new_follow_up_files],
+                "updatedAt": timestamp,
+            }
+            coverage_cards[card_index] = updated_target_card
+            documentation["coverageCards"] = coverage_cards
+
+            updated_ticket_metadata = normalize_json_object(ticket_metadata)
+            updated_ticket_metadata["admin_documentation"] = documentation
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET metadata = %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [json.dumps(updated_ticket_metadata), ticket["id"]],
+                )
+
+            actor = {
+                "id": actor_row["id"],
+                "role": actor_row["role"],
+                "label": actor_row.get("full_name") or actor_row["username"],
+            }
+            insert_history_event(
+                ticket["id"],
+                "coverage_tutor_follow_up_sent",
+                actor,
+                {
+                    "ticketId": ticket["public_id"],
+                    "cardId": updated_target_card["id"],
+                    "tutor": sanitize_text(updated_target_card.get("tutor")),
+                    "tutorEmail": sanitize_text(updated_target_card.get("tutorEmail")),
+                    "requestStatus": request_status,
+                    "sentAt": timestamp,
+                    "fileCount": len(new_follow_up_files),
+                    "fileNames": [sanitize_text(file.get("name")) or "attachment" for file in new_follow_up_files],
+                },
+            )
+
+            webhook_delivery = {
+                "ticket_id": int(ticket["id"]),
+                "ticket_public_id": ticket["public_id"],
+                "card_id": updated_target_card["id"],
+                "payload": build_coverage_tutor_follow_up_webhook_payload(
+                    ticket,
+                    documentation,
+                    updated_target_card,
+                    new_follow_up_files,
+                    actor_row,
+                    sent_at=timestamp,
+                ),
+            }
+    except Exception:
+        for storage_key in stored_attachment_keys:
+            delete_support_attachment_file(storage_key)
+        raise
 
     if webhook_delivery:
         queue_coverage_tutor_follow_up_webhook_delivery(**webhook_delivery)
@@ -14390,12 +14882,17 @@ def post_multipart_webhook(
 
     for i, file in enumerate(files):
         data_url = sanitize_text(file.get("dataUrl") or "")
-        if not data_url.startswith("data:"):
-            continue
+        storage_key = sanitize_text(file.get("storageKey") or "")
+        file_bytes = b""
         try:
-            header, b64data = data_url.split(",", 1)
-            import base64 as _b64
-            file_bytes = _b64.b64decode(b64data)
+            if data_url.startswith("data:"):
+                _header, b64data = data_url.split(",", 1)
+                import base64 as _b64
+                file_bytes = _b64.b64decode(b64data)
+            elif storage_key:
+                file_bytes = resolve_support_attachment_path(storage_key).read_bytes()
+            else:
+                continue
         except Exception:
             continue
         file_name = sanitize_text(file.get("name") or f"attachment_{i}")

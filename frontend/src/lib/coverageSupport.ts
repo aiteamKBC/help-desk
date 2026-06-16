@@ -8,12 +8,36 @@ export interface CoverageDetails {
   sessionSubject: string;
 }
 
-export type CoverageOptionType = "tutors" | "coaches" | "modules" | "times" | "session-dates";
+export type CoverageOptionType = "tutors" | "coaches" | "modules" | "times" | "session-dates" | "tutor-availability";
 
 export interface CoverageTimeOption {
   label: string;
   completed: boolean;
   endDate?: string;
+}
+
+export type CoverageTutorAvailabilityStatus = "available" | "busy" | "unknown" | "no_plan";
+
+export interface CoverageTutorAvailabilityItem {
+  tutor: string;
+  status: CoverageTutorAvailabilityStatus;
+  label: string;
+  summary: string;
+  conflictCount: number;
+  conflicts: Array<{
+    moduleName?: string;
+    timeLabel?: string;
+    startDate?: string;
+    endDate?: string;
+    date?: string;
+    dateLabel?: string;
+  }>;
+  modules: Array<{
+    moduleName?: string;
+    timeLabel?: string;
+    startDate?: string;
+    endDate?: string;
+  }>;
 }
 
 const coverageInquiryLinePatterns = {
@@ -122,6 +146,69 @@ export async function fetchCoverageTimeOptions(params: {
   return rawItems
     .map((item) => normalizeCoverageTimeOption(item))
     .filter((item): item is CoverageTimeOption => Boolean(item));
+}
+
+function normalizeCoverageTutorAvailabilityItem(value: unknown): CoverageTutorAvailabilityItem | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const payload = value as Partial<CoverageTutorAvailabilityItem>;
+  const tutor = typeof payload.tutor === "string" ? payload.tutor.trim() : "";
+  if (!tutor) {
+    return null;
+  }
+
+  const allowedStatuses: CoverageTutorAvailabilityStatus[] = ["available", "busy", "unknown", "no_plan"];
+  const status = allowedStatuses.includes(payload.status as CoverageTutorAvailabilityStatus)
+    ? payload.status as CoverageTutorAvailabilityStatus
+    : "unknown";
+  const conflictCount = typeof payload.conflictCount === "number" && Number.isFinite(payload.conflictCount)
+    ? payload.conflictCount
+    : 0;
+
+  return {
+    tutor,
+    status,
+    label: typeof payload.label === "string" ? payload.label : "",
+    summary: typeof payload.summary === "string" ? payload.summary : "",
+    conflictCount,
+    conflicts: Array.isArray(payload.conflicts) ? payload.conflicts : [],
+    modules: Array.isArray(payload.modules) ? payload.modules : [],
+  };
+}
+
+export async function fetchCoverageTutorAvailability(params: {
+  time?: string;
+  sessionDates?: string[];
+}) {
+  const query = new URLSearchParams({ type: "tutor-availability" });
+  if (params.time) {
+    query.set("time", params.time);
+  }
+  if (params.sessionDates?.length) {
+    query.set("sessionDates", params.sessionDates.join("; "));
+  }
+
+  const response = await fetch(`/api/coverage-options?${query.toString()}`, {
+    cache: "no-store",
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | {
+        message?: string;
+        items?: unknown[];
+      }
+    | null;
+
+  if (!response.ok) {
+    throw new Error(payload?.message || "We could not load tutor availability right now.");
+  }
+
+  return Array.isArray(payload?.items)
+    ? payload.items
+      .map((item) => normalizeCoverageTutorAvailabilityItem(item))
+      .filter((item): item is CoverageTutorAvailabilityItem => Boolean(item))
+    : [];
 }
 
 export async function fetchCoverageTutorEmail(tutor: string) {

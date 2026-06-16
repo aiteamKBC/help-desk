@@ -282,6 +282,48 @@ def parse_chat_submission_request(request, *, file_field_name: str = "attachment
     return parse_json_body(request), []
 
 
+def parse_coverage_tutor_request(request) -> tuple[dict, list]:
+    content_type = (request.content_type or "").strip().lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        payload: dict[str, object] = {}
+        for key, value in request.POST.items():
+            if key in {"card", "documentation"}:
+                try:
+                    payload[key] = json.loads(value) if value else {}
+                except json.JSONDecodeError as error:
+                    raise ApiError(400, "Invalid tutor request payload.") from error
+                continue
+            if key in {"presentationFiles", "presentationFileMetadata"}:
+                try:
+                    payload["presentationFiles"] = json.loads(value) if value else []
+                except json.JSONDecodeError as error:
+                    raise ApiError(400, "Invalid presentation file metadata.") from error
+                continue
+            payload[key] = value
+
+        return payload, list(request.FILES.getlist("presentationFiles"))
+
+    return parse_json_body(request), []
+
+
+def parse_coverage_tutor_follow_up_request(request) -> tuple[dict, list]:
+    content_type = (request.content_type or "").strip().lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        payload: dict[str, object] = {}
+        for key, value in request.POST.items():
+            if key in {"presentationFiles", "presentationFileMetadata"}:
+                try:
+                    payload["presentationFiles"] = json.loads(value) if value else []
+                except json.JSONDecodeError as error:
+                    raise ApiError(400, "Invalid presentation file metadata.") from error
+                continue
+            payload[key] = value
+
+        return payload, list(request.FILES.getlist("presentationFiles"))
+
+    return parse_json_body(request), []
+
+
 def normalize_request_session_instance_id(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
@@ -805,7 +847,14 @@ def admin_ticket_escalation_closure_acknowledge(request, public_id: str):
 @require_http_methods(["POST"])
 def admin_ticket_coverage_tutor_request(request, public_id: str):
     try:
-        return JsonResponse(submit_coverage_tutor_request(public_id, build_session_bound_admin_payload(request)))
+        payload, uploaded_files = parse_coverage_tutor_request(request)
+        return JsonResponse(
+            submit_coverage_tutor_request(
+                public_id,
+                build_session_bound_admin_payload(request, payload=payload),
+                uploaded_files=uploaded_files,
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 
@@ -813,7 +862,14 @@ def admin_ticket_coverage_tutor_request(request, public_id: str):
 @require_http_methods(["POST"])
 def admin_ticket_coverage_tutor_follow_up(request, public_id: str):
     try:
-        return JsonResponse(send_coverage_tutor_follow_up_files(public_id, build_session_bound_admin_payload(request)))
+        payload, uploaded_files = parse_coverage_tutor_follow_up_request(request)
+        return JsonResponse(
+            send_coverage_tutor_follow_up_files(
+                public_id,
+                build_session_bound_admin_payload(request, payload=payload),
+                uploaded_files=uploaded_files,
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 
