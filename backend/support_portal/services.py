@@ -57,6 +57,18 @@ ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
 EMPLOYER_TICKET_PRIORITY = "High"
 COACH_TICKET_PRIORITY = "High"
+ASSIGNED_TEAM_UNASSIGNED = "Unassigned"
+ASSIGNED_TEAM_SUPPORT_DESK = "Support Desk"
+ASSIGNED_TEAM_LEARNING_PLAN = "Learning Plan Team"
+ALLOWED_ASSIGNED_TEAMS = {
+    ASSIGNED_TEAM_UNASSIGNED,
+    ASSIGNED_TEAM_SUPPORT_DESK,
+    ASSIGNED_TEAM_LEARNING_PLAN,
+}
+DEFAULT_ASSIGNED_TEAMS = {
+    ASSIGNED_TEAM_UNASSIGNED,
+    ASSIGNED_TEAM_SUPPORT_DESK,
+}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
     "High": 1,
@@ -5831,8 +5843,33 @@ def parse_assigned_agent_id(value: Any) -> int | None:
         raise ApiError(400, "Invalid assigned agent.") from error
 
 
+def get_effective_assigned_team(value: Any) -> str:
+    normalized_value = sanitize_text(value)
+    return normalized_value or ASSIGNED_TEAM_UNASSIGNED
+
+
+def normalize_assigned_team(value: Any) -> str:
+    normalized_value = sanitize_text(value)
+    if not normalized_value:
+        return ASSIGNED_TEAM_UNASSIGNED
+
+    normalized_lookup = normalized_value.casefold()
+    for allowed_value in ALLOWED_ASSIGNED_TEAMS:
+        if allowed_value.casefold() == normalized_lookup:
+            return allowed_value
+
+    raise ApiError(400, "Invalid assigned team.")
+
+
+def derive_assigned_team_for_ticket_assignment(current_assigned_team: Any, agent: dict[str, Any] | None) -> str:
+    effective_current_team = get_effective_assigned_team(current_assigned_team)
+    if effective_current_team not in DEFAULT_ASSIGNED_TEAMS:
+        return effective_current_team
+    return derive_assigned_team(agent)
+
+
 def derive_assigned_team(agent: dict[str, Any] | None) -> str:
-    return "Support Desk" if agent else "Unassigned"
+    return ASSIGNED_TEAM_SUPPORT_DESK if agent else ASSIGNED_TEAM_UNASSIGNED
 
 
 def map_conversation_status(status: str) -> str:
@@ -10300,7 +10337,7 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
             }
             ticket_metadata[PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY] = pending_notification
         ticket_metadata[TEAMS_CALL_REQUESTED_METADATA_KEY] = True
-        next_assigned_team = derive_assigned_team(target_agent)
+        next_assigned_team = derive_assigned_team_for_ticket_assignment(ticket.get("assigned_team"), target_agent)
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13089,14 +13126,23 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             else None
         )
         current_assigned_agent_id = int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None
+        current_assigned_team = get_effective_assigned_team(ticket.get("assigned_team"))
         requested_assignment_changed = has_assigned_agent_input and current_assigned_agent_id != parsed_assigned_agent_id
+        requested_team_changed = False
+        normalized_requested_assigned_team = None
+        actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
 
         if requested_assignment_changed:
-            actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
             if actor_role not in ADMIN_ACCESS_ROLES:
                 raise ApiError(403, "Only admins and superadmins can assign tickets.")
             if parsed_assigned_agent_id is None:
                 raise ApiError(400, "Select an agent with ticket access before assigning this ticket.")
+
+        if requested_assigned_team is not None:
+            if actor_role not in ADMIN_ACCESS_ROLES:
+                raise ApiError(403, "Only admins and superadmins can transfer tickets between teams.")
+            normalized_requested_assigned_team = normalize_assigned_team(requested_assigned_team)
+            requested_team_changed = normalized_requested_assigned_team != current_assigned_team
 
         escalation_target_agent = None
         if has_escalation_agent_input and parsed_escalation_agent_id is not None:
@@ -13252,11 +13298,14 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             else (auto_assigned_actor["id"] if auto_assigned_actor else ticket.get("assigned_agent_id"))
         )
         if requested_assigned_team is not None:
-            next_assigned_team = requested_assigned_team or derive_assigned_team(assigned_agent)
+            next_assigned_team = normalized_requested_assigned_team or derive_assigned_team_for_ticket_assignment(
+                current_assigned_team,
+                assigned_agent,
+            )
         elif has_assigned_agent_input or auto_assigned_actor:
-            next_assigned_team = derive_assigned_team(assigned_agent)
+            next_assigned_team = derive_assigned_team_for_ticket_assignment(current_assigned_team, assigned_agent)
         else:
-            next_assigned_team = ticket["assigned_team"]
+            next_assigned_team = current_assigned_team
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13338,6 +13387,17 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                     "fromAgentId": ticket.get("assigned_agent_id"),
                     "toAgentId": next_assigned_agent_id,
                     "toAgentName": assigned_agent.get("full_name") if assigned_agent else None,
+                },
+            )
+
+        if requested_team_changed:
+            insert_history_event(
+                ticket["id"],
+                "team_transferred",
+                actor,
+                {
+                    "fromTeam": current_assigned_team,
+                    "toTeam": next_assigned_team,
                 },
             )
 

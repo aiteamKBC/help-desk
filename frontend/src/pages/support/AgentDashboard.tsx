@@ -5,6 +5,7 @@ import {
   Bot,
   AlertOctagon,
   ArrowLeft,
+  ArrowRightLeft,
   Bell,
   CheckCircle2,
   ChevronDown,
@@ -74,6 +75,10 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { SupportLayout } from "@/components/support/SupportLayout";
@@ -483,6 +488,20 @@ const dashboardAgentPollIntervalMs = 15000;
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
+const supportDeskAssignedTeam = "Support Desk";
+const learningPlanAssignedTeam = "Learning Plan Team";
+const dashboardTeamTransferOptions = [
+  {
+    value: learningPlanAssignedTeam,
+    label: learningPlanAssignedTeam,
+    description: "Route this ticket to the learning plan team queue.",
+  },
+  {
+    value: supportDeskAssignedTeam,
+    label: supportDeskAssignedTeam,
+    description: "Return this ticket to the support desk queue.",
+  },
+] as const;
 const documentationStatusReasons = {
   Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed by Requester", "Closed via Agent"],
   Pending: [defaultPendingDocumentationStatusReason, "Awaiting support meeting", "Escalation", "Quick Ticket"],
@@ -499,6 +518,7 @@ type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
 type AdminView = "dashboard" | "coverage" | "console" | "management";
+type LearningPlanTeamSection = "coverage" | "others";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type CoverageWorkspaceTab = "documentation" | "details";
 const coverageCoachUnsetSelectValue = "__coverage_no_coach__";
@@ -549,6 +569,7 @@ const AgentDashboard = () => {
   const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>("newest");
   const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
   const [dashboardArchiveScope, setDashboardArchiveScope] = useState<DashboardArchiveScope>("active");
+  const [learningPlanTeamSection, setLearningPlanTeamSection] = useState<LearningPlanTeamSection>("coverage");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
@@ -574,6 +595,7 @@ const AgentDashboard = () => {
   const [isTransferNotificationsOpen, setIsTransferNotificationsOpen] = useState(false);
   const [activeTransferRequestTicketId, setActiveTransferRequestTicketId] = useState("");
   const [transferReason, setTransferReason] = useState("");
+  const [teamTransferTicketId, setTeamTransferTicketId] = useState("");
   const [isSendingAiMessage, setIsSendingAiMessage] = useState(false);
   const [isSavingDocumentation, setIsSavingDocumentation] = useState(false);
   const [isSavingActiveDocumentation, setIsSavingActiveDocumentation] = useState(false);
@@ -610,6 +632,7 @@ const AgentDashboard = () => {
   const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
   const isConsoleView = adminView === "console";
   const isCoverageDashboardView = adminView === "coverage";
+  const isLearningPlanCoverageSection = isCoverageDashboardView && learningPlanTeamSection === "coverage";
   const isDashboardLikeView = adminView === "dashboard" || adminView === "coverage";
   const useCompactAdminSidebar = !isStackedAdminLayout && isAdminSidebarCollapsed;
   const trimmedNotes = notes.trim();
@@ -625,7 +648,9 @@ const AgentDashboard = () => {
   const normalizedDashboardSearch = normalizeConsoleSearchValue(dashboardSearch);
   const compactDashboardSearch = compactConsoleSearchValue(normalizedDashboardSearch);
   const dashboardSearchPlaceholder = isCoverageDashboardView
-    ? "Search by tutor, module, chat ID, or ticket ID"
+    ? isLearningPlanCoverageSection
+      ? "Search by tutor, module, requester, chat ID, or ticket ID"
+      : "Search by requester, chat ID, or ticket ID"
     : "Search by requester name, chat ID, or ticket ID";
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
   const activeTicketIsArchived = Boolean(activeDetail?.ticket.isArchived);
@@ -955,7 +980,12 @@ const AgentDashboard = () => {
   const busyAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
   const offAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
   const dashboardAgentFilterOptions = [
-    { value: "all" as DashboardAssignedFilter, label: isCoverageDashboardView ? "All Coverage Tickets" : "All Tickets" },
+    {
+      value: "all" as DashboardAssignedFilter,
+      label: isCoverageDashboardView
+        ? (isLearningPlanCoverageSection ? "All Coverage Tickets" : "All Other Learning Plan Tickets")
+        : "All Tickets",
+    },
     ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "unassigned" as DashboardAssignedFilter, label: "Unassigned" },
     ...sortedAgents
@@ -970,9 +1000,21 @@ const AgentDashboard = () => {
   const dashboardArchiveScopedTickets = tickets.filter((ticket) => (
     dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
   ));
+  const learningPlanCoverageBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isCoverageTicket(ticket));
+  const learningPlanOtherBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isLearningPlanOtherTicket(ticket));
   const dashboardBaseTickets = isCoverageDashboardView
-    ? dashboardArchiveScopedTickets.filter((ticket) => isCoverageTicket(ticket))
+    ? (isLearningPlanCoverageSection ? learningPlanCoverageBaseTickets : learningPlanOtherBaseTickets)
     : dashboardArchiveScopedTickets;
+  const learningPlanCoverageAssignmentScopedTickets = filterDashboardTicketsByAssignee(
+    learningPlanCoverageBaseTickets,
+    dashboardAssignedFilter,
+    dashboardSessionAgentId,
+  );
+  const learningPlanOtherAssignmentScopedTickets = filterDashboardTicketsByAssignee(
+    learningPlanOtherBaseTickets,
+    dashboardAssignedFilter,
+    dashboardSessionAgentId,
+  );
   const dashboardAssignmentScopedTickets = filterDashboardTicketsByAssignee(
     dashboardBaseTickets,
     dashboardAssignedFilter,
@@ -989,7 +1031,7 @@ const AgentDashboard = () => {
       const searchableFields = [
         getDisplayedChatReference(ticket),
         ticket.id,
-        ...getDashboardRequesterColumnSummary(ticket, { preferCoverageInquiry: isCoverageDashboardView }).searchTerms,
+        ...getDashboardRequesterColumnSummary(ticket, { preferCoverageInquiry: isLearningPlanCoverageSection }).searchTerms,
         formatRequesterRoleLabel(ticket.requesterRole),
       ];
 
@@ -1034,11 +1076,15 @@ const AgentDashboard = () => {
         : rightTimestamp - leftTimestamp;
     });
   const dashboardActiveTableTitle = dashboardTicketFilter === "all" && isCoverageDashboardView
-    ? "Coverage Tickets"
+    ? (isLearningPlanCoverageSection ? "Coverage Tickets" : "Other Learning Plan Tickets")
     : getDashboardTableTitle(dashboardTicketFilter);
   const dashboardTableTitle = dashboardArchiveScope === "archived"
     ? dashboardTicketFilter === "all"
-      ? (isCoverageDashboardView ? "Archived Coverage Tickets" : "Archived Tickets")
+      ? (
+        isCoverageDashboardView
+          ? (isLearningPlanCoverageSection ? "Archived Coverage Tickets" : "Archived Other Learning Plan Tickets")
+          : "Archived Tickets"
+      )
       : `Archived ${dashboardActiveTableTitle}`
     : dashboardActiveTableTitle;
   const isArchiveMode = dashboardArchiveScope === "archived";
@@ -1075,11 +1121,15 @@ const AgentDashboard = () => {
   const dashboardEmptyMessage = normalizedDashboardSearch
     ? "No matching tickets found for this search."
     : dashboardArchiveScope === "archived"
-      ? (isCoverageDashboardView ? "No archived coverage tickets found." : "No archived tickets found.")
+      ? (
+        isCoverageDashboardView
+          ? (isLearningPlanCoverageSection ? "No archived coverage tickets found." : "No archived other learning plan tickets found.")
+          : "No archived tickets found."
+      )
     : dashboardAssignedFilter !== "all"
       ? getDashboardAssignedFilterEmptyMessage(dashboardTicketFilter, dashboardAssignedFilterEmptyTarget)
       : isCoverageDashboardView && dashboardTicketFilter === "all"
-        ? "No coverage tickets have been created yet."
+        ? (isLearningPlanCoverageSection ? "No coverage tickets have been created yet." : "No transferred learning plan tickets have been created yet.")
         : getDashboardEmptyMessage(dashboardTicketFilter);
   const isConsoleOwnedBySignedInAgent = Boolean(
     consoleDetail
@@ -1087,6 +1137,11 @@ const AgentDashboard = () => {
     && consoleDetail.ticket.assignedAgentId === resolvedSessionAgentId
   );
   const canAssignActiveTicket = Boolean(
+    canAssignTickets
+    && activeDetail
+    && !activeTicketIsArchived,
+  );
+  const canTransferActiveTicketToTeam = Boolean(
     canAssignTickets
     && activeDetail
     && !activeTicketIsArchived,
@@ -2483,6 +2538,57 @@ const AgentDashboard = () => {
     }
   }
 
+  async function handleTeamTransfer(
+    ticket: Pick<TicketSummary, "id" | "assignedTeam" | "isArchived">,
+    nextAssignedTeam: string,
+  ) {
+    if (!canAssignTickets) {
+      toast.error("Only admins and superadmins can transfer tickets between teams.");
+      return;
+    }
+
+    if (ticket.isArchived) {
+      toast.error("Restore this ticket before transferring it to another team.");
+      return;
+    }
+
+    if (normalizeAssignedTeamName(ticket.assignedTeam) === normalizeAssignedTeamName(nextAssignedTeam)) {
+      toast.info(`This ticket is already in ${nextAssignedTeam}.`);
+      return;
+    }
+
+    setTeamTransferTicketId(ticket.id);
+
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticket.id)}`, {
+        method: "PATCH",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({
+          assignedTeam: nextAssignedTeam,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not transfer this ticket to another team right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      if (activeDetail?.ticket.id === payload.ticket.id) {
+        syncDrafts(payload);
+      }
+      toast.success(`Ticket moved to ${nextAssignedTeam}.`);
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setTeamTransferTicketId("");
+    }
+  }
+
   async function updateTicketArchiveState(
     ticket: TicketSummary,
     shouldArchive: boolean,
@@ -3822,13 +3928,58 @@ const AgentDashboard = () => {
   openConsoleChatRef.current = openConsoleChat;
 
   function renderDashboardWorkspace() {
-    const coverageDashboardKpiFilters: DashboardTicketFilter[] = ["coverage", "pending", "closed", "slaBreached"];
+    const coverageDashboardKpiFilters: DashboardTicketFilter[] = ["open", "pending", "closed", "slaBreached"];
     const visibleKpis = isCoverageDashboardView
       ? kpis.filter((kpi) => coverageDashboardKpiFilters.includes(kpi.filter))
       : kpis;
 
     return (
       <div className="space-y-5">
+        {isCoverageDashboardView ? (
+          <div className="rounded-2xl border bg-card/95 p-2 shadow-soft">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {([
+                {
+                  value: "coverage" as LearningPlanTeamSection,
+                  label: "Coverage",
+                  description: "Standard coverage tickets.",
+                  count: learningPlanCoverageAssignmentScopedTickets.length,
+                },
+                {
+                  value: "others" as LearningPlanTeamSection,
+                  label: "Others",
+                  description: "Tickets transferred to Learning Plan Team.",
+                  count: learningPlanOtherAssignmentScopedTickets.length,
+                },
+              ]).map((section) => (
+                <button
+                  key={section.value}
+                  type="button"
+                  onClick={() => {
+                    setLearningPlanTeamSection(section.value);
+                    if (section.value === "others" && dashboardTicketFilter === "coverage") {
+                      setDashboardTicketFilter("all");
+                    }
+                  }}
+                  className={cn(
+                    "rounded-2xl border px-4 py-3 text-left transition-colors",
+                    learningPlanTeamSection === section.value
+                      ? "border-primary bg-primary/6 shadow-sm"
+                      : "border-border/70 bg-background hover:border-primary/30 hover:bg-secondary/20",
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-foreground">{section.label}</div>
+                    <div className="rounded-full border bg-background px-2.5 py-1 text-xs font-semibold text-muted-foreground">
+                      {section.count}
+                    </div>
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">{section.description}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <div className={cn(
           "grid grid-cols-1 gap-4",
           isCoverageDashboardView ? "sm:grid-cols-2 xl:grid-cols-4" : "sm:grid-cols-2 xl:grid-cols-7",
@@ -3904,6 +4055,12 @@ const AgentDashboard = () => {
                       <Archive className="h-3.5 w-3.5 shrink-0" />
                       <span>Archived tickets are separate from the live queue.</span>
                     </div>
+                  ) : isCoverageDashboardView ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {isLearningPlanCoverageSection
+                        ? "Standard coverage tickets are grouped here."
+                        : "Tickets manually transferred to Learning Plan Team appear here."}
+                    </p>
                   ) : dashboardTicketFilter === "quickResolution" ? (
                     <p className="mt-1 text-xs text-muted-foreground">
                       These tickets skip the chat console and stay available from the dashboard only.
@@ -4129,7 +4286,7 @@ const AgentDashboard = () => {
                   {visibleDashboardTickets.map((ticket) => {
                     const requesterColumnSummary = getDashboardRequesterColumnSummary(
                       ticket,
-                      { preferCoverageInquiry: isCoverageDashboardView },
+                      { preferCoverageInquiry: isLearningPlanCoverageSection },
                     );
 
                     return (
@@ -4204,6 +4361,15 @@ const AgentDashboard = () => {
                         </td>
                         <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
                           <div className="flex items-center justify-end gap-2">
+                            {canAssignTickets && !isArchivedTicket(ticket) ? (
+                              <TeamTransferMenu
+                                ticketId={ticket.id}
+                                assignedTeam={ticket.assignedTeam}
+                                disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
+                                isLoading={teamTransferTicketId === ticket.id}
+                                onTransfer={(nextAssignedTeam) => void handleTeamTransfer(ticket, nextAssignedTeam)}
+                              />
+                            ) : null}
                             <Button
                               type="button"
                               size="sm"
@@ -4213,7 +4379,7 @@ const AgentDashboard = () => {
                                 event.stopPropagation();
                                 void updateTicketArchiveState(ticket, !isArchivedTicket(ticket));
                               }}
-                              disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
+                              disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id || teamTransferTicketId === ticket.id}
                             >
                               {archiveActionTicketId === ticket.id ? (
                                 <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -4234,7 +4400,7 @@ const AgentDashboard = () => {
                                   event.stopPropagation();
                                   openPermanentDeleteDialog(ticket);
                                 }}
-                                disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
+                                disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id || teamTransferTicketId === ticket.id}
                                 title="Delete Permanently"
                                 aria-label={`Delete ticket ${ticket.id} permanently`}
                               >
@@ -4526,7 +4692,7 @@ const AgentDashboard = () => {
                   )}
                 >
                   <FileText className="h-4 w-4 shrink-0" />
-                  {!useCompactAdminSidebar ? <span>Coverage Dashboard</span> : null}
+                  {!useCompactAdminSidebar ? <span>Learning Plan Team</span> : null}
                 </TabsTrigger>
                 <TabsTrigger
                   value="console"
@@ -5467,12 +5633,21 @@ const AgentDashboard = () => {
               </div>
 
               <SheetFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
+                {canTransferActiveTicketToTeam ? (
+                  <TeamTransferMenu
+                    ticketId={activeDetail.ticket.id}
+                    assignedTeam={activeDetail.ticket.assignedTeam}
+                    disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id}
+                    isLoading={teamTransferTicketId === activeDetail.ticket.id}
+                    onTransfer={(nextAssignedTeam) => void handleTeamTransfer(activeDetail.ticket, nextAssignedTeam)}
+                  />
+                ) : null}
                 <Button
                   type="button"
                   variant="outline"
                   className="w-full sm:w-auto"
                   onClick={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
-                  disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id}
+                  disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id || teamTransferTicketId === activeDetail.ticket.id}
                 >
                   {archiveActionTicketId === activeDetail.ticket.id ? (
                     <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
@@ -5489,7 +5664,7 @@ const AgentDashboard = () => {
                     variant="destructive"
                     className="w-full sm:w-auto"
                     onClick={() => openPermanentDeleteDialog(activeDetail.ticket)}
-                    disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id}
+                    disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id || teamTransferTicketId === activeDetail.ticket.id}
                   >
                     {deleteActionTicketId === activeDetail.ticket.id ? (
                       <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
@@ -9559,6 +9734,75 @@ const ConsoleField = ({
   </div>
 );
 
+const TeamTransferMenu = ({
+  ticketId,
+  assignedTeam,
+  disabled,
+  isLoading,
+  onTransfer,
+  className,
+  align = "end",
+}: {
+  ticketId: string;
+  assignedTeam: string;
+  disabled?: boolean;
+  isLoading?: boolean;
+  onTransfer: (nextAssignedTeam: string) => void;
+  className?: string;
+  align?: "start" | "center" | "end";
+}) => {
+  const normalizedAssignedTeam = normalizeAssignedTeamName(assignedTeam);
+  const availableTeamOptions = dashboardTeamTransferOptions.filter(
+    (teamOption) => normalizeAssignedTeamName(teamOption.value) !== normalizedAssignedTeam,
+  );
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className={cn("h-8 whitespace-nowrap rounded-full", className)}
+          disabled={disabled || isLoading || availableTeamOptions.length === 0}
+          aria-label={`Transfer ticket ${ticketId} to another team`}
+        >
+          {isLoading ? (
+            <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <ArrowRightLeft className="mr-1.5 h-3.5 w-3.5" />
+          )}
+          Transfer
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align={align} className="w-[min(90vw,280px)] rounded-2xl p-2">
+        <DropdownMenuLabel className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
+          Transfer to team
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {availableTeamOptions.map((teamOption) => {
+          return (
+            <DropdownMenuItem
+              key={teamOption.value}
+              disabled={isLoading}
+              onSelect={(event) => {
+                event.preventDefault();
+                onTransfer(teamOption.value);
+              }}
+              className="rounded-xl px-3 py-2.5"
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium text-foreground">{teamOption.label}</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">{teamOption.description}</div>
+              </div>
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+};
+
 const ActivityLogTimeline = ({
   history,
 }: {
@@ -9659,6 +9903,20 @@ const ActivityPayloadField = ({
 
 function isCoverageTicket(ticket?: Pick<TicketSummary, "technicalSubcategory"> | null) {
   return ticket?.technicalSubcategory === "Coverage";
+}
+
+function normalizeAssignedTeamName(value: string | null | undefined) {
+  return (value || "").trim().toLowerCase();
+}
+
+function isLearningPlanAssignedTeam(teamName: string | null | undefined) {
+  return normalizeAssignedTeamName(teamName) === normalizeAssignedTeamName(learningPlanAssignedTeam);
+}
+
+function isLearningPlanOtherTicket(
+  ticket?: Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> | null,
+) {
+  return !isCoverageTicket(ticket) && isLearningPlanAssignedTeam(ticket?.assignedTeam);
 }
 
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
@@ -10347,6 +10605,7 @@ function parseAdminDeepLink(search: string) {
   const requestedScope = searchParams.get("scope");
   const requestedQueueTab = searchParams.get("tab");
   const shouldOpenManagement = requestedView === "management";
+  const shouldOpenCoverage = requestedView === "coverage";
   const shouldOpenConsole = requestedView === "console" || Boolean(requestedTicketId);
 
   return {
@@ -10354,6 +10613,8 @@ function parseAdminDeepLink(search: string) {
       ? "management" as const
       : shouldOpenConsole
         ? "console" as const
+        : shouldOpenCoverage
+          ? "coverage" as const
         : "dashboard" as const,
     ticketId: requestedTicketId,
     scope: requestedScope === "all" ? "all" as const : "my" as const,
@@ -11438,6 +11699,7 @@ const activityEventLabels: Record<string, string> = {
   support_session_requested: "Session Requested",
   support_session_scheduled: "Session Scheduled",
   support_session_unavailable: "Session Unavailable",
+  team_transferred: "Team Transferred",
   ticket_created: "Ticket Created",
   ticket_updated: "Ticket Updated",
   coverage_ticket_operations_notified: "Operations Notified",
@@ -11509,7 +11771,9 @@ const activityPayloadLabels: Record<string, string> = {
   tutor: "Tutor",
   tutorEmail: "Recipient E-mail",
   targetLabel: "Teams Target",
+  fromTeam: "From Team",
   toAgentUsername: "To Username",
+  toTeam: "To Team",
   webhookDelivered: "Webhook Delivered",
   webhookStatus: "Webhook Status",
 };
@@ -11585,6 +11849,11 @@ function getActivityEventSummary(item: HistoryItem) {
         return `Assigned to ${assignedAgentName}`;
       }
       break;
+    case "team_transferred":
+      if (getActivityPayloadTextValue(item.payload.fromTeam) || getActivityPayloadTextValue(item.payload.toTeam)) {
+        return `Moved from ${getActivityPayloadTextValue(item.payload.fromTeam) || "Unassigned"} to ${getActivityPayloadTextValue(item.payload.toTeam) || "Unassigned"}`;
+      }
+      return "Ticket team changed";
     case "transfer_requested":
       if (assignedAgentName) {
         return `Transfer requested for ${assignedAgentName}`;
@@ -11754,6 +12023,8 @@ function getActivityPayloadSortRank(key: string) {
     "toAgentName",
     "toAgentId",
     "fromAgentId",
+    "fromTeam",
+    "toTeam",
     "category",
     "technical_subcategory",
     "requestedDate",

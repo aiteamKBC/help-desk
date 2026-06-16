@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import AgentDashboard from "@/pages/support/AgentDashboard";
 
@@ -84,6 +84,138 @@ const dashboardPayload = {
         archivedByUsername: "",
         createdAt: "2026-06-14T10:00:00.000Z",
         updatedAt: "2026-06-14T10:00:00.000Z",
+      },
+      {
+        id: "KBC-000002",
+        learnerName: "Coverage Requester",
+        requesterName: "Coverage Requester",
+        email: "coverage@kentbusinesscollege.com",
+        learnerPhone: "",
+        requesterRole: "coach",
+        requesterSource: "microsoft_entra",
+        priority: "High",
+        category: "Technical",
+        technicalSubcategory: "Coverage",
+        inquiryPreview: "Coverage session request",
+        status: "Pending",
+        statusReason: "Coverage Ticket",
+        assignedAgentId: 27,
+        assignedAgentName: "Ayman Badewi",
+        assignedAgentUsername: "ayman.badewi",
+        assignedTeam: "Support Desk",
+        chatId: "CHAT-000002",
+        chatIsActive: false,
+        liveChatRequested: false,
+        liveChatRequestedAt: null,
+        queueAssignedAt: null,
+        chatDurationMinutes: 0,
+        chatState: "closed",
+        lastMessageAt: null,
+        pendingTransferRequest: null,
+        pendingEscalationNotification: null,
+        pendingTeamsCallNotification: null,
+        pendingCoverageTicketNotification: null,
+        teamsCallRequested: false,
+        latestEscalationClosure: null,
+        latestTransferDecision: null,
+        latestCoverageTutorResponse: null,
+        documentation: {
+          inquiry: [
+            "Coverage session request",
+            "Tutor: Sara Ahmed",
+            "Module: Digital Marketing",
+          ].join("\n"),
+          symptoms: "",
+          errors: "",
+          steps: "",
+          resources: "",
+          chatId: "CHAT-000002",
+          ticketId: "KBC-000002",
+          ticketStatus: "",
+          statusReason: "",
+          issuesAddressed: "",
+          escalationAgentId: null,
+          escalationAgentName: "",
+          escalationNote: "",
+          coverageNotes: "",
+          coverageCards: [],
+          documentationCards: [],
+          errorImages: [],
+        },
+        slaStatus: "On Track",
+        slaAttentionRequired: false,
+        evidenceCount: 0,
+        isArchived: false,
+        archivedAt: null,
+        archivedById: null,
+        archivedByName: "",
+        archivedByUsername: "",
+        createdAt: "2026-06-14T11:00:00.000Z",
+        updatedAt: "2026-06-14T11:00:00.000Z",
+      },
+      {
+        id: "KBC-000003",
+        learnerName: "Transferred Requester",
+        requesterName: "Transferred Requester",
+        email: "learning.plan@kentbusinesscollege.com",
+        learnerPhone: "",
+        requesterRole: "user",
+        requesterSource: "microsoft_entra",
+        priority: "Normal",
+        category: "Learning",
+        technicalSubcategory: "",
+        inquiryPreview: "Please help with the training plan update.",
+        status: "Open",
+        statusReason: "",
+        assignedAgentId: 27,
+        assignedAgentName: "Ayman Badewi",
+        assignedAgentUsername: "ayman.badewi",
+        assignedTeam: "Learning Plan Team",
+        chatId: "CHAT-000003",
+        chatIsActive: true,
+        liveChatRequested: false,
+        liveChatRequestedAt: null,
+        queueAssignedAt: null,
+        chatDurationMinutes: 0,
+        chatState: "open",
+        lastMessageAt: null,
+        pendingTransferRequest: null,
+        pendingEscalationNotification: null,
+        pendingTeamsCallNotification: null,
+        pendingCoverageTicketNotification: null,
+        teamsCallRequested: false,
+        latestEscalationClosure: null,
+        latestTransferDecision: null,
+        latestCoverageTutorResponse: null,
+        documentation: {
+          inquiry: "Please help with the training plan update.",
+          symptoms: "",
+          errors: "",
+          steps: "",
+          resources: "",
+          chatId: "CHAT-000003",
+          ticketId: "KBC-000003",
+          ticketStatus: "",
+          statusReason: "",
+          issuesAddressed: "",
+          escalationAgentId: null,
+          escalationAgentName: "",
+          escalationNote: "",
+          coverageNotes: "",
+          coverageCards: [],
+          documentationCards: [],
+          errorImages: [],
+        },
+        slaStatus: "On Track",
+        slaAttentionRequired: false,
+        evidenceCount: 0,
+        isArchived: false,
+        archivedAt: null,
+        archivedById: null,
+        archivedByName: "",
+        archivedByUsername: "",
+        createdAt: "2026-06-14T12:00:00.000Z",
+        updatedAt: "2026-06-14T12:00:00.000Z",
       },
     ],
   },
@@ -206,5 +338,69 @@ describe("AgentDashboard runtime", () => {
     await waitFor(() => {
       expect(screen.getByText("Overview")).toBeInTheDocument();
     });
+  });
+
+  it("shows coverage and routed tickets in the Learning Plan Team tab", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin?view=coverage"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    const learningPlanPanel = await screen.findByRole("tabpanel");
+    expect(within(learningPlanPanel).getByText("Coverage Tickets")).toBeInTheDocument();
+    expect(within(learningPlanPanel).getByText("KBC-000002")).toBeInTheDocument();
+    expect(within(learningPlanPanel).queryByText("KBC-000003")).not.toBeInTheDocument();
+    expect(within(learningPlanPanel).queryByText("KBC-000001")).not.toBeInTheDocument();
+
+    fireEvent.click(within(learningPlanPanel).getByRole("button", { name: /others/i }));
+
+    await waitFor(() => {
+      expect(within(learningPlanPanel).getByText("Other Learning Plan Tickets")).toBeInTheDocument();
+    });
+
+    expect(within(learningPlanPanel).getByText("KBC-000003")).toBeInTheDocument();
+    expect(within(learningPlanPanel).queryByText("KBC-000002")).not.toBeInTheDocument();
+  });
+
+  it("shows only Learning Plan Team when a support desk ticket is transferred", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Overview");
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Transfer ticket KBC-000001 to another team/i }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(await screen.findByRole("menuitem", { name: /Learning Plan Team/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Support Desk/i })).not.toBeInTheDocument();
+  });
+
+  it("shows Support Desk as a return option for Learning Plan Team tickets in admin dashboard", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin?view=coverage"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    const learningPlanPanel = await screen.findByRole("tabpanel");
+    fireEvent.click(within(learningPlanPanel).getByRole("button", { name: /others/i }));
+
+    await waitFor(() => {
+      expect(within(learningPlanPanel).getByText("KBC-000003")).toBeInTheDocument();
+    });
+
+    fireEvent.pointerDown(within(learningPlanPanel).getByRole("button", { name: /Transfer ticket KBC-000003 to another team/i }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(await screen.findByRole("menuitem", { name: /Support Desk/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /Learning Plan Team/i })).not.toBeInTheDocument();
   });
 });
