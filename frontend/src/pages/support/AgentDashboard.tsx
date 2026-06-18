@@ -324,6 +324,14 @@ interface AttachmentItem {
   createdAt: string;
 }
 
+interface AttachmentPreviewItem {
+  id: string | number;
+  name: string;
+  mimeType: string | null;
+  size: number;
+  source: string;
+}
+
 interface HistoryItem {
   id: number;
   eventType: string;
@@ -5895,6 +5903,7 @@ const AgentDashboard = () => {
                         contentClassName="min-h-0 flex-1 overflow-hidden"
                       >
                         <DocumentationWorkflowPanel
+                          ticket={consoleDetail.ticket}
                           draft={documentationDraft}
                           step={documentationStep}
                           ticketStatus={documentationTicketStatus}
@@ -9570,6 +9579,7 @@ const CoverageTicketWorkspace = ({
 };
 
 const DocumentationWorkflowPanel = ({
+  ticket,
   draft,
   step,
   ticketStatus,
@@ -9600,6 +9610,7 @@ const DocumentationWorkflowPanel = ({
   onSubmit,
   canMoveForward,
 }: {
+  ticket?: TicketDetail;
   draft: AdminDocumentation;
   step: number;
   ticketStatus: DocumentationWorkflowStatus | "";
@@ -9633,6 +9644,7 @@ const DocumentationWorkflowPanel = ({
   const automaticStatusReason = !readOnly ? getAutomaticDocumentationStatusReason(ticketStatus) : "";
   const displayedStatusReason = automaticStatusReason || statusReason;
   const isEscalationWorkflow = displayedStatusReason === "Escalation";
+  const shouldRenderReadOnlyCardHistory = Boolean(readOnly && ticket && draft.documentationCards.length > 0);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -9660,7 +9672,22 @@ const DocumentationWorkflowPanel = ({
     <div className="min-h-0 flex-1">
       {step === 1 ? (
         readOnly ? (
-          <DocumentationAccordionReadOnly draft={draft} attachments={attachments} sessionRequests={sessionRequests} />
+          shouldRenderReadOnlyCardHistory && ticket ? (
+            <div className="h-full overflow-y-auto pr-1">
+              <StandardDocumentationWorkspace
+                ticket={ticket}
+                draft={draft}
+                currentAdmin={null}
+                attachments={attachments}
+                readOnly
+                isSaving={isSaving}
+                isDirty={false}
+                onDraftUpdate={() => undefined}
+              />
+            </div>
+          ) : (
+            <DocumentationAccordionReadOnly draft={draft} attachments={attachments} sessionRequests={sessionRequests} />
+          )
         ) : (
           <DocumentationAccordionEditor
             draft={draft}
@@ -10186,12 +10213,14 @@ const StandardDocumentationWorkspace = ({
   onDraftUpdate: (updater: (draft: AdminDocumentation) => AdminDocumentation) => void;
 }) => {
   const [collapsedCardIds, setCollapsedCardIds] = useState<Set<string>>(new Set());
+  const [previewAttachment, setPreviewAttachment] = useState<AttachmentPreviewItem | null>(null);
   const cardRefs = useRef<Record<string, HTMLElement | null>>({});
   const attachmentInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const cardsForDisplay = sortDocumentationWorkflowCardsForDisplay(draft.documentationCards);
 
   useEffect(() => {
     setCollapsedCardIds(new Set());
+    setPreviewAttachment(null);
   }, [ticket.id]);
 
   function focusDocumentationCard(cardId: string) {
@@ -10327,7 +10356,37 @@ const StandardDocumentationWorkspace = ({
     });
   }
 
+  function previewRequesterAttachment(file: AttachmentItem) {
+    if (!file.storageUrl) {
+      return;
+    }
+
+    setPreviewAttachment({
+      id: file.id,
+      name: file.name,
+      mimeType: file.mimeType,
+      size: file.size,
+      source: file.storageUrl,
+    });
+  }
+
+  function previewDocumentationAttachment(file: CoverageCardAttachment) {
+    const source = getCoverageAttachmentSource(file);
+    if (!source) {
+      return;
+    }
+
+    setPreviewAttachment({
+      id: file.id,
+      name: file.name || "attachment",
+      mimeType: file.mimeType || "application/octet-stream",
+      size: file.size || 0,
+      source,
+    });
+  }
+
   return (
+    <>
     <section className="space-y-4">
       <div className="rounded-[28px] border border-primary/15 bg-gradient-to-br from-primary/[0.06] via-white to-fuchsia-50/60 p-4 shadow-[0_18px_45px_rgba(82,54,188,0.10)] sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -10368,7 +10427,7 @@ const StandardDocumentationWorkspace = ({
                       type="button"
                       variant="outline"
                       size="sm"
-                      onClick={() => window.open(file.storageUrl || "", "_blank", "noopener,noreferrer")}
+                      onClick={() => previewRequesterAttachment(file)}
                     >
                       Open
                     </Button>
@@ -10498,6 +10557,7 @@ const StandardDocumentationWorkspace = ({
                           onAttachClick={() => attachmentInputRefs.current[card.id]?.click()}
                           onFilesAdded={(event) => handleDocumentationAttachmentsAdded(card.id, event)}
                           onRemove={(fileId) => removeDocumentationAttachment(card.id, fileId)}
+                          onPreview={previewDocumentationAttachment}
                         />
                       ) : null}
                     </div>
@@ -10517,6 +10577,11 @@ const StandardDocumentationWorkspace = ({
         ) : null}
       </div>
     </section>
+    <AttachmentPreviewDialog
+      attachment={previewAttachment}
+      onClose={() => setPreviewAttachment(null)}
+    />
+    </>
   );
 };
 
@@ -10540,6 +10605,7 @@ const DocumentationCardAttachmentsBlock = ({
   onAttachClick,
   onFilesAdded,
   onRemove,
+  onPreview,
 }: {
   card: DocumentationWorkflowCard;
   readOnly: boolean;
@@ -10547,6 +10613,7 @@ const DocumentationCardAttachmentsBlock = ({
   onAttachClick: () => void;
   onFilesAdded: (event: ChangeEvent<HTMLInputElement>) => void;
   onRemove: (fileId: string) => void;
+  onPreview: (file: CoverageCardAttachment) => void;
 }) => (
   <div className="mt-4 rounded-2xl border border-dashed border-primary/15 bg-white/70 p-3">
     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -10599,7 +10666,7 @@ const DocumentationCardAttachmentsBlock = ({
                     variant="outline"
                     size="sm"
                     className="h-8 rounded-full px-3 text-xs"
-                    onClick={() => window.open(source, "_blank", "noopener,noreferrer")}
+                    onClick={() => onPreview(file)}
                   >
                     Open
                   </Button>
@@ -10628,6 +10695,169 @@ const DocumentationCardAttachmentsBlock = ({
     )}
   </div>
 );
+
+const AttachmentPreviewDialog = ({
+  attachment,
+  onClose,
+}: {
+  attachment: AttachmentPreviewItem | null;
+  onClose: () => void;
+}) => {
+  const [previewSource, setPreviewSource] = useState("");
+  const [previewMimeType, setPreviewMimeType] = useState("");
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const previewKind = getAttachmentPreviewKind({
+    mimeType: previewMimeType || attachment?.mimeType || "",
+    source: previewSource || attachment?.source || "",
+  });
+
+  useEffect(() => {
+    if (!attachment?.source) {
+      setPreviewSource("");
+      setPreviewMimeType("");
+      setPreviewError("");
+      setIsLoadingPreview(false);
+      return;
+    }
+
+    let objectUrl = "";
+    const abortController = new AbortController();
+    const source = attachment.source;
+
+    async function loadPreview() {
+      setPreviewError("");
+      setPreviewMimeType(attachment?.mimeType || "");
+
+      if (!shouldFetchAttachmentPreviewSource(source)) {
+        setPreviewSource(source);
+        setIsLoadingPreview(false);
+        return;
+      }
+
+      setPreviewSource("");
+      setIsLoadingPreview(true);
+
+      try {
+        const response = await fetch(source, {
+          credentials: "same-origin",
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error("Attachment preview request failed.");
+        }
+
+        const blob = await response.blob();
+        objectUrl = URL.createObjectURL(blob);
+        setPreviewMimeType(blob.type || attachment?.mimeType || "");
+        setPreviewSource(objectUrl);
+      } catch (error) {
+        if ((error as DOMException).name === "AbortError") {
+          return;
+        }
+
+        setPreviewError("We could not load this attachment preview. You can still try downloading it.");
+      } finally {
+        if (!abortController.signal.aborted) {
+          setIsLoadingPreview(false);
+        }
+      }
+    }
+
+    void loadPreview();
+
+    return () => {
+      abortController.abort();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [attachment?.source, attachment?.mimeType]);
+
+  return (
+    <Dialog open={Boolean(attachment)} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-h-[90vh] max-w-5xl overflow-hidden">
+        <DialogHeader>
+          <DialogTitle className="truncate pr-8">{attachment?.name || "Attachment Preview"}</DialogTitle>
+          <DialogDescription>
+            {attachment?.mimeType || "Attachment"} {attachment ? `- ${formatBytes(attachment.size)}` : ""}
+          </DialogDescription>
+        </DialogHeader>
+
+        {isLoadingPreview ? (
+          <div className="flex min-h-[220px] items-center justify-center rounded-2xl border bg-secondary/10 text-sm text-muted-foreground">
+            <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+            Loading preview...
+          </div>
+        ) : previewError ? (
+          <div className="rounded-2xl border bg-secondary/10 p-5">
+            <div className="text-sm text-foreground">{previewError}</div>
+            {attachment?.source ? (
+              <div className="mt-4">
+                <a
+                  href={attachment.source}
+                  download={attachment.name}
+                  className="inline-flex items-center rounded-full border px-4 py-2 text-sm font-medium text-primary transition hover:bg-secondary/40"
+                >
+                  Download File
+                </a>
+              </div>
+            ) : null}
+          </div>
+        ) : attachment?.source && previewSource ? (
+          previewKind === "image" ? (
+            <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
+              <img
+                src={previewSource}
+                alt={attachment.name}
+                className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
+              />
+            </div>
+          ) : previewKind === "pdf" ? (
+            <div className="overflow-hidden rounded-2xl border bg-secondary/10">
+              <iframe
+                src={previewSource}
+                title={attachment.name}
+                className="h-[70vh] w-full border-0"
+              />
+            </div>
+          ) : previewKind === "video" ? (
+            <div className="overflow-hidden rounded-2xl border bg-secondary/10 p-3">
+              <video
+                src={previewSource}
+                controls
+                className="mx-auto max-h-[70vh] w-full rounded-xl bg-black"
+              />
+            </div>
+          ) : (
+            <div className="rounded-2xl border bg-secondary/10 p-5">
+              <div className="text-sm text-foreground">
+                Preview is not available for this file type yet.
+              </div>
+              <div className="mt-2 text-xs text-muted-foreground">
+                You can still download the file from here without leaving the page.
+              </div>
+              <div className="mt-4">
+                <a
+                  href={previewSource}
+                  download={attachment.name}
+                  className="inline-flex items-center rounded-full border px-4 py-2 text-sm font-medium text-primary transition hover:bg-secondary/40"
+                >
+                  Download File
+                </a>
+              </div>
+            </div>
+          )
+        ) : (
+          <div className="rounded-2xl border bg-secondary/10 p-5 text-sm text-muted-foreground">
+            This attachment is not available for preview right now.
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+};
 
 const DocumentationAccordionReadOnly = ({
   draft,
@@ -11555,6 +11785,42 @@ function getCoverageAttachmentPreviewKind(file: Pick<CoverageCardAttachment, "mi
   }
 
   return "unsupported";
+}
+
+function getAttachmentPreviewKind(file: Pick<AttachmentPreviewItem, "mimeType" | "source"> | null | undefined) {
+  const mimeType = (file?.mimeType || "").toLowerCase();
+  const source = (file?.source || "").toLowerCase();
+
+  if (mimeType.startsWith("image/") || source.startsWith("data:image/")) {
+    return "image";
+  }
+
+  if (mimeType === "application/pdf" || source.startsWith("data:application/pdf") || source.endsWith(".pdf")) {
+    return "pdf";
+  }
+
+  if (mimeType.startsWith("video/") || source.startsWith("data:video/")) {
+    return "video";
+  }
+
+  return "unsupported";
+}
+
+function shouldFetchAttachmentPreviewSource(source: string) {
+  const normalizedSource = source.trim();
+  if (!normalizedSource || normalizedSource.startsWith("data:") || normalizedSource.startsWith("blob:")) {
+    return false;
+  }
+
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    return new URL(normalizedSource, window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
 }
 
 function isValidCoverageTutorEmail(value: string) {
