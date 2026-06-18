@@ -32,6 +32,7 @@ import {
   Settings2,
   Ticket as TicketIcon,
   Trash2,
+  Undo2,
   UserRound,
   Users,
   X,
@@ -4946,9 +4947,12 @@ const AgentDashboard = () => {
                               type="button"
                               size="sm"
                               variant="outline"
-                              className={cn(
-                                "h-8 rounded-full",
-                                useCompactDashboardTable ? "w-full justify-center px-3 text-xs" : "whitespace-nowrap",
+                              className={getArchiveActionButtonClassName(
+                                isArchivedTicket(ticket),
+                                cn(
+                                  "h-8 rounded-full",
+                                  useCompactDashboardTable ? "w-full justify-center px-3 text-xs" : "whitespace-nowrap",
+                                ),
                               )}
                               onClick={(event) => {
                                 event.stopPropagation();
@@ -6334,7 +6338,7 @@ const AgentDashboard = () => {
                 <Button
                   type="button"
                   variant="outline"
-                  className="w-full sm:w-auto"
+                  className={getArchiveActionButtonClassName(activeTicketIsArchived, "w-full sm:w-auto")}
                   onClick={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
                   disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id || teamTransferTicketId === activeDetail.ticket.id}
                 >
@@ -9463,6 +9467,7 @@ const CoverageTicketWorkspace = ({
           <Button
             type="button"
             variant="outline"
+            className={getArchiveActionButtonClassName(isArchived)}
             onClick={onArchiveToggle}
             disabled={isSaving || isSavingDetails || isArchiving}
           >
@@ -10780,6 +10785,7 @@ const TeamTransferMenu = ({
   const normalizedAssignedTeam = normalizeAssignedTeamName(assignedTeam);
   const isAssignedToLearningPlan = isLearningPlanAssignedTeam(assignedTeam);
   const actionLabel = isAssignedToLearningPlan ? "Return" : "Transfer";
+  const ActionIcon = isAssignedToLearningPlan ? Undo2 : ArrowRightLeft;
   const availableTeamOptions = dashboardTeamTransferOptions.filter(
     (teamOption) => normalizeAssignedTeamName(teamOption.value) !== normalizedAssignedTeam,
   );
@@ -10791,14 +10797,20 @@ const TeamTransferMenu = ({
           type="button"
           size="sm"
           variant="outline"
-          className={cn("h-8 whitespace-nowrap rounded-full", className)}
+          className={cn(
+            "h-8 whitespace-nowrap rounded-full",
+            isAssignedToLearningPlan
+              ? "border-amber-300 bg-amber-50 text-amber-900 shadow-sm hover:border-amber-400 hover:bg-amber-100 hover:text-amber-950"
+              : "border-slate-200 bg-background text-slate-900 hover:border-primary/25 hover:bg-primary/5 hover:text-primary",
+            className,
+          )}
           disabled={disabled || isLoading || availableTeamOptions.length === 0}
           aria-label={`${actionLabel} ticket ${ticketId} to another team`}
         >
           {isLoading ? (
             <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
           ) : (
-            <ArrowRightLeft className="mr-1.5 h-3.5 w-3.5" />
+            <ActionIcon className="mr-1.5 h-3.5 w-3.5" />
           )}
           {actionLabel}
         </Button>
@@ -10817,7 +10829,10 @@ const TeamTransferMenu = ({
                 event.preventDefault();
                 onTransfer(teamOption.value);
               }}
-              className="rounded-xl px-3 py-2.5"
+              className={cn(
+                "rounded-xl px-3 py-2.5",
+                isAssignedToLearningPlan && "focus:bg-amber-50",
+              )}
             >
               <div className="min-w-0">
                 <div className="truncate text-sm font-medium text-foreground">{teamOption.label}</div>
@@ -10955,6 +10970,15 @@ function isLearningPlanTicket(
 
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
   return ticket?.isArchived === true;
+}
+
+function getArchiveActionButtonClassName(isArchived: boolean, className?: string) {
+  return cn(
+    isArchived
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm hover:border-emerald-300 hover:bg-emerald-100 hover:text-emerald-800"
+      : "border-slate-200 bg-slate-100/80 text-slate-700 shadow-sm hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-700",
+    className,
+  );
 }
 
 function formatArchivedTicketLabel(ticket: Pick<TicketSummary, "archivedAt" | "archivedByName" | "archivedByUsername">) {
