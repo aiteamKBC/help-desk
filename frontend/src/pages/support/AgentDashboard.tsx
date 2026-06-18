@@ -177,6 +177,23 @@ interface PendingCoverageTicketNotification {
   createdAt: string;
 }
 
+interface PendingLearningPlanTransferNotification {
+  ticketId: string;
+  requesterName: string;
+  requesterEmail: string;
+  requesterRole: string;
+  fromTeam: string;
+  toTeam: string;
+  transferredAt: string;
+  transferredById: number | null;
+  transferredByName: string;
+  transferredByUsername: string;
+  assignedAgentId: number | null;
+  assignedAgentName: string;
+  assignedAgentUsername: string;
+  note: string;
+}
+
 interface LatestEscalationClosure {
   fromAgentId: number;
   fromAgentName: string;
@@ -244,6 +261,7 @@ interface TicketSummary {
   inquiryPreview: string;
   status: "Open" | "Pending" | "Closed";
   statusReason: string;
+  isQuickTicket?: boolean;
   assignedAgentId: number | null;
   assignedAgentName: string;
   assignedAgentUsername: string;
@@ -260,6 +278,7 @@ interface TicketSummary {
   pendingEscalationNotification?: PendingEscalationNotification | null;
   pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
   pendingCoverageTicketNotification?: PendingCoverageTicketNotification | null;
+  pendingLearningPlanTransferNotification?: PendingLearningPlanTransferNotification | null;
   teamsCallRequested?: boolean;
   latestEscalationClosure?: LatestEscalationClosure | null;
   latestTransferDecision?: LatestTransferDecision | null;
@@ -376,6 +395,12 @@ interface CoverageWorkflowCard {
   locked: boolean;
   createdAt: string;
   updatedAt: string;
+  createdByAgentId?: number | null;
+  createdByAgentName?: string;
+  createdByAgentUsername?: string;
+  updatedByAgentId?: number | null;
+  updatedByAgentName?: string;
+  updatedByAgentUsername?: string;
   submittedAt: string;
   respondedAt: string;
   relatedTutorChoiceCardId: string;
@@ -399,9 +424,16 @@ interface DocumentationWorkflowCard {
   errors: string;
   steps: string;
   resources: string;
+  attachments: CoverageCardAttachment[];
   locked: boolean;
   createdAt: string;
   updatedAt: string;
+  createdByAgentId?: number | null;
+  createdByAgentName?: string;
+  createdByAgentUsername?: string;
+  updatedByAgentId?: number | null;
+  updatedByAgentName?: string;
+  updatedByAgentUsername?: string;
 }
 
 interface AdminDocumentation {
@@ -530,7 +562,7 @@ type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreache
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
-type AdminView = "dashboard" | "coverage" | "console" | "management";
+type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management";
 type LearningPlanTeamSection = "coverage" | "others";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type CoverageWorkspaceTab = "documentation" | "details";
@@ -547,11 +579,72 @@ function buildAdminJsonHeaders() {
   });
 }
 
+function getNormalizedAdminRole(session?: Pick<AdminSession, "role"> | null) {
+  return (session?.role || "").trim().toLowerCase();
+}
+
+function hasFullAdminDashboardAccess(
+  session?: Pick<AdminSession, "role" | "legacyAdminAccess" | "entraDirectoryAdmin"> | null,
+) {
+  return Boolean(
+    userManagementRoles.has(getNormalizedAdminRole(session))
+    || session?.legacyAdminAccess
+    || session?.entraDirectoryAdmin,
+  );
+}
+
+function hasLegacySupportDashboardAccess(
+  session?: Pick<AdminSession, "role" | "legacySupportAccess" | "legacyOperationsAccess"> | null,
+) {
+  if (!session) {
+    return false;
+  }
+
+  if (typeof session.legacySupportAccess === "boolean") {
+    return session.legacySupportAccess;
+  }
+
+  // Older sessions did not carry the access flags; keep agent sessions on the
+  // support dashboard unless the newer operations-only flag is explicit.
+  return getNormalizedAdminRole(session) === "agent" && session.legacyOperationsAccess !== true;
+}
+
+function hasLegacyOperationsDashboardAccess(
+  session?: Pick<AdminSession, "legacyOperationsAccess"> | null,
+) {
+  return session?.legacyOperationsAccess === true;
+}
+
+function hasAnyAdminDashboardAccess(session?: AdminSession | null) {
+  return Boolean(
+    hasFullAdminDashboardAccess(session)
+    || hasLegacySupportDashboardAccess(session)
+    || hasLegacyOperationsDashboardAccess(session),
+  );
+}
+
+function getDefaultAdminLandingView(session?: AdminSession | null): AdminView {
+  if (hasLegacySupportDashboardAccess(session)) {
+    return "dashboard";
+  }
+
+  if (hasLegacyOperationsDashboardAccess(session)) {
+    return "coverage";
+  }
+
+  if (hasFullAdminDashboardAccess(session)) {
+    return "adminDashboard";
+  }
+
+  return "dashboard";
+}
+
 const AgentDashboard = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const [session, setSessionState] = useState<AdminSession | null>(() => getAdminSession());
   const initialConsoleDeepLink = parseAdminDeepLink(location.search);
+  const hasInitialAdminDeepLink = Boolean(location.search);
   const isMountedRef = useRef(true);
   const sessionRef = useRef<AdminSession | null>(session);
   const previousConsoleChatStateRef = useRef<{ ticketId: string; chatState: string } | null>(null);
@@ -559,7 +652,9 @@ const AgentDashboard = () => {
   const pendingConsoleStatusRef = useRef<AdminSelectableConsoleStatus | null>(null);
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [agents, setAgents] = useState<AdminAgent[]>([]);
-  const [adminView, setAdminView] = useState<AdminView>(initialConsoleDeepLink.view);
+  const [adminView, setAdminView] = useState<AdminView>(() => (
+    hasInitialAdminDeepLink ? initialConsoleDeepLink.view : getDefaultAdminLandingView(session)
+  ));
   const [isAdminSidebarCollapsed, setIsAdminSidebarCollapsed] = useState(false);
   const [isStackedAdminLayout, setIsStackedAdminLayout] = useState(() => (
     typeof window !== "undefined" ? window.innerWidth < 1024 : false
@@ -582,6 +677,7 @@ const AgentDashboard = () => {
   const [chatPreviewAttachment, setChatPreviewAttachment] = useState<ChatAttachment | null>(null);
   const consoleAttachmentInputRef = useRef<HTMLInputElement | null>(null);
   const consolePendingAttachmentsRef = useRef<ChatAttachment[]>([]);
+  const standardActionNoteRef = useRef<HTMLTextAreaElement | null>(null);
   const [consoleAiInput, setConsoleAiInput] = useState("");
   const [dashboardTicketFilter, setDashboardTicketFilter] = useState<DashboardTicketFilter>("all");
   const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>(() => (
@@ -593,7 +689,9 @@ const AgentDashboard = () => {
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
+  const [standardDocumentationDraftsByTicketId, setStandardDocumentationDraftsByTicketId] = useState<Record<string, AdminDocumentation>>({});
   const activeDocumentationBaselineRef = useRef<{ ticketId: string; value: string } | null>(null);
+  const standardDocumentationDraftsRef = useRef<Record<string, AdminDocumentation>>({});
   const [documentationStep, setDocumentationStep] = useState(1);
   const [documentationTicketStatus, setDocumentationTicketStatus] = useState<DocumentationWorkflowStatus | "">("");
   const [documentationStatusReason, setDocumentationStatusReason] = useState("");
@@ -647,21 +745,34 @@ const AgentDashboard = () => {
   const clearConsolePendingAttachmentsRef = useRef<(revokePreviewUrls?: boolean) => void>(() => {});
   const showAdminDesktopNotificationRef = useRef<(key: string, title: string, body: string) => void>(() => {});
   const openConsoleChatRef = useRef<(ticketId: string) => Promise<void>>(async () => {});
-  const canManageUsers = userManagementRoles.has((session?.role || "").toLowerCase())
-    && !!(session?.legacyAdminAccess || session?.entraDirectoryAdmin);
-  const canAssignTickets = ticketAssignmentRoles.has((session?.role || "").toLowerCase());
-  const isSuperadminSession = (session?.role || "").toLowerCase() === "superadmin";
+  const signedInAgent = agents.find((agent) => (
+    (session?.id && agent.id === session.id)
+    || (session?.username && agent.username === session.username)
+  ));
+  const accessSession = signedInAgent || session;
+  const normalizedSessionRole = getNormalizedAdminRole(accessSession);
+  const hasFullAdminAccess = hasFullAdminDashboardAccess(accessSession);
+  const hasSupportDashboardAccess = hasLegacySupportDashboardAccess(accessSession);
+  const hasOperationsDashboardAccess = hasLegacyOperationsDashboardAccess(accessSession);
+  const isSuperadminSession = normalizedSessionRole === "superadmin";
+  const canViewSupportDashboard = hasFullAdminAccess || hasSupportDashboardAccess;
+  const canViewAdminDashboard = hasFullAdminAccess;
+  const canViewLearningPlanTeam = hasFullAdminAccess || hasOperationsDashboardAccess;
+  const canUseTicketReceiving = hasFullAdminAccess || hasSupportDashboardAccess;
+  const canManageUsers = userManagementRoles.has(normalizedSessionRole) && hasFullAdminAccess;
+  const canAssignTickets = ticketAssignmentRoles.has(normalizedSessionRole) && hasFullAdminAccess;
   const isConsoleView = adminView === "console";
+  const isAdminDashboardView = adminView === "adminDashboard";
   const isCoverageDashboardView = adminView === "coverage";
   const isLearningPlanCoverageSection = isCoverageDashboardView && learningPlanTeamSection === "coverage";
   const defaultDashboardSortOrder = getDefaultDashboardSortOrder(isLearningPlanCoverageSection);
-  const isDashboardLikeView = adminView === "dashboard" || adminView === "coverage";
+  const isDashboardLikeView = adminView === "dashboard" || adminView === "adminDashboard" || adminView === "coverage";
   const useCompactAdminSidebar = !isStackedAdminLayout && isAdminSidebarCollapsed;
   const trimmedNotes = notes.trim();
   const dashboardSessionAgentName = session?.fullName || session?.username || "Me";
   const isSlaAutoManaged = Boolean(activeDetail) && autoManagedSlaStatuses.has(draftStatus);
   const effectiveDraftSlaStatus = activeDetail
-    ? deriveDashboardSlaStatus(draftStatus, activeDetail.ticket.createdAt, draftSlaStatus)
+    ? deriveDashboardSlaStatus(draftStatus, activeDetail.ticket.createdAt, draftSlaStatus, isCoverageTicket(activeDetail.ticket))
     : draftSlaStatus;
   const isStatusChanging = Boolean(activeDetail) && draftStatus !== activeDetail.ticket.status;
   const canSubmitStatusChange = !isStatusChanging || Boolean(trimmedNotes);
@@ -706,19 +817,37 @@ const AgentDashboard = () => {
     : activeStandardDocumentationBaseline;
   const activeStandardDocumentationDirty = Boolean(activeStandardDocumentationBaseline && activeStandardDocumentationDraft)
     && JSON.stringify(activeStandardDocumentationDraft) !== JSON.stringify(activeStandardDocumentationBaseline);
+  const standardDocumentationWorkspaceDraft = activeDetail && !isActiveCoverageTicket
+    ? activeStandardDocumentationDraft || buildStandardDocumentationDraft(activeDetail.ticket)
+    : null;
+  const shouldRenderStandardDocumentationWorkspace = Boolean(
+    standardDocumentationWorkspaceDraft
+    && (isActiveStandardDocumentationTicket || standardDocumentationWorkspaceDraft.documentationCards.length > 0),
+  );
   const activeAgents = agents.filter((agent) => (
     agent.isActive !== false
     && isStaffSupportAccount(agent)
     && hasCurrentCommunicationCentreAccess(agent)
   ));
   const managementAgents = activeAgents;
-  const signedInAgent = agents.find((agent) => (
-    (session?.id && agent.id === session.id)
-    || (session?.username && agent.username === session.username)
-  ));
   const resolvedSessionAgentId = signedInAgent?.id ?? session?.id ?? null;
   const dashboardSessionAgentId = resolvedSessionAgentId;
-  const scopedConsoleTickets = tickets.filter((ticket) => {
+  const accessibleTickets = tickets.filter((ticket) => {
+    if (hasFullAdminAccess || (hasSupportDashboardAccess && hasOperationsDashboardAccess)) {
+      return true;
+    }
+
+    const isLearningPlanTicketRecord = isLearningPlanTicket(ticket);
+    if (hasOperationsDashboardAccess) {
+      return isLearningPlanTicketRecord;
+    }
+    if (hasSupportDashboardAccess) {
+      return !isLearningPlanTicketRecord;
+    }
+
+    return false;
+  });
+  const scopedConsoleTickets = accessibleTickets.filter((ticket) => {
     if (isArchivedTicket(ticket)) {
       return false;
     }
@@ -795,7 +924,7 @@ const AgentDashboard = () => {
       }
 
       const normalizedRole = (admin.role || "").trim().toLowerCase();
-      if (!adminDashboardAccessRoles.has(normalizedRole)) {
+      if (!adminDashboardAccessRoles.has(normalizedRole) || !hasAnyAdminDashboardAccess(admin)) {
         redirectForEndedAdminSession(options?.expiredMessage || "This account no longer has support dashboard access.", "/support");
         return null;
       }
@@ -945,7 +1074,7 @@ const AgentDashboard = () => {
   const activeConsoleQueueTickets = consoleQueueTab === "open"
     ? visibleOpenConsoleTickets
     : visibleClosedConsoleTickets;
-  const myOpenConsoleQueueTickets = tickets.filter((ticket) => {
+  const myOpenConsoleQueueTickets = accessibleTickets.filter((ticket) => {
     if (isArchivedTicket(ticket)) {
       return false;
     }
@@ -973,8 +1102,15 @@ const AgentDashboard = () => {
       window.focus();
     }
 
-    setAdminView("dashboard");
-    setDashboardSortOrder(getDefaultDashboardSortOrder(false));
+    const nextView = canViewSupportDashboard
+      ? "dashboard"
+      : canViewLearningPlanTeam
+        ? "coverage"
+        : canViewAdminDashboard
+          ? "adminDashboard"
+          : "dashboard";
+    setAdminView(nextView);
+    setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
     setIsTransferNotificationsOpen(true);
   }
 
@@ -1026,7 +1162,9 @@ const AgentDashboard = () => {
       value: "all" as DashboardAssignedFilter,
       label: isCoverageDashboardView
         ? (isLearningPlanCoverageSection ? "All Coverage Tickets" : "All Other Learning Plan Tickets")
-        : "All Tickets",
+        : isAdminDashboardView
+          ? "All Tickets"
+          : "All Support Tickets",
     },
     ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "unassigned" as DashboardAssignedFilter, label: "Unassigned" },
@@ -1038,15 +1176,38 @@ const AgentDashboard = () => {
       })),
   ];
   const assignableTicketAgents = ticketReceivingAgents;
-  const activeTicketCount = tickets.filter((ticket) => !isArchivedTicket(ticket)).length;
-  const dashboardArchiveScopedTickets = tickets.filter((ticket) => (
+  const activeAccessibleTickets = accessibleTickets.filter((ticket) => !isArchivedTicket(ticket));
+  const dashboardArchiveScopedTickets = accessibleTickets.filter((ticket) => (
     dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
   ));
   const learningPlanCoverageBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isCoverageTicket(ticket));
   const learningPlanOtherBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isLearningPlanOtherTicket(ticket));
+  const supportDashboardBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => !isLearningPlanTicket(ticket));
+  const activeLearningPlanCoverageTickets = activeAccessibleTickets.filter((ticket) => isCoverageTicket(ticket));
+  const activeLearningPlanOtherTickets = activeAccessibleTickets.filter((ticket) => isLearningPlanOtherTicket(ticket));
+  const activeLearningPlanTicketCount = activeLearningPlanCoverageTickets.length + activeLearningPlanOtherTickets.length;
+  const activeSupportDashboardTickets = activeAccessibleTickets.filter((ticket) => !isLearningPlanTicket(ticket));
+  const overviewTicketCount = isCoverageDashboardView
+    ? activeLearningPlanTicketCount
+    : isAdminDashboardView || adminView === "management"
+      ? activeAccessibleTickets.length
+      : activeSupportDashboardTickets.length;
+  const overviewTicketCountLabel = isCoverageDashboardView
+    ? "Learning Plan Tickets"
+    : isAdminDashboardView || adminView === "management"
+      ? "All Tickets"
+      : "Support Tickets";
+  const overviewTicketBreakdownItems = isCoverageDashboardView
+    ? [
+        { label: "Coverage", value: activeLearningPlanCoverageTickets.length },
+        { label: "Others", value: activeLearningPlanOtherTickets.length },
+      ]
+    : [];
   const dashboardBaseTickets = isCoverageDashboardView
     ? (isLearningPlanCoverageSection ? learningPlanCoverageBaseTickets : learningPlanOtherBaseTickets)
-    : dashboardArchiveScopedTickets;
+    : isAdminDashboardView
+      ? dashboardArchiveScopedTickets
+      : supportDashboardBaseTickets;
   const learningPlanCoverageAssignmentScopedTickets = filterDashboardTicketsByAssignee(
     learningPlanCoverageBaseTickets,
     dashboardAssignedFilter,
@@ -1129,15 +1290,22 @@ const AgentDashboard = () => {
         ? leftTimestamp - rightTimestamp
         : rightTimestamp - leftTimestamp;
     });
-  const dashboardActiveTableTitle = dashboardTicketFilter === "all" && isCoverageDashboardView
+  const dashboardDefaultTableTitle = isCoverageDashboardView
     ? (isLearningPlanCoverageSection ? "Coverage Tickets" : "Other Learning Plan Tickets")
+    : isAdminDashboardView
+      ? "All Tickets"
+      : "Support Tickets";
+  const dashboardActiveTableTitle = dashboardTicketFilter === "all"
+    ? dashboardDefaultTableTitle
     : getDashboardTableTitle(dashboardTicketFilter);
   const dashboardTableTitle = dashboardArchiveScope === "archived"
     ? dashboardTicketFilter === "all"
       ? (
         isCoverageDashboardView
           ? (isLearningPlanCoverageSection ? "Archived Coverage Tickets" : "Archived Other Learning Plan Tickets")
-          : "Archived Tickets"
+          : isAdminDashboardView
+            ? "Archived Tickets"
+            : "Archived Support Tickets"
       )
       : `Archived ${dashboardActiveTableTitle}`
     : dashboardActiveTableTitle;
@@ -1179,13 +1347,17 @@ const AgentDashboard = () => {
       ? (
         isCoverageDashboardView
           ? (isLearningPlanCoverageSection ? "No archived coverage tickets found." : "No archived other learning plan tickets found.")
-          : "No archived tickets found."
+          : isAdminDashboardView
+            ? "No archived tickets found."
+            : "No archived support tickets found."
       )
     : dashboardAssignedFilter !== "all"
       ? getDashboardAssignedFilterEmptyMessage(dashboardTicketFilter, dashboardAssignedFilterEmptyTarget)
       : isCoverageDashboardView && dashboardTicketFilter === "all"
         ? (isLearningPlanCoverageSection ? "No coverage tickets have been created yet." : "No transferred learning plan tickets have been created yet.")
-        : getDashboardEmptyMessage(dashboardTicketFilter);
+        : dashboardTicketFilter === "all" && !isAdminDashboardView
+          ? "No support tickets are currently available."
+          : getDashboardEmptyMessage(dashboardTicketFilter);
   const isConsoleOwnedBySignedInAgent = Boolean(
     consoleDetail
     && resolvedSessionAgentId
@@ -1213,7 +1385,7 @@ const AgentDashboard = () => {
     && consoleDetail.ticket.status === "Closed"
     && consoleDetail.ticket.chatState !== "closed";
   const transferTargetAgents = sortedAgents.filter((agent) => agent.id !== consoleDetail?.ticket.assignedAgentId);
-  const pendingTransferRequests = tickets
+  const pendingTransferRequests = accessibleTickets
     .filter((ticket) => {
       const pendingTransferRequest = ticket.pendingTransferRequest;
       if (!pendingTransferRequest) {
@@ -1231,7 +1403,7 @@ const AgentDashboard = () => {
       const rightRequestedAt = Date.parse(rightTicket.pendingTransferRequest?.requestedAt || "");
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
-  const pendingEscalationNotifications = tickets
+  const pendingEscalationNotifications = accessibleTickets
     .filter((ticket) => {
       const pendingEscalationNotification = ticket.pendingEscalationNotification;
       if (!pendingEscalationNotification) {
@@ -1249,7 +1421,7 @@ const AgentDashboard = () => {
       const rightRequestedAt = Date.parse(rightTicket.pendingEscalationNotification?.requestedAt || "");
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
-  const pendingTeamsCallNotifications = tickets
+  const pendingTeamsCallNotifications = accessibleTickets
     .filter((ticket) => {
       const pendingTeamsCallNotification = ticket.pendingTeamsCallNotification;
       if (!pendingTeamsCallNotification) {
@@ -1267,8 +1439,8 @@ const AgentDashboard = () => {
       const rightRequestedAt = Date.parse(rightTicket.pendingTeamsCallNotification?.requestedAt || "");
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
-  const waitingLiveChatNotifications = myActualConsoleStatus === "Off"
-    ? tickets
+  const waitingLiveChatNotifications = canUseTicketReceiving && myActualConsoleStatus === "Off"
+    ? accessibleTickets
       .filter((ticket) => (
         ticket.liveChatRequested
         && ticket.chatState !== "closed"
@@ -1281,7 +1453,7 @@ const AgentDashboard = () => {
         return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
       })
     : emptyTicketSummaryList;
-  const transferDecisionNotifications = tickets
+  const transferDecisionNotifications = accessibleTickets
     .filter((ticket) => {
       const latestTransferDecision = ticket.latestTransferDecision;
       if (!latestTransferDecision || latestTransferDecision.requesterAcknowledged) {
@@ -1299,7 +1471,7 @@ const AgentDashboard = () => {
       const rightDecidedAt = Date.parse(rightTicket.latestTransferDecision?.decidedAt || "");
       return (Number.isNaN(rightDecidedAt) ? 0 : rightDecidedAt) - (Number.isNaN(leftDecidedAt) ? 0 : leftDecidedAt);
     });
-  const escalationClosureNotifications = tickets
+  const escalationClosureNotifications = accessibleTickets
     .filter((ticket) => {
       const latestEscalationClosure = ticket.latestEscalationClosure;
       if (!latestEscalationClosure || latestEscalationClosure.requesterAcknowledged) {
@@ -1317,7 +1489,7 @@ const AgentDashboard = () => {
       const rightClosedAt = Date.parse(rightTicket.latestEscalationClosure?.closedAt || "");
       return (Number.isNaN(rightClosedAt) ? 0 : rightClosedAt) - (Number.isNaN(leftClosedAt) ? 0 : leftClosedAt);
     });
-  const coverageTutorResponseNotifications = tickets
+  const coverageTutorResponseNotifications = accessibleTickets
     .filter((ticket) => {
       const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
       if (!latestCoverageTutorResponse || latestCoverageTutorResponse.requesterAcknowledged) {
@@ -1335,12 +1507,19 @@ const AgentDashboard = () => {
       const rightRespondedAt = Date.parse(rightTicket.latestCoverageTutorResponse?.respondedAt || "");
       return (Number.isNaN(rightRespondedAt) ? 0 : rightRespondedAt) - (Number.isNaN(leftRespondedAt) ? 0 : leftRespondedAt);
     });
-  const coverageTicketNotifications = tickets
+  const coverageTicketNotifications = accessibleTickets
     .filter((ticket) => Boolean(ticket.pendingCoverageTicketNotification))
     .sort((leftTicket, rightTicket) => {
       const leftCreatedAt = Date.parse(leftTicket.pendingCoverageTicketNotification?.createdAt || leftTicket.createdAt || "");
       const rightCreatedAt = Date.parse(rightTicket.pendingCoverageTicketNotification?.createdAt || rightTicket.createdAt || "");
       return (Number.isNaN(rightCreatedAt) ? 0 : rightCreatedAt) - (Number.isNaN(leftCreatedAt) ? 0 : leftCreatedAt);
+    });
+  const learningPlanTransferNotifications = accessibleTickets
+    .filter((ticket) => Boolean(ticket.pendingLearningPlanTransferNotification))
+    .sort((leftTicket, rightTicket) => {
+      const leftTransferredAt = Date.parse(leftTicket.pendingLearningPlanTransferNotification?.transferredAt || leftTicket.updatedAt || "");
+      const rightTransferredAt = Date.parse(rightTicket.pendingLearningPlanTransferNotification?.transferredAt || rightTicket.updatedAt || "");
+      return (Number.isNaN(rightTransferredAt) ? 0 : rightTransferredAt) - (Number.isNaN(leftTransferredAt) ? 0 : leftTransferredAt);
     });
   const totalAdminNotificationCount = pendingTransferRequests.length
     + pendingEscalationNotifications.length
@@ -1349,6 +1528,7 @@ const AgentDashboard = () => {
     + transferDecisionNotifications.length
     + escalationClosureNotifications.length
     + coverageTicketNotifications.length
+    + learningPlanTransferNotifications.length
     + coverageTutorResponseNotifications.length;
   const archivedNotificationLog = notificationLog
     .filter((item) => !item.isCurrent)
@@ -1553,6 +1733,10 @@ const AgentDashboard = () => {
       : buildStandardDocumentationDraft(activeDetail.ticket);
     const nextBaseline = JSON.stringify(nextDraft);
     const previousBaseline = activeDocumentationBaselineRef.current;
+    const canRestoreLocalStandardDraft = activeDetail.ticket.status === "Pending" && !activeDetail.ticket.isArchived;
+    const locallySavedStandardDraft = isCoverageTicket(activeDetail.ticket) || !canRestoreLocalStandardDraft
+      ? null
+      : standardDocumentationDraftsRef.current[nextDraft.ticketId] || null;
 
     setActiveDocumentationDraft((currentDraft) => {
       const hasLocalDraftChanges = Boolean(
@@ -1562,14 +1746,22 @@ const AgentDashboard = () => {
         && JSON.stringify(currentDraft) !== previousBaseline.value,
       );
 
-      return hasLocalDraftChanges ? currentDraft : nextDraft;
+      if (hasLocalDraftChanges) {
+        return currentDraft;
+      }
+
+      return locallySavedStandardDraft || nextDraft;
     });
     activeDocumentationBaselineRef.current = {
       ticketId: nextDraft.ticketId,
       value: nextBaseline,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- Keep the active documentation draft in sync with the tracked ticket fields only.
-  }, [activeDetail?.ticket.id, activeDetail?.ticket.updatedAt, activeDetail?.ticket.technicalSubcategory]);
+  }, [activeDetail?.ticket.id, activeDetail?.ticket.updatedAt, activeDetail?.ticket.technicalSubcategory, activeDetail?.ticket.status, activeDetail?.ticket.isArchived]);
+
+  useEffect(() => {
+    standardDocumentationDraftsRef.current = standardDocumentationDraftsByTicketId;
+  }, [standardDocumentationDraftsByTicketId]);
 
   useEffect(() => {
     consolePendingAttachmentsRef.current = consolePendingAttachments;
@@ -1646,15 +1838,35 @@ const AgentDashboard = () => {
   }, [isDashboardLikeView]);
 
   useEffect(() => {
-    if (!canManageUsers && adminView === "management") {
-      setAdminView("dashboard");
-      setDashboardSortOrder(getDefaultDashboardSortOrder(false));
+    const defaultAdminLandingView = getDefaultAdminLandingView(accessSession);
+    let nextView = adminView;
+
+    if ((nextView === "dashboard" || nextView === "console") && !canViewSupportDashboard) {
+      nextView = defaultAdminLandingView;
     }
-  }, [adminView, canManageUsers]);
+
+    if (nextView === "adminDashboard" && !canViewAdminDashboard) {
+      nextView = defaultAdminLandingView;
+    }
+
+    if (nextView === "coverage" && !canViewLearningPlanTeam) {
+      nextView = defaultAdminLandingView;
+    }
+
+    if (nextView === "management" && !canManageUsers) {
+      nextView = defaultAdminLandingView;
+    }
+
+    if (nextView !== adminView) {
+      setAdminView(nextView);
+      setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
+    }
+  }, [accessSession, adminView, canManageUsers, canViewAdminDashboard, canViewLearningPlanTeam, canViewSupportDashboard, learningPlanTeamSection]);
 
   useEffect(() => {
     const nextNotificationKeys = new Set<string>();
     const newCoverageTickets: TicketSummary[] = [];
+    const newLearningPlanTransfers: TicketSummary[] = [];
     const newTransferRequests: TicketSummary[] = [];
     const newEscalationNotifications: TicketSummary[] = [];
     const newTeamsCallNotifications: TicketSummary[] = [];
@@ -1673,6 +1885,19 @@ const AgentDashboard = () => {
       nextNotificationKeys.add(notificationKey);
       if (!seenTransferNotificationKeysRef.current.has(notificationKey)) {
         newCoverageTickets.push(ticket);
+      }
+    }
+
+    for (const ticket of learningPlanTransferNotifications) {
+      const pendingLearningPlanTransferNotification = ticket.pendingLearningPlanTransferNotification;
+      if (!pendingLearningPlanTransferNotification) {
+        continue;
+      }
+
+      const notificationKey = `learning-plan-transfer:${ticket.id}:${pendingLearningPlanTransferNotification.transferredAt}:${pendingLearningPlanTransferNotification.fromTeam}:${pendingLearningPlanTransferNotification.toTeam}`;
+      nextNotificationKeys.add(notificationKey);
+      if (!seenTransferNotificationKeysRef.current.has(notificationKey)) {
+        newLearningPlanTransfers.push(ticket);
       }
     }
 
@@ -1784,6 +2009,22 @@ const AgentDashboard = () => {
       );
     }
 
+    for (const ticket of newLearningPlanTransfers) {
+      const pendingLearningPlanTransferNotification = ticket.pendingLearningPlanTransferNotification;
+      if (!pendingLearningPlanTransferNotification) {
+        continue;
+      }
+
+      toast.info(
+        `${pendingLearningPlanTransferNotification.ticketId} moved from ${pendingLearningPlanTransferNotification.fromTeam} to ${pendingLearningPlanTransferNotification.toTeam}.`,
+      );
+      showAdminDesktopNotificationRef.current(
+        `learning-plan-transfer:${ticket.id}:${pendingLearningPlanTransferNotification.transferredAt}:${pendingLearningPlanTransferNotification.fromTeam}:${pendingLearningPlanTransferNotification.toTeam}`,
+        "Learning Plan Transfer",
+        `${pendingLearningPlanTransferNotification.ticketId} • ${pendingLearningPlanTransferNotification.fromTeam} to ${pendingLearningPlanTransferNotification.toTeam}`,
+      );
+    }
+
     for (const ticket of newTransferRequests) {
       const pendingTransferRequest = ticket.pendingTransferRequest;
       if (!pendingTransferRequest) {
@@ -1892,6 +2133,7 @@ const AgentDashboard = () => {
 
     if (
       newCoverageTickets.length > 0
+      || newLearningPlanTransfers.length > 0
       || newTransferRequests.length > 0
       || newEscalationNotifications.length > 0
       || newTeamsCallNotifications.length > 0
@@ -1904,7 +2146,7 @@ const AgentDashboard = () => {
     }
 
     seenTransferNotificationKeysRef.current = nextNotificationKeys;
-  }, [coverageTicketNotifications, coverageTutorResponseNotifications, escalationClosureNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications, waitingLiveChatNotifications]);
+  }, [coverageTicketNotifications, coverageTutorResponseNotifications, escalationClosureNotifications, learningPlanTransferNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications, waitingLiveChatNotifications]);
 
   useEffect(() => {
     if (!documentationTicketStatus) {
@@ -2333,6 +2575,30 @@ const AgentDashboard = () => {
       const updatedAgent = payload?.agent;
       if (updatedAgent) {
         setAgents((prev) => prev.map((a) => (a.id === updatedAgent.id ? { ...a, ...updatedAgent } : a)));
+        const isUpdatedSignedInAgent = (
+          (session?.id && updatedAgent.id === session.id)
+          || (session?.username && updatedAgent.username === session.username)
+        );
+        if (isUpdatedSignedInAgent && session) {
+          const nextSession = {
+            ...session,
+            role: updatedAgent.role || session.role,
+            fullName: updatedAgent.fullName || session.fullName,
+            email: updatedAgent.email ?? session.email,
+            legacySupportAccess: updatedAgent.legacySupportAccess,
+            legacyOperationsAccess: updatedAgent.legacyOperationsAccess,
+            legacyAdminAccess: updatedAgent.legacyAdminAccess,
+            entraDirectoryAdmin: updatedAgent.entraDirectoryAdmin,
+          };
+          persistAdminSessionState(nextSession);
+          const nextLandingView = getDefaultAdminLandingView(nextSession);
+          if (adminView === "dashboard" && !hasLegacySupportDashboardAccess(nextSession)) {
+            setAdminView(nextLandingView);
+          }
+          if (adminView === "coverage" && !hasLegacyOperationsDashboardAccess(nextSession)) {
+            setAdminView(nextLandingView);
+          }
+        }
       }
       void refreshAgentsOnly(true);
       toast.success(`Support access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
@@ -2376,6 +2642,10 @@ const AgentDashboard = () => {
 
   function shouldAutoAcknowledgeCoverageTicketNotification(ticket: TicketSummary) {
     return Boolean(ticket.pendingCoverageTicketNotification && session?.username);
+  }
+
+  function shouldAutoAcknowledgeLearningPlanTransferNotification(ticket: TicketSummary) {
+    return Boolean(ticket.pendingLearningPlanTransferNotification && session?.username);
   }
 
   async function acknowledgeCoverageTutorResponseSilently(ticket: TicketSummary) {
@@ -2428,6 +2698,31 @@ const AgentDashboard = () => {
     return payload;
   }
 
+  async function acknowledgeLearningPlanTransferNotificationSilently(ticket: TicketSummary) {
+    if (!shouldAutoAcknowledgeLearningPlanTransferNotification(ticket)) {
+      return null;
+    }
+
+    const response = await fetch(
+      `/api/admin/tickets/${encodeURIComponent(ticket.id)}/learning-plan-transfer-notification/acknowledge`,
+      {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({}),
+      },
+    );
+
+    const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+    if (!response.ok || !payload?.ticket) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        return null;
+      }
+      return null;
+    }
+
+    return payload;
+  }
+
   async function openTicket(ticketId: string, initialTab: TicketDetailTab = "conversation") {
     setActiveTicketId(ticketId);
     setActiveTicketTab(initialTab);
@@ -2440,6 +2735,10 @@ const AgentDashboard = () => {
       const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
       if (acknowledgedCoverageTicketPayload?.ticket) {
         payload = acknowledgedCoverageTicketPayload;
+      }
+      const acknowledgedLearningPlanTransferPayload = await acknowledgeLearningPlanTransferNotificationSilently(payload.ticket);
+      if (acknowledgedLearningPlanTransferPayload?.ticket) {
+        payload = acknowledgedLearningPlanTransferPayload;
       }
       const acknowledgedPayload = await acknowledgeCoverageTutorResponseSilently(payload.ticket);
       if (acknowledgedPayload?.ticket) {
@@ -2549,10 +2848,14 @@ const AgentDashboard = () => {
     // dashboard whenever the current route has no query string.
     if (!location.search) {
       processedConsoleDeepLinkRef.current = "";
-      if (adminView !== "dashboard") {
-        setDashboardSortOrder(getDefaultDashboardSortOrder(false));
-      }
-      setAdminView((currentView) => (currentView === "dashboard" ? currentView : "dashboard"));
+      setAdminView((currentView) => {
+        if (currentView !== "console") {
+          return currentView;
+        }
+        const defaultAdminLandingView = getDefaultAdminLandingView(sessionRef.current);
+        setDashboardSortOrder(getDefaultDashboardSortOrder(defaultAdminLandingView === "coverage"));
+        return defaultAdminLandingView;
+      });
       return;
     }
 
@@ -2816,7 +3119,14 @@ const AgentDashboard = () => {
         return currentDraft;
       }
 
-      return updater(baseDraft);
+      const nextDraft = updater(baseDraft);
+      if (nextDraft.ticketId) {
+        setStandardDocumentationDraftsByTicketId((currentDrafts) => ({
+          ...currentDrafts,
+          [nextDraft.ticketId]: nextDraft,
+        }));
+      }
+      return nextDraft;
     });
   }
 
@@ -3709,6 +4019,45 @@ const AgentDashboard = () => {
     }
   }
 
+  async function handleLearningPlanTransferNotificationAcknowledge(ticket: TicketSummary) {
+    if (!ticket.pendingLearningPlanTransferNotification || !session?.username || activeTransferRequestTicketId) {
+      return;
+    }
+
+    setActiveTransferRequestTicketId(ticket.id);
+
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/learning-plan-transfer-notification/acknowledge`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not clear this learning plan transfer alert right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      if (activeDetail?.ticket.id === ticket.id) {
+        syncDrafts(payload);
+      }
+      await refreshTicketsOnly(true);
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setActiveTransferRequestTicketId("");
+    }
+  }
+
   async function handleTeamsCallNotificationOpen(ticket: TicketSummary) {
     if (!ticket.pendingTeamsCallNotification || !session?.username || activeTransferRequestTicketId) {
       return;
@@ -3971,8 +4320,13 @@ const AgentDashboard = () => {
       && activeStandardDocumentationDirty
       ? freezeDocumentationCardsForSave(activeStandardDocumentationDraft)
       : null;
+    const serializedStandardDocumentationToSave = standardDocumentationToSave
+      ? serializeStandardDocumentationForRequest(standardDocumentationToSave)
+      : null;
+    const documentationUploadFiles = getDocumentationUploadFiles(standardDocumentationToSave);
 
     if (nextStatus !== activeDetail.ticket.status && !nextNote) {
+      standardActionNoteRef.current?.focus();
       toast.error("Add an internal note before changing the ticket status.");
       return;
     }
@@ -3985,7 +4339,7 @@ const AgentDashboard = () => {
         ...(overrides?.statusReason ? { statusReason: overrides.statusReason } : {}),
         slaStatus: overrides?.slaStatus ?? effectiveDraftSlaStatus,
         note: nextNote,
-        ...(standardDocumentationToSave ? { documentation: standardDocumentationToSave } : {}),
+        ...(serializedStandardDocumentationToSave ? { documentation: serializedStandardDocumentationToSave } : {}),
       };
 
       if (canAssignActiveTicket) {
@@ -3995,11 +4349,32 @@ const AgentDashboard = () => {
         }
       }
 
-      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
-        method: "PATCH",
-        headers: buildAdminJsonHeaders(),
-        body: JSON.stringify(requestBody),
-      });
+      let response: Response;
+      if (serializedStandardDocumentationToSave && documentationUploadFiles.length > 0) {
+        const formData = new FormData();
+        Object.entries(requestBody).forEach(([key, value]) => {
+          if (key === "documentation") {
+            formData.append(key, JSON.stringify(value));
+            return;
+          }
+
+          formData.append(key, value == null ? "" : String(value));
+        });
+        documentationUploadFiles.forEach((file) => {
+          formData.append("documentationFiles", file, file.name || "attachment");
+        });
+        response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
+          method: "POST",
+          headers: buildCsrfHeaders(),
+          body: formData,
+        });
+      } else {
+        response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
+          method: "PATCH",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify(requestBody),
+        });
+      }
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
@@ -4014,6 +4389,12 @@ const AgentDashboard = () => {
       setActiveDetail(payload);
       syncDrafts(payload);
       if (standardDocumentationToSave) {
+        revokeDocumentationDraftObjectUrls(standardDocumentationToSave);
+        setStandardDocumentationDraftsByTicketId((currentDrafts) => {
+          const nextDrafts = { ...currentDrafts };
+          delete nextDrafts[activeDetail.ticket.id];
+          return nextDrafts;
+        });
         setActiveDocumentationDraft(buildStandardDocumentationDraft(payload.ticket));
       }
       setTickets((currentTickets) => currentTickets.map((ticket) => (
@@ -4040,7 +4421,9 @@ const AgentDashboard = () => {
     const coverageDashboardKpiFilters: DashboardTicketFilter[] = ["open", "pending", "closed", "slaBreached"];
     const visibleKpis = isCoverageDashboardView
       ? kpis.filter((kpi) => coverageDashboardKpiFilters.includes(kpi.filter))
-      : kpis;
+      : isAdminDashboardView
+        ? kpis
+        : kpis.filter((kpi) => kpi.filter !== "coverage");
 
     return (
       <div className="space-y-5">
@@ -4224,7 +4607,7 @@ const AgentDashboard = () => {
                       </button>
                     ))}
                   </div>
-                  {!isCoverageDashboardView ? (
+                  {!isCoverageDashboardView && canUseTicketReceiving ? (
                     <div className="w-full sm:w-[170px]">
                       <Select
                         value={consoleStatus || "Off"}
@@ -4282,19 +4665,20 @@ const AgentDashboard = () => {
                       </SelectContent>
                     </Select>
                   </div>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="outline" className="w-full max-w-full justify-between gap-3 sm:w-[300px]">
-                        <span className="inline-flex items-center gap-2">
-                          <UserRound className="h-4 w-4 text-primary" />
-                          Team Status
-                        </span>
-                        <span className="text-xs text-muted-foreground">
-                          {availableAgentCount} available
-                        </span>
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" className="w-[min(92vw,340px)] p-0">
+                  {canUseTicketReceiving ? (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="outline" className="w-full max-w-full justify-between gap-3 sm:w-[300px]">
+                          <span className="inline-flex items-center gap-2">
+                            <UserRound className="h-4 w-4 text-primary" />
+                            Team Status
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {availableAgentCount} available
+                          </span>
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-[min(92vw,340px)] p-0">
                       <div className="border-b px-4 py-3">
                         <div className="text-sm font-semibold">Agent Status</div>
                         <div className="mt-1 text-xs text-muted-foreground">
@@ -4353,8 +4737,9 @@ const AgentDashboard = () => {
                           </div>
                         )}
                       </div>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  ) : null}
                   <div className="relative w-full xl:ml-auto xl:max-w-[360px]">
                     <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
@@ -4628,10 +5013,25 @@ const AgentDashboard = () => {
         value={adminView}
         onValueChange={(value) => {
           const nextView = value as AdminView;
+          if ((nextView === "dashboard" || nextView === "console") && !canViewSupportDashboard) {
+            return;
+          }
+          if (nextView === "adminDashboard" && !canViewAdminDashboard) {
+            return;
+          }
+          if (nextView === "coverage" && !canViewLearningPlanTeam) {
+            return;
+          }
+          if (nextView === "management" && !canManageUsers) {
+            return;
+          }
           if (nextView !== adminView) {
             closePanel();
           }
           setAdminView(nextView);
+          if (nextView === "dashboard" && dashboardTicketFilter === "coverage") {
+            setDashboardTicketFilter("all");
+          }
           setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
         }}
         className={cn(
@@ -4686,6 +5086,7 @@ const AgentDashboard = () => {
                     <DropdownMenuContent align="start" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
                       <AdminNotificationsPanel
                         coverageTickets={coverageTicketNotifications}
+                        learningPlanTransfers={learningPlanTransferNotifications}
                         requests={pendingTransferRequests}
                         escalations={pendingEscalationNotifications}
                         teamsCalls={pendingTeamsCallNotifications}
@@ -4700,6 +5101,7 @@ const AgentDashboard = () => {
                         onDecision={handleTransferRequestDecision}
                         onOpenTeamsCall={handleTeamsCallNotificationOpen}
                         onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
+                        onAcknowledgeLearningPlanTransfer={handleLearningPlanTransferNotificationAcknowledge}
                         onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
                         onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
                         onAcknowledgeCoverageResponse={handleCoverageTutorResponseAcknowledge}
@@ -4727,64 +5129,72 @@ const AgentDashboard = () => {
                       </div>
                     </div>
                   </div>
-                  <DropdownMenu open={isTransferNotificationsOpen} onOpenChange={setIsTransferNotificationsOpen}>
-                    <DropdownMenuTrigger asChild>
+                  <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-2">
+                    <DropdownMenu open={isTransferNotificationsOpen} onOpenChange={setIsTransferNotificationsOpen}>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Transfer requests"
+                          className="relative h-8 w-8 rounded-full border border-primary/10 bg-background/90 text-muted-foreground shadow-sm hover:bg-background hover:text-foreground"
+                        >
+                          <Bell className="h-4 w-4" />
+                          {totalAdminNotificationCount > 0 ? (
+                            <span className="absolute -right-1 -top-1 inline-flex min-w-[1.1rem] items-center justify-center rounded-full bg-destructive px-1 py-0.5 text-[10px] font-semibold leading-none text-destructive-foreground">
+                              {totalAdminNotificationCount}
+                            </span>
+                          ) : null}
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
+                        <AdminNotificationsPanel
+                          coverageTickets={coverageTicketNotifications}
+                          learningPlanTransfers={learningPlanTransferNotifications}
+                          requests={pendingTransferRequests}
+                          escalations={pendingEscalationNotifications}
+                          teamsCalls={pendingTeamsCallNotifications}
+                          waitingLiveChats={waitingLiveChatNotifications}
+                          currentConsoleStatus={myActualConsoleStatus}
+                          isUpdatingConsoleStatus={isUpdatingConsoleStatus}
+                          coverageResponses={coverageTutorResponseNotifications}
+                          escalationUpdates={escalationClosureNotifications}
+                          decisionUpdates={transferDecisionNotifications}
+                          notificationLog={archivedNotificationLog}
+                          activeTicketId={activeTransferRequestTicketId}
+                          onDecision={handleTransferRequestDecision}
+                          onOpenTeamsCall={handleTeamsCallNotificationOpen}
+                          onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
+                          onAcknowledgeLearningPlanTransfer={handleLearningPlanTransferNotificationAcknowledge}
+                          onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
+                          onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
+                          onAcknowledgeCoverageResponse={handleCoverageTutorResponseAcknowledge}
+                          onAcknowledgeDecision={handleTransferDecisionAcknowledge}
+                          onOpenTicket={openNotificationLogTicket}
+                          onSetAvailable={() => void updateConsoleStatus("Available")}
+                        />
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                    {!isStackedAdminLayout ? (
                       <Button
                         variant="ghost"
                         size="icon"
-                        aria-label="Transfer requests"
-                        className="absolute right-14 top-1/2 h-8 w-8 -translate-y-1/2 rounded-full border border-primary/10 bg-background/90 text-muted-foreground shadow-sm hover:bg-background hover:text-foreground"
+                        onClick={() => setIsAdminSidebarCollapsed((currentState) => !currentState)}
+                        aria-label={useCompactAdminSidebar ? "Expand sidebar" : "Collapse sidebar"}
+                        className="h-8 w-8 rounded-full border border-primary/10 bg-background/90 text-muted-foreground shadow-sm hover:bg-background hover:text-foreground"
                       >
-                        <Bell className="h-4 w-4" />
-                        {totalAdminNotificationCount > 0 ? (
-                          <span className="absolute -right-1 -top-1 inline-flex min-w-[1.1rem] items-center justify-center rounded-full bg-destructive px-1 py-0.5 text-[10px] font-semibold leading-none text-destructive-foreground">
-                            {totalAdminNotificationCount}
-                          </span>
-                        ) : null}
+                        <ChevronLeft className="h-4 w-4" />
                       </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
-                      <AdminNotificationsPanel
-                        coverageTickets={coverageTicketNotifications}
-                        requests={pendingTransferRequests}
-                        escalations={pendingEscalationNotifications}
-                        teamsCalls={pendingTeamsCallNotifications}
-                        waitingLiveChats={waitingLiveChatNotifications}
-                        currentConsoleStatus={myActualConsoleStatus}
-                        isUpdatingConsoleStatus={isUpdatingConsoleStatus}
-                        coverageResponses={coverageTutorResponseNotifications}
-                        escalationUpdates={escalationClosureNotifications}
-                        decisionUpdates={transferDecisionNotifications}
-                        notificationLog={archivedNotificationLog}
-                        activeTicketId={activeTransferRequestTicketId}
-                        onDecision={handleTransferRequestDecision}
-                        onOpenTeamsCall={handleTeamsCallNotificationOpen}
-                        onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
-                        onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
-                        onAcknowledgeEscalationUpdate={handleEscalationClosureAcknowledge}
-                        onAcknowledgeCoverageResponse={handleCoverageTutorResponseAcknowledge}
-                        onAcknowledgeDecision={handleTransferDecisionAcknowledge}
-                        onOpenTicket={openNotificationLogTicket}
-                        onSetAvailable={() => void updateConsoleStatus("Available")}
-                      />
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                  {!isStackedAdminLayout ? (
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setIsAdminSidebarCollapsed((currentState) => !currentState)}
-                      aria-label={useCompactAdminSidebar ? "Expand sidebar" : "Collapse sidebar"}
-                      className="absolute right-3 top-1/2 h-8 w-8 -translate-y-1/2 rounded-full border border-primary/10 bg-background/90 text-muted-foreground shadow-sm hover:bg-background hover:text-foreground"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                    </Button>
-                  ) : null}
+                    ) : null}
+                  </div>
                 </div>
               )}
             </div>
 
-            <div className="mt-4 flex min-h-0 flex-1 flex-col gap-4">
+            <div className="mt-4 flex min-h-0 flex-1 flex-col gap-3">
+              <div className={cn(
+                "min-h-0 flex-1 space-y-3 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+                useCompactAdminSidebar ? "pr-0" : "pr-1",
+              )}>
               <div className={cn(
                 "rounded-2xl border bg-secondary/40",
                 useCompactAdminSidebar ? "p-2" : "p-3",
@@ -4792,8 +5202,17 @@ const AgentDashboard = () => {
                 {useCompactAdminSidebar ? (
                     <div className="space-y-2 text-center text-[11px] font-medium text-muted-foreground">
                       <div className="rounded-xl border bg-background px-2 py-2">
-                        <div className="text-base font-semibold text-foreground">{activeTicketCount}</div>
-                        <div>Tickets</div>
+                        <div className="text-base font-semibold text-foreground">{overviewTicketCount}</div>
+                        <div>{overviewTicketCountLabel}</div>
+                        {overviewTicketBreakdownItems.length ? (
+                          <div className="mt-1 text-[10px] leading-tight text-muted-foreground">
+                            <span className="font-bold text-primary">{overviewTicketBreakdownItems[0].value}</span>
+                            <span className="ml-0.5">Cov</span>
+                            <span className="mx-1 text-muted-foreground/60">/</span>
+                            <span className="font-bold text-primary">{overviewTicketBreakdownItems[1].value}</span>
+                            <span className="ml-0.5">Oth</span>
+                          </div>
+                        ) : null}
                       </div>
                       <div className={cn("rounded-xl border px-2 py-2", myOpenChatCardToneClassName)}>
                         <div className="text-base font-semibold text-foreground">{myOpenChatCount}</div>
@@ -4804,9 +5223,20 @@ const AgentDashboard = () => {
                   <>
                     <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Overview</div>
                     <div className="mt-3 grid grid-cols-2 gap-3">
-                      <div className="rounded-xl border bg-background px-3 py-3">
-                        <div className="text-2xl font-bold">{activeTicketCount}</div>
-                        <div className="text-xs text-muted-foreground">Tickets</div>
+                      <div className="min-w-0 rounded-xl border bg-background px-3 py-3">
+                        <div className="text-2xl font-bold">{overviewTicketCount}</div>
+                        <div className="max-w-full text-xs leading-snug text-muted-foreground">
+                          {overviewTicketCountLabel}
+                        </div>
+                        {overviewTicketBreakdownItems.length ? (
+                          <div className="mt-1 max-w-full truncate text-[11px] leading-tight text-muted-foreground">
+                            <span className="font-bold text-primary">{overviewTicketBreakdownItems[0].value}</span>
+                            <span className="ml-0.5">Cov</span>
+                            <span className="mx-1.5 text-muted-foreground/60">/</span>
+                            <span className="font-bold text-primary">{overviewTicketBreakdownItems[1].value}</span>
+                            <span className="ml-0.5">Oth</span>
+                          </div>
+                        ) : null}
                       </div>
                       <div className={cn("rounded-xl border px-3 py-3", myOpenChatCardToneClassName)}>
                         <div className="text-2xl font-bold text-foreground">{myOpenChatCount}</div>
@@ -4817,87 +5247,107 @@ const AgentDashboard = () => {
                 )}
               </div>
 
-              <div className={cn(
-                "rounded-2xl border bg-secondary/35",
-                useCompactAdminSidebar ? "p-2" : "p-2.5",
-              )}>
-                {useCompactAdminSidebar ? (
-                  <div className="flex flex-col items-center gap-1 text-center">
-                    <span className={cn("h-2.5 w-2.5 rounded-full", presenceDotClassName(myActualConsoleStatus))} />
-                    <span className="text-[11px] font-semibold text-foreground">{myActualConsoleStatus}</span>
-                  </div>
-                ) : (
-                  <>
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                      <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                        My Status:
-                      </div>
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                        <Select
-                          value={consoleStatus || "Off"}
-                          onValueChange={(value) => void updateConsoleStatus(value as AdminSelectableConsoleStatus)}
-                          disabled={isUpdatingConsoleStatus}
-                        >
-                          <SelectTrigger
-                            aria-label="Set your console status"
-                            className={cn(
-                              "h-8 w-full text-sm sm:w-[150px]",
-                              (consoleStatus || "Off") === "Available"
-                                ? "border-emerald-200 bg-emerald-50/80 text-emerald-700"
-                                : "border-slate-200 bg-slate-50/80 text-slate-600",
-                            )}
-                          >
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {adminSelectableConsoleStatuses.map((status) => (
-                              <SelectItem key={status} value={status}>{status}</SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        {isUpdatingConsoleStatus ? (
-                          <span className="text-[11px] text-muted-foreground">Saving...</span>
-                        ) : null}
-                      </div>
+              {canUseTicketReceiving ? (
+                <div className={cn(
+                  "rounded-2xl border bg-secondary/35",
+                  useCompactAdminSidebar ? "p-2" : "p-2.5",
+                )}>
+                  {useCompactAdminSidebar ? (
+                    <div className="flex flex-col items-center gap-1 text-center">
+                      <span className={cn("h-2.5 w-2.5 rounded-full", presenceDotClassName(myActualConsoleStatus))} />
+                      <span className="text-[11px] font-semibold text-foreground">{myActualConsoleStatus}</span>
                     </div>
-                  </>
-                )}
-              </div>
+                  ) : (
+                    <>
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                          My Status:
+                        </div>
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                          <Select
+                            value={consoleStatus || "Off"}
+                            onValueChange={(value) => void updateConsoleStatus(value as AdminSelectableConsoleStatus)}
+                            disabled={isUpdatingConsoleStatus}
+                          >
+                            <SelectTrigger
+                              aria-label="Set your console status"
+                              className={cn(
+                                "h-8 w-full text-sm sm:w-[150px]",
+                                (consoleStatus || "Off") === "Available"
+                                  ? "border-emerald-200 bg-emerald-50/80 text-emerald-700"
+                                  : "border-slate-200 bg-slate-50/80 text-slate-600",
+                              )}
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {adminSelectableConsoleStatuses.map((status) => (
+                                <SelectItem key={status} value={status}>{status}</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {isUpdatingConsoleStatus ? (
+                            <span className="text-[11px] text-muted-foreground">Saving...</span>
+                          ) : null}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : null}
 
               <TabsList className={cn(
                 "grid h-auto w-full grid-cols-1 gap-2 bg-transparent p-0",
                 useCompactAdminSidebar && "justify-items-center",
               )}>
-                <TabsTrigger
-                  value="dashboard"
-                  className={cn(
-                    "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                    useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
-                  )}
-                >
-                  <LayoutDashboard className="h-4 w-4 shrink-0" />
-                  {!useCompactAdminSidebar ? <span>Admin Dashboard</span> : null}
-                </TabsTrigger>
-                <TabsTrigger
-                  value="coverage"
-                  className={cn(
-                    "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                    useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
-                  )}
-                >
-                  <FileText className="h-4 w-4 shrink-0" />
-                  {!useCompactAdminSidebar ? <span>Learning Plan Team</span> : null}
-                </TabsTrigger>
-                <TabsTrigger
-                  value="console"
-                  className={cn(
-                    "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                    useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
-                  )}
-                >
-                  <MessageSquareText className="h-4 w-4 shrink-0" />
-                  {!useCompactAdminSidebar ? <span>Chat Console</span> : null}
-                </TabsTrigger>
+                {canViewAdminDashboard ? (
+                  <TabsTrigger
+                    value="adminDashboard"
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <LayoutDashboard className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span>Admin Dashboard</span> : null}
+                  </TabsTrigger>
+                ) : null}
+                {canViewSupportDashboard ? (
+                  <TabsTrigger
+                    value="dashboard"
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <Headphones className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span>Support Dashboard</span> : null}
+                  </TabsTrigger>
+                ) : null}
+                {canViewLearningPlanTeam ? (
+                  <TabsTrigger
+                    value="coverage"
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <FileText className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span>Learning Plan Team</span> : null}
+                  </TabsTrigger>
+                ) : null}
+                {canViewSupportDashboard ? (
+                  <TabsTrigger
+                    value="console"
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <MessageSquareText className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span>Chat Console</span> : null}
+                  </TabsTrigger>
+                ) : null}
               </TabsList>
 
               {!useCompactAdminSidebar && adminView === "console" ? (
@@ -4982,8 +5432,12 @@ const AgentDashboard = () => {
                   </TabsTrigger>
                 </TabsList>
               ) : null}
+              </div>
 
-              <div className={cn("mt-auto flex gap-2", isStackedAdminLayout ? "flex-row flex-wrap" : "flex-col")}>
+              <div className={cn(
+                "shrink-0 border-t border-border/70 pt-3 flex gap-2",
+                isStackedAdminLayout ? "flex-row flex-wrap" : "flex-col",
+              )}>
                 <Button asChild variant="outline" size={useCompactAdminSidebar ? "icon" : "sm"} className={cn(!useCompactAdminSidebar && "justify-start")}>
                   <Link to="/">
                     <ArrowLeft className={cn("h-4 w-4", !useCompactAdminSidebar && "mr-2")} />
@@ -5007,16 +5461,27 @@ const AgentDashboard = () => {
 
           <div className={cn("flex min-w-0 w-full flex-1 flex-col", isStackedAdminLayout ? "overflow-visible" : "overflow-hidden")}>
 
-          <TabsContent value="dashboard" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
-            {renderDashboardWorkspace()}
-          </TabsContent>
+          {canViewAdminDashboard ? (
+            <TabsContent value="adminDashboard" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+              {renderDashboardWorkspace()}
+            </TabsContent>
+          ) : null}
 
-          <TabsContent value="coverage" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
-            {renderDashboardWorkspace()}
-          </TabsContent>
+          {canViewSupportDashboard ? (
+            <TabsContent value="dashboard" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+              {renderDashboardWorkspace()}
+            </TabsContent>
+          ) : null}
+
+          {canViewLearningPlanTeam ? (
+            <TabsContent value="coverage" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+              {renderDashboardWorkspace()}
+            </TabsContent>
+          ) : null}
 
 
-          <TabsContent value="management" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
+          {canManageUsers ? (
+            <TabsContent value="management" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
             <div className="space-y-6">
               <div className="rounded-3xl border bg-card shadow-card">
                 <div className="border-b px-4 py-4 sm:px-5">
@@ -5116,9 +5581,11 @@ const AgentDashboard = () => {
               </div>
             </div>
 
-          </TabsContent>
+            </TabsContent>
+          ) : null}
 
-          <TabsContent value="console" className="mt-0 min-h-0 flex-1">
+          {canViewSupportDashboard ? (
+            <TabsContent value="console" className="mt-0 min-h-0 flex-1">
             <div className="h-full min-h-0 overflow-hidden rounded-3xl border bg-card p-3 shadow-card md:p-4">
               <div className="flex h-full flex-col">
                 <div className="flex flex-wrap items-center gap-3">
@@ -5505,7 +5972,8 @@ const AgentDashboard = () => {
                 </div>
               </div>
             </div>
-          </TabsContent>
+            </TabsContent>
+          ) : null}
           </div>
         </div>
       </Tabs>
@@ -5540,6 +6008,7 @@ const AgentDashboard = () => {
                   ticket={activeDetail.ticket}
                   history={activeDetail.history}
                   draft={activeCoverageDocumentationDraft}
+                  currentAdmin={session}
                   readOnly={activeCoverageDocumentationReadOnly}
                   isSaving={isSavingActiveDocumentation}
                   isSavingDetails={isSaving}
@@ -5681,14 +6150,15 @@ const AgentDashboard = () => {
                   ) : null}
 
                   <TabsContent value="documentation" className="space-y-5">
-                    {isActiveStandardDocumentationTicket && activeStandardDocumentationDraft ? (
+                    {shouldRenderStandardDocumentationWorkspace && standardDocumentationWorkspaceDraft ? (
                       <StandardDocumentationWorkspace
                         ticket={activeDetail.ticket}
-                        draft={activeStandardDocumentationDraft}
+                        draft={standardDocumentationWorkspaceDraft}
+                        currentAdmin={session}
                         attachments={activeDetail.attachments}
                         readOnly={!isActiveStandardDocumentationTicket}
                         isSaving={isSaving}
-                        isDirty={activeStandardDocumentationDirty}
+                        isDirty={isActiveStandardDocumentationTicket && activeStandardDocumentationDirty}
                         onDraftUpdate={updateActiveStandardDocumentation}
                       />
                     ) : (
@@ -5809,28 +6279,46 @@ const AgentDashboard = () => {
                       <ActivityLogTimeline history={activeDetail.history} />
                     </section>
 
-                    <section>
-                      <Label className="mb-1.5 block">Internal notes</Label>
-                      <Textarea
-                        rows={4}
-                        placeholder="Add an internal note visible to support staff only..."
-                        value={notes}
-                        onChange={(event) => setNotes(event.target.value)}
-                        readOnly={activeTicketIsArchived}
-                      />
-                      {isStatusChanging ? (
-                        <p className={cn("mt-2 text-xs", canSubmitStatusChange ? "text-muted-foreground" : "text-destructive")}>
-                          A note is required before changing this ticket status.
-                        </p>
-                      ) : (
-                        <p className="mt-2 text-xs text-muted-foreground">
-                          Add a note here to explain any admin action or handoff.
-                        </p>
-                      )}
-                    </section>
                   </TabsContent>
                 </Tabs>
               </div>
+
+              {!activeTicketIsArchived ? (
+                <section className={cn(
+                  "rounded-2xl border bg-card/95 p-4 shadow-sm",
+                  !canSubmitStatusChange && "border-destructive/40 bg-destructive/[0.03]",
+                )}>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Label htmlFor="standard-action-note" className="text-sm font-semibold">
+                      Internal note
+                    </Label>
+                    <span className={cn(
+                      "rounded-full border px-2.5 py-0.5 text-[11px] font-semibold",
+                      activeDetail.ticket.status !== "Closed" || isStatusChanging
+                        ? "border-amber-200 bg-amber-50 text-amber-700"
+                        : "border-slate-200 bg-slate-50 text-slate-600",
+                    )}>
+                      {activeDetail.ticket.status !== "Closed" || isStatusChanging ? "Required to close/change status" : "Optional"}
+                    </span>
+                  </div>
+                  <Textarea
+                    id="standard-action-note"
+                    ref={standardActionNoteRef}
+                    rows={3}
+                    className="mt-2 rounded-2xl bg-white"
+                    placeholder="Add an internal note before closing or changing this ticket status..."
+                    value={notes}
+                    onChange={(event) => setNotes(event.target.value)}
+                  />
+                  <p className={cn("mt-2 text-xs", !canSubmitStatusChange ? "text-destructive" : "text-muted-foreground")}>
+                    {isStatusChanging
+                      ? "A note is required before changing this ticket status."
+                      : activeDetail.ticket.status !== "Closed"
+                        ? "Write the reason here before closing the ticket. Documentation-only saves can still be saved without a note."
+                        : "This note is visible to support staff only and will be saved in the activity log."}
+                  </p>
+                </section>
+              ) : null}
 
               <SheetFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
                 {canTransferActiveTicketToTeam ? (
@@ -6349,6 +6837,7 @@ const AgentStatusLabel = ({
 
 const AdminNotificationsPanel = ({
   coverageTickets,
+  learningPlanTransfers,
   requests,
   escalations,
   teamsCalls,
@@ -6363,6 +6852,7 @@ const AdminNotificationsPanel = ({
   onDecision,
   onOpenTeamsCall,
   onAcknowledgeCoverageTicket,
+  onAcknowledgeLearningPlanTransfer,
   onAcknowledgeEscalation,
   onAcknowledgeEscalationUpdate,
   onAcknowledgeCoverageResponse,
@@ -6371,6 +6861,7 @@ const AdminNotificationsPanel = ({
   onSetAvailable,
 }: {
   coverageTickets: TicketSummary[];
+  learningPlanTransfers: TicketSummary[];
   requests: TicketSummary[];
   escalations: TicketSummary[];
   teamsCalls: TicketSummary[];
@@ -6385,6 +6876,7 @@ const AdminNotificationsPanel = ({
   onDecision: (ticket: TicketSummary, action: "accept" | "reject") => Promise<void>;
   onOpenTeamsCall: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeCoverageTicket: (ticket: TicketSummary) => Promise<void>;
+  onAcknowledgeLearningPlanTransfer: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeEscalation: (ticket: TicketSummary, openChat?: boolean) => Promise<void>;
   onAcknowledgeEscalationUpdate: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeCoverageResponse: (ticket: TicketSummary) => Promise<void>;
@@ -6394,6 +6886,7 @@ const AdminNotificationsPanel = ({
 }) => {
   if (
     coverageTickets.length === 0
+    && learningPlanTransfers.length === 0
     && requests.length === 0
     && escalations.length === 0
     && teamsCalls.length === 0
@@ -6417,7 +6910,7 @@ const AdminNotificationsPanel = ({
           Admin Notifications
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
-          Review active alerts and the recent notification log for new coverage tickets, transfer, escalation, coverage tutor replies, Teams calls, and waiting live chat activity.
+          Review active alerts and the recent notification log for new coverage tickets, learning plan transfers, transfer requests, escalation, coverage tutor replies, Teams calls, and waiting live chat activity.
         </div>
       </div>
       <div className="max-h-[420px] space-y-2 overflow-y-auto p-2">
@@ -6475,6 +6968,72 @@ const AdminNotificationsPanel = ({
                   variant="outline"
                   disabled={Boolean(activeTicketId)}
                   onClick={() => void onAcknowledgeCoverageTicket(ticket)}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          );
+        })}
+        {learningPlanTransfers.length > 0 ? (
+          <div className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            Learning Plan Transfers
+          </div>
+        ) : null}
+        {learningPlanTransfers.map((ticket) => {
+          const pendingLearningPlanTransferNotification = ticket.pendingLearningPlanTransferNotification;
+          if (!pendingLearningPlanTransferNotification) {
+            return null;
+          }
+
+          const isBusy = activeTicketId === ticket.id;
+
+          return (
+            <div key={`${ticket.id}-${pendingLearningPlanTransferNotification.transferredAt}`} className="rounded-2xl border border-emerald-200 bg-emerald-50/70 px-3 py-3 shadow-soft">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-mono text-xs font-semibold text-emerald-700">Ticket {pendingLearningPlanTransferNotification.ticketId}</div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground">
+                    {pendingLearningPlanTransferNotification.requesterName || getRequesterDisplayName(ticket)}
+                  </div>
+                  <div className="mt-2">
+                    <RequesterRoleBadge
+                      role={pendingLearningPlanTransferNotification.requesterRole || ticket.requesterRole}
+                      source={ticket.requesterSource}
+                      className="border-emerald-200 bg-white/80 text-emerald-700"
+                    />
+                  </div>
+                  <div className="mt-1 text-xs text-emerald-700/80">
+                    {pendingLearningPlanTransferNotification.fromTeam} to {pendingLearningPlanTransferNotification.toTeam} • {formatDateTime(pendingLearningPlanTransferNotification.transferredAt)}
+                  </div>
+                  {pendingLearningPlanTransferNotification.transferredByName ? (
+                    <div className="mt-1 text-xs text-emerald-700/80">
+                      Transferred by {pendingLearningPlanTransferNotification.transferredByName}
+                    </div>
+                  ) : null}
+                </div>
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
+              </div>
+              {ticket.inquiryPreview ? (
+                <div className="mt-3 rounded-xl border border-emerald-200/80 bg-background px-3 py-2 text-sm leading-6 text-foreground">
+                  {ticket.inquiryPreview}
+                </div>
+              ) : null}
+              <div className="mt-3 flex gap-2">
+                <Button
+                  size="sm"
+                  className="border-0 bg-emerald-600 text-white hover:bg-emerald-700"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onOpenTicket(ticket.id)}
+                >
+                  {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Open Ticket
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onAcknowledgeLearningPlanTransfer(ticket)}
                 >
                   Dismiss
                 </Button>
@@ -7455,6 +8014,7 @@ const CoverageTicketWorkspace = ({
   ticket,
   history,
   draft,
+  currentAdmin,
   readOnly,
   isSaving,
   isSavingDetails,
@@ -7489,6 +8049,7 @@ const CoverageTicketWorkspace = ({
   ticket: TicketDetail;
   history: HistoryItem[];
   draft: AdminDocumentation;
+  currentAdmin: AdminSession | null;
   readOnly: boolean;
   isSaving: boolean;
   isSavingDetails: boolean;
@@ -7667,6 +8228,7 @@ const CoverageTicketWorkspace = ({
               ...card,
               ...updates,
               updatedAt: timestamp,
+              ...buildCoverageCardActorFields(currentAdmin, "updated"),
             }
           : card
       )),
@@ -7679,7 +8241,7 @@ const CoverageTicketWorkspace = ({
       ...currentDraft,
       coverageCards: currentDraft.coverageCards.some(isOpenCoverageTutorChoiceDraft)
         ? currentDraft.coverageCards
-        : [...currentDraft.coverageCards, createCoverageTutorChoiceCard(currentDraft.inquiry)],
+        : [...currentDraft.coverageCards, createCoverageTutorChoiceCard(currentDraft.inquiry, currentAdmin)],
     }));
   };
 
@@ -7687,7 +8249,7 @@ const CoverageTicketWorkspace = ({
     expandCoverageHistoryCards();
     onDraftUpdate((currentDraft) => ({
       ...currentDraft,
-      coverageCards: [...currentDraft.coverageCards, createCoverageNoteCard()],
+      coverageCards: [...currentDraft.coverageCards, createCoverageNoteCard(currentAdmin)],
     }));
   };
 
@@ -7890,6 +8452,7 @@ const CoverageTicketWorkspace = ({
                 ...card,
                 presentationFiles: [...card.presentationFiles, ...nextFiles],
                 updatedAt: new Date().toISOString(),
+                ...buildCoverageCardActorFields(currentAdmin, "updated"),
               }
             : card
         )),
@@ -7909,6 +8472,7 @@ const CoverageTicketWorkspace = ({
               ...card,
               presentationFiles: card.presentationFiles.filter((file) => file.id !== fileId),
               updatedAt: new Date().toISOString(),
+              ...buildCoverageCardActorFields(currentAdmin, "updated"),
             }
           : card
       )),
@@ -8233,7 +8797,7 @@ const CoverageTicketWorkspace = ({
                       ) : null}
                     </div>
                     <div className={cn("rounded-full border bg-white px-3 py-1 text-xs font-medium", replyBorderClassName, replyMutedTextClassName)}>
-                      {buildCoverageCardTimestampLabel(card.createdAt, card.updatedAt)}
+                      {buildCoverageCardMetaLabel(card)}
                     </div>
                     {canCollapseCard ? (
                       <button
@@ -8404,7 +8968,7 @@ const CoverageTicketWorkspace = ({
                     </div>
                     <div className="flex items-center gap-2">
                       <div className="rounded-full border bg-background px-3 py-1 text-xs font-medium text-muted-foreground">
-                        {buildCoverageCardTimestampLabel(card.createdAt, card.updatedAt)}
+                        {buildCoverageCardMetaLabel(card)}
                       </div>
                       {canCollapseCard ? (
                         <button
@@ -8497,7 +9061,7 @@ const CoverageTicketWorkspace = ({
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="rounded-full border bg-background px-3 py-1 text-xs font-medium text-muted-foreground">
-                      {buildCoverageCardTimestampLabel(card.createdAt, card.updatedAt)}
+                      {buildCoverageCardMetaLabel(card)}
                     </div>
                     {canCollapseCard ? (
                       <button
@@ -9599,6 +10163,7 @@ const documentationCardFields: {
 const StandardDocumentationWorkspace = ({
   ticket,
   draft,
+  currentAdmin,
   attachments,
   readOnly,
   isSaving,
@@ -9607,6 +10172,7 @@ const StandardDocumentationWorkspace = ({
 }: {
   ticket: TicketDetail;
   draft: AdminDocumentation;
+  currentAdmin: AdminSession | null;
   attachments: AttachmentItem[];
   readOnly: boolean;
   isSaving: boolean;
@@ -9615,6 +10181,7 @@ const StandardDocumentationWorkspace = ({
 }) => {
   const [collapsedCardIds, setCollapsedCardIds] = useState<Set<string>>(new Set());
   const cardRefs = useRef<Record<string, HTMLElement | null>>({});
+  const attachmentInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const cardsForDisplay = sortDocumentationWorkflowCardsForDisplay(draft.documentationCards);
 
   useEffect(() => {
@@ -9641,7 +10208,7 @@ const StandardDocumentationWorkspace = ({
       return;
     }
 
-    const nextCard = createDocumentationCard();
+    const nextCard = createDocumentationCard(currentAdmin);
     onDraftUpdate((currentDraft) => ({
       ...currentDraft,
       documentationCards: [nextCard, ...currentDraft.documentationCards],
@@ -9677,13 +10244,72 @@ const StandardDocumentationWorkspace = ({
       ...currentDraft,
       documentationCards: currentDraft.documentationCards.map((card) => (
         card.id === cardId && !card.locked
-          ? { ...card, [field]: value, updatedAt: new Date().toISOString() }
+          ? {
+              ...card,
+              [field]: value,
+              updatedAt: new Date().toISOString(),
+              ...buildDocumentationCardActorFields(currentAdmin, "updated"),
+            }
+          : card
+      )),
+    }));
+  }
+
+  function handleDocumentationAttachmentsAdded(cardId: string, event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    const oversizedFiles = getOversizedCoveragePresentationFiles(files);
+    if (oversizedFiles.length > 0) {
+      toast.error(`Each documentation attachment must be ${formatBytes(coveragePresentationMaxFileBytes)} or smaller.`);
+      return;
+    }
+
+    const nextFiles = files.map(createPendingCoverageCardAttachment);
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      documentationCards: currentDraft.documentationCards.map((card) => (
+        card.id === cardId && !card.locked
+          ? {
+              ...card,
+              attachments: [...card.attachments, ...nextFiles],
+              updatedAt: new Date().toISOString(),
+              ...buildDocumentationCardActorFields(currentAdmin, "updated"),
+            }
+          : card
+      )),
+    }));
+  }
+
+  function removeDocumentationAttachment(cardId: string, attachmentId: string) {
+    const targetCard = draft.documentationCards.find((card) => card.id === cardId);
+    targetCard?.attachments
+      .filter((file) => file.id === attachmentId)
+      .forEach(revokeCoverageAttachmentObjectUrl);
+
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      documentationCards: currentDraft.documentationCards.map((card) => (
+        card.id === cardId && !card.locked
+          ? {
+              ...card,
+              attachments: card.attachments.filter((file) => file.id !== attachmentId),
+              updatedAt: new Date().toISOString(),
+              ...buildDocumentationCardActorFields(currentAdmin, "updated"),
+            }
           : card
       )),
     }));
   }
 
   function discardDocumentationCard(cardId: string) {
+    draft.documentationCards
+      .find((card) => card.id === cardId)
+      ?.attachments.forEach(revokeCoverageAttachmentObjectUrl);
     onDraftUpdate((currentDraft) => ({
       ...currentDraft,
       documentationCards: currentDraft.documentationCards.filter((card) => card.id !== cardId || card.locked),
@@ -9757,17 +10383,21 @@ const StandardDocumentationWorkspace = ({
           <div>
             <h3 className="text-sm font-semibold text-foreground">Agent Documentation Cards</h3>
             <p className="mt-1 text-xs text-muted-foreground">
-              Add updates while the ticket is pending. Saved cards become frozen history.
+              {readOnly
+                ? "Saved documentation cards are shown as frozen history."
+                : "Add updates while the ticket is pending. Saved cards become frozen history."}
             </p>
           </div>
-          <Button
-            type="button"
-            className="border-0 bg-gradient-to-r from-primary to-violet-500 text-white shadow-[0_12px_26px_rgba(82,54,188,0.22)] hover:opacity-95"
-            onClick={addDocumentationCard}
-            disabled={readOnly || isSaving}
-          >
-            Add Documentation Card
-          </Button>
+          {!readOnly ? (
+            <Button
+              type="button"
+              className="border-0 bg-gradient-to-r from-primary to-violet-500 text-white shadow-[0_12px_26px_rgba(82,54,188,0.22)] hover:opacity-95"
+              onClick={addDocumentationCard}
+              disabled={isSaving}
+            >
+              Add Documentation Card
+            </Button>
+          ) : null}
         </div>
 
         {cardsForDisplay.length > 0 ? (
@@ -9852,6 +10482,18 @@ const StandardDocumentationWorkspace = ({
                           ))}
                         </div>
                       )}
+                      {card.attachments.length > 0 || !isCardReadOnly ? (
+                        <DocumentationCardAttachmentsBlock
+                          card={card}
+                          readOnly={isCardReadOnly}
+                          inputRef={(element) => {
+                            attachmentInputRefs.current[card.id] = element;
+                          }}
+                          onAttachClick={() => attachmentInputRefs.current[card.id]?.click()}
+                          onFilesAdded={(event) => handleDocumentationAttachmentsAdded(card.id, event)}
+                          onRemove={(fileId) => removeDocumentationAttachment(card.id, fileId)}
+                        />
+                      ) : null}
                     </div>
                   ) : null}
                 </article>
@@ -9882,6 +10524,102 @@ const ReadOnlyDocumentationBlock = ({
   <div className="rounded-2xl border bg-white/85 px-4 py-3">
     <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">{label}</div>
     <div className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">{value.trim() ? value : "-"}</div>
+  </div>
+);
+
+const DocumentationCardAttachmentsBlock = ({
+  card,
+  readOnly,
+  inputRef,
+  onAttachClick,
+  onFilesAdded,
+  onRemove,
+}: {
+  card: DocumentationWorkflowCard;
+  readOnly: boolean;
+  inputRef: (element: HTMLInputElement | null) => void;
+  onAttachClick: () => void;
+  onFilesAdded: (event: ChangeEvent<HTMLInputElement>) => void;
+  onRemove: (fileId: string) => void;
+}) => (
+  <div className="mt-4 rounded-2xl border border-dashed border-primary/15 bg-white/70 p-3">
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+        <Paperclip className="h-3.5 w-3.5" />
+        Attachments
+      </div>
+      {!readOnly ? (
+        <>
+          <input
+            ref={inputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={onFilesAdded}
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full px-3 text-xs"
+            onClick={onAttachClick}
+          >
+            <Paperclip className="mr-2 h-3.5 w-3.5" />
+            Attach Files
+          </Button>
+        </>
+      ) : null}
+    </div>
+
+    {card.attachments.length > 0 ? (
+      <div className="mt-3 grid gap-2">
+        {card.attachments.map((file) => {
+          const source = getCoverageAttachmentSource(file);
+          const previewKind = getCoverageAttachmentPreviewKind(file);
+
+          return (
+            <div key={file.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border bg-background/90 px-3 py-2.5 shadow-sm">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-semibold text-foreground">{file.name || "attachment"}</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {(file.mimeType || "application/octet-stream")} - {formatBytes(file.size || 0)}
+                  {previewKind === "image" ? " - Image" : previewKind === "pdf" ? " - PDF" : ""}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {source ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 rounded-full px-3 text-xs"
+                    onClick={() => window.open(source, "_blank", "noopener,noreferrer")}
+                  >
+                    Open
+                  </Button>
+                ) : null}
+                {!readOnly ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 rounded-full text-muted-foreground hover:text-destructive"
+                    onClick={() => onRemove(file.id)}
+                    aria-label={`Remove ${file.name || "attachment"}`}
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    ) : (
+      <div className="mt-3 rounded-2xl border border-dashed bg-secondary/20 px-3 py-3 text-sm text-muted-foreground">
+        No attachments added to this documentation card yet.
+      </div>
+    )}
   </div>
 );
 
@@ -10039,6 +10777,8 @@ const TeamTransferMenu = ({
   align?: "start" | "center" | "end";
 }) => {
   const normalizedAssignedTeam = normalizeAssignedTeamName(assignedTeam);
+  const isAssignedToLearningPlan = isLearningPlanAssignedTeam(assignedTeam);
+  const actionLabel = isAssignedToLearningPlan ? "Return" : "Transfer";
   const availableTeamOptions = dashboardTeamTransferOptions.filter(
     (teamOption) => normalizeAssignedTeamName(teamOption.value) !== normalizedAssignedTeam,
   );
@@ -10052,19 +10792,19 @@ const TeamTransferMenu = ({
           variant="outline"
           className={cn("h-8 whitespace-nowrap rounded-full", className)}
           disabled={disabled || isLoading || availableTeamOptions.length === 0}
-          aria-label={`Transfer ticket ${ticketId} to another team`}
+          aria-label={`${actionLabel} ticket ${ticketId} to another team`}
         >
           {isLoading ? (
             <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" />
           ) : (
             <ArrowRightLeft className="mr-1.5 h-3.5 w-3.5" />
           )}
-          Transfer
+          {actionLabel}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align={align} className="w-[min(90vw,280px)] rounded-2xl p-2">
         <DropdownMenuLabel className="text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
-          Transfer to team
+          {isAssignedToLearningPlan ? "Return to team" : "Transfer to team"}
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         {availableTeamOptions.map((teamOption) => {
@@ -10206,6 +10946,12 @@ function isLearningPlanOtherTicket(
   return !isCoverageTicket(ticket) && isLearningPlanAssignedTeam(ticket?.assignedTeam);
 }
 
+function isLearningPlanTicket(
+  ticket?: Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> | null,
+) {
+  return isCoverageTicket(ticket) || isLearningPlanAssignedTeam(ticket?.assignedTeam);
+}
+
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
   return ticket?.isArchived === true;
 }
@@ -10336,7 +11082,34 @@ function CoverageInquirySummary({ inquiry }: { inquiry: string }) {
   );
 }
 
-function createCoverageTutorChoiceCard(inquiry: string): CoverageWorkflowCard {
+function buildCoverageCardActorFields(
+  admin: Pick<AdminSession, "id" | "fullName" | "username"> | null | undefined,
+  prefix: "created" | "updated",
+): Partial<CoverageWorkflowCard> {
+  if (!admin) {
+    return {};
+  }
+
+  const actorName = admin.fullName || admin.username || "";
+  if (prefix === "created") {
+    return {
+      createdByAgentId: admin.id || null,
+      createdByAgentName: actorName,
+      createdByAgentUsername: admin.username || "",
+    };
+  }
+
+  return {
+    updatedByAgentId: admin.id || null,
+    updatedByAgentName: actorName,
+    updatedByAgentUsername: admin.username || "",
+  };
+}
+
+function createCoverageTutorChoiceCard(
+  inquiry: string,
+  currentAdmin?: Pick<AdminSession, "id" | "fullName" | "username"> | null,
+): CoverageWorkflowCard {
   const timestamp = new Date().toISOString();
   const parsedInquiry = parseCoverageInquiry(inquiry);
 
@@ -10356,6 +11129,8 @@ function createCoverageTutorChoiceCard(inquiry: string): CoverageWorkflowCard {
     locked: false,
     createdAt: timestamp,
     updatedAt: timestamp,
+    ...buildCoverageCardActorFields(currentAdmin, "created"),
+    ...buildCoverageCardActorFields(currentAdmin, "updated"),
     submittedAt: "",
     respondedAt: "",
     relatedTutorChoiceCardId: "",
@@ -10373,7 +11148,9 @@ function createCoverageTutorChoiceCard(inquiry: string): CoverageWorkflowCard {
   };
 }
 
-function createCoverageNoteCard(): CoverageWorkflowCard {
+function createCoverageNoteCard(
+  currentAdmin?: Pick<AdminSession, "id" | "fullName" | "username"> | null,
+): CoverageWorkflowCard {
   const timestamp = new Date().toISOString();
 
   return {
@@ -10392,6 +11169,8 @@ function createCoverageNoteCard(): CoverageWorkflowCard {
     locked: false,
     createdAt: timestamp,
     updatedAt: timestamp,
+    ...buildCoverageCardActorFields(currentAdmin, "created"),
+    ...buildCoverageCardActorFields(currentAdmin, "updated"),
     submittedAt: "",
     respondedAt: "",
     relatedTutorChoiceCardId: "",
@@ -10512,6 +11291,12 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           locked: Boolean(card.locked),
           createdAt: card.createdAt || "",
           updatedAt: card.updatedAt || "",
+          createdByAgentId: card.createdByAgentId ?? null,
+          createdByAgentName: card.createdByAgentName || "",
+          createdByAgentUsername: card.createdByAgentUsername || "",
+          updatedByAgentId: card.updatedByAgentId ?? null,
+          updatedByAgentName: card.updatedByAgentName || "",
+          updatedByAgentUsername: card.updatedByAgentUsername || "",
           submittedAt: card.submittedAt || "",
           respondedAt: card.respondedAt || "",
           relatedTutorChoiceCardId: card.relatedTutorChoiceCardId || "",
@@ -10551,7 +11336,33 @@ function sortCoverageWorkflowCardsForDisplay(cards: CoverageWorkflowCard[]): Cov
   ));
 }
 
-function createDocumentationCard(): DocumentationWorkflowCard {
+function buildDocumentationCardActorFields(
+  admin: Pick<AdminSession, "id" | "fullName" | "username"> | null | undefined,
+  prefix: "created" | "updated",
+): Partial<DocumentationWorkflowCard> {
+  if (!admin) {
+    return {};
+  }
+
+  const actorName = admin.fullName || admin.username || "";
+  if (prefix === "created") {
+    return {
+      createdByAgentId: admin.id || null,
+      createdByAgentName: actorName,
+      createdByAgentUsername: admin.username || "",
+    };
+  }
+
+  return {
+    updatedByAgentId: admin.id || null,
+    updatedByAgentName: actorName,
+    updatedByAgentUsername: admin.username || "",
+  };
+}
+
+function createDocumentationCard(
+  currentAdmin?: Pick<AdminSession, "id" | "fullName" | "username"> | null,
+): DocumentationWorkflowCard {
   const timestamp = new Date().toISOString();
 
   return {
@@ -10561,9 +11372,12 @@ function createDocumentationCard(): DocumentationWorkflowCard {
     errors: "",
     steps: "",
     resources: "",
+    attachments: [],
     locked: false,
     createdAt: timestamp,
     updatedAt: timestamp,
+    ...buildDocumentationCardActorFields(currentAdmin, "created"),
+    ...buildDocumentationCardActorFields(currentAdmin, "updated"),
   };
 }
 
@@ -10583,9 +11397,20 @@ function normalizeDocumentationWorkflowCards(
           errors: card.errors || "",
           steps: card.steps || "",
           resources: card.resources || "",
+          attachments: Array.isArray(card.attachments)
+            ? card.attachments
+              .map((file) => normalizeCoverageCardAttachment(file))
+              .filter((file): file is CoverageCardAttachment => Boolean(file))
+            : [],
           locked: Boolean(card.locked),
           createdAt: card.createdAt || "",
           updatedAt: card.updatedAt || "",
+          createdByAgentId: card.createdByAgentId ?? null,
+          createdByAgentName: card.createdByAgentName || "",
+          createdByAgentUsername: card.createdByAgentUsername || "",
+          updatedByAgentId: card.updatedByAgentId ?? null,
+          updatedByAgentName: card.updatedByAgentName || "",
+          updatedByAgentUsername: card.updatedByAgentUsername || "",
         }];
       })
     : [];
@@ -10611,9 +11436,10 @@ function sortDocumentationWorkflowCardsForDisplay(cards: DocumentationWorkflowCa
   ));
 }
 
-function isDocumentationCardEmpty(card: Pick<DocumentationWorkflowCard, "inquiry" | "symptoms" | "errors" | "steps" | "resources">) {
+function isDocumentationCardEmpty(card: Pick<DocumentationWorkflowCard, "inquiry" | "symptoms" | "errors" | "steps" | "resources" | "attachments">) {
   return [card.inquiry, card.symptoms, card.errors, card.steps, card.resources]
-    .every((value) => !(value || "").trim());
+    .every((value) => !(value || "").trim())
+    && card.attachments.length === 0;
 }
 
 function buildDocumentationCardTimestampLabel(card: DocumentationWorkflowCard) {
@@ -10621,11 +11447,14 @@ function buildDocumentationCardTimestampLabel(card: DocumentationWorkflowCard) {
     return "Created time unavailable";
   }
 
+  const createdBy = card.createdByAgentName || card.createdByAgentUsername || "";
+  const updatedBy = card.updatedByAgentName || card.updatedByAgentUsername || "";
+  const createdLabel = `Created ${formatDateTime(card.createdAt)}${createdBy ? ` by ${createdBy}` : ""}`;
   if (card.updatedAt && card.updatedAt !== card.createdAt) {
-    return `Created ${formatDateTime(card.createdAt)} | Edited ${formatDateTime(card.updatedAt)}`;
+    return `${createdLabel} | Edited ${formatDateTime(card.updatedAt)}${updatedBy ? ` by ${updatedBy}` : ""}`;
   }
 
-  return `Created ${formatDateTime(card.createdAt)}`;
+  return createdLabel;
 }
 
 function freezeDocumentationCardsForSave(documentation: AdminDocumentation): AdminDocumentation {
@@ -10656,6 +11485,32 @@ function freezeDocumentationCardsForSave(documentation: AdminDocumentation): Adm
     steps: latestCard?.steps || documentation.steps,
     resources: latestCard?.resources || documentation.resources,
   };
+}
+
+function serializeStandardDocumentationForRequest(documentation: AdminDocumentation): AdminDocumentation {
+  return {
+    ...documentation,
+    documentationCards: documentation.documentationCards.map((card) => ({
+      ...card,
+      attachments: card.attachments.map(serializeCoverageCardAttachmentForRequest),
+    })),
+  };
+}
+
+function getDocumentationUploadFiles(documentation: AdminDocumentation | null): File[] {
+  if (!documentation) {
+    return [];
+  }
+
+  return documentation.documentationCards.flatMap((card) => (
+    card.attachments.flatMap((attachment) => (attachment.file ? [attachment.file] : []))
+  ));
+}
+
+function revokeDocumentationDraftObjectUrls(documentation: AdminDocumentation | null) {
+  documentation?.documentationCards.forEach((card) => {
+    card.attachments.forEach(revokeCoverageAttachmentObjectUrl);
+  });
 }
 
 function getCoverageAttachmentSource(file: Pick<CoverageCardAttachment, "dataUrl" | "objectUrl" | "storageUrl"> | null | undefined) {
@@ -10699,6 +11554,48 @@ function buildCoverageTimestampLabel(createdAt: string, updatedAt: string) {
 
 function buildCoverageCardTimestampLabel(createdAt: string, updatedAt: string) {
   return buildCoverageTimestampLabel(createdAt, updatedAt).replace(" â€¢ ", " | ");
+}
+
+function getCoverageCardActorDisplayName(
+  card: Pick<
+    CoverageWorkflowCard,
+    | "createdByAgentName"
+    | "createdByAgentUsername"
+    | "updatedByAgentName"
+    | "updatedByAgentUsername"
+    | "requestSubmittedByAgentName"
+    | "requestSubmittedByAgentUsername"
+  >,
+  type: "created" | "updated",
+) {
+  if (type === "created") {
+    return card.createdByAgentName || card.createdByAgentUsername || "";
+  }
+
+  return card.updatedByAgentName || card.updatedByAgentUsername || "";
+}
+
+function getCoverageCardSubmittedByDisplayName(
+  card: Pick<CoverageWorkflowCard, "requestSubmittedByAgentName" | "requestSubmittedByAgentUsername">,
+) {
+  return card.requestSubmittedByAgentName || card.requestSubmittedByAgentUsername || "";
+}
+
+function buildCoverageCardMetaLabel(card: CoverageWorkflowCard) {
+  if (!card.createdAt) {
+    return "Created time unavailable";
+  }
+
+  const createdBy = getCoverageCardActorDisplayName(card, "created");
+  const updatedBy = getCoverageCardActorDisplayName(card, "updated");
+  const submittedBy = getCoverageCardSubmittedByDisplayName(card);
+  const createdLabel = `Created ${formatDateTime(card.createdAt)}${createdBy ? ` by ${createdBy}` : ""}`;
+  const submittedLabel = !createdBy && submittedBy ? ` | Sent by ${submittedBy}` : "";
+  if (!hasCoverageTimestampUpdate(card.createdAt, card.updatedAt)) {
+    return `${createdLabel}${submittedLabel}`;
+  }
+
+  return `${createdLabel} | Edited ${formatDateTime(card.updatedAt)}${updatedBy ? ` by ${updatedBy}` : ""}${submittedLabel}`;
 }
 
 function summarizeCoverageTutorRequestDetails(sessionDetails: string) {
@@ -10953,6 +11850,7 @@ function parseAdminDeepLink(search: string) {
   const requestedScope = searchParams.get("scope");
   const requestedQueueTab = searchParams.get("tab");
   const shouldOpenManagement = requestedView === "management";
+  const shouldOpenAdminDashboard = requestedView === "adminDashboard" || requestedView === "admin";
   const shouldOpenCoverage = requestedView === "coverage";
   const shouldOpenConsole = requestedView === "console" || Boolean(requestedTicketId);
 
@@ -10961,9 +11859,11 @@ function parseAdminDeepLink(search: string) {
       ? "management" as const
       : shouldOpenConsole
         ? "console" as const
-        : shouldOpenCoverage
-          ? "coverage" as const
-        : "dashboard" as const,
+        : shouldOpenAdminDashboard
+          ? "adminDashboard" as const
+          : shouldOpenCoverage
+            ? "coverage" as const
+            : "dashboard" as const,
     ticketId: requestedTicketId,
     scope: requestedScope === "all" ? "all" as const : "my" as const,
     queueTab: requestedQueueTab === "closed" ? "closed" as const : "open" as const,
@@ -11387,16 +12287,12 @@ function getDashboardAssignedFilterEmptyMessage(
   return `No tickets are currently assigned to ${targetLabel}.`;
 }
 
-function isQuickResolutionTicket(ticket: Pick<TicketSummary, "status" | "statusReason">) {
-  if (ticket.status !== "Pending") {
-    return false;
-  }
-
-  return normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket";
+function isQuickResolutionTicket(ticket: Pick<TicketSummary, "statusReason" | "isQuickTicket">) {
+  return Boolean(ticket.isQuickTicket) || normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket";
 }
 
 function isDashboardQuickResolutionTicket(
-  ticket: Pick<TicketSummary, "status" | "statusReason" | "technicalSubcategory">,
+  ticket: Pick<TicketSummary, "statusReason" | "technicalSubcategory" | "isQuickTicket">,
 ) {
   return isQuickResolutionTicket(ticket) && !isCoverageTicket(ticket);
 }
@@ -11826,7 +12722,7 @@ const InfoCard = ({ label, value }: { label: string; value: string }) => (
   </div>
 );
 
-const LogoutButton = ({ collapsed = false }: { collapsed?: boolean }) => {
+const LogoutButton = ({ collapsed = false, className = "" }: { collapsed?: boolean; className?: string }) => {
   const navigate = useNavigate();
 
   async function handleLogout() {
@@ -11852,7 +12748,9 @@ const LogoutButton = ({ collapsed = false }: { collapsed?: boolean }) => {
     <Button
       variant="outline"
       size={collapsed ? "icon" : "sm"}
-      className={cn(!collapsed && "justify-start")}
+      aria-label={collapsed ? "Logout" : undefined}
+      title={collapsed ? "Logout" : undefined}
+      className={cn(!collapsed && "justify-start", className)}
       onClick={() => void handleLogout()}
     >
       <LogOut className={cn("h-4 w-4", !collapsed && "mr-2")} />
@@ -12785,7 +13683,24 @@ function deriveDashboardSlaStatus(
   status: TicketSummary["status"],
   createdAt: string,
   fallback: TicketSummary["slaStatus"],
+  isCoverageManaged = false,
 ): TicketSummary["slaStatus"] {
+  if (isCoverageManaged) {
+    if (status === "Closed") {
+      return "On Track";
+    }
+
+    if (status === "Pending") {
+      return fallback === "Breached" ? "Breached" : "On Track";
+    }
+
+    if (status === "Open") {
+      return "On Track";
+    }
+
+    return fallback;
+  }
+
   if (status === "Open") {
     return "Pending Review";
   }

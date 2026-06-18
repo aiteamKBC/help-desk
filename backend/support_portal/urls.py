@@ -40,6 +40,7 @@ urlpatterns = [
     path("admin/tickets/<str:public_id>/coverage-tutor-request", views.admin_ticket_coverage_tutor_request, name="admin-ticket-coverage-tutor-request"),
     path("admin/tickets/<str:public_id>/coverage-tutor-follow-up", views.admin_ticket_coverage_tutor_follow_up, name="admin-ticket-coverage-tutor-follow-up"),
     path("admin/tickets/<str:public_id>/coverage-ticket-notification/acknowledge", views.admin_ticket_coverage_ticket_notification_acknowledge, name="admin-ticket-coverage-ticket-notification-acknowledge"),
+    path("admin/tickets/<str:public_id>/learning-plan-transfer-notification/acknowledge", views.admin_ticket_learning_plan_transfer_notification_acknowledge, name="admin-ticket-learning-plan-transfer-notification-acknowledge"),
     path("admin/tickets/<str:public_id>/coverage-tutor-response/acknowledge", views.admin_ticket_coverage_tutor_response_acknowledge, name="admin-ticket-coverage-tutor-response-acknowledge"),
     path("admin/tickets/<str:public_id>/coverage-confirm-session", views.admin_ticket_coverage_confirm_session, name="admin-ticket-coverage-confirm-session"),
     path("admin/tickets/<str:public_id>", views.admin_ticket_detail, name="admin-ticket-detail"),

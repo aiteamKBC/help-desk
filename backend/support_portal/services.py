@@ -155,8 +155,10 @@ PENDING_ESCALATION_NOTIFICATION_METADATA_KEY = "pending_escalation_notification"
 LATEST_ESCALATION_CLOSURE_METADATA_KEY = "latest_escalation_closure"
 PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY = "pending_teams_call_notification"
 PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY = "pending_coverage_ticket_notification"
+PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY = "pending_learning_plan_transfer_notification"
 TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
 LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
+QUICK_TICKET_ORIGIN_METADATA_KEY = "quick_ticket_origin"
 LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY = "latest_coverage_tutor_response"
 QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_confirmation_email_sent_at"
 QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_closed_email_sent_at"
@@ -164,6 +166,7 @@ LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailab
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
+LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
@@ -539,7 +542,12 @@ def list_ticket_attachment_storage_keys(ticket_id: int) -> list[str]:
     return [sanitize_text(row.get("storage_url")) for row in rows if sanitize_text(row.get("storage_url"))]
 
 
-def get_admin_ticket_attachment_file(public_id: str, attachment_id: int) -> dict[str, Any]:
+def get_admin_ticket_attachment_file(
+    public_id: str,
+    attachment_id: int,
+    *,
+    actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
     if attachment_id <= 0:
@@ -547,7 +555,15 @@ def get_admin_ticket_attachment_file(public_id: str, attachment_id: int) -> dict
 
     attachment = run_query_one(
         """
-        SELECT a.id, a.file_name, a.mime_type, a.storage_url
+        SELECT
+          a.id,
+          a.file_name,
+          a.mime_type,
+          a.storage_url,
+          t.public_id,
+          t.technical_subcategory,
+          t.assigned_team,
+          t.metadata
         FROM ticket_attachments a
         JOIN tickets t
           ON t.id = a.ticket_id
@@ -560,6 +576,9 @@ def get_admin_ticket_attachment_file(public_id: str, attachment_id: int) -> dict
 
     if not attachment:
         raise ApiError(404, "Attachment not found.")
+
+    if actor is not None:
+        require_actor_can_access_admin_ticket(actor, attachment)
 
     storage_key = sanitize_text(attachment.get("storage_url"))
     if not storage_key:
@@ -576,7 +595,12 @@ def get_admin_ticket_attachment_file(public_id: str, attachment_id: int) -> dict
     }
 
 
-def get_ticket_chat_attachment_file(public_id: str, client_attachment_id: str) -> dict[str, Any]:
+def get_ticket_chat_attachment_file(
+    public_id: str,
+    client_attachment_id: str,
+    *,
+    actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
 
@@ -586,7 +610,14 @@ def get_ticket_chat_attachment_file(public_id: str, client_attachment_id: str) -
 
     attachment = run_query_one(
         """
-        SELECT ma.file_name, ma.mime_type, ma.storage_url
+        SELECT
+          ma.file_name,
+          ma.mime_type,
+          ma.storage_url,
+          t.public_id,
+          t.technical_subcategory,
+          t.assigned_team,
+          t.metadata
         FROM message_attachments ma
         JOIN tickets t
           ON t.conversation_id = ma.conversation_id
@@ -599,6 +630,9 @@ def get_ticket_chat_attachment_file(public_id: str, client_attachment_id: str) -
 
     if not attachment:
         raise ApiError(404, "Attachment not found.")
+
+    if actor is not None:
+        require_actor_can_access_admin_ticket(actor, attachment)
 
     storage_key = sanitize_text(attachment.get("storage_url"))
     if not storage_key:
@@ -835,6 +869,53 @@ def normalize_pending_coverage_ticket_notification(value: Any) -> dict[str, Any]
 def get_pending_coverage_ticket_notification(metadata: Any) -> dict[str, Any] | None:
     return normalize_pending_coverage_ticket_notification(
         normalize_json_object(metadata).get(PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY)
+    )
+
+
+def normalize_pending_learning_plan_transfer_notification(value: Any) -> dict[str, Any] | None:
+    payload = normalize_json_object(value)
+    if not payload:
+        return None
+
+    ticket_id = sanitize_text(payload.get("ticketId")) or sanitize_text(payload.get("chatId"))
+    requester_name = sanitize_text(payload.get("requesterName"))
+    requester_email = sanitize_text(payload.get("requesterEmail"))
+    requester_role = normalize_public_requester_role(payload.get("requesterRole"))
+    from_team = sanitize_text(payload.get("fromTeam"))
+    to_team = sanitize_text(payload.get("toTeam"))
+    transferred_at = serialize_datetime_value(coerce_datetime(payload.get("transferredAt")))
+    transferred_by_id = parse_assigned_agent_id(payload.get("transferredById"))
+    transferred_by_name = sanitize_text(payload.get("transferredByName"))
+    transferred_by_username = sanitize_text(payload.get("transferredByUsername"))
+    assigned_agent_id = parse_assigned_agent_id(payload.get("assignedAgentId"))
+    assigned_agent_name = sanitize_text(payload.get("assignedAgentName"))
+    assigned_agent_username = sanitize_text(payload.get("assignedAgentUsername"))
+    note = sanitize_text(payload.get("note"))
+
+    if not ticket_id or not requester_email or not from_team or not to_team or not transferred_at:
+        return None
+
+    return {
+        "ticketId": ticket_id,
+        "requesterName": requester_name,
+        "requesterEmail": requester_email,
+        "requesterRole": requester_role,
+        "fromTeam": from_team,
+        "toTeam": to_team,
+        "transferredAt": transferred_at,
+        "transferredById": transferred_by_id,
+        "transferredByName": transferred_by_name,
+        "transferredByUsername": transferred_by_username,
+        "assignedAgentId": assigned_agent_id,
+        "assignedAgentName": assigned_agent_name,
+        "assignedAgentUsername": assigned_agent_username,
+        "note": note,
+    }
+
+
+def get_pending_learning_plan_transfer_notification(metadata: Any) -> dict[str, Any] | None:
+    return normalize_pending_learning_plan_transfer_notification(
+        normalize_json_object(metadata).get(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY)
     )
 
 
@@ -1283,14 +1364,15 @@ def is_live_chat_requested(ticket_metadata: Any, conversation_metadata: Any = No
     )
 
 
-def normalize_coverage_card_attachment(value: Any) -> dict[str, Any] | None:
+def normalize_coverage_card_attachment(value: Any, *, allow_pending_upload: bool = False) -> dict[str, Any] | None:
     source = normalize_json_object(value)
     data_url = sanitize_text(source.get("dataUrl"))
     storage_url = sanitize_text(source.get("storageUrl"))
     storage_key = sanitize_text(source.get("storageKey"))
     if data_url and not data_url.startswith("data:"):
         data_url = ""
-    if not data_url and not storage_url and not storage_key:
+    has_pending_upload_metadata = bool(sanitize_text(source.get("id")) or sanitize_text(source.get("name")))
+    if not data_url and not storage_url and not storage_key and not (allow_pending_upload and has_pending_upload_metadata):
         return None
 
     attachment_id = None
@@ -1359,6 +1441,12 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "locked": normalize_bool(source.get("locked")),
                 "createdAt": sanitize_text(source.get("createdAt")),
                 "updatedAt": sanitize_text(source.get("updatedAt")),
+                "createdByAgentId": parse_assigned_agent_id(source.get("createdByAgentId")),
+                "createdByAgentName": sanitize_text(source.get("createdByAgentName")),
+                "createdByAgentUsername": sanitize_text(source.get("createdByAgentUsername")),
+                "updatedByAgentId": parse_assigned_agent_id(source.get("updatedByAgentId")),
+                "updatedByAgentName": sanitize_text(source.get("updatedByAgentName")),
+                "updatedByAgentUsername": sanitize_text(source.get("updatedByAgentUsername")),
                 "submittedAt": sanitize_text(source.get("submittedAt")),
                 "respondedAt": sanitize_text(source.get("respondedAt")),
                 "relatedTutorChoiceCardId": sanitize_text(source.get("relatedTutorChoiceCardId")),
@@ -1379,6 +1467,95 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
     return normalized_cards
 
 
+COVERAGE_CARD_ACTOR_FIELDS = {
+    "createdByAgentId",
+    "createdByAgentName",
+    "createdByAgentUsername",
+    "updatedByAgentId",
+    "updatedByAgentName",
+    "updatedByAgentUsername",
+}
+
+
+def build_coverage_card_actor_stamp(actor_row: dict[str, Any] | None, prefix: str) -> dict[str, Any]:
+    if not actor_row:
+        return {}
+
+    actor_id = parse_assigned_agent_id(actor_row.get("id"))
+    actor_username = sanitize_text(actor_row.get("username"))
+    actor_name = sanitize_text(actor_row.get("full_name")) or actor_username
+    if not actor_id and not actor_username and not actor_name:
+        return {}
+
+    return {
+        f"{prefix}ByAgentId": actor_id,
+        f"{prefix}ByAgentName": actor_name,
+        f"{prefix}ByAgentUsername": actor_username,
+    }
+
+
+def normalize_coverage_card_for_actor_comparison(card: Any) -> dict[str, Any]:
+    normalized_card = normalize_json_object(card)
+    for field in COVERAGE_CARD_ACTOR_FIELDS:
+        normalized_card.pop(field, None)
+    return normalized_card
+
+
+def stamp_coverage_documentation_card_actors(
+    documentation: Any,
+    previous_documentation: Any,
+    actor_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized_documentation = normalize_admin_documentation(documentation)
+    if not actor_row:
+        return normalized_documentation
+
+    previous_cards = {
+        sanitize_text(card.get("id")): normalize_json_object(card)
+        for card in normalize_admin_documentation(previous_documentation).get("coverageCards", [])
+        if sanitize_text(card.get("id"))
+    }
+    created_stamp = build_coverage_card_actor_stamp(actor_row, "created")
+    updated_stamp = build_coverage_card_actor_stamp(actor_row, "updated")
+    stamped_cards: list[dict[str, Any]] = []
+
+    for card in normalized_documentation.get("coverageCards", []):
+        normalized_card = normalize_json_object(card)
+        card_id = sanitize_text(normalized_card.get("id"))
+        previous_card = previous_cards.get(card_id)
+
+        if not previous_card:
+            stamped_cards.append({**normalized_card, **created_stamp, **updated_stamp})
+            continue
+
+        stamped_card = {**normalized_card}
+        for field in ("createdByAgentId", "createdByAgentName", "createdByAgentUsername"):
+            if previous_card.get(field) not in (None, ""):
+                stamped_card[field] = previous_card.get(field)
+
+        card_changed = (
+            normalize_coverage_card_for_actor_comparison(stamped_card)
+            != normalize_coverage_card_for_actor_comparison(previous_card)
+        )
+        if card_changed:
+            stamped_card.update(updated_stamp)
+        else:
+            has_created_actor = any(stamped_card.get(field) not in (None, "") for field in ("createdByAgentId", "createdByAgentName", "createdByAgentUsername"))
+            has_updated_actor = False
+            for field in ("updatedByAgentId", "updatedByAgentName", "updatedByAgentUsername"):
+                if previous_card.get(field) not in (None, ""):
+                    stamped_card[field] = previous_card.get(field)
+                    has_updated_actor = True
+            if not has_created_actor and not has_updated_actor and updated_stamp:
+                stamped_card.update(updated_stamp)
+                stamped_card["updatedAt"] = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+
+        stamped_cards.append(stamped_card)
+
+    normalized_documentation["coverageCards"] = stamped_cards
+    return normalized_documentation
+
+
 def normalize_documentation_cards(value: Any) -> list[dict[str, Any]]:
     raw_cards = value if isinstance(value, list) else []
     normalized_cards: list[dict[str, Any]] = []
@@ -1396,13 +1573,147 @@ def normalize_documentation_cards(value: Any) -> list[dict[str, Any]]:
                 "errors": sanitize_text(source.get("errors")),
                 "steps": sanitize_text(source.get("steps")),
                 "resources": sanitize_text(source.get("resources")),
+                "attachments": [
+                    normalized_attachment
+                    for attachment in (source.get("attachments") if isinstance(source.get("attachments"), list) else [])
+                    if (normalized_attachment := normalize_coverage_card_attachment(attachment, allow_pending_upload=True))
+                ],
                 "locked": normalize_bool(source.get("locked")),
                 "createdAt": sanitize_text(source.get("createdAt")),
                 "updatedAt": sanitize_text(source.get("updatedAt")),
+                "createdByAgentId": parse_assigned_agent_id(source.get("createdByAgentId")),
+                "createdByAgentName": sanitize_text(source.get("createdByAgentName")),
+                "createdByAgentUsername": sanitize_text(source.get("createdByAgentUsername")),
+                "updatedByAgentId": parse_assigned_agent_id(source.get("updatedByAgentId")),
+                "updatedByAgentName": sanitize_text(source.get("updatedByAgentName")),
+                "updatedByAgentUsername": sanitize_text(source.get("updatedByAgentUsername")),
             }
         )
 
     return normalized_cards
+
+
+def normalize_documentation_card_for_actor_comparison(card: Any) -> dict[str, Any]:
+    normalized_card = normalize_json_object(card)
+    for field in COVERAGE_CARD_ACTOR_FIELDS:
+        normalized_card.pop(field, None)
+    return normalized_card
+
+
+def stamp_documentation_card_actors(
+    documentation: Any,
+    previous_documentation: Any,
+    actor_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    normalized_documentation = normalize_admin_documentation(documentation)
+    if not actor_row:
+        return normalized_documentation
+
+    previous_cards = {
+        sanitize_text(card.get("id")): normalize_json_object(card)
+        for card in normalize_admin_documentation(previous_documentation).get("documentationCards", [])
+        if sanitize_text(card.get("id"))
+    }
+    created_stamp = build_coverage_card_actor_stamp(actor_row, "created")
+    updated_stamp = build_coverage_card_actor_stamp(actor_row, "updated")
+    stamped_cards: list[dict[str, Any]] = []
+
+    for card in normalized_documentation.get("documentationCards", []):
+        normalized_card = normalize_json_object(card)
+        card_id = sanitize_text(normalized_card.get("id"))
+        previous_card = previous_cards.get(card_id)
+
+        if not previous_card:
+            stamped_cards.append({**normalized_card, **created_stamp, **updated_stamp})
+            continue
+
+        stamped_card = {**normalized_card}
+        for field in ("createdByAgentId", "createdByAgentName", "createdByAgentUsername"):
+            if previous_card.get(field) not in (None, ""):
+                stamped_card[field] = previous_card.get(field)
+
+        card_changed = (
+            normalize_documentation_card_for_actor_comparison(stamped_card)
+            != normalize_documentation_card_for_actor_comparison(previous_card)
+        )
+        if card_changed:
+            stamped_card.update(updated_stamp)
+        else:
+            has_created_actor = any(stamped_card.get(field) not in (None, "") for field in ("createdByAgentId", "createdByAgentName", "createdByAgentUsername"))
+            has_updated_actor = False
+            for field in ("updatedByAgentId", "updatedByAgentName", "updatedByAgentUsername"):
+                if previous_card.get(field) not in (None, ""):
+                    stamped_card[field] = previous_card.get(field)
+                    has_updated_actor = True
+            if not has_created_actor and not has_updated_actor and updated_stamp:
+                stamped_card.update(updated_stamp)
+                stamped_card["updatedAt"] = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+
+        stamped_cards.append(stamped_card)
+
+    normalized_documentation["documentationCards"] = stamped_cards
+    return normalized_documentation
+
+
+def attach_uploaded_documentation_card_files(
+    *,
+    ticket_id: int,
+    ticket_public_id: str,
+    documentation: Any,
+    uploaded_files: list[Any],
+) -> dict[str, Any]:
+    normalized_documentation = normalize_admin_documentation(documentation)
+    files_to_store = list(uploaded_files or [])
+    if not files_to_store:
+        return normalized_documentation
+
+    upload_slots: list[tuple[dict[str, Any], int]] = []
+    for card_index, card in enumerate(normalized_documentation.get("documentationCards", [])):
+        attachments = card.get("attachments") if isinstance(card.get("attachments"), list) else []
+        for attachment_index, attachment in enumerate(attachments):
+            normalized_attachment = normalize_json_object(attachment)
+            if (
+                sanitize_text(normalized_attachment.get("storageUrl"))
+                or sanitize_text(normalized_attachment.get("storageKey"))
+                or normalized_attachment.get("attachmentId") not in (None, "")
+                or sanitize_text(normalized_attachment.get("dataUrl")).startswith("data:")
+            ):
+                continue
+            upload_slots.append((card, attachment_index))
+
+    if len(upload_slots) != len(files_to_store):
+        raise ApiError(400, "One or more documentation attachments are missing an uploaded file.")
+
+    stored_attachment_keys: list[str] = []
+    try:
+        stored_attachment_rows = store_uploaded_ticket_attachments(ticket_public_id, files_to_store)
+        stored_attachment_keys = [
+            attachment.get("storageKey")
+            for attachment in stored_attachment_rows
+            if sanitize_text(attachment.get("storageKey"))
+        ]
+        inserted_attachments = insert_ticket_attachment_rows(
+            ticket_id,
+            ticket_public_id,
+            stored_attachment_rows,
+            metadata_overrides={"source": "documentation_card"},
+        )
+    except Exception:
+        for storage_key in stored_attachment_keys:
+            delete_support_attachment_file(storage_key)
+        raise
+
+    for (card, attachment_index), inserted_attachment in zip(upload_slots, inserted_attachments):
+        attachments = list(card.get("attachments") or [])
+        client_attachment = normalize_json_object(attachments[attachment_index])
+        attachments[attachment_index] = {
+            **inserted_attachment,
+            "id": sanitize_text(client_attachment.get("id")) or inserted_attachment.get("id"),
+        }
+        card["attachments"] = attachments
+
+    normalized_documentation["documentationCards"] = normalized_documentation.get("documentationCards", [])
+    return normalized_documentation
 
 
 def normalize_admin_documentation(
@@ -1674,6 +1985,15 @@ def build_sla_metadata_patch(attention_required: bool, attention_reason: str | N
     }
 
 
+def build_resolved_coverage_sla_metadata(metadata: Any) -> dict[str, Any]:
+    next_metadata = {
+        **normalize_json_object(metadata),
+        **build_sla_metadata_patch(False, None),
+    }
+    next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
+    return next_metadata
+
+
 def validate_status_reason_for_status(status: str, status_reason: str) -> None:
     normalized_status = sanitize_text(status)
     normalized_status_reason = sanitize_text(status_reason)
@@ -1704,62 +2024,51 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
     current_attention_required = normalize_bool(metadata.get("sla_attention_required"))
     current_attention_reason = sanitize_text(metadata.get("sla_attention_reason")) or None
 
-    if is_coverage_ticket_waiting_for_initial_action(row):
+    if is_coverage_ticket_record(row):
         coverage_sla_state = get_coverage_sla_state(metadata)
-        if current_attention_reason == SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE or coverage_sla_state:
+        if (
+            is_coverage_ticket_waiting_for_initial_action(row)
+            and (
+                current_attention_reason == SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
+                or coverage_sla_state
+            )
+        ):
             next_sla_status = "Breached"
             metadata_patch = build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
             next_metadata = {**metadata, **metadata_patch}
-            row["sla_status"] = next_sla_status
-            row["sla_attention_required"] = True
-            row["metadata"] = next_metadata
-            if (
-                persist
-                and row.get("id")
-                and (
-                    current_sla_status != next_sla_status
-                    or not current_attention_required
-                    or current_attention_reason != SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
-                )
-            ):
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        UPDATE tickets
-                        SET sla_status = %s,
-                            metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
-                            updated_at = NOW()
-                        WHERE id = %s
-                        """,
-                        [next_sla_status, json.dumps(metadata_patch), row["id"]],
-                    )
-            return row
+            next_attention_required = True
+            next_attention_reason = SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
+        else:
+            next_sla_status = "On Track"
+            next_metadata = build_resolved_coverage_sla_metadata(metadata)
+            next_attention_required = False
+            next_attention_reason = None
 
-        next_sla_status = "On Track"
-        metadata_patch = build_sla_metadata_patch(False, None)
-        next_metadata = {**metadata, **metadata_patch}
         row["sla_status"] = next_sla_status
-        row["sla_attention_required"] = False
+        row["sla_attention_required"] = next_attention_required
         row["metadata"] = next_metadata
+        next_coverage_sla_state = get_coverage_sla_state(next_metadata)
+
         if (
             persist
             and row.get("id")
             and (
                 current_sla_status != next_sla_status
-                or current_attention_required
-                or current_attention_reason is not None
+                or current_attention_required != next_attention_required
+                or current_attention_reason != next_attention_reason
+                or normalize_coverage_sla_state(coverage_sla_state) != normalize_coverage_sla_state(next_coverage_sla_state)
             )
         ):
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     UPDATE tickets
-                    SET sla_status = %s,
-                        metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                        SET sla_status = %s,
+                        metadata = %s::jsonb,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [next_sla_status, json.dumps(metadata_patch), row["id"]],
+                    [next_sla_status, json.dumps(next_metadata), row["id"]],
                 )
         return row
 
@@ -1796,6 +2105,48 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
             )
 
     return row
+
+
+def resolve_ticket_sla_update(
+    ticket: dict[str, Any],
+    status: Any,
+    *,
+    metadata: Any = None,
+    requested_sla_status: Any = None,
+) -> tuple[str, bool, str | None, dict[str, Any]]:
+    base_metadata = normalize_json_object(ticket.get("metadata") if metadata is None else metadata)
+
+    if is_coverage_ticket_record(ticket):
+        coverage_row = {
+            **ticket,
+            "status": sanitize_text(status),
+            "metadata": base_metadata,
+            "sla_status": sanitize_text(ticket.get("sla_status")) or "Pending Review",
+        }
+        apply_ticket_sla_policy(coverage_row)
+        resolved_metadata = normalize_json_object(coverage_row.get("metadata"))
+        return (
+            sanitize_text(coverage_row.get("sla_status")) or "On Track",
+            normalize_bool(coverage_row.get("sla_attention_required")),
+            sanitize_text(resolved_metadata.get("sla_attention_reason")) or None,
+            resolved_metadata,
+        )
+
+    next_sla_status, attention_required, attention_reason = resolve_next_sla_state(
+        status,
+        ticket.get("created_at"),
+        ticket.get("sla_status"),
+        requested_sla_status,
+    )
+    return (
+        next_sla_status,
+        attention_required,
+        attention_reason,
+        {
+            **base_metadata,
+            **build_sla_metadata_patch(attention_required, attention_reason),
+        },
+    )
 
 
 def sync_auto_managed_ticket_sla_statuses() -> dict[str, int]:
@@ -2966,6 +3317,17 @@ def get_coverage_ticket_operations_webhook_url() -> str:
     return sanitize_text(getattr(settings, "COVERAGE_TICKET_WEBHOOK_URL", ""))
 
 
+def get_coverage_ticket_operations_webhook_secret() -> str:
+    return sanitize_text(getattr(settings, "COVERAGE_TICKET_WEBHOOK_SECRET", ""))
+
+
+def build_coverage_ticket_operations_webhook_headers() -> dict[str, str]:
+    secret = get_coverage_ticket_operations_webhook_secret()
+    if not secret:
+        return {}
+    return {"x-support-webhook-secret": secret}
+
+
 def get_coverage_sla_alerts_webhook_url() -> str:
     return sanitize_text(getattr(settings, "COVERAGE_SLA_WEBHOOK_URL", ""))
 
@@ -3886,11 +4248,156 @@ def build_coverage_ticket_operations_webhook_payload(
     }
 
 
+def build_learning_plan_ticket_transfer_webhook_payload(
+    *,
+    ticket_row: dict[str, Any],
+    from_team: str,
+    to_team: str,
+    transferred_by: dict[str, Any] | None = None,
+    transferred_at: Any = None,
+    assigned_agent_id: Any = None,
+    assigned_agent_name: Any = None,
+    assigned_agent_username: Any = None,
+    note: Any = "",
+) -> dict[str, Any]:
+    public_base_url = get_support_portal_public_base_url("")
+    dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
+    ticket_metadata = normalize_json_object(ticket_row.get("metadata"))
+    requester_role = get_ticket_requester_role(ticket_metadata)
+    requester_source = get_ticket_requester_source(
+        ticket_metadata,
+        learner_source=ticket_row.get("learner_source"),
+        learner_metadata=ticket_row.get("learner_metadata"),
+    )
+    requester_email = sanitize_text(ticket_row.get("learner_email"))
+    requester_name = (
+        sanitize_text(ticket_row.get("learner_name"))
+        or sanitize_text(ticket_row.get("requester_name"))
+        or requester_email
+    )
+    resolved_assigned_agent_id = parse_assigned_agent_id(
+        assigned_agent_id if assigned_agent_id is not None else ticket_row.get("assigned_agent_id")
+    )
+    resolved_assigned_agent_name = (
+        sanitize_text(assigned_agent_name)
+        or sanitize_text(ticket_row.get("assigned_agent_name"))
+    )
+    resolved_assigned_agent_username = (
+        sanitize_text(assigned_agent_username)
+        or sanitize_text(ticket_row.get("assigned_agent_username"))
+    )
+    transferred_by_row = transferred_by or {}
+
+    return {
+        "event": LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT,
+        "source": "support_portal",
+        "ticket": {
+            "id": sanitize_text(ticket_row.get("public_id")),
+            "status": sanitize_text(ticket_row.get("status")),
+            "statusReason": sanitize_text(ticket_row.get("status_reason")),
+            "category": sanitize_text(ticket_row.get("category")),
+            "technicalSubcategory": sanitize_text(ticket_row.get("technical_subcategory")),
+            "priority": sanitize_text(ticket_row.get("priority")),
+            "assignedTeam": sanitize_text(to_team) or ASSIGNED_TEAM_UNASSIGNED,
+            "slaStatus": sanitize_text(ticket_row.get("sla_status")),
+            "createdAt": serialize_datetime_value(ticket_row.get("created_at")),
+            "dashboardUrl": dashboard_url,
+        },
+        "requester": {
+            "name": requester_name,
+            "email": requester_email,
+            "role": requester_role,
+            "source": requester_source,
+        },
+        "transfer": {
+            "fromTeam": sanitize_text(from_team) or ASSIGNED_TEAM_UNASSIGNED,
+            "toTeam": sanitize_text(to_team) or ASSIGNED_TEAM_UNASSIGNED,
+            "transferredAt": serialize_datetime_value(transferred_at) or datetime.now(timezone.utc).isoformat(),
+            "note": sanitize_text(note),
+            "transferredBy": {
+                "id": parse_assigned_agent_id(transferred_by_row.get("id")),
+                "name": sanitize_text(transferred_by_row.get("full_name")) or sanitize_text(transferred_by_row.get("username")),
+                "username": sanitize_text(transferred_by_row.get("username")),
+                "email": sanitize_text(transferred_by_row.get("email")),
+                "role": sanitize_text(transferred_by_row.get("role")),
+            },
+            "assignedAgent": {
+                "id": resolved_assigned_agent_id,
+                "name": resolved_assigned_agent_name,
+                "username": resolved_assigned_agent_username,
+            },
+        },
+    }
+
+
+def build_learning_plan_transfer_notification_payload(
+    *,
+    ticket_id: Any,
+    requester_name: Any,
+    requester_email: Any,
+    requester_role: Any,
+    from_team: Any,
+    to_team: Any,
+    transferred_at: Any,
+    transferred_by: dict[str, Any] | None = None,
+    assigned_agent_id: Any = None,
+    assigned_agent_name: Any = None,
+    assigned_agent_username: Any = None,
+    note: Any = "",
+) -> dict[str, Any]:
+    transferred_by_row = transferred_by or {}
+
+    return {
+        "ticketId": sanitize_text(ticket_id),
+        "requesterName": sanitize_text(requester_name),
+        "requesterEmail": sanitize_text(requester_email),
+        "requesterRole": normalize_public_requester_role(requester_role),
+        "fromTeam": sanitize_text(from_team) or ASSIGNED_TEAM_UNASSIGNED,
+        "toTeam": sanitize_text(to_team) or ASSIGNED_TEAM_UNASSIGNED,
+        "transferredAt": serialize_datetime_value(transferred_at) or datetime.now(timezone.utc).isoformat(),
+        "transferredById": parse_assigned_agent_id(transferred_by_row.get("id")),
+        "transferredByName": sanitize_text(transferred_by_row.get("full_name")) or sanitize_text(transferred_by_row.get("username")),
+        "transferredByUsername": sanitize_text(transferred_by_row.get("username")),
+        "assignedAgentId": parse_assigned_agent_id(assigned_agent_id),
+        "assignedAgentName": sanitize_text(assigned_agent_name),
+        "assignedAgentUsername": sanitize_text(assigned_agent_username),
+        "note": sanitize_text(note),
+    }
+
+
 def send_coverage_ticket_operations_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    request_kwargs: dict[str, Any] = {
+        "timeout_seconds": COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS,
+    }
+    webhook_headers = build_coverage_ticket_operations_webhook_headers()
+    if webhook_headers:
+        request_kwargs["headers"] = webhook_headers
+
     configured, delivered, status, response_payload = post_json_webhook(
         get_coverage_ticket_operations_webhook_url(),
         payload,
-        timeout_seconds=COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS,
+        **request_kwargs,
+    )
+    return {
+        "configured": configured,
+        "delivered": delivered,
+        "status": status,
+        "response": response_payload,
+    }
+
+
+def send_learning_plan_ticket_transfer_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+    request_kwargs: dict[str, Any] = {
+        "timeout_seconds": COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS,
+    }
+    webhook_headers = build_coverage_ticket_operations_webhook_headers()
+    if webhook_headers:
+        request_kwargs["headers"] = webhook_headers
+
+    configured, delivered, status, response_payload = post_json_webhook(
+        get_coverage_ticket_operations_webhook_url(),
+        payload,
+        **request_kwargs,
     )
     return {
         "configured": configured,
@@ -3922,6 +4429,39 @@ def notify_coverage_ticket_operations_team(ticket_id: int, payload: dict[str, An
                 "module": payload.get("coverage", {}).get("module"),
                 "tutor": payload.get("coverage", {}).get("tutor"),
                 "sessionCount": len(payload.get("coverage", {}).get("sessions") or []),
+                "webhookStatus": webhook_result.get("status"),
+                "webhookDelivered": webhook_result.get("delivered"),
+            },
+        )
+    except Exception:
+        pass
+
+    return webhook_result
+
+
+def notify_learning_plan_ticket_transfer(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    if not get_coverage_ticket_operations_webhook_url():
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    webhook_result = send_learning_plan_ticket_transfer_webhook(payload)
+    event_type = (
+        "learning_plan_ticket_transfer_notified"
+        if webhook_result["delivered"]
+        else "learning_plan_ticket_transfer_notification_failed"
+    )
+    try:
+        insert_history_event(
+            ticket_id,
+            event_type,
+            None,
+            {
+                "ticketId": payload.get("ticket", {}).get("id"),
+                "requesterName": payload.get("requester", {}).get("name"),
+                "requesterEmail": payload.get("requester", {}).get("email"),
+                "fromTeam": payload.get("transfer", {}).get("fromTeam"),
+                "toTeam": payload.get("transfer", {}).get("toTeam"),
+                "transferredByName": payload.get("transfer", {}).get("transferredBy", {}).get("name"),
+                "assignedAgentName": payload.get("transfer", {}).get("assignedAgent", {}).get("name"),
                 "webhookStatus": webhook_result.get("status"),
                 "webhookDelivered": webhook_result.get("delivered"),
             },
@@ -4821,18 +5361,15 @@ def synchronize_coverage_tutor_workflow_ticket(
     next_sla_status = ticket.get("sla_status")
     next_sla_attention_required = bool(ticket.get("sla_attention_required"))
     next_sla_attention_reason = None
-    if status_changed:
-        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
-            next_status,
-            ticket.get("created_at"),
-            ticket.get("sla_status"),
-        )
-
     updated_ticket_metadata = normalize_json_object(ticket_metadata)
     updated_ticket_metadata["admin_documentation"] = derived_documentation
     updated_ticket_metadata[LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY] = derived_latest_response
     if status_changed:
-        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
+            ticket,
+            next_status,
+            metadata=updated_ticket_metadata,
+        )
 
     next_chat_state = sanitize_text(ticket.get("conversation_status")) or map_conversation_status(next_status)
     if status_changed:
@@ -5666,22 +6203,156 @@ def is_quick_ticket_status_reason(status_reason: Any) -> bool:
     }
 
 
+def is_quick_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    if not ticket or is_coverage_ticket_record(ticket):
+        return False
+
+    if normalize_bool(ticket.get("_derived_is_quick_ticket")):
+        return True
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return (
+        normalize_bool(metadata.get(QUICK_TICKET_ORIGIN_METADATA_KEY))
+        or is_quick_ticket_status_reason(ticket.get("status_reason"))
+    )
+
+
+def has_quick_ticket_status_reason_history(history_rows: list[dict[str, Any]]) -> bool:
+    for history_row in history_rows:
+        if sanitize_text(history_row.get("event_type")) != "status_reason_changed":
+            continue
+
+        payload = normalize_json_object(history_row.get("payload"))
+        if (
+            is_quick_ticket_status_reason(payload.get("from"))
+            or is_quick_ticket_status_reason(payload.get("to"))
+        ):
+            return True
+
+    return False
+
+
 def is_coverage_tutor_status_reason(status_reason: Any) -> bool:
     return sanitize_text(status_reason).lower() in {
         sanitize_text(reason).lower() for reason in COVERAGE_TUTOR_STATUS_REASONS
     }
 
 
+def get_ticket_scope_value(ticket: dict[str, Any], snake_case_key: str, camel_case_key: str) -> Any:
+    if snake_case_key in ticket:
+        return ticket.get(snake_case_key)
+    return ticket.get(camel_case_key)
+
+
 def is_coverage_ticket_record(ticket: dict[str, Any] | None) -> bool:
     if not isinstance(ticket, dict):
         return False
 
-    direct_value = sanitize_text(ticket.get("technical_subcategory")).lower()
+    direct_value = sanitize_text(get_ticket_scope_value(ticket, "technical_subcategory", "technicalSubcategory")).lower()
     if direct_value == "coverage":
         return True
 
     metadata = normalize_json_object(ticket.get("metadata"))
     return sanitize_text(metadata.get("technical_subcategory")).lower() == "coverage"
+
+
+def is_learning_plan_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    if is_coverage_ticket_record(ticket):
+        return True
+
+    assigned_team = sanitize_text(get_ticket_scope_value(ticket, "assigned_team", "assignedTeam"))
+    return assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold()
+
+
+def actor_has_metadata_flag(
+    actor: dict[str, Any] | None,
+    key: str,
+    *,
+    default: bool = False,
+) -> bool:
+    if not isinstance(actor, dict):
+        return False
+
+    metadata = normalize_json_object(actor.get("metadata"))
+    if key in metadata:
+        return normalize_bool(metadata.get(key))
+    return default
+
+
+def actor_has_admin_dashboard_access(actor: dict[str, Any] | None) -> bool:
+    if not isinstance(actor, dict):
+        return False
+
+    role = sanitize_text(actor.get("role")).lower()
+    return (
+        role in ADMIN_ACCESS_ROLES
+        or actor_has_metadata_flag(actor, "legacy_admin_access")
+        or actor_has_metadata_flag(actor, "entra_directory_admin_access")
+    )
+
+
+def actor_has_support_dashboard_access(actor: dict[str, Any] | None) -> bool:
+    if not isinstance(actor, dict):
+        return False
+
+    role = sanitize_text(actor.get("role")).lower()
+    legacy_default = role == ROLE_AGENT
+    return actor_has_metadata_flag(actor, "legacy_support_access", default=legacy_default)
+
+
+def actor_has_operations_dashboard_access(actor: dict[str, Any] | None) -> bool:
+    return actor_has_metadata_flag(actor, "legacy_operations_access")
+
+
+def actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    if actor_has_admin_dashboard_access(actor):
+        return True
+
+    has_support_access = actor_has_support_dashboard_access(actor)
+    has_operations_access = actor_has_operations_dashboard_access(actor)
+    if has_support_access and has_operations_access:
+        return True
+
+    is_learning_plan_ticket = is_learning_plan_ticket_record(ticket)
+    if has_operations_access:
+        return is_learning_plan_ticket
+    if has_support_access:
+        return not is_learning_plan_ticket
+
+    return False
+
+
+def require_actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> None:
+    if not actor_can_access_admin_ticket(actor, ticket):
+        raise ApiError(403, "You do not have permission to access this ticket.")
+
+
+def filter_admin_tickets_for_actor(tickets: list[dict[str, Any]], actor: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if actor is None:
+        return tickets
+    return [ticket for ticket in tickets if actor_can_access_admin_ticket(actor, ticket)]
+
+
+def fetch_ticket_scope_record(public_id: str) -> dict[str, Any] | None:
+    normalized_public_id = sanitize_text(public_id)
+    if not normalized_public_id:
+        return None
+
+    return run_query_one(
+        """
+        SELECT public_id, technical_subcategory, assigned_team, metadata
+        FROM tickets
+        WHERE public_id = %s
+        LIMIT 1
+        """,
+        [normalized_public_id],
+    )
 
 
 def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[int] | None = None) -> dict[str, Any]:
@@ -5831,6 +6502,7 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "inquiryPreview": sanitize_text(row.get("inquiry")),
         "status": row["status"],
         "statusReason": row.get("status_reason") or "",
+        "isQuickTicket": is_quick_ticket_record(row),
         "assignedAgentId": int(row["assigned_agent_id"]) if row.get("assigned_agent_id") else None,
         "assignedAgentName": row.get("assigned_agent_name") or "Unassigned",
         "assignedAgentUsername": row.get("assigned_agent_username") or "",
@@ -5848,6 +6520,7 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "pendingEscalationNotification": get_pending_escalation_notification(ticket_metadata),
         "pendingTeamsCallNotification": get_pending_teams_call_notification(ticket_metadata),
         "pendingCoverageTicketNotification": get_pending_coverage_ticket_notification(ticket_metadata),
+        "pendingLearningPlanTransferNotification": get_pending_learning_plan_transfer_notification(ticket_metadata),
         "teamsCallRequested": is_teams_call_requested(ticket_metadata),
         "latestEscalationClosure": get_latest_escalation_closure(ticket_metadata),
         "latestTransferDecision": get_latest_transfer_decision(ticket_metadata),
@@ -7536,12 +8209,10 @@ def apply_ticket_chat_history_sync(
         next_status_reason = get_default_status_reason_for_status(status)
     elif status == "Pending" and status_reason is None and not is_status_reason_allowed_for_status(status, next_status_reason):
         next_status_reason = get_default_status_reason_for_status(status)
-    next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+    next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
+        ticket,
         status,
-        ticket.get("created_at"),
-        ticket["sla_status"],
     )
-    sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -7550,7 +8221,7 @@ def apply_ticket_chat_history_sync(
             SET status = %s,
                 status_reason = %s,
                 sla_status = %s,
-                metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                metadata = %s::jsonb,
                 updated_at = NOW(),
                 closed_at = CASE
                   WHEN %s = 'Closed' THEN NOW()
@@ -7559,7 +8230,7 @@ def apply_ticket_chat_history_sync(
                 END
             WHERE id = %s
             """,
-            [status, next_status_reason, next_sla_status, json.dumps(sla_metadata_patch), status, status, ticket["id"]],
+            [status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), status, status, ticket["id"]],
         )
 
     if status == "Pending" and is_quick_ticket_status_reason(next_status_reason) and not is_coverage_ticket_record(ticket):
@@ -8884,40 +9555,58 @@ def select_next_live_chat_agent(
     return None
 
 
-def sort_admins_for_quick_ticket_queue(
-    admins: list[dict[str, Any]],
+def sort_agents_for_quick_ticket_queue(
+    agents: list[dict[str, Any]],
     now: datetime | None = None,
     open_assigned_chat_agent_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     comparison_now = now or datetime.now(timezone.utc)
     busy_agent_ids = open_assigned_chat_agent_ids or set()
-    console_status_priority = {"Available": 0, "Busy": 1, "Off": 2}
 
-    def queue_sort_key(admin: dict[str, Any]) -> tuple[int, datetime, int]:
-        metadata = normalize_json_object(admin.get("metadata"))
-        admin_id = int(admin["id"])
-        console_status = resolve_agent_console_status(
+    def queue_sort_key(agent: dict[str, Any]) -> tuple[int, datetime, datetime, int]:
+        metadata = normalize_json_object(agent.get("metadata"))
+        agent_id = int(agent["id"])
+        session_active = is_agent_session_active(metadata, comparison_now)
+        effective_console_status = resolve_agent_console_status(
             metadata,
-            has_open_assigned_chat=admin_id in busy_agent_ids,
+            session_active=session_active,
+            has_open_assigned_chat=agent_id in busy_agent_ids,
         )
+        queue_joined_at = get_agent_queue_joined_at(metadata, comparison_now) or comparison_now
         last_assigned_at = (
             get_agent_last_quick_ticket_assigned_at(metadata)
             or get_agent_last_live_chat_assigned_at(metadata)
-            or get_agent_queue_joined_at(metadata, comparison_now)
+            or queue_joined_at
             or comparison_now
         )
-        return (console_status_priority.get(console_status, 99), last_assigned_at, admin_id)
+        priority = 0 if effective_console_status == "Available" else 1
+        return (priority, last_assigned_at, queue_joined_at, agent_id)
 
-    return sorted(admins, key=queue_sort_key)
+    return sorted(agents, key=queue_sort_key)
 
 
-def select_next_quick_ticket_admin(
-    admins: list[dict[str, Any]],
+def select_next_quick_ticket_agent(
+    agents: list[dict[str, Any]],
     now: datetime | None = None,
     open_assigned_chat_agent_ids: set[int] | None = None,
 ) -> dict[str, Any] | None:
-    sorted_admins = sort_admins_for_quick_ticket_queue(admins, now, open_assigned_chat_agent_ids)
-    return sorted_admins[0] if sorted_admins else None
+    comparison_now = now or datetime.now(timezone.utc)
+    busy_agent_ids = open_assigned_chat_agent_ids or set()
+    sorted_agents = sort_agents_for_quick_ticket_queue(agents, comparison_now, busy_agent_ids)
+
+    for agent in sorted_agents:
+        metadata = normalize_json_object(agent.get("metadata"))
+        agent_id = int(agent["id"])
+        session_active = is_agent_session_active(metadata, comparison_now)
+        effective_console_status = resolve_agent_console_status(
+            metadata,
+            session_active=session_active,
+            has_open_assigned_chat=agent_id in busy_agent_ids,
+        )
+        if effective_console_status == "Available":
+            return agent
+
+    return None
 
 
 def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assigned_at: datetime) -> bool:
@@ -9017,18 +9706,18 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
     return True
 
 
-def assign_quick_ticket_to_admin(ticket: dict[str, Any], admin: dict[str, Any], assigned_at: datetime) -> bool:
-    next_assigned_admin_id = int(admin["id"])
-    current_assigned_admin_id = int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None
+def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assigned_at: datetime) -> bool:
+    next_assigned_agent_id = int(agent["id"])
+    current_assigned_agent_id = int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None
 
-    if current_assigned_admin_id == next_assigned_admin_id:
+    if current_assigned_agent_id == next_assigned_agent_id:
         return False
 
     assigned_at_value = serialize_datetime_value(assigned_at)
     ticket_metadata = normalize_json_object(ticket.get("metadata"))
     conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
-    assigned_team = derive_assigned_team(admin)
-    admin_name = admin.get("full_name") or admin["username"]
+    assigned_team = derive_assigned_team(agent)
+    agent_name = agent.get("full_name") or agent["username"]
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -9041,13 +9730,13 @@ def assign_quick_ticket_to_admin(ticket: dict[str, Any], admin: dict[str, Any], 
             WHERE id = %s
             """,
             [
-                next_assigned_admin_id,
+                next_assigned_agent_id,
                 assigned_team,
                 json.dumps(
                     {
                         "quick_ticket_assigned_at": assigned_at_value,
-                        "quick_ticket_assigned_admin_username": admin["username"],
-                        "quick_ticket_assigned_admin_name": admin_name,
+                        "quick_ticket_assigned_admin_username": agent["username"],
+                        "quick_ticket_assigned_admin_name": agent_name,
                     }
                 ),
                 ticket["id"],
@@ -9064,9 +9753,9 @@ def assign_quick_ticket_to_admin(ticket: dict[str, Any], admin: dict[str, Any], 
                 [
                     json.dumps(
                         {
-                            "assigned_agent_id": next_assigned_admin_id,
-                            "assigned_agent_username": admin["username"],
-                            "assigned_agent_name": admin_name,
+                            "assigned_agent_id": next_assigned_agent_id,
+                            "assigned_agent_username": agent["username"],
+                            "assigned_agent_name": agent_name,
                             "quick_ticket_assigned_at": assigned_at_value,
                         }
                     ),
@@ -9079,35 +9768,35 @@ def assign_quick_ticket_to_admin(ticket: dict[str, Any], admin: dict[str, Any], 
         "assignment_changed",
         {"role": "system", "label": "quick_ticket_queue"},
         {
-            "fromAgentId": current_assigned_admin_id,
-            "toAgentId": next_assigned_admin_id,
-            "toAgentName": admin_name,
+            "fromAgentId": current_assigned_agent_id,
+            "toAgentId": next_assigned_agent_id,
+            "toAgentName": agent_name,
             "assignedAt": assigned_at_value,
             "assignmentSource": "quick_ticket",
             "statusReason": STATUS_REASON_QUICK_TICKET,
         },
     )
 
-    next_admin_metadata = normalize_json_object(admin.get("metadata"))
-    next_admin_metadata[LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY] = assigned_at_value
-    persist_agent_metadata(int(admin["id"]), next_admin_metadata)
-    admin["metadata"] = next_admin_metadata
+    next_agent_metadata = normalize_json_object(agent.get("metadata"))
+    next_agent_metadata[LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY] = assigned_at_value
+    persist_agent_metadata(int(agent["id"]), next_agent_metadata)
+    agent["metadata"] = next_agent_metadata
 
-    ticket["assigned_agent_id"] = next_assigned_admin_id
-    ticket["assigned_agent_username"] = admin["username"]
-    ticket["assigned_agent_name"] = admin_name
+    ticket["assigned_agent_id"] = next_assigned_agent_id
+    ticket["assigned_agent_username"] = agent["username"]
+    ticket["assigned_agent_name"] = agent_name
     ticket["assigned_team"] = assigned_team
     ticket["metadata"] = {
         **ticket_metadata,
         "quick_ticket_assigned_at": assigned_at_value,
-        "quick_ticket_assigned_admin_username": admin["username"],
-        "quick_ticket_assigned_admin_name": admin_name,
+        "quick_ticket_assigned_admin_username": agent["username"],
+        "quick_ticket_assigned_admin_name": agent_name,
     }
     ticket["conversation_metadata"] = {
         **conversation_metadata,
-        "assigned_agent_id": next_assigned_admin_id,
-        "assigned_agent_username": admin["username"],
-        "assigned_agent_name": admin_name,
+        "assigned_agent_id": next_assigned_agent_id,
+        "assigned_agent_username": agent["username"],
+        "assigned_agent_name": agent_name,
         "quick_ticket_assigned_at": assigned_at_value,
     }
     return True
@@ -9117,29 +9806,28 @@ def try_auto_assign_quick_ticket(ticket: dict[str, Any], now: datetime | None = 
     if ticket.get("assigned_agent_id"):
         return None
 
-    admin_candidates = run_query(
+    agent_candidates = run_query(
         """
-        SELECT id, username, full_name, email, role, metadata
+        SELECT id, username, full_name, email, account_scope, role, metadata
         FROM support_accounts
         WHERE is_active = TRUE
           AND account_scope = %s
-          AND role = %s
           AND (metadata->>'legacy_support_access')::boolean = TRUE
         ORDER BY id ASC
         """,
-        [ACCOUNT_SCOPE_STAFF, ROLE_ADMIN],
+        [ACCOUNT_SCOPE_STAFF],
     )
-    if not admin_candidates:
+    if not agent_candidates:
         return None
 
     assignment_now = now or datetime.now(timezone.utc)
     open_assigned_chat_agent_ids = get_open_assigned_live_chat_agent_ids()
-    next_admin = select_next_quick_ticket_admin(admin_candidates, assignment_now, open_assigned_chat_agent_ids)
-    if not next_admin:
+    next_agent = select_next_quick_ticket_agent(agent_candidates, assignment_now, open_assigned_chat_agent_ids)
+    if not next_agent:
         return None
-    if not assign_quick_ticket_to_admin(ticket, next_admin, assignment_now):
+    if not assign_quick_ticket_to_agent(ticket, next_agent, assignment_now):
         return None
-    return next_admin
+    return next_agent
 
 
 def assign_waiting_live_chat_tickets(now: datetime | None = None) -> list[int]:
@@ -9469,6 +10157,8 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
         """,
         [ticket["id"]],
     )
+    if has_quick_ticket_status_reason_history(history):
+        ticket["_derived_is_quick_ticket"] = True
     chat_history_events = [
         row
         for row in history
@@ -9619,8 +10309,8 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
     if not username or not password:
         raise ApiError(400, "Username and password are required.")
 
-    # Support-account password login is optional; KBC auth remains the fallback.
-    support_access_agent = (
+    # Staff-account password login is optional; KBC auth remains the fallback.
+    dashboard_access_agent = (
         fetch_agent_account_by_username(username, active_only=True)
         or run_query_one(
             """
@@ -9628,30 +10318,31 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
             FROM support_accounts
             WHERE LOWER(TRIM(email)) = %s
               AND account_scope = %s
-              AND (metadata->>'legacy_support_access')::boolean = TRUE
               AND is_active = TRUE
             LIMIT 1
             """,
             [normalize_email(username), ACCOUNT_SCOPE_STAFF],
         )
     )
-    if support_access_agent and normalize_bool(
-        normalize_json_object(support_access_agent.get("metadata")).get("legacy_support_access")
+    if dashboard_access_agent and (
+        actor_has_support_dashboard_access(dashboard_access_agent)
+        or actor_has_operations_dashboard_access(dashboard_access_agent)
+        or actor_has_admin_dashboard_access(dashboard_access_agent)
     ):
-        agent_metadata = normalize_json_object(support_access_agent.get("metadata"))
+        agent_metadata = normalize_json_object(dashboard_access_agent.get("metadata"))
         if get_agent_password_hash(agent_metadata):
-            if not verify_agent_password(support_access_agent, password):
+            if not verify_agent_password(dashboard_access_agent, password):
                 raise ApiError(401, "Invalid username or password.")
             return {
                 "admin": register_agent_session(
-                    sanitize_text(support_access_agent.get("username")).lower(),
+                    sanitize_text(dashboard_access_agent.get("username")).lower(),
                     instance_id,
                     console_status,
                 ),
                 "message": "Login successful.",
             }
 
-        # Passwordless support accounts should continue through the KBC auth
+        # Passwordless staff accounts should continue through the KBC auth
         # fallback below or Microsoft sign-in.
         if not fetch_legacy_support_user_by_username(username):
             raise ApiError(401, "This account does not have a password set. Please sign in with Microsoft.")
@@ -10410,7 +11101,7 @@ def trigger_ticket_background_sync() -> None:
     threading.Thread(target=_sync_tickets_background, daemon=True).start()
 
 
-def list_admin_tickets() -> dict[str, Any]:
+def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
     trigger_ticket_background_sync()
 
     tickets = run_query(
@@ -10477,6 +11168,7 @@ def list_admin_tickets() -> dict[str, Any]:
     )
 
     tickets = [ticket for ticket in tickets if not is_admin_hidden_support_flow_ticket_record(ticket)]
+    tickets = filter_admin_tickets_for_actor(tickets, actor)
     tickets = [apply_ticket_sla_policy(ticket) for ticket in tickets]
     tickets = sort_tickets_by_priority_and_recency(tickets)
     return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
@@ -10646,6 +11338,8 @@ def list_admin_notifications(actor_username: Any, instance_id: Any, *, limit: An
           h.payload,
           h.created_at,
           t.public_id,
+          t.technical_subcategory,
+          t.assigned_team,
           t.status,
           t.status_reason,
           t.metadata,
@@ -10673,13 +11367,20 @@ def list_admin_notifications(actor_username: Any, instance_id: Any, *, limit: An
         """,
         [actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, resolved_limit],
     )
+    notifications = filter_admin_tickets_for_actor(notifications, actor)
 
     return {"notifications": [serialize_admin_notification_log_item(row) for row in notifications]}
 
 
-def get_admin_ticket_detail_response(public_id: str) -> dict[str, Any]:
+def get_admin_ticket_detail_response(public_id: str, actor: dict[str, Any] | None = None) -> dict[str, Any]:
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
+
+    if actor is not None:
+        ticket_scope = fetch_ticket_scope_record(public_id)
+        if not ticket_scope:
+            raise ApiError(404, "Ticket not found.")
+        require_actor_can_access_admin_ticket(actor, ticket_scope)
 
     sync_open_ticket_inactivity(public_id=public_id)
     detail = fetch_admin_ticket_detail(public_id)
@@ -11538,6 +12239,8 @@ def submit_coverage_tutor_request(
                             or sanitize_text(requested_card.get("createdAt")),
                         }
                 documentation["coverageCards"] = coverage_cards
+        documentation = stamp_coverage_documentation_card_actors(documentation, existing_documentation, actor_row)
+        coverage_cards = list(documentation.get("coverageCards") or [])
         card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
         if card_index is None:
             raise ApiError(404, "Coverage card not found.")
@@ -11633,6 +12336,16 @@ def submit_coverage_tutor_request(
             "requestStatus": "requested",
             "submittedAt": sanitize_text(target_card.get("submittedAt")) or timestamp,
             "updatedAt": timestamp,
+            **(
+                {}
+                if (
+                    parse_assigned_agent_id(target_card.get("createdByAgentId"))
+                    or sanitize_text(target_card.get("createdByAgentName"))
+                    or sanitize_text(target_card.get("createdByAgentUsername"))
+                )
+                else build_coverage_card_actor_stamp(actor_row, "created")
+            ),
+            **build_coverage_card_actor_stamp(actor_row, "updated"),
             "respondedAt": "",
             "responseToken": response_token,
             "requestSubmittedByAgentId": int(actor_row["id"]),
@@ -11658,13 +12371,8 @@ def submit_coverage_tutor_request(
 
         next_status = "Pending"
         next_status_reason = request_status_reason
-        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
-            next_status,
-            ticket.get("created_at"),
-            ticket.get("sla_status"),
-        )
-        updated_ticket_metadata = normalize_json_object(ticket_metadata)
-        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        next_sla_status = "On Track"
+        updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
         updated_ticket_metadata["admin_documentation"] = documentation
         # A fresh tutor request supersedes any prior accepted/refused response.
         updated_ticket_metadata.pop(LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY, None)
@@ -11905,22 +12613,24 @@ def send_coverage_tutor_follow_up_files(
                 **target_card,
                 "presentationFiles": [*existing_files, *new_follow_up_files],
                 "updatedAt": timestamp,
+                **build_coverage_card_actor_stamp(actor_row, "updated"),
             }
             coverage_cards[card_index] = updated_target_card
             documentation["coverageCards"] = coverage_cards
 
-            updated_ticket_metadata = normalize_json_object(ticket_metadata)
+            updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
             updated_ticket_metadata["admin_documentation"] = documentation
 
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
                     UPDATE tickets
-                    SET metadata = %s::jsonb,
+                    SET sla_status = %s,
+                        metadata = %s::jsonb,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [json.dumps(updated_ticket_metadata), ticket["id"]],
+                    ["On Track", json.dumps(updated_ticket_metadata), ticket["id"]],
                 )
 
             actor = {
@@ -12091,13 +12801,8 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
 
         next_status = "Closed" if outcome == "accepted" else "Pending"
         next_status_reason = STATUS_REASON_TUTOR_ACCEPTED if outcome == "accepted" else STATUS_REASON_TUTOR_REJECTED
-        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
-            next_status,
-            ticket.get("created_at"),
-            ticket.get("sla_status"),
-        )
-        updated_ticket_metadata = normalize_json_object(ticket_metadata)
-        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        next_sla_status = "On Track"
+        updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
         updated_ticket_metadata["admin_documentation"] = documentation
         latest_response_payload = build_coverage_tutor_response_payload(
             ticket_public_id=ticket_public_id,
@@ -12308,6 +13013,63 @@ def acknowledge_coverage_ticket_notification(public_id: str, payload: dict[str, 
     return detail
 
 
+def acknowledge_learning_plan_transfer_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.technical_subcategory,
+              t.assigned_team,
+              t.metadata
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        require_actor_can_access_admin_ticket(actor_row, ticket)
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        if not get_pending_learning_plan_transfer_notification(ticket_metadata):
+            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
+
+        ticket_metadata.pop(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY, None)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
 def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     card_id = sanitize_text(payload.get("cardId"))
@@ -12378,6 +13140,7 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
                 **card,
                 "locked": True,
                 "updatedAt": confirmed_at,
+                **build_coverage_card_actor_stamp(actor_row, "updated"),
             }
             if sanitize_text(card.get("id")) == card_id:
                 updated_card.update(
@@ -12393,13 +13156,8 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
 
         next_status = "Closed"
         next_status_reason = STATUS_REASON_CLOSED_BY_AGENT
-        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
-            next_status,
-            ticket.get("created_at"),
-            ticket.get("sla_status"),
-        )
-        updated_ticket_metadata = normalize_json_object(ticket_metadata)
-        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        next_sla_status = "On Track"
+        updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
         updated_ticket_metadata["admin_documentation"] = documentation
 
         with connection.cursor() as cursor:
@@ -13515,13 +14273,14 @@ def get_ticket_chat_context_response(public_id: str) -> dict[str, Any]:
     }
 
 
-def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
     requested_status = sanitize_text(payload.get("status")) if "status" in payload else None
     requested_status_reason = sanitize_text(payload.get("statusReason")) if "statusReason" in payload else None
     requested_chat_state = sanitize_text(payload.get("chatState")).lower() if "chatState" in payload else None
     requested_sla_status = sanitize_text(payload.get("slaStatus")) if "slaStatus" in payload else None
     requested_assigned_team = sanitize_text(payload.get("assignedTeam")) if "assignedTeam" in payload else None
     requested_documentation = payload.get("documentation") if isinstance(payload.get("documentation"), dict) else None
+    uploaded_documentation_files = list(uploaded_files or [])
     should_create_follow_up_ticket = normalize_bool(payload.get("createFollowUpTicket"))
     requested_follow_up_inquiry = sanitize_text(payload.get("followUpInquiry"))
     has_escalation_agent_input = "escalationAgentId" in payload
@@ -13542,8 +14301,14 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
     if requested_sla_status is not None and requested_sla_status not in ALLOWED_SLA_STATUSES:
         raise ApiError(400, "Invalid SLA status.")
 
+    if uploaded_documentation_files and requested_documentation is None:
+        raise ApiError(400, "Documentation payload is required when uploading documentation attachments.")
+
     parsed_assigned_agent_id = parse_assigned_agent_id(payload.get("assignedAgentId")) if has_assigned_agent_input else None
     parsed_escalation_agent_id = parse_assigned_agent_id(payload.get("escalationAgentId")) if has_escalation_agent_input else None
+    learning_plan_transfer_webhook_ticket_id: int | None = None
+    learning_plan_transfer_webhook_payload: dict[str, Any] | None = None
+    learning_plan_transfer_notification_payload: dict[str, Any] | None = None
 
     with transaction.atomic():
         ticket = run_query_one(
@@ -13594,6 +14359,18 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
 
         apply_ticket_sla_policy(ticket)
 
+        actor_row = fetch_actor_by_username(actor_username) if actor_username else None
+        require_actor_can_access_admin_ticket(actor_row, ticket)
+        actor = (
+            {
+                "id": actor_row["id"],
+                "role": actor_row["role"],
+                "label": actor_row.get("full_name") or actor_row["username"],
+            }
+            if actor_row
+            else None
+        )
+
         if (
             requested_status_reason is not None
             and is_coverage_ticket_record(ticket)
@@ -13607,16 +14384,6 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
         if requested_status is not None and requested_status != ticket["status"] and not note:
             raise ApiError(400, "Add an internal note before changing the ticket status.")
 
-        actor_row = fetch_actor_by_username(actor_username) if actor_username else None
-        actor = (
-            {
-                "id": actor_row["id"],
-                "role": actor_row["role"],
-                "label": actor_row.get("full_name") or actor_row["username"],
-            }
-            if actor_row
-            else None
-        )
         current_assigned_agent_id = int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None
         current_assigned_team = get_effective_assigned_team(ticket.get("assigned_team"))
         requested_assignment_changed = has_assigned_agent_input and current_assigned_agent_id != parsed_assigned_agent_id
@@ -13710,29 +14477,45 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             elif requested_status_reason is None and not is_status_reason_allowed_for_status(next_status, next_status_reason):
                 next_status_reason = ""
         validate_status_reason_for_status(next_status, next_status_reason)
-        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
-            next_status,
-            ticket.get("created_at"),
-            ticket["sla_status"],
-            requested_sla_status,
-        )
         next_chat_state = requested_chat_state or map_conversation_status(next_status)
         ensure_open_ticket_uses_open_chat(next_status, next_chat_state)
         updated_ticket_metadata = normalize_json_object(ticket.get("metadata"))
-        updated_ticket_metadata.update(build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason))
+        if is_quick_ticket_record(ticket) or (
+            is_quick_ticket_status_reason(next_status_reason)
+            and not is_coverage_ticket_record(ticket)
+        ):
+            updated_ticket_metadata[QUICK_TICKET_ORIGIN_METADATA_KEY] = True
         chat_public_id = build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata"))
         if requested_documentation is not None:
+            previous_documentation_payload = normalize_json_object(ticket.get("metadata")).get("admin_documentation")
             documentation_payload = normalize_admin_documentation(
                 requested_documentation,
                 fallback_inquiry=sanitize_text(ticket.get("inquiry")),
                 fallback_chat_id=chat_public_id,
                 fallback_ticket_id=ticket["public_id"],
             )
+            if uploaded_documentation_files:
+                documentation_payload = attach_uploaded_documentation_card_files(
+                    ticket_id=int(ticket["id"]),
+                    ticket_public_id=ticket["public_id"],
+                    documentation=documentation_payload,
+                    uploaded_files=uploaded_documentation_files,
+                )
             if is_coverage_ticket_record(ticket):
                 documentation_payload = freeze_coverage_documentation_snapshot(
-                    normalize_json_object(ticket.get("metadata")).get("admin_documentation"),
+                    previous_documentation_payload,
                     documentation_payload,
                 )
+                documentation_payload = stamp_coverage_documentation_card_actors(
+                    documentation_payload,
+                    previous_documentation_payload,
+                    actor_row,
+                )
+            documentation_payload = stamp_documentation_card_actors(
+                documentation_payload,
+                previous_documentation_payload,
+                actor_row,
+            )
             updated_ticket_metadata["admin_documentation"] = documentation_payload
 
         if is_escalation_notification and escalation_target_agent:
@@ -13784,6 +14567,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             updated_ticket_metadata.pop(PENDING_ESCALATION_NOTIFICATION_METADATA_KEY, None)
             updated_ticket_metadata[LATEST_ESCALATION_CLOSURE_METADATA_KEY] = latest_escalation_closure
 
+        next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
+            ticket,
+            next_status,
+            metadata=updated_ticket_metadata,
+            requested_sla_status=requested_sla_status,
+        )
+
         next_assigned_agent_id = (
             parsed_assigned_agent_id
             if has_assigned_agent_input
@@ -13798,6 +14588,43 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             next_assigned_team = derive_assigned_team_for_ticket_assignment(current_assigned_team, assigned_agent)
         else:
             next_assigned_team = current_assigned_team
+        next_assigned_agent_name = (
+            sanitize_text(assigned_agent.get("full_name") or assigned_agent.get("username"))
+            if isinstance(assigned_agent, dict)
+            else sanitize_text(ticket.get("assigned_agent_name"))
+        )
+        next_assigned_agent_username = (
+            sanitize_text(assigned_agent.get("username"))
+            if isinstance(assigned_agent, dict)
+            else sanitize_text(ticket.get("assigned_agent_username"))
+        )
+
+        next_requester_role = get_ticket_requester_role(updated_ticket_metadata)
+        next_requester_email = sanitize_text(ticket.get("learner_email"))
+        next_requester_name = sanitize_text(ticket.get("learner_name")) or next_requester_email
+        is_next_learning_plan_team = next_assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold()
+
+        if not is_next_learning_plan_team:
+            updated_ticket_metadata.pop(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY, None)
+
+        if requested_team_changed and is_next_learning_plan_team:
+            learning_plan_transfer_notification_payload = build_learning_plan_transfer_notification_payload(
+                ticket_id=ticket["public_id"],
+                requester_name=next_requester_name,
+                requester_email=next_requester_email,
+                requester_role=next_requester_role,
+                from_team=current_assigned_team,
+                to_team=next_assigned_team,
+                transferred_at=datetime.now(timezone.utc),
+                transferred_by=actor_row,
+                assigned_agent_id=next_assigned_agent_id,
+                assigned_agent_name=next_assigned_agent_name,
+                assigned_agent_username=next_assigned_agent_username,
+                note=note,
+            )
+            updated_ticket_metadata[PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY] = (
+                learning_plan_transfer_notification_payload
+            )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13892,6 +14719,29 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
                     "toTeam": next_assigned_team,
                 },
             )
+            if next_assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold():
+                learning_plan_transfer_webhook_ticket_id = int(ticket["id"])
+                learning_plan_transfer_webhook_payload = build_learning_plan_ticket_transfer_webhook_payload(
+                    ticket_row={
+                        **ticket,
+                        "status": next_status,
+                        "status_reason": next_status_reason,
+                        "assigned_agent_id": next_assigned_agent_id,
+                        "assigned_agent_name": next_assigned_agent_name,
+                        "assigned_agent_username": next_assigned_agent_username,
+                        "assigned_team": next_assigned_team,
+                        "sla_status": next_sla_status,
+                        "metadata": updated_ticket_metadata,
+                    },
+                    from_team=current_assigned_team,
+                    to_team=next_assigned_team,
+                    transferred_by=actor_row,
+                    transferred_at=datetime.now(timezone.utc),
+                    assigned_agent_id=next_assigned_agent_id,
+                    assigned_agent_name=next_assigned_agent_name,
+                    assigned_agent_username=next_assigned_agent_username,
+                    note=note,
+                )
 
         if ticket["sla_status"] != next_sla_status:
             insert_history_event(ticket["id"], "sla_changed", actor, {"from": ticket["sla_status"], "to": next_sla_status})
@@ -13958,6 +14808,11 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any]) -> dict[str, An
             status=next_status,
             status_reason=next_status_reason,
         )
+    if learning_plan_transfer_webhook_ticket_id and learning_plan_transfer_webhook_payload:
+        notify_learning_plan_ticket_transfer(
+            learning_plan_transfer_webhook_ticket_id,
+            learning_plan_transfer_webhook_payload,
+        )
 
     detail_public_id = follow_up_public_id or public_id
     detail = fetch_admin_ticket_detail(detail_public_id)
@@ -13979,7 +14834,7 @@ def update_admin_ticket_archive_state(public_id: str, payload: dict[str, Any]) -
     with transaction.atomic():
         ticket = run_query_one(
             """
-            SELECT id, public_id, is_archived
+            SELECT id, public_id, technical_subcategory, assigned_team, metadata, is_archived
             FROM tickets
             WHERE public_id = %s
             LIMIT 1
@@ -13991,6 +14846,7 @@ def update_admin_ticket_archive_state(public_id: str, payload: dict[str, Any]) -
             raise ApiError(404, "Ticket not found.")
 
         actor_row = fetch_actor_by_username(actor_username) if actor_username else None
+        require_actor_can_access_admin_ticket(actor_row, ticket)
         actor = (
             {
                 "id": actor_row["id"],
@@ -14065,6 +14921,9 @@ def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> 
             SELECT
               t.id,
               t.public_id,
+              t.technical_subcategory,
+              t.assigned_team,
+              t.metadata,
               t.is_archived,
               t.conversation_id,
               c.metadata AS conversation_metadata
@@ -14078,6 +14937,8 @@ def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> 
         )
         if not ticket:
             raise ApiError(404, "Ticket not found.")
+
+        require_actor_can_access_admin_ticket(actor_row, ticket)
 
         if not normalize_bool(ticket.get("is_archived")):
             raise ApiError(409, "Archive this ticket before deleting it permanently.")
@@ -14850,8 +15711,14 @@ def delete_request(url: str, headers: dict[str, str] | None = None) -> tuple[boo
     return execute_http_request(request)
 
 
-def post_json_webhook(url: str, payload: dict[str, Any], *, timeout_seconds: int = 20) -> tuple[bool, bool, int | None, Any]:
-    return post_json_request(url, payload, timeout_seconds=timeout_seconds)
+def post_json_webhook(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: int = 20,
+) -> tuple[bool, bool, int | None, Any]:
+    return post_json_request(url, payload, headers=headers, timeout_seconds=timeout_seconds)
 
 
 def post_multipart_webhook(
@@ -15494,15 +16361,12 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             {"requestedDate": requested_date, "requestedTime": requested_time},
         )
 
-        apply_ticket_sla_policy(ticket)
-        next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+        next_sla_status, next_sla_attention_required, _next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
+            ticket,
             "Pending",
-            ticket.get("created_at"),
-            ticket["sla_status"],
         )
-        sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
         session_ticket_metadata_patch = {
-            **sla_metadata_patch,
+            **updated_ticket_metadata,
             SUPPORT_FLOW_STAGE_METADATA_KEY: None,
             "booking_started_at": None,
         }
@@ -15514,7 +16378,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                 SET status = %s,
                     status_reason = %s,
                     sla_status = %s,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    metadata = %s::jsonb,
                     updated_at = NOW(),
                     closed_at = CASE
                       WHEN status = 'Closed' THEN NULL
@@ -15726,12 +16590,10 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
     if not cancellation_result["cancelled"]:
         raise ApiError(502, cancellation_result["message"] or "We could not cancel the support meeting right now.")
 
-    next_sla_status, next_sla_attention_required, next_sla_attention_reason = resolve_next_sla_state(
+    next_sla_status, next_sla_attention_required, _next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
+        ticket,
         "Open",
-        ticket.get("created_at"),
-        ticket["sla_status"],
     )
-    sla_metadata_patch = build_sla_metadata_patch(next_sla_attention_required, next_sla_attention_reason)
     cancellation_metadata_patch = {
         "cancelled_at": datetime.now(timezone.utc).isoformat(),
         "cancellation_configured": cancellation_result["configured"],
@@ -15756,7 +16618,7 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
                 SET status = %s,
                     status_reason = %s,
                     sla_status = %s,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    metadata = %s::jsonb,
                     updated_at = NOW(),
                     closed_at = CASE
                       WHEN status = 'Closed' THEN NULL
@@ -15764,7 +16626,7 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
                     END
                 WHERE id = %s
                 """,
-                ["Open", "", next_sla_status, json.dumps(sla_metadata_patch), ticket["id"]],
+                ["Open", "", next_sla_status, json.dumps(updated_ticket_metadata), ticket["id"]],
             )
 
             if ticket.get("conversation_id"):

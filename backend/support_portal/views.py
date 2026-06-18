@@ -23,6 +23,7 @@ from .services import (
     acknowledge_ticket_teams_call_notification,
     acknowledge_ticket_transfer_decision,
     acknowledge_coverage_ticket_notification,
+    acknowledge_learning_plan_transfer_notification,
     acknowledge_coverage_tutor_response,
     accept_ticket_transfer_request,
     ApiError,
@@ -320,6 +321,24 @@ def parse_coverage_tutor_follow_up_request(request) -> tuple[dict, list]:
             payload[key] = value
 
         return payload, list(request.FILES.getlist("presentationFiles"))
+
+    return parse_json_body(request), []
+
+
+def parse_admin_ticket_update_request(request) -> tuple[dict, list]:
+    content_type = (request.content_type or "").strip().lower()
+    if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
+        payload: dict[str, object] = {}
+        for key, value in request.POST.items():
+            if key == "documentation":
+                try:
+                    payload[key] = json.loads(value) if value else {}
+                except json.JSONDecodeError as error:
+                    raise ApiError(400, "Invalid documentation payload.") from error
+                continue
+            payload[key] = value
+
+        return payload, list(request.FILES.getlist("documentationFiles"))
 
     return parse_json_body(request), []
 
@@ -671,8 +690,8 @@ def admin_account_detail(request, account_id: int):
 @require_http_methods(["GET"])
 def admin_tickets(request):
     try:
-        require_request_admin_session(request)
-        return JsonResponse(list_admin_tickets())
+        actor, _session_payload = require_request_admin_session(request)
+        return JsonResponse(list_admin_tickets(actor))
     except Exception as error:
         return handle_api_error(error)
 
@@ -693,14 +712,21 @@ def admin_notifications(request):
         return handle_api_error(error)
 
 
-@require_http_methods(["GET", "PATCH"])
+@require_http_methods(["GET", "PATCH", "POST"])
 def admin_ticket_detail(request, public_id: str):
     try:
-        require_request_admin_session(request)
+        actor, _session_payload = require_request_admin_session(request)
         if request.method == "GET":
-            return JsonResponse(get_admin_ticket_detail_response(public_id))
+            return JsonResponse(get_admin_ticket_detail_response(public_id, actor))
 
-        return JsonResponse(update_admin_ticket(public_id, build_session_bound_admin_payload(request)))
+        payload, uploaded_files = parse_admin_ticket_update_request(request)
+        return JsonResponse(
+            update_admin_ticket(
+                public_id,
+                build_session_bound_admin_payload(request, payload=payload),
+                uploaded_files=uploaded_files,
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 
@@ -726,8 +752,8 @@ def admin_ticket_permanent_delete(request, public_id: str):
 @require_http_methods(["GET"])
 def admin_ticket_attachment_download(request, public_id: str, attachment_id: int):
     try:
-        require_request_admin_session(request)
-        attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
+        actor, _session_payload = require_request_admin_session(request)
+        attachment = get_admin_ticket_attachment_file(public_id, attachment_id, actor=actor)
         response = FileResponse(
             attachment["path"].open("rb"),
             as_attachment=False,
@@ -743,8 +769,8 @@ def admin_ticket_attachment_download(request, public_id: str, attachment_id: int
 @require_http_methods(["GET"])
 def admin_ticket_chat_attachment_download(request, public_id: str, client_attachment_id: str):
     try:
-        require_request_admin_session(request)
-        attachment = get_ticket_chat_attachment_file(public_id, client_attachment_id)
+        actor, _session_payload = require_request_admin_session(request)
+        attachment = get_ticket_chat_attachment_file(public_id, client_attachment_id, actor=actor)
         response = FileResponse(
             attachment["path"].open("rb"),
             as_attachment=False,
@@ -886,6 +912,14 @@ def admin_ticket_coverage_tutor_response_acknowledge(request, public_id: str):
 def admin_ticket_coverage_ticket_notification_acknowledge(request, public_id: str):
     try:
         return JsonResponse(acknowledge_coverage_ticket_notification(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_learning_plan_transfer_notification_acknowledge(request, public_id: str):
+    try:
+        return JsonResponse(acknowledge_learning_plan_transfer_notification(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
