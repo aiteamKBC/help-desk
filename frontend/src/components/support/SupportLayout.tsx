@@ -33,7 +33,7 @@ export const SupportLayout = ({
     isKnowledgeBaseArea;
   const [isAdminMobileNavOpen, setIsAdminMobileNavOpen] = useState(false);
   const [showAdminReturnLink, setShowAdminReturnLink] = useState(() => !isAdminArea && canReturnToAdminDashboard());
-  const effectiveShowHeader = showHeader && (isAdminArea || showAdminReturnLink);
+  const effectiveShowHeader = showHeader;
   const adminHeaderShellClassName = fullWidth
     ? "w-full px-4 sm:px-6 lg:px-8 xl:px-10"
     : "mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8";
@@ -76,6 +76,13 @@ export const SupportLayout = ({
       <UserRound className="h-4 w-4 text-primary" />
       <span className="sm:hidden">Portal</span>
       <span className="hidden sm:inline">Support Portal</span>
+    </Link>
+  ) : null;
+  const publicAdminPortalLink = !isAdminArea && !showAdminReturnLink ? (
+    <Link to="/admin" className={internalLinkClassName(false)}>
+      <ShieldCheck className="h-4 w-4 text-primary" />
+      <span className="sm:hidden">Admin</span>
+      <span className="hidden sm:inline">Admin</span>
     </Link>
   ) : null;
 
@@ -183,12 +190,11 @@ export const SupportLayout = ({
 
               {left ? <div className="flex items-center gap-2">{left}</div> : null}
 
-              {showAdminReturnLink || right ? (
-                <div className="ml-auto flex items-center gap-2">
-                  {adminReturnLink}
-                  {right}
-                </div>
-              ) : null}
+              <div className="ml-auto flex items-center gap-2">
+                {adminReturnLink}
+                {right}
+                {publicAdminPortalLink}
+              </div>
             </div>
           </header>
         )

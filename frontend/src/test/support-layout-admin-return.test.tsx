@@ -27,7 +27,7 @@ describe("SupportLayout admin return link", () => {
     });
   });
 
-  it("does not show the Admin link for normal support portal visits", () => {
+  it("shows the Admin link for normal support portal visits", () => {
     render(
       <MemoryRouter initialEntries={["/"]}>
         <SupportLayout>
@@ -36,6 +36,19 @@ describe("SupportLayout admin return link", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole("link", { name: /Admin/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Admin/i })).toHaveAttribute("href", "/admin");
+    expect(screen.queryByRole("link", { name: /Support Portal/i })).not.toBeInTheDocument();
+  });
+
+  it("shows the Support Portal link for admin area visits", () => {
+    render(
+      <MemoryRouter initialEntries={["/admin/login"]}>
+        <SupportLayout>
+          <div>Admin Login</div>
+        </SupportLayout>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("link", { name: /Support Portal/i })).toHaveAttribute("href", "/?adminPortalReturn=1");
   });
 });

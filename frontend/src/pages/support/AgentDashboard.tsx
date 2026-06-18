@@ -4807,7 +4807,8 @@ const AgentDashboard = () => {
                       { preferCoverageInquiry: isLearningPlanCoverageSection },
                     );
                     const createdAtLabel = formatDateTime(ticket.createdAt);
-                    const [createdDateLabel, createdTimeLabel = ""] = createdAtLabel.split(", ");
+                    const createdDateLabel = formatDateShort(ticket.createdAt);
+                    const createdTimeLabel = formatTimeShort(ticket.createdAt);
                     const coverageSessionDateLabel = isLearningPlanCoverageSection
                       ? getCoverageTicketNextSessionDateInfo(ticket, coveragePriorityReferenceDate)?.label || ""
                       : "";
@@ -12764,6 +12765,13 @@ function formatDateShort(value: string) {
     year: "numeric",
     month: "short",
     day: "numeric",
+  });
+}
+
+function formatTimeShort(value: string) {
+  return new Date(value).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
   });
 }
 
