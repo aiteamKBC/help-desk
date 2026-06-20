@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -42,6 +43,28 @@ def build_unverified_jwt(payload: dict) -> str:
     encoded_header = base64.urlsafe_b64encode(json.dumps({"alg": "none", "typ": "JWT"}).encode("utf-8")).decode("utf-8").rstrip("=")
     encoded_payload = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
     return f"{encoded_header}.{encoded_payload}.signature"
+
+
+class EnvLoadingTests(SimpleTestCase):
+    def test_load_env_file_uses_file_value_when_existing_env_var_is_blank(self):
+        with TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env.local"
+            env_path.write_text("N8N_COVERAGE_TICKET_WEBHOOK_SECRET=file-secret\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"N8N_COVERAGE_TICKET_WEBHOOK_SECRET": ""}, clear=True):
+                config_env.load_env_file(env_path)
+
+                self.assertEqual(os.environ["N8N_COVERAGE_TICKET_WEBHOOK_SECRET"], "file-secret")
+
+    def test_load_env_file_preserves_non_empty_existing_env_var(self):
+        with TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env.local"
+            env_path.write_text("N8N_COVERAGE_TICKET_WEBHOOK_SECRET=file-secret\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"N8N_COVERAGE_TICKET_WEBHOOK_SECRET": "runtime-secret"}, clear=True):
+                config_env.load_env_file(env_path)
+
+                self.assertEqual(os.environ["N8N_COVERAGE_TICKET_WEBHOOK_SECRET"], "runtime-secret")
 
 
 class LearnerLookupTests(SimpleTestCase):

@@ -168,3 +168,41 @@ After every meaningful code or product change, append a new entry to the end of 
   - A same-day UI fix moved the permanent-delete confirmation dialog to the top-level `AgentDashboard` render tree so archive-table delete buttons can actually open the confirmation modal even when the coverage workspace panel is closed.
   - The archive table was also compacted the same day by merging `Chat ID + Ticket ID` into one column, merging `Status + Status Reason` into one column, and shrinking permanent delete to an icon button so archived rows fit more cleanly without horizontal scroll on common desktop widths.
   - The archive view header was then polished with an explicit `Archive Mode` badge, warm archive-specific styling, an `Archived` scope label, and a more professional reset action label (`Return to Active View` / `Clear Filters`) so users can immediately tell they are outside the live queue.
+
+### 2026-06-20 - Post-2026-06-13 Repo Catch-Up Summary
+- Request:
+  Refresh durable session memory so newer repo changes made after `2026-06-13` are represented briefly.
+- What changed:
+  - Reviewed live repo history from `2026-06-15` through `2026-06-18` and recorded the main post-`2026-06-13` behavior changes here.
+  - Support portal flows were expanded with learning plan team transfer handling, related dashboard/e-mail/webhook notifications, and local n8n workflow guidance assets.
+  - Coverage flow now includes Aptem coach recipient sourcing and a backend SLA alert sync command; support session booking also blocks overlapping session requests.
+  - Admin/support UI was refined with restored support header + created-time display, clearer transfer-return vs archive actions, and improved documentation attachment preview behavior.
+- Why it changed:
+  The session document had stopped at `2026-06-13`, while the live repo contains several newer changes that future sessions should not miss.
+- Files touched:
+  - `AI_SESSION_DOCUMENTATION.md`
+  - Reference review covered `backend/support_portal/services.py`, `backend/support_portal/tests.py`, `backend/support_portal/views.py`, `backend/support_portal/management/commands/sync_coverage_sla_alerts.py`, `frontend/src/pages/support/AgentDashboard.tsx`, `frontend/src/pages/support/ChatSupport.tsx`, `frontend/src/pages/support/EmbeddedBooking.tsx`, `frontend/src/pages/support/InquiryDetails.tsx`, `frontend/src/components/support/SupportLayout.tsx`, and local `docs/` learning-plan workflow notes.
+- Verification:
+  - Reviewed `git log` entries dated `2026-06-15` through `2026-06-18` on `2026-06-20`.
+  - Checked current local context in `Tests_Notes` and `docs/` for newer workflow notes not already captured in this file.
+- Follow-up notes:
+  - This is a concise catch-up summary, not a full one-entry-per-commit backfill.
+  - Local `docs/` learning-plan workflow files and `Tests_Notes` currently appear as working-tree context, so future sessions should treat them as local notes unless they are committed.
+  - This partially supersedes the `2026-06-13 - Coverage Coach Fields And Stable Manual E-mail Editing` entry by widening coach recipient sourcing beyond `coach_profiles` to include Aptem owner data.
+
+### 2026-06-20 - Fix Webhook Secret Loading For Open-Ticket n8n Calls
+- Request:
+  Fix missing `x-support-webhook-secret` on `open/ticket` webhook deliveries even though the secret was already present in `.env.local`.
+- What changed:
+  - Updated `backend/config/env.py` so `.env.local` and `.env` values now fill env vars that are missing or blank, instead of skipping them whenever the host process already defines the key as an empty string.
+  - Added regression tests covering blank-env fallback and non-empty-env preservation for `N8N_COVERAGE_TICKET_WEBHOOK_SECRET`.
+- Why it changed:
+  The webhook sender already attached the header when Django had a non-empty secret, but the env loader used `setdefault`, so an empty host env var could silently block the file-based secret from loading.
+- Files touched:
+  - `backend/config/env.py`
+  - `backend/support_portal/tests.py`
+  - `AI_SESSION_DOCUMENTATION.md`
+- Verification:
+  - `.\.venv\Scripts\python.exe manage.py test --keepdb support_portal.tests.EnvLoadingTests support_portal.tests.SupportSessionValidationTests.test_send_coverage_ticket_operations_webhook_includes_secret_header_when_configured support_portal.tests.SupportSessionValidationTests.test_send_learning_plan_ticket_transfer_webhook_includes_secret_header_when_configured` passed in `backend/` on `2026-06-20`.
+- Follow-up notes:
+  - The running backend still needs a restart after deployment so Django reloads env values and starts sending the header on new webhook calls.

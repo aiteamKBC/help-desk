@@ -23,7 +23,9 @@ def load_env_file(path: Path) -> None:
         value = value.strip().strip("'").strip('"')
 
         if key:
-            os.environ.setdefault(key, value)
+            current_value = os.environ.get(key)
+            if current_value is None or not current_value.strip():
+                os.environ[key] = value
 
 
 load_env_file(BASE_DIR / ".env.local")
