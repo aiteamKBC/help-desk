@@ -52,6 +52,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -3192,6 +3193,8 @@ const AgentDashboard = () => {
     status?: TicketSummary["status"];
     statusReason?: string;
     note?: string;
+    assignedAgentId?: number | null;
+    slaStatus?: TicketSummary["slaStatus"];
     successMessage?: string;
     errorMessage?: string;
     showSuccessToast?: boolean;
@@ -3209,15 +3212,21 @@ const AgentDashboard = () => {
     setIsSavingActiveDocumentation(true);
 
     try {
+      const requestBody: Record<string, unknown> = {
+        documentation: documentationToSave,
+        ...(options?.status ? { status: options.status } : {}),
+        ...(options?.statusReason ? { statusReason: options.statusReason } : {}),
+        ...(options?.note ? { note: options.note } : {}),
+        ...(options?.slaStatus ? { slaStatus: options.slaStatus } : {}),
+      };
+      if (options && "assignedAgentId" in options) {
+        requestBody.assignedAgentId = options.assignedAgentId;
+      }
+
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}`, {
         method: "PATCH",
         headers: buildAdminJsonHeaders(),
-        body: JSON.stringify({
-          documentation: documentationToSave,
-          ...(options?.status ? { status: options.status } : {}),
-          ...(options?.statusReason ? { statusReason: options.statusReason } : {}),
-          ...(options?.note ? { note: options.note } : {}),
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
@@ -3246,10 +3255,51 @@ const AgentDashboard = () => {
   }
 
   async function saveActiveCoverageDocumentation() {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return;
+    }
+
     await persistActiveCoverageDocumentation({
+      documentation: serializeCoverageDocumentationForRequest(
+        activeDocumentationDraft || buildCoverageDocumentationDraft(activeDetail.ticket),
+      ),
+      note: trimmedNotes,
       successMessage: "Coverage ticket saved.",
       errorMessage: "We could not save the coverage ticket right now.",
     });
+  }
+
+  async function closeActiveCoverageTicket() {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return false;
+    }
+
+    const closeNote = notes.trim();
+    if (!closeNote) {
+      toast.error("Add an internal note before closing this ticket.");
+      return false;
+    }
+
+    const currentAssignedAgentId = activeDetail.ticket.assignedAgentId ? String(activeDetail.ticket.assignedAgentId) : "unassigned";
+    const nextAssignedAgentId = canAssignActiveTicket
+      && draftAgentId !== currentAssignedAgentId
+      ? (draftAgentId === "unassigned" ? null : Number(draftAgentId))
+      : undefined;
+    const documentationToSave = serializeCoverageDocumentationForRequest(
+      activeDocumentationDraft || buildCoverageDocumentationDraft(activeDetail.ticket),
+    );
+    const payload = await persistActiveCoverageDocumentation({
+      documentation: documentationToSave,
+      status: "Closed",
+      statusReason: "Closed via Agent",
+      note: closeNote,
+      assignedAgentId: nextAssignedAgentId,
+      slaStatus: effectiveDraftSlaStatus,
+      successMessage: "Ticket closed",
+      errorMessage: "We could not close the coverage ticket right now.",
+    });
+
+    return Boolean(payload?.ticket);
   }
 
   async function submitActiveCoverageTutorChoiceCard(cardId: string) {
@@ -6025,7 +6075,7 @@ const AgentDashboard = () => {
                   currentAdmin={session}
                   readOnly={activeCoverageDocumentationReadOnly}
                   isSaving={isSavingActiveDocumentation}
-                  isSavingDetails={isSaving}
+                  isSavingDetails={isSaving || isSavingActiveDocumentation}
                   isArchived={activeTicketIsArchived}
                   isArchiving={archiveActionTicketId === activeDetail.ticket.id}
                   isDirty={activeCoverageDocumentationDirty}
@@ -6049,6 +6099,7 @@ const AgentDashboard = () => {
                   onCancel={closePanel}
                   onSave={() => void saveActiveCoverageDocumentation()}
                   onSaveDetails={() => void saveTicket({ successMessage: "Changes saved" })}
+                  onCloseTicket={closeActiveCoverageTicket}
                   onArchiveToggle={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
                   onSubmitTutorChoiceCard={(cardId) => void submitActiveCoverageTutorChoiceCard(cardId)}
                   onSendTutorFollowUpFiles={sendActiveCoverageTutorFollowUpFiles}
@@ -7874,11 +7925,105 @@ const ConsoleChatBubble = ({
   );
 };
 
+const CoverageCloseTicketButton = ({
+  note,
+  onNoteChange,
+  onCloseTicket,
+  isSaving,
+  disabled = false,
+  className,
+}: {
+  note: string;
+  onNoteChange: (value: string) => void;
+  onCloseTicket: () => Promise<boolean>;
+  isSaving: boolean;
+  disabled?: boolean;
+  className?: string;
+}) => {
+  const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const trimmedNote = note.trim();
+
+  const handleConfirmClose = async () => {
+    if (!trimmedNote) {
+      return;
+    }
+
+    const didClose = await onCloseTicket();
+    if (didClose) {
+      setIsDialogOpen(false);
+    }
+  };
+
+  return (
+    <>
+      <Button
+        type="button"
+        variant="outline"
+        className={className}
+        onClick={() => setIsDialogOpen(true)}
+        disabled={disabled || isSaving}
+      >
+        <X className="h-4 w-4 mr-2" /> Close
+      </Button>
+      <Dialog open={isDialogOpen} onOpenChange={(open) => {
+        if (!isSaving) {
+          setIsDialogOpen(open);
+        }
+      }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Close Coverage Ticket</DialogTitle>
+            <DialogDescription>
+              Add an internal note before closing this coverage ticket.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Label htmlFor="coverage-close-note" className="text-sm font-semibold">
+              Internal note
+            </Label>
+            <Textarea
+              id="coverage-close-note"
+              rows={4}
+              autoFocus
+              value={note}
+              onChange={(event) => onNoteChange(event.target.value)}
+              placeholder="Add an internal note before closing this coverage ticket..."
+              className="rounded-2xl bg-white"
+            />
+            <p className={cn("text-xs", trimmedNote ? "text-muted-foreground" : "text-destructive")}>
+              {trimmedNote
+                ? "This note will be saved in the activity log for support staff."
+                : "A note is required before the close action can be applied."}
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:justify-end">
+            <Button variant="outline" onClick={() => setIsDialogOpen(false)} disabled={isSaving}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => void handleConfirmClose()}
+              disabled={!trimmedNote || isSaving}
+            >
+              {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <X className="h-4 w-4 mr-2" />}
+              Close Ticket
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+};
+
 const CoverageTicketDetailsPanel = ({
   ticket,
   history,
   readOnly,
   isSaving,
+  notes,
+  onNotesChange,
   draftStatus,
   canAssignActiveTicket,
   draftAgentId,
@@ -7892,12 +8037,15 @@ const CoverageTicketDetailsPanel = ({
   slaStatuses,
   canSubmitStatusChange,
   onCancel,
+  onCloseTicket,
   onSaveDetails,
 }: {
   ticket: TicketDetail;
   history: HistoryItem[];
   readOnly: boolean;
   isSaving: boolean;
+  notes: string;
+  onNotesChange: (value: string) => void;
   draftStatus: TicketSummary["status"];
   canAssignActiveTicket: boolean;
   draftAgentId: string;
@@ -7911,6 +8059,7 @@ const CoverageTicketDetailsPanel = ({
   slaStatuses: TicketSummary["slaStatus"][];
   canSubmitStatusChange: boolean;
   onCancel: () => void;
+  onCloseTicket: () => Promise<boolean>;
   onSaveDetails: () => void;
 }) => (
   <div className="space-y-5">
@@ -7921,7 +8070,7 @@ const CoverageTicketDetailsPanel = ({
           {draftStatus}
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          Coverage ticket status is managed by the workflow.
+          Coverage tickets usually close through the tutor workflow, but admins can also close them manually with an internal note.
         </p>
       </div>
       <div>
@@ -8007,17 +8156,25 @@ const CoverageTicketDetailsPanel = ({
 
     <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
       <div className="text-xs text-muted-foreground">
-        {readOnly ? "Closed tickets are view-only." : "Review ticket metadata, then save your changes. Coverage tickets close after a tutor accepts the request."}
+        {readOnly ? "Closed tickets are view-only." : "Review ticket metadata, save your changes, or close the coverage ticket with a required internal note."}
       </div>
       <div className="flex flex-wrap justify-end gap-2">
         <Button variant="outline" onClick={onCancel}>
           Cancel
         </Button>
         {!readOnly ? (
-          <Button onClick={onSaveDetails} className="border-0 gradient-primary" disabled={isSaving || !canSubmitStatusChange}>
-            {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
-            Save Changes
-          </Button>
+          <>
+            <CoverageCloseTicketButton
+              note={notes}
+              onNoteChange={onNotesChange}
+              onCloseTicket={onCloseTicket}
+              isSaving={isSaving}
+            />
+            <Button onClick={onSaveDetails} className="border-0 gradient-primary" disabled={isSaving || !canSubmitStatusChange}>
+              {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+              Save Changes
+            </Button>
+          </>
         ) : null}
       </div>
     </div>
@@ -8055,6 +8212,7 @@ const CoverageTicketWorkspace = ({
   onCancel,
   onSave,
   onSaveDetails,
+  onCloseTicket,
   onArchiveToggle,
   onSubmitTutorChoiceCard,
   onSendTutorFollowUpFiles,
@@ -8090,6 +8248,7 @@ const CoverageTicketWorkspace = ({
   onCancel: () => void;
   onSave: () => void;
   onSaveDetails: () => void;
+  onCloseTicket: () => Promise<boolean>;
   onArchiveToggle: () => void;
   onSubmitTutorChoiceCard: (cardId: string) => void;
   onSendTutorFollowUpFiles: (cardId: string, presentationFiles: CoverageCardAttachment[]) => Promise<boolean>;
@@ -9467,7 +9626,7 @@ const CoverageTicketWorkspace = ({
               ? hasCoverageFollowUpOpportunity
                 ? "Closed tickets are view-only, but you can still send presentation files for accepted tutor requests."
                 : "Closed tickets are view-only."
-              : "Save your work or submit a tutor request. Coverage tickets close after a tutor accepts the request."}
+              : "Save your work, submit a tutor request, or close the coverage ticket with a required internal note."}
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <Button variant="outline" onClick={onCancel}>
@@ -9491,6 +9650,12 @@ const CoverageTicketWorkspace = ({
           </Button>
           {!readOnly ? (
             <>
+              <CoverageCloseTicketButton
+                note={notes}
+                onNoteChange={onNotesChange}
+                onCloseTicket={onCloseTicket}
+                isSaving={isSaving}
+              />
               <Button onClick={onSave} className="border-0 gradient-primary" disabled={!isDirty || isSaving}>
                 {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
                 Save Ticket
@@ -9507,6 +9672,8 @@ const CoverageTicketWorkspace = ({
             history={history}
             readOnly={readOnly}
             isSaving={isSavingDetails}
+            notes={notes}
+            onNotesChange={onNotesChange}
             draftStatus={draftStatus}
             canAssignActiveTicket={canAssignActiveTicket}
             draftAgentId={draftAgentId}
@@ -9520,6 +9687,7 @@ const CoverageTicketWorkspace = ({
             slaStatuses={slaStatuses}
             canSubmitStatusChange={canSubmitStatusChange}
             onCancel={onCancel}
+            onCloseTicket={onCloseTicket}
             onSaveDetails={onSaveDetails}
           />
         </TabsContent>
@@ -11745,6 +11913,20 @@ function freezeDocumentationCardsForSave(documentation: AdminDocumentation): Adm
 function serializeStandardDocumentationForRequest(documentation: AdminDocumentation): AdminDocumentation {
   return {
     ...documentation,
+    documentationCards: documentation.documentationCards.map((card) => ({
+      ...card,
+      attachments: card.attachments.map(serializeCoverageCardAttachmentForRequest),
+    })),
+  };
+}
+
+function serializeCoverageDocumentationForRequest(documentation: AdminDocumentation): AdminDocumentation {
+  return {
+    ...documentation,
+    coverageCards: documentation.coverageCards.map((card) => ({
+      ...card,
+      presentationFiles: card.presentationFiles.map(serializeCoverageCardAttachmentForRequest),
+    })),
     documentationCards: documentation.documentationCards.map((card) => ({
       ...card,
       attachments: card.attachments.map(serializeCoverageCardAttachmentForRequest),

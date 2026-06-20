@@ -206,3 +206,22 @@ After every meaningful code or product change, append a new entry to the end of 
   - `.\.venv\Scripts\python.exe manage.py test --keepdb support_portal.tests.EnvLoadingTests support_portal.tests.SupportSessionValidationTests.test_send_coverage_ticket_operations_webhook_includes_secret_header_when_configured support_portal.tests.SupportSessionValidationTests.test_send_learning_plan_ticket_transfer_webhook_includes_secret_header_when_configured` passed in `backend/` on `2026-06-20`.
 - Follow-up notes:
   - The running backend still needs a restart after deployment so Django reloads env values and starts sending the header on new webhook calls.
+
+### 2026-06-20 - Manual Close Button For Coverage Tickets
+- Request:
+  Add a close action to coverage tickets like normal/quick tickets, but require a note entry through a popup before the close can be applied.
+- What changed:
+  - Added a reusable `Close` action for coverage tickets in both the documentation footer and the coverage details footer.
+  - The action now opens a dialog that requires an internal note before `Closed via Agent` can be submitted.
+  - Coverage close requests now persist the current coverage documentation draft alongside any pending assignee/SLA detail edits so the manual close behaves more like the standard ticket close flow.
+  - Coverage save requests now serialize coverage-card attachments more safely before sending them to the backend.
+- Why it changed:
+  Coverage tickets previously exposed save/tutor-workflow actions only, which made manual closure inconsistent with normal and quick tickets and too easy to attempt without a documented closing note.
+- Files touched:
+  - `frontend/src/pages/support/AgentDashboard.tsx`
+  - `AI_SESSION_DOCUMENTATION.md`
+- Verification:
+  - `npm run build` passed in `frontend/` on `2026-06-20`.
+- Follow-up notes:
+  - The close dialog shares the existing coverage note state, so any note already typed in the workspace is prefilled automatically when the close popup opens.
+  - A same-day runtime fix removed an accidental `coverageCard.attachments` read from the coverage serializer after the close popup appeared clickable but failed on click before the PATCH request was sent; a dashboard runtime regression test now covers the close-dialog submit path.

@@ -378,6 +378,44 @@ function buildDashboardAccountsPayload() {
   };
 }
 
+function buildRuntimeTicketDetail(ticketId: string) {
+  const summary = dashboardPayload.tickets.tickets.find((ticket) => ticket.id === ticketId);
+  if (!summary) {
+    throw new Error(`Ticket ${ticketId} was not found in runtime payload.`);
+  }
+
+  return {
+    ticket: {
+      ...summary,
+      inquiry: summary.documentation?.inquiry || summary.inquiryPreview,
+      closedAt: summary.status === "Closed" ? summary.updatedAt : null,
+      documentation: summary.documentation || {
+        inquiry: summary.inquiryPreview,
+        symptoms: "",
+        errors: "",
+        steps: "",
+        resources: "",
+        chatId: summary.chatId,
+        ticketId: summary.id,
+        ticketStatus: "",
+        statusReason: "",
+        issuesAddressed: "",
+        escalationAgentId: null,
+        escalationAgentName: "",
+        escalationNote: "",
+        coverageNotes: "",
+        coverageCards: [],
+        documentationCards: [],
+        errorImages: [],
+      },
+    },
+    chatHistory: [],
+    attachments: [],
+    history: [],
+    sessionRequests: [],
+  };
+}
+
 describe("AgentDashboard runtime", () => {
   beforeEach(() => {
     window.sessionStorage.clear();
@@ -654,5 +692,77 @@ describe("AgentDashboard runtime", () => {
 
     expect(await screen.findByRole("menuitem", { name: /Support Desk/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Learning Plan Team/i })).not.toBeInTheDocument();
+  });
+
+  it("closes a coverage ticket from the close dialog when a note is provided", async () => {
+    const originalFetch = global.fetch;
+    const patchRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.endsWith("/api/admin/tickets/KBC-000002") && (!init?.method || init.method === "GET")) {
+        return new Response(JSON.stringify(buildRuntimeTicketDetail("KBC-000002")), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.endsWith("/api/admin/tickets/KBC-000002") && init?.method === "PATCH") {
+        const parsedBody = JSON.parse(String(init.body || "{}")) as Record<string, unknown>;
+        patchRequests.push({ url, body: parsedBody });
+        const detail = buildRuntimeTicketDetail("KBC-000002");
+
+        return new Response(JSON.stringify({
+          ...detail,
+          ticket: {
+            ...detail.ticket,
+            status: "Closed",
+            statusReason: "Closed via Agent",
+            closedAt: "2026-06-20T16:00:00.000Z",
+            updatedAt: "2026-06-20T16:00:00.000Z",
+          },
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=coverage"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    const learningPlanPanel = await screen.findByRole("tabpanel");
+    const coverageRow = within(learningPlanPanel)
+      .getAllByRole("button")
+      .find((candidate) => /KBC-000002/.test(candidate.textContent || ""));
+    expect(coverageRow).toBeTruthy();
+    fireEvent.click(coverageRow as HTMLElement);
+
+    expect(await screen.findByText("Coverage Cards")).toBeInTheDocument();
+
+    const saveTicketButton = screen.getByRole("button", { name: /Save Ticket/i });
+    const workspaceFooter = saveTicketButton.parentElement;
+    expect(workspaceFooter).not.toBeNull();
+    fireEvent.click(within(workspaceFooter as HTMLElement).getByRole("button", { name: /^Close$/i }));
+    expect(await screen.findByText("Close Coverage Ticket")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Internal note"), {
+      target: { value: "Closing this coverage ticket after manual review." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Close Ticket/i }));
+
+    await waitFor(() => {
+      expect(patchRequests).toHaveLength(1);
+    });
+
+    expect(patchRequests[0].body.status).toBe("Closed");
+    expect(patchRequests[0].body.statusReason).toBe("Closed via Agent");
+    expect(patchRequests[0].body.note).toBe("Closing this coverage ticket after manual review.");
   });
 });
