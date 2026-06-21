@@ -73,6 +73,7 @@ from .services import (
     submit_coverage_tutor_request,
     update_admin_ticket,
     update_admin_ticket_archive_state,
+    update_agent_operations_access,
     update_agent_support_access,
     update_ticket,
 )
@@ -678,10 +679,14 @@ def admin_account_detail(request, account_id: int):
             remove_agent(account_id)
             return JsonResponse({"ok": True})
         payload = parse_json_body(request)
-        if "supportAccess" not in payload:
-            raise ApiError(400, "supportAccess field is required.")
-        support_access = bool(payload["supportAccess"])
-        agent = update_agent_support_access(account_id, support_access=support_access)
+        has_support_access_patch = "supportAccess" in payload
+        has_operations_access_patch = "operationsAccess" in payload
+        if has_support_access_patch == has_operations_access_patch:
+            raise ApiError(400, "Send exactly one ticket access field.")
+        if has_support_access_patch:
+            agent = update_agent_support_access(account_id, support_access=bool(payload["supportAccess"]))
+        else:
+            agent = update_agent_operations_access(account_id, operations_access=bool(payload["operationsAccess"]))
         return JsonResponse({"agent": agent})
     except Exception as error:
         return handle_api_error(error)

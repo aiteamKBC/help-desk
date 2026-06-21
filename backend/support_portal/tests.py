@@ -1426,6 +1426,54 @@ class AdminSessionViewTests(SimpleTestCase):
         )
         add_entra_agent.assert_called_once_with({"email": "agent@example.com"})
 
+    def test_admin_account_detail_patch_allows_operations_access_update(self):
+        request = self.factory.patch(
+            "/api/admin/accounts/24",
+            data=json.dumps({"operationsAccess": True}),
+            content_type="application/json",
+        )
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 7,
+                    "username": "admin1",
+                    "full_name": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                },
+            ) as require_agent_session_actor,
+            patch.object(
+                views,
+                "update_agent_operations_access",
+                return_value={"id": 24, "legacyOperationsAccess": True},
+            ) as update_agent_operations_access,
+        ):
+            response = views.admin_account_detail(request, 24)
+
+        self.assertEqual(response.status_code, 200)
+        require_agent_session_actor.assert_called_once_with(
+            "admin1",
+            "instance-1",
+            allowed_roles=views.ADMIN_ACCESS_ROLES,
+        )
+        update_agent_operations_access.assert_called_once_with(24, operations_access=True)
+
     def test_admin_ticket_detail_uses_server_session_actor_for_updates(self):
         request = self.factory.patch(
             "/api/admin/tickets/KBC-000001",
@@ -3516,6 +3564,127 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertTrue(summary["ticketState"]["canShowConversation"])
         self.assertFalse(summary["ticketState"]["canReceiveChat"])
 
+    def test_serialize_ticket_summary_prefers_persisted_ticket_state_metadata(self):
+        ticket_row = {
+            "public_id": "KBC-000131",
+            "learner_name": "Persisted State",
+            "learner_email": "persisted@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "State should not come from status reason",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Learning Plan Team",
+            "conversation_id": 10,
+            "conversation_status": "open",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {
+                services.TICKET_STATE_METADATA_KEY: {
+                    "ticketType": "learning_plan",
+                    "workflowStage": "learning_plan_review",
+                    "queueScope": "operations",
+                    "dashboardBucket": "learning_plan",
+                    "canShowConversation": False,
+                    "canReceiveChat": False,
+                    "resolutionReason": "",
+                }
+            },
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "learning_plan_review")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["queueScope"], "operations")
+
+    def test_serialize_ticket_summary_prefers_ticket_state_columns_over_metadata(self):
+        ticket_row = {
+            "public_id": "KBC-000133",
+            "learner_name": "Column State",
+            "learner_email": "column@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Columns should be preferred",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Support Desk",
+            "conversation_id": 10,
+            "conversation_status": "open",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {
+                services.TICKET_STATE_METADATA_KEY: {
+                    "ticketType": "quick",
+                    "workflowStage": "awaiting_review",
+                    "queueScope": "support",
+                    "dashboardBucket": "quick",
+                    "canShowConversation": False,
+                    "canReceiveChat": False,
+                    "resolutionReason": "",
+                }
+            },
+            "ticket_type": "learning_plan",
+            "workflow_stage": "learning_plan_review",
+            "queue_scope": "operations",
+            "dashboard_bucket": "learning_plan",
+            "can_show_conversation": False,
+            "can_receive_chat": False,
+            "resolution_reason": "",
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "learning_plan_review")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["queueScope"], "operations")
+
+    def test_with_ticket_state_metadata_persists_current_state_snapshot(self):
+        metadata = services.with_ticket_state_metadata(
+            {"technical_subcategory": "Coverage"},
+            {
+                "public_id": "KBC-000132",
+                "category": "Technical",
+                "technical_subcategory": "Coverage",
+                "status": "Pending",
+                "status_reason": "Tutor Requested",
+                "assigned_agent_id": None,
+                "assigned_team": "Learning Plan Team",
+                "metadata": {"technical_subcategory": "Coverage"},
+            },
+        )
+
+        self.assertEqual(
+            metadata[services.TICKET_STATE_METADATA_KEY],
+            {
+                "ticketType": "coverage",
+                "workflowStage": "tutor_requested",
+                "queueScope": "operations",
+                "dashboardBucket": "coverage",
+                "canShowConversation": False,
+                "canReceiveChat": False,
+                "resolutionReason": "",
+            },
+        )
+
     def test_serialize_ticket_summary_includes_assigned_live_chat_ticket_state(self):
         ticket_row = {
             "public_id": "KBC-000127",
@@ -4672,6 +4841,37 @@ class SupportDirectoryTests(SimpleTestCase):
         sync_legacy_support_access_group_membership.assert_called_once_with(77, False)
         saved_metadata = persist_agent_metadata.call_args.args[1]
         self.assertFalse(saved_metadata["legacy_support_access"])
+        self.assertFalse(response["legacySupportAccess"])
+
+    def test_update_agent_operations_access_syncs_linked_kbc_auth_group(self):
+        agent = {
+            "id": 24,
+            "username": "learning.plan",
+            "full_name": "Learning Plan",
+            "email": "learning.plan@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 78,
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+            },
+        }
+
+        with (
+            patch.object(services, "run_query_one", return_value=agent),
+            patch.object(services, "sync_legacy_operations_access_group_membership") as sync_legacy_operations_access_group_membership,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = services.update_agent_operations_access(24, operations_access=True)
+
+        sync_legacy_operations_access_group_membership.assert_called_once_with(78, True)
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertTrue(saved_metadata["legacy_operations_access"])
+        self.assertTrue(response["legacyOperationsAccess"])
         self.assertFalse(response["legacySupportAccess"])
 
     def test_remove_agent_turns_off_support_access(self):
@@ -6110,10 +6310,11 @@ class AdminTicketUpdateTests(SimpleTestCase):
         self.assertEqual(response, detail)
         ticket_insert_params = cursor.execute.call_args_list[0].args[1]
         self.assertEqual(ticket_insert_params[10], "High")
-        new_ticket_metadata = json.loads(ticket_insert_params[-1])
+        new_ticket_metadata = json.loads(ticket_insert_params[12])
         self.assertEqual(new_ticket_metadata["requester_role"], "employer")
         self.assertEqual(new_ticket_metadata["requester_account_id"], 71)
         self.assertEqual(new_ticket_metadata["requester_username"], "employer1")
+        self.assertEqual(ticket_insert_params[13:20], ["standard", "active", "support", "support", True, False, None])
 
     def test_request_ticket_transfer_creates_pending_transfer_request(self):
         ticket = {

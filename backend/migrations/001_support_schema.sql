@@ -140,6 +140,13 @@ CREATE TABLE IF NOT EXISTS tickets (
   status_reason TEXT NOT NULL DEFAULT '',
   assigned_agent_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL,
   assigned_team TEXT NOT NULL DEFAULT 'Unassigned',
+  ticket_type TEXT,
+  workflow_stage TEXT,
+  queue_scope TEXT,
+  dashboard_bucket TEXT,
+  can_show_conversation BOOLEAN,
+  can_receive_chat BOOLEAN,
+  resolution_reason TEXT,
   sla_status TEXT NOT NULL DEFAULT 'Pending Review',
   priority TEXT NOT NULL DEFAULT 'Normal',
   evidence_count INTEGER NOT NULL DEFAULT 0,
@@ -165,6 +172,51 @@ ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 
 ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS archived_by_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS ticket_type TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS workflow_stage TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS queue_scope TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS dashboard_bucket TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS can_show_conversation BOOLEAN;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS can_receive_chat BOOLEAN;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS resolution_reason TEXT;
+
+UPDATE tickets
+SET ticket_type = COALESCE(NULLIF(ticket_type, ''), NULLIF(metadata #>> '{ticket_state,ticketType}', '')),
+    workflow_stage = COALESCE(NULLIF(workflow_stage, ''), NULLIF(metadata #>> '{ticket_state,workflowStage}', '')),
+    queue_scope = COALESCE(NULLIF(queue_scope, ''), NULLIF(metadata #>> '{ticket_state,queueScope}', '')),
+    dashboard_bucket = COALESCE(NULLIF(dashboard_bucket, ''), NULLIF(metadata #>> '{ticket_state,dashboardBucket}', '')),
+    can_show_conversation = COALESCE(
+      can_show_conversation,
+      CASE
+        WHEN LOWER(COALESCE(metadata #>> '{ticket_state,canShowConversation}', '')) IN ('true', 'false')
+          THEN (metadata #>> '{ticket_state,canShowConversation}')::boolean
+        ELSE NULL
+      END
+    ),
+    can_receive_chat = COALESCE(
+      can_receive_chat,
+      CASE
+        WHEN LOWER(COALESCE(metadata #>> '{ticket_state,canReceiveChat}', '')) IN ('true', 'false')
+          THEN (metadata #>> '{ticket_state,canReceiveChat}')::boolean
+        ELSE NULL
+      END
+    ),
+    resolution_reason = COALESCE(NULLIF(resolution_reason, ''), NULLIF(metadata #>> '{ticket_state,resolutionReason}', ''))
+WHERE metadata ? 'ticket_state';
 
 ALTER TABLE tickets
 DROP CONSTRAINT IF EXISTS tickets_conversation_id_key;

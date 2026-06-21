@@ -612,6 +612,8 @@ type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
 type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management";
+type ManagementAccessTab = "support" | "operations" | "admins";
+type TicketAccessKind = "support" | "operations";
 type LearningPlanTeamSection = "coverage" | "others";
 type TicketDetailTab = "conversation" | "documentation" | "details";
 type CoverageWorkspaceTab = "documentation" | "details";
@@ -792,6 +794,7 @@ const AgentDashboard = () => {
   const [deleteConfirmationTicketId, setDeleteConfirmationTicketId] = useState("");
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
+  const [managementAccessTab, setManagementAccessTab] = useState<ManagementAccessTab>("support");
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
   const chatPreviewAttachmentUrl = chatPreviewAttachment ? getChatAttachmentOpenUrl(chatPreviewAttachment) : "";
@@ -895,7 +898,10 @@ const AgentDashboard = () => {
     && isStaffSupportAccount(agent)
     && hasCurrentCommunicationCentreAccess(agent)
   ));
-  const managementAgents = activeAgents;
+  const managementAgents = agents.filter((agent) => (
+    agent.isActive !== false
+    && isStaffSupportAccount(agent)
+  ));
   const resolvedSessionAgentId = signedInAgent?.id ?? session?.id ?? null;
   const dashboardSessionAgentId = resolvedSessionAgentId;
   const accessibleTickets = tickets.filter((ticket) => {
@@ -2638,17 +2644,19 @@ const AgentDashboard = () => {
     }
   }
 
-  async function toggleSupportAccess(agent: AdminAgent, nextValue: boolean) {
+  async function toggleTicketAccess(agent: AdminAgent, accessKind: TicketAccessKind, nextValue: boolean) {
+    const payloadKey = accessKind === "support" ? "supportAccess" : "operationsAccess";
+    const accessLabel = accessKind === "support" ? "Support" : "Learning Plan";
     setTogglingAccessIds((prev) => new Set(prev).add(agent.id));
     try {
       const response = await fetch(`/api/admin/accounts/${agent.id}`, {
         method: "PATCH",
         headers: buildAdminJsonHeaders(),
-        body: JSON.stringify({ supportAccess: nextValue }),
+        body: JSON.stringify({ [payloadKey]: nextValue }),
       });
       const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
       if (!response.ok) {
-        toast.error(payload?.message || "Could not update support access.");
+        toast.error(payload?.message || `Could not update ${accessLabel.toLowerCase()} access.`);
         return;
       }
       const updatedAgent = payload?.agent;
@@ -2680,9 +2688,9 @@ const AgentDashboard = () => {
         }
       }
       void refreshAgentsOnly(true);
-      toast.success(`Support access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
+      toast.success(`${accessLabel} access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
     } catch {
-      toast.error("Could not update support access.");
+      toast.error(`Could not update ${accessLabel.toLowerCase()} access.`);
     } finally {
       setTogglingAccessIds((prev) => {
         const next = new Set(prev);
@@ -2690,6 +2698,14 @@ const AgentDashboard = () => {
         return next;
       });
     }
+  }
+
+  async function toggleSupportAccess(agent: AdminAgent, nextValue: boolean) {
+    await toggleTicketAccess(agent, "support", nextValue);
+  }
+
+  async function toggleOperationsAccess(agent: AdminAgent, nextValue: boolean) {
+    await toggleTicketAccess(agent, "operations", nextValue);
   }
 
   async function fetchTicketDetail(ticketId: string) {
@@ -5159,6 +5175,128 @@ const AgentDashboard = () => {
     );
   }
 
+  const normalizedManagementSearch = managementSearch.trim().toLowerCase();
+  const filteredManagementAgents = managementAgents.filter((agent) => {
+    if (!normalizedManagementSearch) return true;
+    return (
+      (agent.fullName || "").toLowerCase().includes(normalizedManagementSearch) ||
+      agent.username.toLowerCase().includes(normalizedManagementSearch) ||
+      (agent.email || "").toLowerCase().includes(normalizedManagementSearch)
+    );
+  });
+  const supportAccessCount = managementAgents.filter((agent) => agent.legacySupportAccess === true).length;
+  const operationsAccessCount = managementAgents.filter((agent) => agent.legacyOperationsAccess === true).length;
+  const adminAccessCount = managementAgents.filter((agent) => (
+    agent.legacyAdminAccess === true ||
+    agent.entraDirectoryAdmin === true ||
+    getNormalizedAdminRole(agent) === "admin" ||
+    getNormalizedAdminRole(agent) === "superadmin"
+  )).length;
+
+  function getAdminAccessLabel(agent: AdminAgent) {
+    const normalizedRole = getNormalizedAdminRole(agent);
+    if (normalizedRole === "superadmin") return "Super Admin";
+    if (agent.entraDirectoryAdmin) return "Directory admin";
+    if (agent.legacyAdminAccess || normalizedRole === "admin") return "Admin access";
+    return "No admin access";
+  }
+
+  function renderManagementAccessRows(tab: ManagementAccessTab): ReactNode {
+    const visibleAgents = tab === "admins"
+      ? filteredManagementAgents.filter((agent) => (
+          agent.legacyAdminAccess === true ||
+          agent.entraDirectoryAdmin === true ||
+          getNormalizedAdminRole(agent) === "admin" ||
+          getNormalizedAdminRole(agent) === "superadmin"
+        ))
+      : filteredManagementAgents;
+
+    if (isAgentsLoading) {
+      return (
+        <div className="flex items-center justify-center gap-2 p-10 text-sm text-muted-foreground">
+          <LoaderCircle className="h-4 w-4 animate-spin" />
+          Loading accounts...
+        </div>
+      );
+    }
+
+    if (visibleAgents.length === 0) {
+      const emptyMessage = tab === "admins"
+        ? "No matching admin accounts found. Admin access is managed separately from ticket access."
+        : "No matching staff accounts found. Add or sync the user in Communication Centre first.";
+      return (
+        <div className="p-10 text-center text-sm text-muted-foreground">
+          {emptyMessage}
+        </div>
+      );
+    }
+
+    return visibleAgents.map((agent) => {
+      const isToggling = togglingAccessIds.has(agent.id);
+      const hasSupportAccess = agent.legacySupportAccess === true;
+      const hasOperationsAccess = agent.legacyOperationsAccess === true;
+      const isCurrentUser = session?.id === agent.id;
+      const isSupportTab = tab === "support";
+      const isOperationsTab = tab === "operations";
+      const hasTabAccess = isSupportTab ? hasSupportAccess : isOperationsTab ? hasOperationsAccess : false;
+      const statusLabel = isSupportTab
+        ? hasSupportAccess ? "Receives support tickets" : "No support access"
+        : isOperationsTab
+          ? hasOperationsAccess ? "Learning Plan access" : "No Learning Plan access"
+          : getAdminAccessLabel(agent);
+      const Icon = isSupportTab ? Headphones : isOperationsTab ? FileText : Settings2;
+
+      return (
+        <div key={`${tab}-${agent.id}`} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className={cn(
+              "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl",
+              isSupportTab ? "bg-primary/10 text-primary" : isOperationsTab ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600",
+            )}>
+              <Icon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium text-foreground">
+                {agent.fullName || agent.username}
+                {isCurrentUser ? <span className="ml-1.5 text-xs text-muted-foreground">(You)</span> : null}
+              </div>
+              <div className="truncate text-xs text-muted-foreground">
+                @{agent.username}{agent.email ? ` - ${agent.email}` : ""}
+              </div>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-3">
+            <span className={cn(
+              "hidden text-xs font-medium sm:block",
+              hasTabAccess || tab === "admins" ? "text-emerald-600" : "text-muted-foreground",
+            )}>
+              {statusLabel}
+            </span>
+            {isSupportTab ? (
+              <Switch
+                checked={hasSupportAccess}
+                disabled={isToggling}
+                onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
+                aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
+              />
+            ) : isOperationsTab ? (
+              <Switch
+                checked={hasOperationsAccess}
+                disabled={isToggling}
+                onCheckedChange={(checked) => void toggleOperationsAccess(agent, checked)}
+                aria-label={`Toggle Learning Plan access for ${agent.fullName || agent.username}`}
+              />
+            ) : (
+              <span className="rounded-full border bg-muted/40 px-3 py-1 text-xs font-medium text-muted-foreground">
+                Read only
+              </span>
+            )}
+          </div>
+        </div>
+      );
+    });
+  }
+
   return (
     <SupportLayout
       fullWidth
@@ -5589,7 +5727,7 @@ const AgentDashboard = () => {
                     )}
                   >
                     <Settings2 className="h-4 w-4 shrink-0" />
-                    {!useCompactAdminSidebar ? <span>Manage Agents</span> : null}
+                    {!useCompactAdminSidebar ? <span>Team Management</span> : null}
                   </TabsTrigger>
                 </TabsList>
               ) : null}
@@ -5648,9 +5786,9 @@ const AgentDashboard = () => {
                 <div className="border-b px-4 py-4 sm:px-5">
                   <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <h2 className="text-lg font-semibold text-foreground">Agent Management</h2>
+                      <h2 className="text-lg font-semibold text-foreground">Team Management</h2>
                       <p className="mt-1 text-sm text-muted-foreground">
-                        Showing current Communication Centre support, operations, and admin access.
+                        Manage ticket access by team. Admin access is shown for visibility only.
                       </p>
                     </div>
                     <div className="relative w-full sm:w-[280px]">
@@ -5665,6 +5803,35 @@ const AgentDashboard = () => {
                   </div>
                 </div>
 
+                <Tabs value={managementAccessTab} onValueChange={(value) => setManagementAccessTab(value as ManagementAccessTab)}>
+                  <div className="border-b px-4 py-3 sm:px-5">
+                    <TabsList className="grid h-auto w-full grid-cols-1 gap-2 rounded-2xl bg-muted/40 p-1 sm:grid-cols-3">
+                      <TabsTrigger value="support" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
+                        <span>Support Agents</span>
+                        <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{supportAccessCount}</span>
+                      </TabsTrigger>
+                      <TabsTrigger value="operations" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
+                        <span>Learning Plan Team</span>
+                        <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{operationsAccessCount}</span>
+                      </TabsTrigger>
+                      <TabsTrigger value="admins" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
+                        <span>Admins</span>
+                        <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{adminAccessCount}</span>
+                      </TabsTrigger>
+                    </TabsList>
+                  </div>
+                  <TabsContent value="support" className="m-0">
+                    <div className="divide-y">{renderManagementAccessRows("support")}</div>
+                  </TabsContent>
+                  <TabsContent value="operations" className="m-0">
+                    <div className="divide-y">{renderManagementAccessRows("operations")}</div>
+                  </TabsContent>
+                  <TabsContent value="admins" className="m-0">
+                    <div className="divide-y">{renderManagementAccessRows("admins")}</div>
+                  </TabsContent>
+                </Tabs>
+
+                {false ? (
                 <div className="divide-y">
                   {isAgentsLoading ? (
                     <div className="flex items-center justify-center gap-2 p-10 text-sm text-muted-foreground">
@@ -5739,6 +5906,7 @@ const AgentDashboard = () => {
                       })
                   )}
                 </div>
+                ) : null}
               </div>
             </div>
 
@@ -12980,7 +13148,7 @@ function getDashboardAssignedFilterEmptyMessage(
 }
 
 function isQuickResolutionTicket(
-  ticket: Pick<TicketSummary, "statusReason" | "isQuickTicket"> & Partial<Pick<TicketSummary, "ticketState">>,
+  ticket: Pick<TicketSummary, "statusReason"> & Partial<Pick<TicketSummary, "isQuickTicket" | "ticketState">>,
 ) {
   return (
     ticket.ticketState?.ticketType === "quick"
@@ -13718,17 +13886,17 @@ function formatTicketHeaderCategoryLabel(category: string, technicalSubcategory:
 }
 
 function getTicketTransferRowClassName(
-  ticket: Pick<TicketSummary, "pendingTransferRequest" | "latestTransferDecision" | "status" | "statusReason" | "slaStatus">,
+  ticket: Pick<TicketSummary, "pendingTransferRequest" | "latestTransferDecision" | "status" | "statusReason" | "slaStatus"> & Partial<Pick<TicketSummary, "ticketState" | "isQuickTicket">>,
 ) {
   if (ticket.slaStatus === "Breached") {
     return "bg-red-50/70 hover:bg-red-50";
   }
 
-  if (normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket") {
+  if (isQuickResolutionTicket(ticket)) {
     return "bg-violet-50/70 hover:bg-violet-50";
   }
 
-  if (ticket.status === "Pending" && ticket.statusReason === "Escalation") {
+  if (isDashboardEscalationTicket(ticket)) {
     return "bg-amber-50/70 hover:bg-amber-50";
   }
 

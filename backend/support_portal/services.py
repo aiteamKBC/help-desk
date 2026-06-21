@@ -103,6 +103,16 @@ STATUS_REASON_TUTOR_REFUSED = "Tutor Refused"
 STATUS_REASON_REREQUESTING = "Rerequesting"
 SUPPORT_FLOW_STAGE_METADATA_KEY = "support_flow_stage"
 SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS = "booking_in_progress"
+TICKET_STATE_METADATA_KEY = "ticket_state"
+TICKET_STATE_COLUMN_PAYLOAD_KEYS = {
+    "ticket_type": "ticketType",
+    "workflow_stage": "workflowStage",
+    "queue_scope": "queueScope",
+    "dashboard_bucket": "dashboardBucket",
+    "can_show_conversation": "canShowConversation",
+    "can_receive_chat": "canReceiveChat",
+    "resolution_reason": "resolutionReason",
+}
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION = "Awaiting Resolution"
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND = "Awaiting resolution"
 STATUS_REASON_AWAITING_RESOLUTION = LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND
@@ -5386,6 +5396,15 @@ def synchronize_coverage_tutor_workflow_ticket(
     next_chat_state = sanitize_text(ticket.get("conversation_status")) or map_conversation_status(next_status)
     if status_changed:
         next_chat_state = map_conversation_status(next_status)
+    updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        updated_ticket_metadata,
+        {
+            **ticket,
+            "status": next_status,
+            "status_reason": next_status_reason,
+        },
+        chat_state=next_chat_state,
+    )
 
     sync_timestamp = datetime.now(timezone.utc)
     with connection.cursor() as cursor:
@@ -5397,6 +5416,13 @@ def synchronize_coverage_tutor_workflow_ticket(
               status_reason = %s,
               sla_status = %s,
               metadata = %s::jsonb,
+              ticket_type = %s,
+              workflow_stage = %s,
+              queue_scope = %s,
+              dashboard_bucket = %s,
+              can_show_conversation = %s,
+              can_receive_chat = %s,
+              resolution_reason = %s,
               updated_at = NOW(),
               closed_at = CASE
                 WHEN %s = 'Closed' THEN COALESCE(closed_at, NOW())
@@ -5409,6 +5435,7 @@ def synchronize_coverage_tutor_workflow_ticket(
                 next_status_reason,
                 next_sla_status,
                 json.dumps(updated_ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
                 next_status,
                 ticket["id"],
             ],
@@ -6170,6 +6197,7 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           )
         ORDER BY
           CASE
+            WHEN t.status = 'Pending' AND COALESCE(t.metadata #>> '{ticket_state,workflowStage}', '') = 'awaiting_meeting' THEN 0
             WHEN t.status = 'Pending' AND t.status_reason = %s THEN 0
             WHEN t.status = 'Open' THEN 1
             ELSE 2
@@ -6223,6 +6251,10 @@ def is_quick_ticket_record(ticket: dict[str, Any] | None) -> bool:
         return True
 
     metadata = normalize_json_object(ticket.get("metadata"))
+    if not normalize_bool(ticket.get("_ignore_persisted_ticket_state")):
+        ticket_state = normalize_json_object(metadata.get(TICKET_STATE_METADATA_KEY))
+        if sanitize_text(ticket_state.get("ticketType")) == "quick":
+            return True
     return (
         normalize_bool(metadata.get(QUICK_TICKET_ORIGIN_METADATA_KEY))
         or is_quick_ticket_status_reason(ticket.get("status_reason"))
@@ -6265,6 +6297,10 @@ def is_coverage_ticket_record(ticket: dict[str, Any] | None) -> bool:
         return True
 
     metadata = normalize_json_object(ticket.get("metadata"))
+    if not normalize_bool(ticket.get("_ignore_persisted_ticket_state")):
+        ticket_state = normalize_json_object(metadata.get(TICKET_STATE_METADATA_KEY))
+        if sanitize_text(ticket_state.get("ticketType")) == "coverage":
+            return True
     return sanitize_text(metadata.get("technical_subcategory")).lower() == "coverage"
 
 
@@ -6524,7 +6560,7 @@ def is_admin_hidden_support_flow_ticket_record(ticket: dict[str, Any] | None) ->
     )
 
 
-def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+def derive_legacy_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
     normalized_status = sanitize_text(row.get("status")) or "Open"
     normalized_status_reason = sanitize_text(row.get("status_reason"))
     normalized_chat_state = sanitize_text(chat_state or row.get("conversation_status")).lower()
@@ -6537,12 +6573,16 @@ def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -
     is_learning_plan_other = ticket_routing_policy["key"] == TICKET_RECEIVER_SCOPE_OPERATIONS and not is_coverage
     live_chat_requested = is_live_chat_requested(row.get("metadata"), row.get("conversation_metadata"))
     teams_call_requested = is_teams_call_requested(row.get("metadata"))
+    ticket_metadata = normalize_json_object(row.get("metadata"))
+    booking_in_progress = sanitize_text(ticket_metadata.get(SUPPORT_FLOW_STAGE_METADATA_KEY)) == SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS
     assigned_agent_id = parse_assigned_agent_id(row.get("assigned_agent_id"))
 
     if is_coverage:
         ticket_type = "coverage"
     elif is_quick:
         ticket_type = "quick"
+    elif booking_in_progress:
+        ticket_type = "booking"
     elif normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
         ticket_type = "booking"
     elif teams_call_requested:
@@ -6569,6 +6609,8 @@ def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -
         workflow_stage = "closed"
     elif is_quick:
         workflow_stage = "awaiting_review"
+    elif booking_in_progress:
+        workflow_stage = "booking_in_progress"
     elif normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
         workflow_stage = "awaiting_meeting"
     elif normalized_status_reason == STATUS_REASON_ESCALATION:
@@ -6618,6 +6660,117 @@ def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -
         "canReceiveChat": can_receive_chat,
         "resolutionReason": resolution_reason,
     }
+
+
+def normalize_ticket_state_payload(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    payload = normalize_json_object(value)
+    return {
+        "ticketType": sanitize_text(payload.get("ticketType")) or fallback["ticketType"],
+        "workflowStage": sanitize_text(payload.get("workflowStage")) or fallback["workflowStage"],
+        "queueScope": sanitize_text(payload.get("queueScope")) or fallback["queueScope"],
+        "dashboardBucket": sanitize_text(payload.get("dashboardBucket")) or fallback["dashboardBucket"],
+        "canShowConversation": normalize_bool(payload.get("canShowConversation"))
+        if payload.get("canShowConversation") is not None
+        else fallback["canShowConversation"],
+        "canReceiveChat": normalize_bool(payload.get("canReceiveChat"))
+        if payload.get("canReceiveChat") is not None
+        else fallback["canReceiveChat"],
+        "resolutionReason": sanitize_text(payload.get("resolutionReason")) or fallback["resolutionReason"],
+    }
+
+
+def build_ticket_state_metadata(ticket: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+    return derive_legacy_ticket_state(ticket, chat_state=chat_state)
+
+
+def build_ticket_state_column_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for column_key, payload_key in TICKET_STATE_COLUMN_PAYLOAD_KEYS.items():
+        if column_key not in row:
+            continue
+
+        value = row.get(column_key)
+        if payload_key in {"canShowConversation", "canReceiveChat"}:
+            if value is not None:
+                payload[payload_key] = value
+            continue
+
+        normalized_value = sanitize_text(value)
+        if normalized_value:
+            payload[payload_key] = normalized_value
+
+    return payload
+
+
+def build_ticket_state_column_values(ticket_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ticket_type": sanitize_text(ticket_state.get("ticketType")),
+        "workflow_stage": sanitize_text(ticket_state.get("workflowStage")),
+        "queue_scope": sanitize_text(ticket_state.get("queueScope")),
+        "dashboard_bucket": sanitize_text(ticket_state.get("dashboardBucket")),
+        "can_show_conversation": bool(ticket_state.get("canShowConversation")),
+        "can_receive_chat": bool(ticket_state.get("canReceiveChat")),
+        "resolution_reason": sanitize_text(ticket_state.get("resolutionReason")),
+    }
+
+
+def get_ticket_state_column_params(ticket_state_columns: dict[str, Any]) -> list[Any]:
+    return [
+        ticket_state_columns.get("ticket_type") or None,
+        ticket_state_columns.get("workflow_stage") or None,
+        ticket_state_columns.get("queue_scope") or None,
+        ticket_state_columns.get("dashboard_bucket") or None,
+        ticket_state_columns.get("can_show_conversation"),
+        ticket_state_columns.get("can_receive_chat"),
+        ticket_state_columns.get("resolution_reason") or None,
+    ]
+
+
+def build_ticket_state_persistence(
+    metadata: Any,
+    ticket: dict[str, Any],
+    *,
+    chat_state: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    next_metadata = normalize_json_object(metadata)
+    ticket_state = build_ticket_state_metadata(
+        {
+            **ticket,
+            "metadata": next_metadata,
+            "_ignore_persisted_ticket_state": True,
+        },
+        chat_state=chat_state,
+    )
+    next_metadata[TICKET_STATE_METADATA_KEY] = ticket_state
+    return next_metadata, build_ticket_state_column_values(ticket_state)
+
+
+def with_ticket_state_metadata(
+    metadata: Any,
+    ticket: dict[str, Any],
+    *,
+    chat_state: str | None = None,
+) -> dict[str, Any]:
+    next_metadata, _ticket_state_columns = build_ticket_state_persistence(
+        metadata,
+        ticket,
+        chat_state=chat_state,
+    )
+    return next_metadata
+
+
+def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+    fallback = derive_legacy_ticket_state(row, chat_state=chat_state)
+    metadata = normalize_json_object(row.get("metadata"))
+    persisted_state = (
+        build_ticket_state_column_payload(row)
+        or row.get(TICKET_STATE_METADATA_KEY)
+        or metadata.get(TICKET_STATE_METADATA_KEY)
+    )
+    if not persisted_state:
+        return fallback
+
+    return normalize_ticket_state_payload(persisted_state, fallback)
 
 
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
@@ -8382,6 +8535,15 @@ def apply_ticket_chat_history_sync(
         ticket,
         status,
     )
+    updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        updated_ticket_metadata,
+        {
+            **ticket,
+            "status": status,
+            "status_reason": next_status_reason,
+        },
+        chat_state=map_conversation_status(status),
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -8391,6 +8553,13 @@ def apply_ticket_chat_history_sync(
                 status_reason = %s,
                 sla_status = %s,
                 metadata = %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW(),
                 closed_at = CASE
                   WHEN %s = 'Closed' THEN NOW()
@@ -8399,11 +8568,35 @@ def apply_ticket_chat_history_sync(
                 END
             WHERE id = %s
             """,
-            [status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), status, status, ticket["id"]],
+            [
+                status,
+                next_status_reason,
+                next_sla_status,
+                json.dumps(updated_ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
+                status,
+                status,
+                ticket["id"],
+            ],
         )
 
     if status == "Pending" and is_quick_ticket_status_reason(next_status_reason) and not is_coverage_ticket_record(ticket):
-        try_auto_assign_quick_ticket(ticket, now=persisted_at)
+        assignment_ticket = {
+            **ticket,
+            "status": status,
+            "status_reason": next_status_reason,
+            "metadata": updated_ticket_metadata,
+        }
+        if try_auto_assign_quick_ticket(assignment_ticket, now=persisted_at):
+            ticket.update(
+                {
+                    "assigned_agent_id": assignment_ticket.get("assigned_agent_id"),
+                    "assigned_agent_username": assignment_ticket.get("assigned_agent_username"),
+                    "assigned_agent_name": assignment_ticket.get("assigned_agent_name"),
+                    "assigned_team": assignment_ticket.get("assigned_team"),
+                    "metadata": assignment_ticket.get("metadata"),
+                }
+            )
 
     if map_conversation_status(status) == "closed":
         persist_conversation_chat_duration(ticket["id"], ticket["conversation_id"], reference_time=persisted_at)
@@ -9367,10 +9560,13 @@ def persist_ticket_metadata_patch(ticket_id: int, metadata_patch: dict[str, Any]
         )
 
 
-def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+def sync_legacy_access_group_membership(legacy_auth_user_id: int, group_name: str, enabled: bool) -> None:
     normalized_user_id = int(legacy_auth_user_id or 0)
     if normalized_user_id <= 0:
         raise ApiError(400, "A linked KBC auth user is required.")
+    normalized_group_name = sanitize_text(group_name).lower()
+    if not normalized_group_name:
+        raise ApiError(400, "A valid KBC auth access group is required.")
     auth_database_url = get_support_auth_database_url()
     if not auth_database_url:
         raise ApiError(503, "KBC auth database is not configured.")
@@ -9387,7 +9583,7 @@ def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enable
 
                 cursor.execute(
                     "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
-                    [SUPPORT_ACCESS_GROUP_NAME],
+                    [normalized_group_name],
                 )
                 group_row = cursor.fetchone()
                 if group_row:
@@ -9422,13 +9618,29 @@ def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enable
     except ApiError:
         raise
     except Exception as exc:
-        log_unexpected_api_error("Failed to sync KBC support access group membership.", exc)
+        log_unexpected_api_error("Failed to sync KBC access group membership.", exc)
         raise ApiError(502, "We could not update this agent in the KBC auth database right now.") from exc
 
 
-def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
+def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+    sync_legacy_access_group_membership(legacy_auth_user_id, SUPPORT_ACCESS_GROUP_NAME, enabled)
+
+
+def sync_legacy_operations_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+    sync_legacy_access_group_membership(legacy_auth_user_id, OPERATIONS_ACCESS_GROUP_NAME, enabled)
+
+
+def update_agent_ticket_access(
+    agent_id: int,
+    *,
+    support_access: bool | None = None,
+    operations_access: bool | None = None,
+) -> dict[str, Any]:
     from django.contrib.auth import get_user_model
-    from .admin import sync_support_access_group_membership
+    from .admin import sync_operations_access_group_membership, sync_support_access_group_membership
+
+    if support_access is None and operations_access is None:
+        raise ApiError(400, "At least one ticket access field is required.")
 
     agent = run_query_one(
         """
@@ -9445,7 +9657,10 @@ def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[
     metadata = normalize_json_object(agent.get("metadata"))
     legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
     if legacy_auth_user_id > 0:
-        sync_legacy_support_access_group_membership(legacy_auth_user_id, support_access)
+        if support_access is not None:
+            sync_legacy_support_access_group_membership(legacy_auth_user_id, support_access)
+        if operations_access is not None:
+            sync_legacy_operations_access_group_membership(legacy_auth_user_id, operations_access)
     else:
         User = get_user_model()
         django_user = None
@@ -9453,13 +9668,27 @@ def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[
         if agent_email:
             django_user = User.objects.filter(email__iexact=agent_email).first()
         if django_user:
-            sync_support_access_group_membership(django_user, support_access)
+            if support_access is not None:
+                sync_support_access_group_membership(django_user, support_access)
+            if operations_access is not None:
+                sync_operations_access_group_membership(django_user, operations_access)
 
-    metadata["legacy_support_access"] = support_access
+    if support_access is not None:
+        metadata["legacy_support_access"] = support_access
+    if operations_access is not None:
+        metadata["legacy_operations_access"] = operations_access
     persist_agent_metadata(agent_id, metadata)
 
     agent["metadata"] = metadata
     return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
+
+
+def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
+    return update_agent_ticket_access(agent_id, support_access=support_access)
+
+
+def update_agent_operations_access(agent_id: int, *, operations_access: bool) -> dict[str, Any]:
+    return update_agent_ticket_access(agent_id, operations_access=operations_access)
 
 
 def is_agent_session_active(metadata: Any, now: datetime | None = None) -> bool:
@@ -9790,6 +10019,20 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
     conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
     assigned_team = derive_assigned_team(agent)
     agent_name = agent.get("full_name") or agent["username"]
+    ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+        {
+            **ticket_metadata,
+            "queue_assigned_at": assigned_at_value,
+            "queue_assigned_agent_username": agent["username"],
+            "queue_assigned_agent_name": agent_name,
+        },
+        {
+            **ticket,
+            "assigned_agent_id": next_assigned_agent_id,
+            "assigned_team": assigned_team,
+        },
+        chat_state=ticket.get("conversation_status"),
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -9798,19 +10041,21 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
             SET assigned_agent_id = %s,
                 assigned_team = %s,
                 metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
             [
                 next_assigned_agent_id,
                 assigned_team,
-                json.dumps(
-                    {
-                        "queue_assigned_at": assigned_at_value,
-                        "queue_assigned_agent_username": agent["username"],
-                        "queue_assigned_agent_name": agent_name,
-                    }
-                ),
+                json.dumps(ticket_metadata_patch),
+                *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
             ],
         )
@@ -9859,12 +10104,7 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
     ticket["assigned_agent_username"] = agent["username"]
     ticket["assigned_agent_name"] = agent_name
     ticket["assigned_team"] = assigned_team
-    ticket["metadata"] = {
-        **ticket_metadata,
-        "queue_assigned_at": assigned_at_value,
-        "queue_assigned_agent_username": agent["username"],
-        "queue_assigned_agent_name": agent_name,
-    }
+    ticket["metadata"] = ticket_metadata_patch
     ticket["conversation_metadata"] = {
         **conversation_metadata,
         "assigned_agent_id": next_assigned_agent_id,
@@ -9887,6 +10127,20 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
     conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
     assigned_team = derive_assigned_team(agent)
     agent_name = agent.get("full_name") or agent["username"]
+    ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+        {
+            **ticket_metadata,
+            "quick_ticket_assigned_at": assigned_at_value,
+            "quick_ticket_assigned_admin_username": agent["username"],
+            "quick_ticket_assigned_admin_name": agent_name,
+        },
+        {
+            **ticket,
+            "assigned_agent_id": next_assigned_agent_id,
+            "assigned_team": assigned_team,
+        },
+        chat_state=ticket.get("conversation_status"),
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -9895,19 +10149,21 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
             SET assigned_agent_id = %s,
                 assigned_team = %s,
                 metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
             [
                 next_assigned_agent_id,
                 assigned_team,
-                json.dumps(
-                    {
-                        "quick_ticket_assigned_at": assigned_at_value,
-                        "quick_ticket_assigned_admin_username": agent["username"],
-                        "quick_ticket_assigned_admin_name": agent_name,
-                    }
-                ),
+                json.dumps(ticket_metadata_patch),
+                *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
             ],
         )
@@ -9955,12 +10211,7 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
     ticket["assigned_agent_username"] = agent["username"]
     ticket["assigned_agent_name"] = agent_name
     ticket["assigned_team"] = assigned_team
-    ticket["metadata"] = {
-        **ticket_metadata,
-        "quick_ticket_assigned_at": assigned_at_value,
-        "quick_ticket_assigned_admin_username": agent["username"],
-        "quick_ticket_assigned_admin_name": agent_name,
-    }
+    ticket["metadata"] = ticket_metadata_patch
     ticket["conversation_metadata"] = {
         **conversation_metadata,
         "assigned_agent_id": next_assigned_agent_id,
@@ -11613,9 +11864,17 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
                 "ticketId": ticket["public_id"],
                 "requestedAt": serialize_datetime_value(datetime.now(timezone.utc)),
             }
-            ticket_metadata[PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY] = pending_notification
+        ticket_metadata[PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY] = pending_notification
         ticket_metadata[TEAMS_CALL_REQUESTED_METADATA_KEY] = True
         next_assigned_team = derive_assigned_team_for_ticket_assignment(ticket.get("assigned_team"), target_agent)
+        ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            ticket_metadata,
+            {
+                **ticket,
+                "assigned_agent_id": target_agent["id"],
+                "assigned_team": next_assigned_team,
+            },
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -11624,10 +11883,23 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
                 SET assigned_agent_id = %s,
                     assigned_team = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                [target_agent["id"], next_assigned_team, json.dumps(ticket_metadata), ticket["id"]],
+                [
+                    target_agent["id"],
+                    next_assigned_team,
+                    json.dumps(ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -11701,6 +11973,14 @@ def clear_prepared_support_teams_call(ticket: dict[str, Any]) -> bool:
     ticket_metadata.pop(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY, None)
     next_assigned_agent_id = None if should_clear_assignment else current_assigned_agent_id
     next_assigned_team = "Unassigned" if should_clear_assignment else (sanitize_text(ticket.get("assigned_team")) or "Unassigned")
+    ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        ticket_metadata,
+        {
+            **ticket,
+            "assigned_agent_id": next_assigned_agent_id,
+            "assigned_team": next_assigned_team,
+        },
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -11709,6 +11989,13 @@ def clear_prepared_support_teams_call(ticket: dict[str, Any]) -> bool:
             SET assigned_agent_id = %s,
                 assigned_team = %s,
                 metadata = %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
@@ -11716,6 +12003,7 @@ def clear_prepared_support_teams_call(ticket: dict[str, Any]) -> bool:
                 next_assigned_agent_id,
                 next_assigned_team,
                 json.dumps(ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
             ],
         )
@@ -11944,6 +12232,14 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
             "decidedByUsername": actor_row["username"],
             "requesterAcknowledged": False,
         }
+        ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            ticket_metadata,
+            {
+                **ticket,
+                "assigned_agent_id": target_agent["id"],
+                "assigned_team": next_assigned_team,
+            },
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -11952,10 +12248,23 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
                 SET assigned_agent_id = %s,
                     assigned_team = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                [target_agent["id"], next_assigned_team, json.dumps(ticket_metadata), ticket["id"]],
+                [
+                    target_agent["id"],
+                    next_assigned_team,
+                    json.dumps(ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -12551,6 +12860,17 @@ def submit_coverage_tutor_request(
         updated_ticket_metadata["admin_documentation"] = documentation
         # A fresh tutor request supersedes any prior accepted/refused response.
         updated_ticket_metadata.pop(LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY, None)
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+                "assigned_agent_id": next_assigned_agent_id,
+                "assigned_team": next_assigned_team,
+            },
+            chat_state=map_conversation_status(next_status),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -12563,6 +12883,13 @@ def submit_coverage_tutor_request(
                   assigned_team = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -12573,6 +12900,7 @@ def submit_coverage_tutor_request(
                     next_assigned_team,
                     next_sla_status,
                     json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     ticket["id"],
                 ],
             )
@@ -12999,6 +13327,15 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
                 next_status=next_status,
                 next_status_reason=next_status_reason,
             )
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+            },
+            chat_state=map_conversation_status(next_status),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13009,6 +13346,13 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
                   status_reason = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW(),
                   closed_at = CASE
                     WHEN %s = 'Closed' THEN COALESCE(closed_at, NOW())
@@ -13016,7 +13360,15 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
                   END
                 WHERE id = %s
                 """,
-                [next_status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), next_status, ticket["id"]],
+                [
+                    next_status,
+                    next_status_reason,
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    next_status,
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -13334,6 +13686,15 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
         next_sla_status = "On Track"
         updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
         updated_ticket_metadata["admin_documentation"] = documentation
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+            },
+            chat_state=map_conversation_status(next_status),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13344,11 +13705,25 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
                   status_reason = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW(),
                   closed_at = NOW()
                 WHERE id = %s
                 """,
-                [next_status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), ticket["id"]],
+                [
+                    next_status,
+                    next_status_reason,
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -13509,6 +13884,24 @@ def create_follow_up_ticket_from_source_ticket(
     )
     pending_escalation_notification = get_pending_escalation_notification(ticket_metadata)
     draft_public_id = f"TMP-{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:8]}"
+    follow_up_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        {
+            "source": "support_portal_follow_up",
+            "parent_ticket_public_id": ticket["public_id"],
+            "chat_public_id": chat_public_id,
+            "technical_subcategory": ticket.get("technical_subcategory") or None,
+            "requester_role": requester_role,
+            "requester_account_id": requester_account_id,
+            "requester_username": requester_username,
+        },
+        {
+            **ticket,
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": ticket.get("assigned_team") or "Unassigned",
+        },
+        chat_state="open",
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -13526,9 +13919,16 @@ def create_follow_up_ticket_from_source_ticket(
               assigned_team,
               priority,
               evidence_count,
-              metadata
+              metadata,
+              ticket_type,
+              workflow_stage,
+              queue_scope,
+              dashboard_bucket,
+              can_show_conversation,
+              can_receive_chat,
+              resolution_reason
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             [
@@ -13544,17 +13944,8 @@ def create_follow_up_ticket_from_source_ticket(
                 ticket.get("assigned_team") or "Unassigned",
                 next_priority,
                 0,
-                json.dumps(
-                    {
-                        "source": "support_portal_follow_up",
-                        "parent_ticket_public_id": ticket["public_id"],
-                        "chat_public_id": chat_public_id,
-                        "technical_subcategory": ticket.get("technical_subcategory") or None,
-                        "requester_role": requester_role,
-                        "requester_account_id": requester_account_id,
-                        "requester_username": requester_username,
-                    }
-                ),
+                json.dumps(follow_up_ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
             ],
         )
         new_ticket_row = dictfetchone(cursor)
@@ -14046,7 +14437,7 @@ def set_ticket_booking_progress(public_id: str, *, active: bool) -> dict[str, An
 
     ticket = run_query_one(
         """
-        SELECT id, public_id, status, metadata
+        SELECT id, public_id, status, status_reason, technical_subcategory, assigned_team, metadata
         FROM tickets
         WHERE public_id = %s
         LIMIT 1
@@ -14058,19 +14449,32 @@ def set_ticket_booking_progress(public_id: str, *, active: bool) -> dict[str, An
         raise ApiError(404, "Ticket not found.")
 
     metadata_patch = {
+        **normalize_json_object(ticket.get("metadata")),
         SUPPORT_FLOW_STAGE_METADATA_KEY: SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS if active else None,
         "booking_started_at": serialize_datetime_value(datetime.now(timezone.utc)) if active else None,
     }
+    metadata_patch, ticket_state_columns = build_ticket_state_persistence(metadata_patch, ticket)
 
     with connection.cursor() as cursor:
         cursor.execute(
             """
             UPDATE tickets
             SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
-            [json.dumps(metadata_patch), ticket["id"]],
+            [
+                json.dumps(metadata_patch),
+                *get_ticket_state_column_params(ticket_state_columns),
+                ticket["id"],
+            ],
         )
 
     return {
@@ -14288,6 +14692,15 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
 
         mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
         chat_public_id = build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"))
+        ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+            {
+                **normalize_json_object(ticket.get("metadata")),
+                "live_chat_requested": True,
+                "live_chat_requested_at": request_time.isoformat(),
+            },
+            ticket,
+            chat_state="open",
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -14295,16 +14708,19 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
                 UPDATE tickets
                 SET
                   metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW()
                 WHERE id = %s
                 """,
                 [
-                    json.dumps(
-                        {
-                            "live_chat_requested": True,
-                            "live_chat_requested_at": request_time.isoformat(),
-                        }
-                    ),
+                    json.dumps(ticket_metadata_patch),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     ticket["id"],
                 ],
             )
@@ -14821,6 +15237,18 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 learning_plan_transfer_notification_payload
             )
 
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+                "assigned_agent_id": next_assigned_agent_id,
+                "assigned_team": next_assigned_team,
+            },
+            chat_state=next_chat_state,
+        )
+
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -14832,6 +15260,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                   assigned_team = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW(),
                   closed_at = CASE
                     WHEN %s = 'Closed' THEN NOW()
@@ -14847,6 +15282,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                     next_assigned_team,
                     next_sla_status,
                     json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     next_status,
                     next_status,
                     ticket["id"],
@@ -15325,6 +15761,18 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         "requesterRole": requester_role,
                         "createdAt": serialize_datetime_value(ticket_row.get("created_at")) or serialize_datetime_value(datetime.now(timezone.utc)),
                     }
+                ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+                    ticket_metadata,
+                    {
+                        "public_id": public_id,
+                        "category": category,
+                        "technical_subcategory": technical_subcategory or "",
+                        "status": ticket_row["status"],
+                        "status_reason": "",
+                        "assigned_team": ticket_row["assigned_team"],
+                    },
+                    chat_state="open",
+                )
 
                 cursor.execute(
                     """
@@ -15372,10 +15820,26 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 cursor.execute(
                     """
                     UPDATE tickets
-                    SET public_id = %s, conversation_id = %s, metadata = %s::jsonb, updated_at = NOW()
+                    SET public_id = %s,
+                        conversation_id = %s,
+                        metadata = %s::jsonb,
+                        ticket_type = %s,
+                        workflow_stage = %s,
+                        queue_scope = %s,
+                        dashboard_bucket = %s,
+                        can_show_conversation = %s,
+                        can_receive_chat = %s,
+                        resolution_reason = %s,
+                        updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [public_id, conversation_id, json.dumps(ticket_metadata), ticket_row["id"]],
+                    [
+                        public_id,
+                        conversation_id,
+                        json.dumps(ticket_metadata),
+                        *get_ticket_state_column_params(ticket_state_columns),
+                        ticket_row["id"],
+                    ],
                 )
 
                 if conversation_id:
@@ -16565,6 +17029,15 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             SUPPORT_FLOW_STAGE_METADATA_KEY: None,
             "booking_started_at": None,
         }
+        session_ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+            session_ticket_metadata_patch,
+            {
+                **ticket,
+                "status": "Pending",
+                "status_reason": STATUS_REASON_AWAITING_MEETING,
+            },
+            chat_state=map_conversation_status("Pending"),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -16574,6 +17047,13 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                     status_reason = %s,
                     sla_status = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW(),
                     closed_at = CASE
                       WHEN status = 'Closed' THEN NULL
@@ -16586,6 +17066,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                     STATUS_REASON_AWAITING_MEETING,
                     next_sla_status,
                     json.dumps(session_ticket_metadata_patch),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     ticket["id"],
                 ],
             )
@@ -16797,6 +17278,15 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
         "reservation_confirmed": False,
         "meeting_join_url": None,
     }
+    updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        updated_ticket_metadata,
+        {
+            **ticket,
+            "status": "Open",
+            "status_reason": "",
+        },
+        chat_state=map_conversation_status("Open"),
+    )
 
     with transaction.atomic():
         update_support_session_request_record(
@@ -16814,6 +17304,13 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
                     status_reason = %s,
                     sla_status = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW(),
                     closed_at = CASE
                       WHEN status = 'Closed' THEN NULL
@@ -16821,7 +17318,14 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
                     END
                 WHERE id = %s
                 """,
-                ["Open", "", next_sla_status, json.dumps(updated_ticket_metadata), ticket["id"]],
+                [
+                    "Open",
+                    "",
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
