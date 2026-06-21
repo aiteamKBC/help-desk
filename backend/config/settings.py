@@ -8,6 +8,7 @@ DEBUG = get_env_bool("DJANGO_DEBUG", True)
 DJANGO_ENV = (get_env("DJANGO_ENV", "development") or "development").strip().lower()
 IS_PRODUCTION_LIKE = DJANGO_ENV == "production" or not DEBUG
 IS_RUNSERVER = any(arg.startswith("runserver") for arg in sys.argv[1:])
+IS_TESTING = any(arg == "test" or arg.endswith(".test") for arg in sys.argv[1:])
 LOCAL_ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver"]
 LOCAL_CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:3000",
@@ -102,6 +103,10 @@ MAIL_WEBHOOK_URL = get_env("N8N_MAIL_WEBHOOK_URL")
 SUPPORT_NOTIFICATION_WEBHOOK_URL = get_env(
     "N8N_SUPPORT_NOTIFICATION_WEBHOOK_URL",
     get_env("SUPPORT_NOTIFICATION_WEBHOOK_URL", ""),
+)
+SUPPORT_NOTIFICATION_DELIVERY_ENABLED = get_env_bool(
+    "SUPPORT_NOTIFICATION_DELIVERY_ENABLED",
+    not IS_TESTING,
 )
 COVERAGE_TICKET_WEBHOOK_URL = get_env(
     "N8N_COVERAGE_TICKET_WEBHOOK_URL",

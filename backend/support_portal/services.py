@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
-from django.db import connection, transaction
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone as django_timezone
 
 from .roles import (
@@ -3335,6 +3335,10 @@ def get_support_notification_webhook_url() -> str:
     return sanitize_text(getattr(settings, "SUPPORT_NOTIFICATION_WEBHOOK_URL", ""))
 
 
+def is_support_notification_delivery_enabled() -> bool:
+    return bool(getattr(settings, "SUPPORT_NOTIFICATION_DELIVERY_ENABLED", True))
+
+
 def get_coverage_ticket_operations_webhook_url() -> str:
     return sanitize_text(getattr(settings, "COVERAGE_TICKET_WEBHOOK_URL", ""))
 
@@ -4570,6 +4574,67 @@ def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def deliver_support_notification(
+    *,
+    ticket_id: int,
+    ticket_public_id: str,
+    event: str,
+    payload: dict[str, Any],
+    sent_metadata_key: str,
+) -> dict[str, Any]:
+    delivered_event_type, failed_event_type = SUPPORT_NOTIFICATION_HISTORY_EVENTS.get(
+        event,
+        ("support_notification_delivered", "support_notification_failed"),
+    )
+
+    try:
+        result = send_support_notification_webhook(payload)
+    except Exception:
+        result = {"configured": True, "delivered": False, "status": None, "response": None}
+
+    delivered_at = datetime.now(timezone.utc)
+    delivered = bool(result.get("delivered"))
+    if delivered and sent_metadata_key:
+        try:
+            persist_ticket_metadata_patch(ticket_id, {sent_metadata_key: serialize_datetime_value(delivered_at)})
+        except Exception:
+            logger.warning(
+                "Failed to persist support notification metadata for ticket %s",
+                ticket_public_id,
+                exc_info=True,
+            )
+
+    try:
+        insert_history_event(
+            ticket_id,
+            delivered_event_type if delivered else failed_event_type,
+            {"role": "system", "label": "support_notification"},
+            {
+                "event": event,
+                "ticketId": ticket_public_id,
+                "recipientType": payload.get("recipientType"),
+                "requesterName": payload.get("requester", {}).get("name"),
+                "requesterEmail": payload.get("requester", {}).get("email"),
+                "webhookConfigured": bool(result.get("configured")),
+                "webhookDelivered": delivered,
+                "webhookStatus": result.get("status"),
+                "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Failed to record support notification history for ticket %s",
+            ticket_public_id,
+            exc_info=True,
+        )
+
+    return {
+        **result,
+        "deliveredAt": delivered_at,
+        "historyEventType": delivered_event_type if delivered else failed_event_type,
+    }
+
+
 def queue_support_notification_delivery(
     *,
     ticket_id: int,
@@ -4578,55 +4643,21 @@ def queue_support_notification_delivery(
     payload: dict[str, Any],
     sent_metadata_key: str,
 ) -> None:
-    if not get_support_notification_webhook_url():
+    if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
         return
 
-    delivered_event_type, failed_event_type = SUPPORT_NOTIFICATION_HISTORY_EVENTS.get(
-        event,
-        ("support_notification_delivered", "support_notification_failed"),
-    )
-
     def deliver() -> None:
+        close_old_connections()
         try:
-            result = send_support_notification_webhook(payload)
-        except Exception:
-            result = {"configured": True, "delivered": False, "status": None, "response": None}
-
-        delivered_at = datetime.now(timezone.utc)
-        delivered = bool(result.get("delivered"))
-        if delivered and sent_metadata_key:
-            try:
-                persist_ticket_metadata_patch(ticket_id, {sent_metadata_key: serialize_datetime_value(delivered_at)})
-            except Exception:
-                logger.warning(
-                    "Failed to persist support notification metadata for ticket %s",
-                    ticket_public_id,
-                    exc_info=True,
-                )
-
-        try:
-            insert_history_event(
-                ticket_id,
-                delivered_event_type if delivered else failed_event_type,
-                {"role": "system", "label": "support_notification"},
-                {
-                    "event": event,
-                    "ticketId": ticket_public_id,
-                    "recipientType": payload.get("recipientType"),
-                    "requesterName": payload.get("requester", {}).get("name"),
-                    "requesterEmail": payload.get("requester", {}).get("email"),
-                    "webhookConfigured": bool(result.get("configured")),
-                    "webhookDelivered": delivered,
-                    "webhookStatus": result.get("status"),
-                    "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
-                },
+            deliver_support_notification(
+                ticket_id=ticket_id,
+                ticket_public_id=ticket_public_id,
+                event=event,
+                payload=payload,
+                sent_metadata_key=sent_metadata_key,
             )
-        except Exception:
-            logger.warning(
-                "Failed to record support notification history for ticket %s",
-                ticket_public_id,
-                exc_info=True,
-            )
+        finally:
+            close_old_connections()
 
     thread = threading.Thread(
         target=deliver,

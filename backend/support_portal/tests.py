@@ -11,9 +11,9 @@ from django.core.exceptions import ImproperlyConfigured
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.utils import OperationalError as DjangoOperationalError
 from django.core.management import call_command
-from django.test import RequestFactory, SimpleTestCase
+from django.test import RequestFactory, SimpleTestCase, override_settings
 from psycopg import OperationalError as PsycopgOperationalError
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from config import env as config_env
@@ -9143,6 +9143,85 @@ class AgentQueueTests(SimpleTestCase):
         queue_closed.assert_called_once()
         self.assertEqual(queue_closed.call_args.kwargs["status"], "Closed")
         self.assertEqual(queue_closed.call_args.kwargs["status_reason"], services.STATUS_REASON_CLOSED_BY_AGENT)
+
+    @override_settings(
+        SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification",
+        SUPPORT_NOTIFICATION_DELIVERY_ENABLED=False,
+    )
+    def test_queue_support_notification_delivery_skips_when_disabled(self):
+        with (
+            patch.object(services.threading, "Thread") as thread_class,
+            patch.object(services, "deliver_support_notification") as deliver_support_notification,
+        ):
+            services.queue_support_notification_delivery(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload={"recipientType": "requester", "requester": {"name": "Omar", "email": "omar@example.com"}},
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        thread_class.assert_not_called()
+        deliver_support_notification.assert_not_called()
+
+    @override_settings(
+        SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification",
+        SUPPORT_NOTIFICATION_DELIVERY_ENABLED=True,
+    )
+    def test_queue_support_notification_delivery_starts_background_thread_when_enabled(self):
+        thread = MagicMock()
+
+        with patch.object(services.threading, "Thread", return_value=thread) as thread_class:
+            services.queue_support_notification_delivery(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload={"recipientType": "requester", "requester": {"name": "Omar", "email": "omar@example.com"}},
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        thread_class.assert_called_once()
+        self.assertEqual(
+            thread_class.call_args.kwargs["name"],
+            "support-notification-quick_ticket_submitted-KBC-000023",
+        )
+        self.assertTrue(thread_class.call_args.kwargs["daemon"])
+        thread.start.assert_called_once()
+
+    def test_deliver_support_notification_records_success_history(self):
+        payload = {
+            "recipientType": "requester",
+            "requester": {"name": "Omar", "email": "omar@example.com"},
+        }
+
+        with (
+            patch.object(
+                services,
+                "send_support_notification_webhook",
+                return_value={"configured": True, "delivered": True, "status": 202, "response": {"ok": True}},
+            ) as send_support_notification_webhook,
+            patch.object(services, "persist_ticket_metadata_patch") as persist_ticket_metadata_patch,
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.deliver_support_notification(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload=payload,
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        send_support_notification_webhook.assert_called_once_with(payload)
+        persist_ticket_metadata_patch.assert_called_once_with(
+            23,
+            {services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY: ANY},
+        )
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[0], 23)
+        self.assertEqual(insert_history_event.call_args.args[1], "quick_ticket_confirmation_email_sent")
+        self.assertEqual(insert_history_event.call_args.args[3]["ticketId"], "KBC-000023")
+        self.assertTrue(insert_history_event.call_args.args[3]["webhookDelivered"])
+        self.assertEqual(result["historyEventType"], "quick_ticket_confirmation_email_sent")
 
     def test_try_auto_assign_quick_ticket_prefers_available_ticket_receiving_agent_and_updates_ticket(self):
         ticket = {
