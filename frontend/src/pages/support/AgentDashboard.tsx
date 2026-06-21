@@ -250,6 +250,16 @@ interface LatestCoverageTutorResponse {
   requesterAcknowledged: boolean;
 }
 
+interface TicketState {
+  ticketType: string;
+  workflowStage: string;
+  queueScope: string;
+  dashboardBucket: string;
+  canShowConversation: boolean;
+  canReceiveChat: boolean;
+  resolutionReason: string;
+}
+
 interface TicketSummary {
   id: string;
   learnerName: string;
@@ -263,6 +273,7 @@ interface TicketSummary {
   inquiryPreview: string;
   status: "Open" | "Pending" | "Closed";
   statusReason: string;
+  ticketState?: TicketState;
   isQuickTicket?: boolean;
   assignedAgentId: number | null;
   assignedAgentName: string;
@@ -481,6 +492,14 @@ interface TicketDetailResponse {
   sessionRequests: SessionRequestItem[];
 }
 
+type PendingTeamTransfer = {
+  ticket: Pick<
+    TicketSummary,
+    "id" | "assignedTeam" | "isArchived" | "requesterName" | "learnerName" | "email" | "category" | "technicalSubcategory"
+  >;
+  nextAssignedTeam: string;
+};
+
 interface ListResponse {
   message?: string;
   tickets?: TicketSummary[];
@@ -545,18 +564,38 @@ const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
 const supportDeskAssignedTeam = "Support Desk";
 const learningPlanAssignedTeam = "Learning Plan Team";
-const dashboardTeamTransferOptions = [
+
+type TeamRoutingPolicy = {
+  key: string;
+  assignedTeam: string;
+  label: string;
+  description: string;
+  receiverAccessKey: "legacySupportAccess" | "legacyOperationsAccess";
+};
+
+const teamRoutingPolicies: TeamRoutingPolicy[] = [
   {
-    value: learningPlanAssignedTeam,
-    label: learningPlanAssignedTeam,
-    description: "Route this ticket to the learning plan team queue.",
-  },
-  {
-    value: supportDeskAssignedTeam,
+    key: "support",
+    assignedTeam: supportDeskAssignedTeam,
     label: supportDeskAssignedTeam,
     description: "Return this ticket to the support desk queue.",
+    receiverAccessKey: "legacySupportAccess",
   },
-] as const;
+  {
+    key: "operations",
+    assignedTeam: learningPlanAssignedTeam,
+    label: learningPlanAssignedTeam,
+    description: "Route this ticket to the learning plan team queue.",
+    receiverAccessKey: "legacyOperationsAccess",
+  },
+];
+const supportTeamRoutingPolicy = teamRoutingPolicies[0];
+const learningPlanTeamRoutingPolicy = teamRoutingPolicies[1];
+const dashboardTeamTransferOptions = teamRoutingPolicies.map((policy) => ({
+  value: policy.assignedTeam,
+  label: policy.label,
+  description: policy.description,
+}));
 const documentationStatusReasons = {
   Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed by Requester", "Closed via Agent"],
   Pending: [defaultPendingDocumentationStatusReason, "Awaiting support meeting", "Escalation", "Quick Ticket"],
@@ -623,6 +662,21 @@ function hasLegacyOperationsDashboardAccess(
   session?: Pick<AdminSession, "legacyOperationsAccess"> | null,
 ) {
   return session?.legacyOperationsAccess === true;
+}
+
+function hasTeamRoutingDashboardAccess(
+  session: Pick<AdminSession, "role" | "legacySupportAccess" | "legacyOperationsAccess"> | AdminAgent | null | undefined,
+  policy: TeamRoutingPolicy,
+) {
+  if (policy.receiverAccessKey === "legacySupportAccess") {
+    return hasLegacySupportDashboardAccess(session);
+  }
+
+  if (policy.receiverAccessKey === "legacyOperationsAccess") {
+    return hasLegacyOperationsDashboardAccess(session);
+  }
+
+  return false;
 }
 
 function hasAnyAdminDashboardAccess(session?: AdminSession | null) {
@@ -725,6 +779,8 @@ const AgentDashboard = () => {
   const [activeTransferRequestTicketId, setActiveTransferRequestTicketId] = useState("");
   const [transferReason, setTransferReason] = useState("");
   const [teamTransferTicketId, setTeamTransferTicketId] = useState("");
+  const [pendingTeamTransfer, setPendingTeamTransfer] = useState<PendingTeamTransfer | null>(null);
+  const [teamTransferNote, setTeamTransferNote] = useState("");
   const [isSendingAiMessage, setIsSendingAiMessage] = useState(false);
   const [isSavingDocumentation, setIsSavingDocumentation] = useState(false);
   const [isSavingActiveDocumentation, setIsSavingActiveDocumentation] = useState(false);
@@ -798,8 +854,8 @@ const AgentDashboard = () => {
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
   const activeTicketIsArchived = Boolean(activeDetail?.ticket.isArchived);
   const activeTicketCanBePermanentlyDeleted = activeTicketIsArchived && isSuperadminSession;
-  const isActiveQuickTicket = Boolean(activeDetail) && isDashboardQuickResolutionTicket(activeDetail.ticket);
-  const effectiveActiveTicketTab = isActiveQuickTicket && activeTicketTab === "conversation"
+  const canShowActiveTicketConversation = Boolean(activeDetail) && canShowTicketConversation(activeDetail.ticket);
+  const effectiveActiveTicketTab = !canShowActiveTicketConversation && activeTicketTab === "conversation"
     ? "documentation"
     : activeTicketTab;
   const activeCoverageDocumentationBaseline = activeDetail && isActiveCoverageTicket
@@ -862,13 +918,11 @@ const AgentDashboard = () => {
       return false;
     }
 
-    if (isQuickResolutionTicket(ticket)) {
+    if (!canShowTicketConversation(ticket)) {
       return false;
     }
 
-    // The live chat console should only surface cases that explicitly requested
-    // a handoff from the chatbot into an admin chat.
-    if (!ticket.chatIsActive || !ticket.liveChatRequested) {
+    if (!isOpenConsoleQueueTicket(ticket) && !isClosedConsoleHistoryTicket(ticket)) {
       return false;
     }
 
@@ -879,11 +933,11 @@ const AgentDashboard = () => {
     return true;
   });
   const openConsoleQueueTickets = sortConsoleTickets(
-    scopedConsoleTickets.filter((ticket) => ticket.chatState !== "closed"),
+    scopedConsoleTickets.filter(isOpenConsoleQueueTicket),
     "open",
   );
   const closedConsoleQueueTickets = sortConsoleTickets(
-    scopedConsoleTickets.filter((ticket) => ticket.chatState === "closed"),
+    scopedConsoleTickets.filter(isClosedConsoleHistoryTicket),
     "closed",
   );
 
@@ -1070,8 +1124,8 @@ const AgentDashboard = () => {
     consoleSearchStatusFilter === "all"
       ? true
       : consoleSearchStatusFilter === "open"
-        ? ticket.chatState !== "closed"
-        : ticket.chatState === "closed"
+        ? isOpenConsoleQueueTicket(ticket)
+        : isClosedConsoleHistoryTicket(ticket)
   ));
   const searchResultConsoleTickets = !normalizedConsoleSearch
     ? []
@@ -1089,11 +1143,11 @@ const AgentDashboard = () => {
       return false;
     }
 
-    if (isQuickResolutionTicket(ticket)) {
+    if (!canShowTicketConversation(ticket)) {
       return false;
     }
 
-    if (!ticket.chatIsActive || !ticket.liveChatRequested || ticket.chatState === "closed") {
+    if (!isOpenConsoleQueueTicket(ticket)) {
       return false;
     }
 
@@ -1185,7 +1239,9 @@ const AgentDashboard = () => {
         label: getAgentDisplayName(agent),
       })),
   ];
-  const assignableTicketAgents = ticketReceivingAgents;
+  const activeTicketAssignableAgents = sortedAgents.filter((agent) => (
+    canReceiveTicketAssignment(agent, activeDetail?.ticket)
+  ));
   const activeAccessibleTickets = accessibleTickets.filter((ticket) => !isArchivedTicket(ticket));
   const dashboardArchiveScopedTickets = accessibleTickets.filter((ticket) => (
     dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
@@ -1378,10 +1434,18 @@ const AgentDashboard = () => {
     && activeDetail
     && !activeTicketIsArchived,
   );
+  const canTransferTicketToTeam = (
+    ticket: Pick<TicketSummary, "technicalSubcategory" | "assignedTeam" | "isArchived"> & Partial<Pick<TicketSummary, "ticketState">>,
+  ) => Boolean(
+    !isArchivedTicket(ticket)
+    && (
+      canAssignTickets
+      || hasTeamRoutingDashboardAccess(accessSession, getTicketRoutingPolicy(ticket))
+    ),
+  );
   const canTransferActiveTicketToTeam = Boolean(
-    canAssignTickets
-    && activeDetail
-    && !activeTicketIsArchived,
+    activeDetail
+    && canTransferTicketToTeam(activeDetail.ticket),
   );
   const normalizedDeleteConfirmationTicketId = deleteConfirmationTicketId.trim().toUpperCase();
   const normalizedPendingPermanentDeleteTicketId = ticketPendingPermanentDelete?.id.trim().toUpperCase() || "";
@@ -1394,7 +1458,12 @@ const AgentDashboard = () => {
   const canForceCloseConsoleChat = Boolean(consoleDetail)
     && consoleDetail.ticket.status === "Closed"
     && consoleDetail.ticket.chatState !== "closed";
-  const transferTargetAgents = sortedAgents.filter((agent) => agent.id !== consoleDetail?.ticket.assignedAgentId);
+  const transferTargetAgents = consoleDetail
+    ? sortedAgents.filter((agent) => (
+        agent.id !== consoleDetail.ticket.assignedAgentId
+        && canReceiveTicketAssignment(agent, consoleDetail.ticket)
+      ))
+    : [];
   const pendingTransferRequests = accessibleTickets
     .filter((ticket) => {
       const pendingTransferRequest = ticket.pendingTransferRequest;
@@ -2231,21 +2300,21 @@ const AgentDashboard = () => {
     },
     {
       label: "Pending Tickets",
-      value: dashboardAssignmentScopedTickets.filter((ticket) => ticket.status === "Pending").length,
+      value: dashboardAssignmentScopedTickets.filter(isDashboardPendingTicket).length,
       icon: Clock,
       color: "text-warning bg-warning/10",
       filter: "pending" as const,
     },
     {
       label: "Escalation Tickets",
-      value: dashboardAssignmentScopedTickets.filter((ticket) => ticket.status === "Pending" && ticket.statusReason === "Escalation").length,
+      value: dashboardAssignmentScopedTickets.filter(isDashboardEscalationTicket).length,
       icon: AlertOctagon,
       color: "text-amber-700 bg-amber-100",
       filter: "escalation" as const,
     },
     {
       label: "Closed Tickets",
-      value: dashboardAssignmentScopedTickets.filter((ticket) => ticket.status === "Closed").length,
+      value: dashboardAssignmentScopedTickets.filter(isDashboardClosedTicket).length,
       icon: CheckCircle2,
       color: "text-success bg-success/10",
       filter: "closed" as const,
@@ -2755,7 +2824,7 @@ const AgentDashboard = () => {
         payload = acknowledgedPayload;
       }
 
-      if (isDashboardQuickResolutionTicket(payload.ticket) && initialTab === "conversation") {
+      if (!canShowTicketConversation(payload.ticket) && initialTab === "conversation") {
         setActiveTicketTab("documentation");
       }
 
@@ -2925,12 +2994,12 @@ const AgentDashboard = () => {
     }
   }
 
-  async function handleTeamTransfer(
-    ticket: Pick<TicketSummary, "id" | "assignedTeam" | "isArchived">,
+  function handleTeamTransfer(
+    ticket: PendingTeamTransfer["ticket"],
     nextAssignedTeam: string,
   ) {
-    if (!canAssignTickets) {
-      toast.error("Only admins and superadmins can transfer tickets between teams.");
+    if (!canTransferTicketToTeam(ticket)) {
+      toast.error("You do not have permission to transfer this ticket to another team.");
       return;
     }
 
@@ -2944,14 +3013,41 @@ const AgentDashboard = () => {
       return;
     }
 
-    setTeamTransferTicketId(ticket.id);
+    setPendingTeamTransfer({ ticket, nextAssignedTeam });
+    setTeamTransferNote("");
+  }
+
+  function dismissPendingTeamTransfer() {
+    if (teamTransferTicketId) {
+      return;
+    }
+
+    setPendingTeamTransfer(null);
+    setTeamTransferNote("");
+  }
+
+  async function submitPendingTeamTransfer() {
+    const pendingTransfer = pendingTeamTransfer;
+    const trimmedNote = teamTransferNote.trim();
+
+    if (!pendingTransfer) {
+      return;
+    }
+
+    if (!trimmedNote) {
+      toast.error("Add a transfer note before moving this ticket to another team.");
+      return;
+    }
+
+    setTeamTransferTicketId(pendingTransfer.ticket.id);
 
     try {
-      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticket.id)}`, {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(pendingTransfer.ticket.id)}`, {
         method: "PATCH",
         headers: buildAdminJsonHeaders(),
         body: JSON.stringify({
-          assignedTeam: nextAssignedTeam,
+          assignedTeam: pendingTransfer.nextAssignedTeam,
+          note: trimmedNote,
         }),
       });
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
@@ -2968,7 +3064,9 @@ const AgentDashboard = () => {
       if (activeDetail?.ticket.id === payload.ticket.id) {
         syncDrafts(payload);
       }
-      toast.success(`Ticket moved to ${nextAssignedTeam}.`);
+      setPendingTeamTransfer(null);
+      setTeamTransferNote("");
+      toast.success(`Ticket moved to ${pendingTransfer.nextAssignedTeam}.`);
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
@@ -4991,7 +5089,7 @@ const AgentDashboard = () => {
                         </td>
                         <td className={dashboardCellClassName} onClick={(event) => event.stopPropagation()}>
                           <div className={cn("flex items-center justify-end gap-2", useCompactDashboardTable && "flex-col items-stretch")}>
-                            {canAssignTickets && !isArchivedTicket(ticket) ? (
+                            {canTransferTicketToTeam(ticket) ? (
                               <TeamTransferMenu
                                 ticketId={ticket.id}
                                 assignedTeam={ticket.assignedTeam}
@@ -6086,7 +6184,7 @@ const AgentDashboard = () => {
                   draftAgentId={draftAgentId}
                   onDraftAgentChange={setDraftAgentId}
                   selectedDraftAgent={selectedDraftAgent}
-                  assignableTicketAgents={assignableTicketAgents}
+                  assignableTicketAgents={activeTicketAssignableAgents}
                   isActiveTicketAlreadyAssigned={isActiveTicketAlreadyAssigned}
                   isSlaAutoManaged={isSlaAutoManaged}
                   effectiveDraftSlaStatus={effectiveDraftSlaStatus}
@@ -6113,8 +6211,8 @@ const AgentDashboard = () => {
                       onValueChange={(value) => setActiveTicketTab(value as TicketDetailTab)}
                       className="space-y-4"
                     >
-                  <TabsList className={cn("grid w-full", isActiveQuickTicket ? "grid-cols-2" : "grid-cols-3")}>
-                    {!isActiveQuickTicket ? (
+                  <TabsList className={cn("grid w-full", canShowActiveTicketConversation ? "grid-cols-3" : "grid-cols-2")}>
+                    {canShowActiveTicketConversation ? (
                       <TabsTrigger value="conversation">
                         <MessageSquareText className="mr-2 h-4 w-4" /> Conversation
                       </TabsTrigger>
@@ -6127,7 +6225,7 @@ const AgentDashboard = () => {
                     </TabsTrigger>
                   </TabsList>
 
-                  {!isActiveQuickTicket ? (
+                  {canShowActiveTicketConversation ? (
                     <TabsContent value="conversation" className="space-y-5">
                     <section>
                       <Label className="mb-1.5 block">Inquiry details</Label>
@@ -6271,7 +6369,7 @@ const AgentDashboard = () => {
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="unassigned">Unassigned</SelectItem>
-                                {assignableTicketAgents.map((agent) => (
+                                {activeTicketAssignableAgents.map((agent) => (
                                   <SelectItem key={agent.id} value={String(agent.id)} className="py-2">
                                     <AgentStatusLabel agent={agent} />
                                   </SelectItem>
@@ -6541,6 +6639,87 @@ const AgentDashboard = () => {
           </div>
         </AlertDialogContent>
       </AlertDialog>
+
+      <Dialog
+        open={Boolean(pendingTeamTransfer)}
+        onOpenChange={(open) => {
+          if (!open) {
+            dismissPendingTeamTransfer();
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Transfer Ticket To Team</DialogTitle>
+            <DialogDescription>
+              Add a handoff note so the receiving team understands why this ticket is moving.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-2xl border bg-secondary/20 p-4 text-sm">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="font-semibold text-foreground">
+                    {pendingTeamTransfer?.ticket.id || "Selected ticket"}
+                  </div>
+                  <div className="mt-1 text-muted-foreground">
+                    {pendingTeamTransfer ? getRequesterDisplayName(pendingTeamTransfer.ticket) : "Requester"}
+                  </div>
+                </div>
+                <div className="rounded-full border bg-background px-3 py-1 text-xs font-medium text-primary">
+                  {pendingTeamTransfer?.nextAssignedTeam || "Target team"}
+                </div>
+              </div>
+              <div className="mt-3 text-xs leading-5 text-muted-foreground">
+                Current team: {pendingTeamTransfer?.ticket.assignedTeam || "Unassigned"}. The current assigned agent will be cleared so the receiving team can assign an eligible receiver.
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="team-transfer-note">Handoff note</Label>
+              <Textarea
+                id="team-transfer-note"
+                rows={4}
+                value={teamTransferNote}
+                onChange={(event) => setTeamTransferNote(event.target.value)}
+                placeholder="Explain why this ticket is moving and what the receiving team should check next..."
+                disabled={Boolean(teamTransferTicketId)}
+                className="rounded-2xl bg-white"
+              />
+              <p className={cn("text-xs", teamTransferNote.trim() ? "text-muted-foreground" : "text-destructive")}>
+                {teamTransferNote.trim()
+                  ? "This note will be saved in the activity log."
+                  : "A handoff note is required before the ticket can be moved."}
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter className="gap-2 sm:justify-end">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={dismissPendingTeamTransfer}
+              disabled={Boolean(teamTransferTicketId)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void submitPendingTeamTransfer()}
+              disabled={!pendingTeamTransfer || !teamTransferNote.trim() || Boolean(teamTransferTicketId)}
+              className="border-0 gradient-primary"
+            >
+              {teamTransferTicketId ? (
+                <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <ArrowRightLeft className="mr-2 h-4 w-4" />
+              )}
+              Transfer Ticket
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={Boolean(ticketPendingPermanentDelete)}
@@ -11342,28 +11521,47 @@ const ActivityPayloadField = ({
   </div>
 );
 
-function isCoverageTicket(ticket?: Pick<TicketSummary, "technicalSubcategory"> | null) {
-  return ticket?.technicalSubcategory === "Coverage";
+function isCoverageTicket(
+  ticket?: (Pick<TicketSummary, "technicalSubcategory"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
+) {
+  return ticket?.ticketState?.ticketType === "coverage" || ticket?.technicalSubcategory === "Coverage";
 }
 
 function normalizeAssignedTeamName(value: string | null | undefined) {
   return (value || "").trim().toLowerCase();
 }
 
+function getTeamRoutingPolicyByAssignedTeam(teamName: string | null | undefined) {
+  const normalizedTeamName = normalizeAssignedTeamName(teamName);
+  return teamRoutingPolicies.find((policy) => (
+    normalizeAssignedTeamName(policy.assignedTeam) === normalizedTeamName
+  )) || supportTeamRoutingPolicy;
+}
+
+function getTicketRoutingPolicy(
+  ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
+) {
+  if (isCoverageTicket(ticket)) {
+    return learningPlanTeamRoutingPolicy;
+  }
+
+  return getTeamRoutingPolicyByAssignedTeam(ticket?.assignedTeam);
+}
+
 function isLearningPlanAssignedTeam(teamName: string | null | undefined) {
-  return normalizeAssignedTeamName(teamName) === normalizeAssignedTeamName(learningPlanAssignedTeam);
+  return getTeamRoutingPolicyByAssignedTeam(teamName).key === learningPlanTeamRoutingPolicy.key;
 }
 
 function isLearningPlanOtherTicket(
-  ticket?: Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> | null,
+  ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
 ) {
   return !isCoverageTicket(ticket) && isLearningPlanAssignedTeam(ticket?.assignedTeam);
 }
 
 function isLearningPlanTicket(
-  ticket?: Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> | null,
+  ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
 ) {
-  return isCoverageTicket(ticket) || isLearningPlanAssignedTeam(ticket?.assignedTeam);
+  return getTicketRoutingPolicy(ticket).key === learningPlanTeamRoutingPolicy.key;
 }
 
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
@@ -12528,14 +12726,35 @@ function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">)
 
 function hasCurrentCommunicationCentreAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess">) {
   return Boolean(
-    agent.legacySupportAccess
-    || agent.legacyOperationsAccess
+    teamRoutingPolicies.some((policy) => agent[policy.receiverAccessKey] === true)
     || agent.legacyAdminAccess,
   );
 }
 
-function hasTicketAccess(agent: Pick<AdminAgent, "legacySupportAccess">) {
-  return agent.legacySupportAccess === true;
+function canReceiveTeamTickets(
+  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">,
+  policy: TeamRoutingPolicy,
+) {
+  return agent[policy.receiverAccessKey] === true;
+}
+
+function canReceiveSupportTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">) {
+  return canReceiveTeamTickets(agent, supportTeamRoutingPolicy);
+}
+
+function canReceiveLearningPlanTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">) {
+  return canReceiveTeamTickets(agent, learningPlanTeamRoutingPolicy);
+}
+
+function canReceiveTicketAssignment(
+  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">,
+  ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
+) {
+  return canReceiveTeamTickets(agent, getTicketRoutingPolicy(ticket));
+}
+
+function hasTicketAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">) {
+  return canReceiveSupportTickets(agent);
 }
 
 function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicketFilter) {
@@ -12544,15 +12763,15 @@ function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicke
   }
 
   if (filter === "pending") {
-    return tickets.filter((ticket) => ticket.status === "Pending");
+    return tickets.filter(isDashboardPendingTicket);
   }
 
   if (filter === "escalation") {
-    return tickets.filter((ticket) => ticket.status === "Pending" && ticket.statusReason === "Escalation");
+    return tickets.filter(isDashboardEscalationTicket);
   }
 
   if (filter === "closed") {
-    return tickets.filter((ticket) => ticket.status === "Closed");
+    return tickets.filter(isDashboardClosedTicket);
   }
 
   if (filter === "slaBreached") {
@@ -12760,14 +12979,55 @@ function getDashboardAssignedFilterEmptyMessage(
   return `No tickets are currently assigned to ${targetLabel}.`;
 }
 
-function isQuickResolutionTicket(ticket: Pick<TicketSummary, "statusReason" | "isQuickTicket">) {
-  return Boolean(ticket.isQuickTicket) || normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket";
+function isQuickResolutionTicket(
+  ticket: Pick<TicketSummary, "statusReason" | "isQuickTicket"> & Partial<Pick<TicketSummary, "ticketState">>,
+) {
+  return (
+    ticket.ticketState?.ticketType === "quick"
+    || Boolean(ticket.isQuickTicket)
+    || normalizeQuickTicketStatusReason(ticket.statusReason) === "Quick Ticket"
+  );
 }
 
 function isDashboardQuickResolutionTicket(
-  ticket: Pick<TicketSummary, "statusReason" | "technicalSubcategory" | "isQuickTicket">,
+  ticket: Pick<TicketSummary, "statusReason" | "technicalSubcategory" | "isQuickTicket"> & Partial<Pick<TicketSummary, "ticketState">>,
 ) {
   return isQuickResolutionTicket(ticket) && !isCoverageTicket(ticket);
+}
+
+function canShowTicketConversation(
+  ticket: Pick<TicketSummary, "statusReason" | "technicalSubcategory" | "isQuickTicket"> & Partial<Pick<TicketSummary, "ticketState">>,
+) {
+  if (typeof ticket.ticketState?.canShowConversation === "boolean") {
+    return ticket.ticketState.canShowConversation;
+  }
+
+  return !isDashboardQuickResolutionTicket(ticket) && !isCoverageTicket(ticket);
+}
+
+function getTicketDashboardBucket(ticket: Partial<Pick<TicketSummary, "ticketState">>) {
+  return ticket.ticketState?.dashboardBucket || "";
+}
+
+function isDashboardPendingTicket(
+  ticket: Pick<TicketSummary, "status"> & Partial<Pick<TicketSummary, "ticketState">>,
+) {
+  return ticket.status === "Pending" || getTicketDashboardBucket(ticket) === "pending";
+}
+
+function isDashboardEscalationTicket(
+  ticket: Pick<TicketSummary, "status" | "statusReason"> & Partial<Pick<TicketSummary, "ticketState">>,
+) {
+  return (
+    getTicketDashboardBucket(ticket) === "escalation"
+    || (ticket.status === "Pending" && ticket.statusReason === "Escalation")
+  );
+}
+
+function isDashboardClosedTicket(
+  ticket: Pick<TicketSummary, "status"> & Partial<Pick<TicketSummary, "ticketState">>,
+) {
+  return ticket.status === "Closed" || getTicketDashboardBucket(ticket) === "closed";
 }
 
 function getDisplayedChatReference(
@@ -12808,6 +13068,20 @@ function getDisplayedChatReference(
   }
 
   return "-";
+}
+
+type TicketChatRoutingFields = Pick<TicketSummary, "chatState" | "chatIsActive" | "liveChatRequested"> & Partial<Pick<TicketSummary, "ticketState">>;
+
+function isOpenConsoleQueueTicket(ticket: TicketChatRoutingFields) {
+  if (typeof ticket.ticketState?.canReceiveChat === "boolean") {
+    return ticket.ticketState.canReceiveChat;
+  }
+
+  return ticket.chatState !== "closed" && ticket.chatIsActive && ticket.liveChatRequested;
+}
+
+function isClosedConsoleHistoryTicket(ticket: Pick<TicketSummary, "chatState" | "liveChatRequested">) {
+  return ticket.chatState === "closed" && ticket.liveChatRequested;
 }
 
 function isDashboardOpenTicket(ticket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested">) {
@@ -13085,13 +13359,15 @@ function compareCoverageTicketUpcomingSessionPriority(
   return leftSessionTimestamp - rightSessionTimestamp;
 }
 
-function shouldPrioritizeTicketByStatus(ticket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested">) {
-  return isDashboardOpenTicket(ticket) || ticket.status === "Pending";
+function shouldPrioritizeTicketByStatus(
+  ticket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested"> & Partial<Pick<TicketSummary, "ticketState">>,
+) {
+  return isOpenConsoleQueueTicket(ticket) || isDashboardOpenTicket(ticket) || ticket.status === "Pending";
 }
 
 function compareTicketLifecycleRank(
-  leftTicket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested">,
-  rightTicket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested">,
+  leftTicket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested"> & Partial<Pick<TicketSummary, "ticketState">>,
+  rightTicket: Pick<TicketSummary, "status" | "chatState" | "chatIsActive" | "liveChatRequested"> & Partial<Pick<TicketSummary, "ticketState">>,
 ) {
   const leftRank = shouldPrioritizeTicketByStatus(leftTicket) ? 0 : 1;
   const rightRank = shouldPrioritizeTicketByStatus(rightTicket) ? 0 : 1;

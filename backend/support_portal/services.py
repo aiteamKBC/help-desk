@@ -60,15 +60,27 @@ COACH_TICKET_PRIORITY = "High"
 ASSIGNED_TEAM_UNASSIGNED = "Unassigned"
 ASSIGNED_TEAM_SUPPORT_DESK = "Support Desk"
 ASSIGNED_TEAM_LEARNING_PLAN = "Learning Plan Team"
-ALLOWED_ASSIGNED_TEAMS = {
-    ASSIGNED_TEAM_UNASSIGNED,
-    ASSIGNED_TEAM_SUPPORT_DESK,
-    ASSIGNED_TEAM_LEARNING_PLAN,
-}
 DEFAULT_ASSIGNED_TEAMS = {
     ASSIGNED_TEAM_UNASSIGNED,
     ASSIGNED_TEAM_SUPPORT_DESK,
 }
+TICKET_RECEIVER_SCOPE_SUPPORT = "support"
+TICKET_RECEIVER_SCOPE_OPERATIONS = "operations"
+TEAM_ROUTING_POLICIES = {
+    ASSIGNED_TEAM_SUPPORT_DESK: {
+        "key": TICKET_RECEIVER_SCOPE_SUPPORT,
+        "assigned_team": ASSIGNED_TEAM_SUPPORT_DESK,
+        "receiver_access_metadata_key": "legacy_support_access",
+        "receiver_error_ticket_label": "support",
+    },
+    ASSIGNED_TEAM_LEARNING_PLAN: {
+        "key": TICKET_RECEIVER_SCOPE_OPERATIONS,
+        "assigned_team": ASSIGNED_TEAM_LEARNING_PLAN,
+        "receiver_access_metadata_key": "legacy_operations_access",
+        "receiver_error_ticket_label": "Learning Plan",
+    },
+}
+ALLOWED_ASSIGNED_TEAMS = {ASSIGNED_TEAM_UNASSIGNED, *TEAM_ROUTING_POLICIES.keys()}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
     "High": 1,
@@ -6256,15 +6268,28 @@ def is_coverage_ticket_record(ticket: dict[str, Any] | None) -> bool:
     return sanitize_text(metadata.get("technical_subcategory")).lower() == "coverage"
 
 
+def get_team_routing_policy_by_assigned_team(assigned_team: Any) -> dict[str, str]:
+    normalized_assigned_team = sanitize_text(assigned_team).casefold()
+    for team_name, policy in TEAM_ROUTING_POLICIES.items():
+        if normalized_assigned_team == team_name.casefold():
+            return policy
+
+    return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]
+
+
+def get_ticket_routing_policy(ticket: dict[str, Any] | None) -> dict[str, str]:
+    if is_coverage_ticket_record(ticket):
+        return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN]
+
+    assigned_team = get_ticket_scope_value(ticket or {}, "assigned_team", "assignedTeam")
+    return get_team_routing_policy_by_assigned_team(assigned_team)
+
+
 def is_learning_plan_ticket_record(ticket: dict[str, Any] | None) -> bool:
     if not isinstance(ticket, dict):
         return False
 
-    if is_coverage_ticket_record(ticket):
-        return True
-
-    assigned_team = sanitize_text(get_ticket_scope_value(ticket, "assigned_team", "assignedTeam"))
-    return assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold()
+    return get_ticket_routing_policy(ticket)["key"] == TICKET_RECEIVER_SCOPE_OPERATIONS
 
 
 def actor_has_metadata_flag(
@@ -6295,16 +6320,24 @@ def actor_has_admin_dashboard_access(actor: dict[str, Any] | None) -> bool:
 
 
 def actor_has_support_dashboard_access(actor: dict[str, Any] | None) -> bool:
+    return actor_has_team_routing_access(actor, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK])
+
+
+def actor_has_operations_dashboard_access(actor: dict[str, Any] | None) -> bool:
+    return actor_has_team_routing_access(actor, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN])
+
+
+def actor_has_team_routing_access(actor: dict[str, Any] | None, policy: dict[str, str]) -> bool:
     if not isinstance(actor, dict):
         return False
 
     role = sanitize_text(actor.get("role")).lower()
-    legacy_default = role == ROLE_AGENT
-    return actor_has_metadata_flag(actor, "legacy_support_access", default=legacy_default)
-
-
-def actor_has_operations_dashboard_access(actor: dict[str, Any] | None) -> bool:
-    return actor_has_metadata_flag(actor, "legacy_operations_access")
+    legacy_default = policy["key"] == TICKET_RECEIVER_SCOPE_SUPPORT and role == ROLE_AGENT
+    return actor_has_metadata_flag(
+        actor,
+        policy["receiver_access_metadata_key"],
+        default=legacy_default,
+    )
 
 
 def actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> bool:
@@ -6314,18 +6347,26 @@ def actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str
     if actor_has_admin_dashboard_access(actor):
         return True
 
-    has_support_access = actor_has_support_dashboard_access(actor)
-    has_operations_access = actor_has_operations_dashboard_access(actor)
-    if has_support_access and has_operations_access:
+    return actor_has_team_routing_access(actor, get_ticket_routing_policy(ticket))
+
+
+def actor_can_transfer_ticket_between_teams(
+    actor: dict[str, Any] | None,
+    ticket: dict[str, Any] | None,
+    target_assigned_team: Any,
+) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    if actor_has_admin_dashboard_access(actor):
         return True
 
-    is_learning_plan_ticket = is_learning_plan_ticket_record(ticket)
-    if has_operations_access:
-        return is_learning_plan_ticket
-    if has_support_access:
-        return not is_learning_plan_ticket
+    try:
+        normalize_assigned_team(target_assigned_team)
+    except ApiError:
+        return False
 
-    return False
+    return actor_has_team_routing_access(actor, get_ticket_routing_policy(ticket))
 
 
 def require_actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> None:
@@ -6391,7 +6432,7 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
     }
 
 
-def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+def is_active_staff_support_account(account: dict[str, Any] | None) -> bool:
     if not account:
         return False
 
@@ -6403,8 +6444,39 @@ def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
     if account_scope != ACCOUNT_SCOPE_STAFF:
         return False
 
+    return True
+
+
+def account_has_team_receiver_access(account: dict[str, Any] | None, policy: dict[str, str]) -> bool:
+    if not is_active_staff_support_account(account):
+        return False
+
     metadata = normalize_json_object(account.get("metadata"))
-    return normalize_bool(metadata.get("legacy_support_access"))
+    return normalize_bool(metadata.get(policy["receiver_access_metadata_key"]))
+
+
+def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+    return account_has_team_receiver_access(account, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK])
+
+
+def is_operations_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+    return account_has_team_receiver_access(account, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN])
+
+
+def get_ticket_receiver_scope(ticket: dict[str, Any] | None) -> str:
+    return get_ticket_routing_policy(ticket)["key"]
+
+
+def account_can_receive_ticket_assignment(
+    account: dict[str, Any] | None,
+    ticket: dict[str, Any] | None,
+) -> bool:
+    return account_has_team_receiver_access(account, get_ticket_routing_policy(ticket))
+
+
+def get_ticket_assignment_receiver_error(ticket: dict[str, Any] | None) -> str:
+    ticket_label = get_ticket_routing_policy(ticket)["receiver_error_ticket_label"]
+    return f"The selected agent does not receive {ticket_label} tickets."
 
 
 def is_booking_in_progress_ticket_record(ticket: dict[str, Any] | None) -> bool:
@@ -6450,6 +6522,102 @@ def is_admin_hidden_support_flow_ticket_record(ticket: dict[str, Any] | None) ->
         is_booking_in_progress_ticket_record(ticket)
         or is_cancelled_direct_booking_waiting_for_support_route(ticket)
     )
+
+
+def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+    normalized_status = sanitize_text(row.get("status")) or "Open"
+    normalized_status_reason = sanitize_text(row.get("status_reason"))
+    normalized_chat_state = sanitize_text(chat_state or row.get("conversation_status")).lower()
+    if normalized_chat_state not in ALLOWED_CHAT_STATES:
+        normalized_chat_state = "closed" if normalized_status == "Closed" else "open"
+
+    is_coverage = is_coverage_ticket_record(row)
+    is_quick = is_quick_ticket_record(row)
+    ticket_routing_policy = get_ticket_routing_policy(row)
+    is_learning_plan_other = ticket_routing_policy["key"] == TICKET_RECEIVER_SCOPE_OPERATIONS and not is_coverage
+    live_chat_requested = is_live_chat_requested(row.get("metadata"), row.get("conversation_metadata"))
+    teams_call_requested = is_teams_call_requested(row.get("metadata"))
+    assigned_agent_id = parse_assigned_agent_id(row.get("assigned_agent_id"))
+
+    if is_coverage:
+        ticket_type = "coverage"
+    elif is_quick:
+        ticket_type = "quick"
+    elif normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        ticket_type = "booking"
+    elif teams_call_requested:
+        ticket_type = "teams_call"
+    elif live_chat_requested:
+        ticket_type = "live_chat"
+    else:
+        ticket_type = "standard"
+
+    if is_coverage:
+        if normalized_status_reason == STATUS_REASON_TUTOR_REQUESTED:
+            workflow_stage = "tutor_requested"
+        elif normalized_status_reason == STATUS_REASON_REREQUESTING:
+            workflow_stage = "rerequesting"
+        elif normalized_status_reason == STATUS_REASON_TUTOR_ACCEPTED:
+            workflow_stage = "tutor_accepted"
+        elif normalized_status_reason in {STATUS_REASON_TUTOR_REJECTED, STATUS_REASON_TUTOR_REFUSED}:
+            workflow_stage = "tutor_rejected"
+        elif normalized_status == "Closed":
+            workflow_stage = "closed"
+        else:
+            workflow_stage = "coverage_review"
+    elif normalized_status == "Closed":
+        workflow_stage = "closed"
+    elif is_quick:
+        workflow_stage = "awaiting_review"
+    elif normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        workflow_stage = "awaiting_meeting"
+    elif normalized_status_reason == STATUS_REASON_ESCALATION:
+        workflow_stage = "escalated"
+    elif teams_call_requested:
+        workflow_stage = "awaiting_staff_call"
+    elif live_chat_requested:
+        workflow_stage = "with_agent" if assigned_agent_id else "awaiting_agent"
+    elif normalized_status == "Pending":
+        workflow_stage = "pending"
+    else:
+        workflow_stage = "active"
+
+    if normalized_status == "Closed":
+        dashboard_bucket = "closed"
+    elif is_coverage:
+        dashboard_bucket = "coverage"
+    elif is_learning_plan_other:
+        dashboard_bucket = "learning_plan"
+    elif is_quick:
+        dashboard_bucket = "quick"
+    elif normalized_status_reason == STATUS_REASON_ESCALATION:
+        dashboard_bucket = "escalation"
+    elif live_chat_requested:
+        dashboard_bucket = "live_chat"
+    elif normalized_status == "Pending":
+        dashboard_bucket = "pending"
+    else:
+        dashboard_bucket = "support"
+
+    queue_scope = ticket_routing_policy["key"]
+    can_show_conversation = not (is_coverage or is_quick)
+    can_receive_chat = (
+        can_show_conversation
+        and normalized_status == "Open"
+        and normalized_chat_state != "closed"
+        and live_chat_requested
+    )
+    resolution_reason = normalized_status_reason if normalized_status == "Closed" else ""
+
+    return {
+        "ticketType": ticket_type,
+        "workflowStage": workflow_stage,
+        "queueScope": queue_scope,
+        "dashboardBucket": dashboard_bucket,
+        "canShowConversation": can_show_conversation,
+        "canReceiveChat": can_receive_chat,
+        "resolutionReason": resolution_reason,
+    }
 
 
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
@@ -6502,6 +6670,7 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "inquiryPreview": sanitize_text(row.get("inquiry")),
         "status": row["status"],
         "statusReason": row.get("status_reason") or "",
+        "ticketState": derive_ticket_state(row, chat_state=chat_state),
         "isQuickTicket": is_quick_ticket_record(row),
         "assignedAgentId": int(row["assigned_agent_id"]) if row.get("assigned_agent_id") else None,
         "assignedAgentName": row.get("assigned_agent_name") or "Unassigned",
@@ -11624,17 +11793,20 @@ def request_ticket_transfer(public_id: str, payload: dict[str, Any]) -> dict[str
 
         target_agent = run_query_one(
             """
-            SELECT id, username, full_name, email, role, metadata
+            SELECT id, username, full_name, email, account_scope, role, is_active, metadata
             FROM support_accounts
             WHERE id = %s
               AND is_active = TRUE
+              AND account_scope = %s
             LIMIT 1
             """,
-            [target_agent_id],
+            [target_agent_id, ACCOUNT_SCOPE_STAFF],
         )
 
         if not target_agent:
             raise ApiError(400, "The selected admin does not exist.")
+        if not account_can_receive_ticket_assignment(target_agent, ticket):
+            raise ApiError(400, get_ticket_assignment_receiver_error(ticket))
         if int(ticket["assigned_agent_id"]) == int(target_agent["id"]):
             raise ApiError(400, "This ticket is already assigned to the selected admin.")
 
@@ -11740,24 +11912,27 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
 
         target_agent = run_query_one(
             """
-            SELECT id, username, full_name, email, role, metadata
+            SELECT id, username, full_name, email, account_scope, role, is_active, metadata
             FROM support_accounts
             WHERE id = %s
               AND is_active = TRUE
+              AND account_scope = %s
             LIMIT 1
             """,
-            [pending_transfer_request["toAgentId"]],
+            [pending_transfer_request["toAgentId"], ACCOUNT_SCOPE_STAFF],
         )
 
         if not target_agent:
             raise ApiError(409, "The requested admin is no longer available.")
+        if not account_can_receive_ticket_assignment(target_agent, ticket):
+            raise ApiError(409, "The requested admin no longer receives this ticket type.")
 
         actor = {
             "id": actor_row["id"],
             "role": actor_row["role"],
             "label": actor_row.get("full_name") or actor_row["username"],
         }
-        next_assigned_team = derive_assigned_team(target_agent)
+        next_assigned_team = derive_assigned_team_for_ticket_assignment(ticket.get("assigned_team"), target_agent)
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         ticket_metadata.pop(PENDING_TRANSFER_REQUEST_METADATA_KEY, None)
         ticket_metadata[LATEST_TRANSFER_DECISION_METADATA_KEY] = {
@@ -14394,14 +14569,27 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         if requested_assignment_changed:
             if actor_role not in ADMIN_ACCESS_ROLES:
                 raise ApiError(403, "Only admins and superadmins can assign tickets.")
-            if parsed_assigned_agent_id is None:
-                raise ApiError(400, "Select an agent with ticket access before assigning this ticket.")
 
         if requested_assigned_team is not None:
-            if actor_role not in ADMIN_ACCESS_ROLES:
-                raise ApiError(403, "Only admins and superadmins can transfer tickets between teams.")
             normalized_requested_assigned_team = normalize_assigned_team(requested_assigned_team)
             requested_team_changed = normalized_requested_assigned_team != current_assigned_team
+            if requested_team_changed and not actor_can_transfer_ticket_between_teams(
+                actor_row,
+                ticket,
+                normalized_requested_assigned_team,
+            ):
+                raise ApiError(403, "You do not have permission to transfer this ticket to another team.")
+            if requested_team_changed and actor_role not in ADMIN_ACCESS_ROLES and has_assigned_agent_input:
+                raise ApiError(403, "Team transfers by agents cannot assign a receiver.")
+            if requested_team_changed and not note:
+                raise ApiError(400, "Add a transfer note before moving this ticket to another team.")
+
+        target_assignment_ticket = {
+            **ticket,
+            "assigned_team": normalized_requested_assigned_team
+            if requested_assigned_team is not None
+            else current_assigned_team,
+        }
 
         escalation_target_agent = None
         if has_escalation_agent_input and parsed_escalation_agent_id is not None:
@@ -14427,14 +14615,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 WHERE id = %s
                   AND is_active = TRUE
                   AND account_scope = %s
-                  AND (metadata->>'legacy_support_access')::boolean = TRUE
                 LIMIT 1
                 """,
                 [parsed_assigned_agent_id, ACCOUNT_SCOPE_STAFF],
             )
-            if not is_ticket_receiving_staff_account(assigned_agent):
-                raise ApiError(400, "The selected agent does not receive tickets.")
-        elif not has_assigned_agent_input and ticket.get("assigned_agent_id"):
+            if not account_can_receive_ticket_assignment(assigned_agent, target_assignment_ticket):
+                raise ApiError(400, get_ticket_assignment_receiver_error(target_assignment_ticket))
+        elif not has_assigned_agent_input and ticket.get("assigned_agent_id") and not requested_team_changed:
             assigned_agent = {
                 "id": ticket["assigned_agent_id"],
                 "username": ticket.get("assigned_agent_username"),
@@ -14446,9 +14633,10 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         if (
             not has_assigned_agent_input
             and current_assigned_agent_id is None
+            and not requested_team_changed
             and actor_row
             and sanitize_text(actor_row.get("role")).lower() in {ROLE_ADMIN, ROLE_SUPERADMIN}
-            and is_ticket_receiving_staff_account(actor_row)
+            and account_can_receive_ticket_assignment(actor_row, target_assignment_ticket)
         ):
             auto_assigned_actor = {
                 "id": int(actor_row["id"]),
@@ -14574,11 +14762,15 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             requested_sla_status=requested_sla_status,
         )
 
-        next_assigned_agent_id = (
-            parsed_assigned_agent_id
-            if has_assigned_agent_input
-            else (auto_assigned_actor["id"] if auto_assigned_actor else ticket.get("assigned_agent_id"))
-        )
+        if has_assigned_agent_input:
+            next_assigned_agent_id = parsed_assigned_agent_id
+        elif auto_assigned_actor:
+            next_assigned_agent_id = auto_assigned_actor["id"]
+        elif requested_team_changed:
+            next_assigned_agent_id = None
+        else:
+            next_assigned_agent_id = ticket.get("assigned_agent_id")
+
         if requested_assigned_team is not None:
             next_assigned_team = normalized_requested_assigned_team or derive_assigned_team_for_ticket_assignment(
                 current_assigned_team,
@@ -14588,21 +14780,24 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             next_assigned_team = derive_assigned_team_for_ticket_assignment(current_assigned_team, assigned_agent)
         else:
             next_assigned_team = current_assigned_team
-        next_assigned_agent_name = (
-            sanitize_text(assigned_agent.get("full_name") or assigned_agent.get("username"))
-            if isinstance(assigned_agent, dict)
-            else sanitize_text(ticket.get("assigned_agent_name"))
-        )
-        next_assigned_agent_username = (
-            sanitize_text(assigned_agent.get("username"))
-            if isinstance(assigned_agent, dict)
-            else sanitize_text(ticket.get("assigned_agent_username"))
-        )
+        if next_assigned_agent_id is None:
+            next_assigned_agent_name = ""
+            next_assigned_agent_username = ""
+        elif isinstance(assigned_agent, dict):
+            next_assigned_agent_name = sanitize_text(assigned_agent.get("full_name") or assigned_agent.get("username"))
+            next_assigned_agent_username = sanitize_text(assigned_agent.get("username"))
+        else:
+            next_assigned_agent_name = sanitize_text(ticket.get("assigned_agent_name"))
+            next_assigned_agent_username = sanitize_text(ticket.get("assigned_agent_username"))
 
         next_requester_role = get_ticket_requester_role(updated_ticket_metadata)
         next_requester_email = sanitize_text(ticket.get("learner_email"))
         next_requester_name = sanitize_text(ticket.get("learner_name")) or next_requester_email
         is_next_learning_plan_team = next_assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold()
+
+        if requested_team_changed:
+            updated_ticket_metadata.pop(PENDING_TRANSFER_REQUEST_METADATA_KEY, None)
+            updated_ticket_metadata.pop(LATEST_TRANSFER_DECISION_METADATA_KEY, None)
 
         if not is_next_learning_plan_team:
             updated_ticket_metadata.pop(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY, None)

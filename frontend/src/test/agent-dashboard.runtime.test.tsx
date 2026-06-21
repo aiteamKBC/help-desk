@@ -552,6 +552,56 @@ describe("AgentDashboard runtime", () => {
     expect(within(adminPanel).getByRole("heading", { name: "All Tickets" })).toBeInTheDocument();
   });
 
+  it("surfaces live handoffs from ticketState even before chatIsActive is set", async () => {
+    const originalFetch = global.fetch;
+    const waitingLiveTicket = {
+      ...dashboardPayload.tickets.tickets[0],
+      id: "KBC-000005",
+      learnerName: "Waiting Learner",
+      requesterName: "Waiting Learner",
+      email: "waiting.learner@kentbusinesscollege.com",
+      inquiryPreview: "Waiting for an available support agent",
+      chatId: "CHAT-000005",
+      chatIsActive: false,
+      liveChatRequested: true,
+      liveChatRequestedAt: "2026-06-14T10:05:00.000Z",
+      chatState: "open",
+      ticketState: {
+        ticketType: "live_chat",
+        workflowStage: "awaiting_agent",
+        queueScope: "support",
+        dashboardBucket: "live_chat",
+        canShowConversation: true,
+        canReceiveChat: true,
+        resolutionReason: "",
+      },
+    };
+
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/tickets")) {
+        return new Response(JSON.stringify({
+          tickets: [...dashboardPayload.tickets.tickets, waitingLiveTicket],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=console"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Waiting Learner")).toBeInTheDocument();
+    expect(screen.getByText("CHAT-000005")).toBeInTheDocument();
+  });
+
   it("opens the Admin Dashboard overview from the admin view deep link", async () => {
     render(
       <MemoryRouter initialEntries={["/admin?view=adminDashboard"]}>
