@@ -11417,8 +11417,72 @@ const DocumentationCardAttachmentsBlock = ({
 
 function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
   const [zoomLevel, setZoomLevel] = useState(1);
+  const [previewMode, setPreviewMode] = useState<"smart" | "original">("smart");
+  const [smartPreviewSource, setSmartPreviewSource] = useState("");
+  const [isPreparingSmartPreview, setIsPreparingSmartPreview] = useState(false);
   const isZoomed = zoomLevel > 1;
+  const isUsingSmartPreview = previewMode === "smart" && Boolean(smartPreviewSource);
+  const displaySource = isUsingSmartPreview ? smartPreviewSource : src;
   const fileName = alt || "attachment";
+
+  useEffect(() => {
+    let isCancelled = false;
+    let smartObjectUrl = "";
+    const image = new Image();
+
+    setZoomLevel(1);
+    setPreviewMode("smart");
+    setSmartPreviewSource("");
+    setIsPreparingSmartPreview(true);
+
+    image.onload = () => {
+      void createSmartImagePreviewObjectUrl(image)
+        .then((nextSmartObjectUrl) => {
+          if (isCancelled) {
+            if (nextSmartObjectUrl) {
+              URL.revokeObjectURL(nextSmartObjectUrl);
+            }
+            return;
+          }
+
+          if (nextSmartObjectUrl) {
+            smartObjectUrl = nextSmartObjectUrl;
+            setSmartPreviewSource(nextSmartObjectUrl);
+            setPreviewMode("smart");
+          } else {
+            setPreviewMode("original");
+          }
+        })
+        .catch(() => {
+          if (!isCancelled) {
+            setPreviewMode("original");
+          }
+        })
+        .finally(() => {
+          if (!isCancelled) {
+            setIsPreparingSmartPreview(false);
+          }
+        });
+    };
+
+    image.onerror = () => {
+      if (!isCancelled) {
+        setPreviewMode("original");
+        setIsPreparingSmartPreview(false);
+      }
+    };
+
+    image.src = src;
+
+    return () => {
+      isCancelled = true;
+      image.onload = null;
+      image.onerror = null;
+      if (smartObjectUrl) {
+        URL.revokeObjectURL(smartObjectUrl);
+      }
+    };
+  }, [src]);
 
   function zoomOut() {
     setZoomLevel((currentZoom) => Math.max(1, Number((currentZoom - 0.5).toFixed(1))));
@@ -11428,13 +11492,44 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
     setZoomLevel((currentZoom) => Math.min(3, Number((currentZoom + 0.5).toFixed(1))));
   }
 
+  function showSmartPreview() {
+    setPreviewMode("smart");
+    setZoomLevel(1);
+  }
+
+  function showOriginalPreview() {
+    setPreviewMode("original");
+    setZoomLevel(1);
+  }
+
   return (
     <div className="rounded-2xl border bg-secondary/10 p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs font-medium text-muted-foreground">
-          Zoom {Math.round(zoomLevel * 100)}%
+          {isUsingSmartPreview ? "Smart preview" : "Original"} · Zoom {Math.round(zoomLevel * 100)}%
+          {isPreparingSmartPreview ? " · preparing smart crop..." : ""}
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant={isUsingSmartPreview ? "default" : "outline"}
+            size="sm"
+            className="h-8 rounded-full px-3 text-xs"
+            onClick={showSmartPreview}
+            disabled={!smartPreviewSource || isUsingSmartPreview}
+          >
+            Smart preview
+          </Button>
+          <Button
+            type="button"
+            variant={!isUsingSmartPreview ? "default" : "outline"}
+            size="sm"
+            className="h-8 rounded-full px-3 text-xs"
+            onClick={showOriginalPreview}
+            disabled={!isUsingSmartPreview}
+          >
+            Original
+          </Button>
           <Button
             type="button"
             variant="outline"
@@ -11490,7 +11585,7 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
           style={isZoomed ? { width: `${zoomLevel * 100}%` } : undefined}
         >
           <img
-            src={src}
+            src={displaySource}
             alt={alt}
             className={cn(
               "rounded-xl",
@@ -11501,6 +11596,116 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
       </div>
     </div>
   );
+}
+
+async function createSmartImagePreviewObjectUrl(image: HTMLImageElement): Promise<string | null> {
+  const naturalWidth = image.naturalWidth;
+  const naturalHeight = image.naturalHeight;
+
+  if (!naturalWidth || !naturalHeight) {
+    return null;
+  }
+
+  const maxDetectionSide = 1400;
+  const detectionScale = Math.min(1, maxDetectionSide / Math.max(naturalWidth, naturalHeight));
+  const detectionWidth = Math.max(1, Math.round(naturalWidth * detectionScale));
+  const detectionHeight = Math.max(1, Math.round(naturalHeight * detectionScale));
+  const detectionCanvas = document.createElement("canvas");
+  const detectionContext = detectionCanvas.getContext("2d", { willReadFrequently: true });
+
+  if (!detectionContext) {
+    return null;
+  }
+
+  detectionCanvas.width = detectionWidth;
+  detectionCanvas.height = detectionHeight;
+  detectionContext.drawImage(image, 0, 0, detectionWidth, detectionHeight);
+
+  const { data } = detectionContext.getImageData(0, 0, detectionWidth, detectionHeight);
+  const whiteThreshold = 248;
+  const alphaThreshold = 12;
+  let minX = detectionWidth;
+  let minY = detectionHeight;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < detectionHeight; y += 1) {
+    for (let x = 0; x < detectionWidth; x += 1) {
+      const index = (y * detectionWidth + x) * 4;
+      const alpha = data[index + 3];
+
+      if (alpha <= alphaThreshold) {
+        continue;
+      }
+
+      const red = data[index];
+      const green = data[index + 1];
+      const blue = data[index + 2];
+      const isNearWhite = red >= whiteThreshold && green >= whiteThreshold && blue >= whiteThreshold;
+
+      if (!isNearWhite) {
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) {
+    return null;
+  }
+
+  const padding = Math.max(12, Math.round(Math.min(detectionWidth, detectionHeight) * 0.02));
+  minX = Math.max(0, minX - padding);
+  minY = Math.max(0, minY - padding);
+  maxX = Math.min(detectionWidth - 1, maxX + padding);
+  maxY = Math.min(detectionHeight - 1, maxY + padding);
+
+  const cropWidthRatio = (maxX - minX + 1) / detectionWidth;
+  const cropHeightRatio = (maxY - minY + 1) / detectionHeight;
+
+  if (cropWidthRatio > 0.94 && cropHeightRatio > 0.94) {
+    return null;
+  }
+
+  const cropX = Math.max(0, Math.floor(minX / detectionScale));
+  const cropY = Math.max(0, Math.floor(minY / detectionScale));
+  const cropWidth = Math.min(naturalWidth - cropX, Math.ceil((maxX - minX + 1) / detectionScale));
+  const cropHeight = Math.min(naturalHeight - cropY, Math.ceil((maxY - minY + 1) / detectionScale));
+
+  if (cropWidth <= 0 || cropHeight <= 0) {
+    return null;
+  }
+
+  const outputCanvas = document.createElement("canvas");
+  const outputContext = outputCanvas.getContext("2d");
+
+  if (!outputContext) {
+    return null;
+  }
+
+  const maxOutputSide = 2400;
+  const outputScale = Math.min(1, maxOutputSide / Math.max(cropWidth, cropHeight));
+  outputCanvas.width = Math.max(1, Math.round(cropWidth * outputScale));
+  outputCanvas.height = Math.max(1, Math.round(cropHeight * outputScale));
+  outputContext.drawImage(
+    image,
+    cropX,
+    cropY,
+    cropWidth,
+    cropHeight,
+    0,
+    0,
+    outputCanvas.width,
+    outputCanvas.height,
+  );
+
+  return new Promise((resolve) => {
+    outputCanvas.toBlob((blob) => {
+      resolve(blob ? URL.createObjectURL(blob) : null);
+    }, "image/png");
+  });
 }
 
 const AttachmentPreviewDialog = ({
