@@ -152,7 +152,21 @@ ALLOWED_STATUS_REASONS_BY_STATUS = {
 }
 AUTO_MANAGED_SLA_STATUSES = {"Open", "Pending", "Closed"}
 PENDING_SLA_BREACH_AFTER = timedelta(days=3)
+MEETING_SLA_BREACH_AFTER = timedelta(days=3)
 SLA_ATTENTION_REASON_PENDING_OVERDUE = "pending_over_3_days"
+SLA_ATTENTION_REASON_MEETING_OVERDUE = "meeting_over_3_days"
+SLA_POLICY_KEY_METADATA_KEY = "sla_policy_key"
+SLA_STARTED_AT_METADATA_KEY = "sla_started_at"
+SLA_DUE_AT_METADATA_KEY = "sla_due_at"
+SLA_BREACHED_AT_METADATA_KEY = "sla_breached_at"
+SLA_RESOLVED_AT_METADATA_KEY = "sla_resolved_at"
+SLA_OUTCOME_STATUS_METADATA_KEY = "sla_outcome_status"
+SLA_POLICY_OPEN_REVIEW = "open_review"
+SLA_POLICY_PENDING_AGE = "pending_age"
+SLA_POLICY_AWAITING_SUPPORT_MEETING = "awaiting_support_meeting"
+SLA_POLICY_COVERAGE_SESSION_DEADLINE = "coverage_session_deadline"
+SLA_POLICY_CLOSED = "closed"
+SLA_POLICY_ARCHIVED = "archived"
 CHAT_INACTIVITY_REMINDER_AFTER = timedelta(minutes=2)
 CHAT_INACTIVITY_AUTO_CLOSE_AFTER = timedelta(minutes=3)
 OPEN_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS = 10
@@ -176,6 +190,7 @@ LATEST_TRANSFER_DECISION_METADATA_KEY = "latest_transfer_decision"
 PENDING_ESCALATION_NOTIFICATION_METADATA_KEY = "pending_escalation_notification"
 LATEST_ESCALATION_CLOSURE_METADATA_KEY = "latest_escalation_closure"
 PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY = "pending_teams_call_notification"
+PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY = "pending_support_queue_notification"
 PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY = "pending_coverage_ticket_notification"
 PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY = "pending_learning_plan_transfer_notification"
 TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
@@ -863,6 +878,59 @@ def normalize_pending_teams_call_notification(value: Any) -> dict[str, Any] | No
 
 def get_pending_teams_call_notification(metadata: Any) -> dict[str, Any] | None:
     return normalize_pending_teams_call_notification(normalize_json_object(metadata).get(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY))
+
+
+def normalize_pending_support_queue_notification(value: Any) -> dict[str, Any] | None:
+    payload = normalize_json_object(value)
+    if not payload:
+        return None
+
+    ticket_id = sanitize_text(payload.get("ticketId")) or sanitize_text(payload.get("chatId"))
+    requester_name = sanitize_text(payload.get("requesterName"))
+    requester_email = sanitize_text(payload.get("requesterEmail"))
+    requester_role = normalize_public_requester_role(payload.get("requesterRole"))
+    reason = sanitize_text(payload.get("reason")) or "support_ticket_created"
+    queue = sanitize_text(payload.get("queue")) or ASSIGNED_TEAM_SUPPORT_DESK
+    created_at = serialize_datetime_value(coerce_datetime(payload.get("createdAt")))
+
+    if not ticket_id or not requester_email or not created_at:
+        return None
+
+    return {
+        "ticketId": ticket_id,
+        "requesterName": requester_name,
+        "requesterEmail": requester_email,
+        "requesterRole": requester_role,
+        "queue": queue,
+        "reason": reason,
+        "createdAt": created_at,
+    }
+
+
+def get_pending_support_queue_notification(metadata: Any) -> dict[str, Any] | None:
+    return normalize_pending_support_queue_notification(
+        normalize_json_object(metadata).get(PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY)
+    )
+
+
+def build_support_queue_notification_payload(
+    *,
+    ticket_id: str,
+    requester_name: Any,
+    requester_email: Any,
+    requester_role: Any,
+    reason: str,
+    created_at: Any,
+) -> dict[str, Any]:
+    return {
+        "ticketId": ticket_id,
+        "requesterName": sanitize_text(requester_name),
+        "requesterEmail": normalize_email(requester_email),
+        "requesterRole": normalize_public_requester_role(requester_role),
+        "queue": ASSIGNED_TEAM_SUPPORT_DESK,
+        "reason": sanitize_text(reason) or "support_ticket_created",
+        "createdAt": serialize_datetime_value(coerce_datetime(created_at)) or serialize_datetime_value(datetime.now(timezone.utc)),
+    }
 
 
 def normalize_pending_coverage_ticket_notification(value: Any) -> dict[str, Any] | None:
@@ -1622,6 +1690,282 @@ def normalize_documentation_card_for_actor_comparison(card: Any) -> dict[str, An
     return normalized_card
 
 
+def normalize_documentation_card_for_history_comparison(card: Any) -> dict[str, Any]:
+    normalized_card = normalize_documentation_card_for_actor_comparison(card)
+    for field in ("createdAt", "updatedAt"):
+        normalized_card.pop(field, None)
+    return normalized_card
+
+
+def normalize_card_content_for_history_comparison(card: Any, attachment_field: str) -> dict[str, Any]:
+    normalized_card = normalize_documentation_card_for_history_comparison(card)
+    normalized_card.pop(attachment_field, None)
+    return normalized_card
+
+
+CARD_HISTORY_ATTACHMENT_FIELDS = {
+    "attachmentId",
+    "id",
+    "mimeType",
+    "name",
+    "size",
+    "storageUrl",
+}
+CARD_HISTORY_EXCLUDED_FIELDS = {"dataUrl", "responseToken", "storageKey"}
+
+
+def has_history_payload_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def build_history_attachment_details(attachment: Any) -> dict[str, Any]:
+    source = normalize_json_object(attachment)
+    return {
+        field: source.get(field)
+        for field in CARD_HISTORY_ATTACHMENT_FIELDS
+        if has_history_payload_value(source.get(field))
+    }
+
+
+def build_card_history_details(card: Any, attachment_field: str) -> dict[str, Any]:
+    source = normalize_json_object(card)
+    details: dict[str, Any] = {}
+    for key, value in source.items():
+        if key in CARD_HISTORY_EXCLUDED_FIELDS:
+            continue
+        if key == attachment_field:
+            attachments = value if isinstance(value, list) else []
+            attachment_details = [
+                item
+                for attachment in attachments
+                if (item := build_history_attachment_details(attachment))
+            ]
+            if attachment_details:
+                details[key] = attachment_details
+            continue
+        if has_history_payload_value(value):
+            details[key] = value
+    return details
+
+
+def build_card_history_diff(previous_card: Any, next_card: Any, attachment_field: str) -> dict[str, Any]:
+    previous_details = normalize_card_content_for_history_comparison(previous_card, attachment_field)
+    next_details = normalize_card_content_for_history_comparison(next_card, attachment_field)
+    changed_fields = sorted(
+        field
+        for field in set(previous_details) | set(next_details)
+        if previous_details.get(field) != next_details.get(field)
+    )
+    return {
+        "changedFields": changed_fields,
+        "previousValues": {
+            field: previous_details.get(field)
+            for field in changed_fields
+            if has_history_payload_value(previous_details.get(field))
+        },
+        "currentValues": {
+            field: next_details.get(field)
+            for field in changed_fields
+            if has_history_payload_value(next_details.get(field))
+        },
+    }
+
+
+def get_card_attachment_identity(attachment: Any) -> str:
+    source = normalize_json_object(attachment)
+    for field in ("attachmentId", "id", "storageKey", "storageUrl"):
+        value = sanitize_text(source.get(field))
+        if value:
+            return f"{field}:{value}"
+    name = sanitize_text(source.get("name"))
+    size = sanitize_text(source.get("size"))
+    if name or size:
+        return f"name:{name}:size:{size}"
+    return ""
+
+
+def get_card_attachment_identities(card: Any, attachment_field: str) -> set[str]:
+    source = normalize_json_object(card)
+    attachments = source.get(attachment_field) if isinstance(source.get(attachment_field), list) else []
+    return {
+        identity
+        for attachment in attachments
+        if (identity := get_card_attachment_identity(attachment))
+    }
+
+
+def get_added_card_attachments(previous_card: Any, next_card: Any, attachment_field: str) -> list[dict[str, Any]]:
+    previous_identities = get_card_attachment_identities(previous_card, attachment_field)
+    source = normalize_json_object(next_card)
+    attachments = source.get(attachment_field) if isinstance(source.get(attachment_field), list) else []
+    added_attachments: list[dict[str, Any]] = []
+    for attachment in attachments:
+        identity = get_card_attachment_identity(attachment)
+        if identity and identity not in previous_identities:
+            added_attachments.append(normalize_json_object(attachment))
+    return added_attachments
+
+
+def build_card_history_payload(
+    card: Any,
+    *,
+    card_kind: str,
+    attachment_field: str,
+    previous_card: Any | None = None,
+    added_attachments: list[dict[str, Any]] | None = None,
+    include_diff: bool = False,
+) -> dict[str, Any]:
+    source = normalize_json_object(card)
+    attachments = source.get(attachment_field) if isinstance(source.get(attachment_field), list) else []
+    added_files = list(added_attachments or [])
+    card_type = sanitize_text(source.get("type")) or "documentation"
+    card_title = (
+        sanitize_text(source.get("title"))
+        or sanitize_text(source.get("inquiry"))
+        or sanitize_text(source.get("note"))
+        or card_type.replace("_", " ").title()
+    )
+    payload: dict[str, Any] = {
+        "cardId": sanitize_text(source.get("id")),
+        "cardKind": card_kind,
+        "cardType": card_type,
+        "cardTitle": card_title,
+        "attachmentCount": len(attachments),
+        "cardDetails": build_card_history_details(source, attachment_field),
+    }
+    if added_attachments is not None:
+        payload["addedAttachmentCount"] = len(added_files)
+        payload["fileCount"] = len(added_files)
+        payload["fileNames"] = [
+            sanitize_text(attachment.get("name"))
+            for attachment in added_files
+            if sanitize_text(attachment.get("name"))
+        ]
+        payload["addedAttachments"] = [
+            item
+            for attachment in added_files
+            if (item := build_history_attachment_details(attachment))
+        ]
+        payload["allAttachments"] = [
+            item
+            for attachment in attachments
+            if (item := build_history_attachment_details(attachment))
+        ]
+    if include_diff and previous_card is not None:
+        payload.update(build_card_history_diff(previous_card, source, attachment_field))
+    return payload
+
+
+def build_card_collection_history_events(
+    previous_cards: Any,
+    next_cards: Any,
+    *,
+    card_kind: str,
+    attachment_field: str,
+    create_event_type: str,
+    update_event_type: str,
+    attachment_event_type: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    previous_by_id: dict[str, dict[str, Any]] = {}
+    for card in previous_cards if isinstance(previous_cards, list) else []:
+        normalized_previous_card = normalize_json_object(card)
+        previous_card_id = sanitize_text(normalized_previous_card.get("id"))
+        if previous_card_id:
+            previous_by_id[previous_card_id] = normalized_previous_card
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    for card in next_cards if isinstance(next_cards, list) else []:
+        normalized_card = normalize_json_object(card)
+        card_id = sanitize_text(normalized_card.get("id"))
+        previous_card = previous_by_id.get(card_id)
+
+        if not previous_card:
+            events.append(
+                (
+                    create_event_type,
+                    build_card_history_payload(
+                        normalized_card,
+                        card_kind=card_kind,
+                        attachment_field=attachment_field,
+                    ),
+                )
+            )
+            continue
+
+        added_attachments = get_added_card_attachments(previous_card, normalized_card, attachment_field)
+        if added_attachments:
+            events.append(
+                (
+                    attachment_event_type,
+                    build_card_history_payload(
+                        normalized_card,
+                        card_kind=card_kind,
+                        attachment_field=attachment_field,
+                        previous_card=previous_card,
+                        added_attachments=added_attachments,
+                    ),
+                )
+            )
+
+        if (
+            normalize_card_content_for_history_comparison(normalized_card, attachment_field)
+            != normalize_card_content_for_history_comparison(previous_card, attachment_field)
+        ):
+            events.append(
+                (
+                    update_event_type,
+                    build_card_history_payload(
+                        normalized_card,
+                        card_kind=card_kind,
+                        attachment_field=attachment_field,
+                        previous_card=previous_card,
+                        include_diff=True,
+                    ),
+                )
+            )
+
+    return events
+
+
+def build_documentation_card_history_events(
+    previous_documentation: Any,
+    next_documentation: Any,
+) -> list[tuple[str, dict[str, Any]]]:
+    previous_payload = normalize_admin_documentation(previous_documentation)
+    next_payload = normalize_admin_documentation(next_documentation)
+    events: list[tuple[str, dict[str, Any]]] = []
+    events.extend(
+        build_card_collection_history_events(
+            previous_payload.get("documentationCards"),
+            next_payload.get("documentationCards"),
+            card_kind="Documentation",
+            attachment_field="attachments",
+            create_event_type="documentation_card_created",
+            update_event_type="documentation_card_updated",
+            attachment_event_type="documentation_attachment_added",
+        )
+    )
+    events.extend(
+        build_card_collection_history_events(
+            previous_payload.get("coverageCards"),
+            next_payload.get("coverageCards"),
+            card_kind="Coverage",
+            attachment_field="presentationFiles",
+            create_event_type="coverage_card_created",
+            update_event_type="coverage_card_updated",
+            attachment_event_type="coverage_attachment_added",
+        )
+    )
+    return events
+
+
 def stamp_documentation_card_actors(
     documentation: Any,
     previous_documentation: Any,
@@ -1956,12 +2300,99 @@ def is_coverage_ticket_waiting_for_initial_action(row: dict[str, Any]) -> bool:
     return not has_submitted_coverage_tutor_request(coverage_cards)
 
 
-def derive_sla_state(status: Any, created_at: Any, current_sla_status: Any) -> tuple[str, bool, str | None]:
-    normalized_status = sanitize_text(status)
-    fallback_sla_status = sanitize_text(current_sla_status)
+def normalize_sla_status(value: Any, fallback: str = "Pending Review") -> str:
+    normalized_value = sanitize_text(value)
+    return normalized_value if normalized_value in ALLOWED_SLA_STATUSES else fallback
 
-    if fallback_sla_status not in ALLOWED_SLA_STATUSES:
-        fallback_sla_status = "Pending Review"
+
+def get_sla_comparison_now(reference_time: datetime | None = None, tzinfo: Any = timezone.utc) -> datetime:
+    comparison_now = reference_time or datetime.now(tzinfo or timezone.utc)
+    if comparison_now.tzinfo is None:
+        comparison_now = comparison_now.replace(tzinfo=timezone.utc)
+    return comparison_now
+
+
+def get_sla_started_at(metadata: Any, created_at: Any) -> datetime | None:
+    normalized_metadata = normalize_json_object(metadata)
+    return (
+        coerce_datetime(normalized_metadata.get(SLA_STARTED_AT_METADATA_KEY))
+        or coerce_datetime(normalized_metadata.get("queue_assigned_at"))
+        or coerce_datetime(normalized_metadata.get("quick_ticket_assigned_at"))
+        or coerce_datetime(created_at)
+    )
+
+
+def build_pending_age_due_at(started_at: datetime | None) -> datetime | None:
+    if not started_at:
+        return None
+    return started_at + PENDING_SLA_BREACH_AFTER
+
+
+def build_sla_metadata_patch(
+    attention_required: bool,
+    attention_reason: str | None,
+    *,
+    policy_key: str | None = None,
+    started_at: datetime | None = None,
+    due_at: datetime | None = None,
+    breached_at: datetime | None = None,
+    resolved_at: datetime | None = None,
+    outcome_status: str | None = None,
+) -> dict[str, Any]:
+    patch: dict[str, Any] = {
+        "sla_attention_required": attention_required,
+        "sla_attention_reason": attention_reason,
+        "sla_attention_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if policy_key is not None:
+        patch[SLA_POLICY_KEY_METADATA_KEY] = policy_key
+    if started_at is not None:
+        patch[SLA_STARTED_AT_METADATA_KEY] = serialize_datetime_value(started_at)
+    if due_at is not None:
+        patch[SLA_DUE_AT_METADATA_KEY] = serialize_datetime_value(due_at)
+    else:
+        patch[SLA_DUE_AT_METADATA_KEY] = None
+    if breached_at is not None:
+        patch[SLA_BREACHED_AT_METADATA_KEY] = serialize_datetime_value(breached_at)
+    elif not attention_required:
+        patch[SLA_BREACHED_AT_METADATA_KEY] = None
+    if resolved_at is not None:
+        patch[SLA_RESOLVED_AT_METADATA_KEY] = serialize_datetime_value(resolved_at)
+    elif policy_key != SLA_POLICY_CLOSED:
+        patch[SLA_RESOLVED_AT_METADATA_KEY] = None
+    if outcome_status is not None:
+        patch[SLA_OUTCOME_STATUS_METADATA_KEY] = normalize_sla_status(outcome_status)
+    elif policy_key != SLA_POLICY_CLOSED:
+        patch[SLA_OUTCOME_STATUS_METADATA_KEY] = None
+    return patch
+
+
+def derive_sla_policy_key(status: Any, status_reason: Any = None) -> str:
+    normalized_status = sanitize_text(status)
+    normalized_status_reason = sanitize_text(status_reason)
+
+    if normalized_status == "Open":
+        return SLA_POLICY_OPEN_REVIEW
+    if normalized_status == "Closed":
+        return SLA_POLICY_CLOSED
+    if normalized_status == "Pending" and normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        return SLA_POLICY_AWAITING_SUPPORT_MEETING
+    if normalized_status == "Pending":
+        return SLA_POLICY_PENDING_AGE
+    return SLA_POLICY_OPEN_REVIEW
+
+
+def derive_sla_state(
+    status: Any,
+    created_at: Any,
+    current_sla_status: Any,
+    *,
+    status_reason: Any = None,
+    metadata: Any = None,
+    reference_time: datetime | None = None,
+) -> tuple[str, bool, str | None]:
+    normalized_status = sanitize_text(status)
+    fallback_sla_status = normalize_sla_status(current_sla_status)
 
     if normalized_status == "Open":
         return "Pending Review", False, None
@@ -1970,10 +2401,26 @@ def derive_sla_state(status: Any, created_at: Any, current_sla_status: Any) -> t
         return "On Track", False, None
 
     if normalized_status == "Pending":
-        created_datetime = created_at if isinstance(created_at, datetime) else None
-        if created_datetime:
-            comparison_now = datetime.now(created_datetime.tzinfo or timezone.utc)
-            if (comparison_now - created_datetime) > PENDING_SLA_BREACH_AFTER:
+        if sanitize_text(status_reason) == STATUS_REASON_AWAITING_MEETING:
+            normalized_metadata = normalize_json_object(metadata)
+            meeting_due_at = (
+                coerce_datetime(normalized_metadata.get(SLA_DUE_AT_METADATA_KEY))
+                or coerce_datetime(normalized_metadata.get("support_session_requested_start_at"))
+                or coerce_datetime(normalized_metadata.get("requested_start_at"))
+                or coerce_datetime(normalized_metadata.get("scheduled_at"))
+            )
+            if meeting_due_at:
+                comparison_now = get_sla_comparison_now(reference_time, meeting_due_at.tzinfo)
+                if comparison_now > meeting_due_at + MEETING_SLA_BREACH_AFTER:
+                    return "Breached", True, SLA_ATTENTION_REASON_MEETING_OVERDUE
+
+            return "On Track", False, None
+
+        started_at = get_sla_started_at(metadata, created_at)
+        due_at = build_pending_age_due_at(started_at)
+        if due_at:
+            comparison_now = get_sla_comparison_now(reference_time, due_at.tzinfo)
+            if comparison_now > due_at:
                 return "Breached", True, SLA_ATTENTION_REASON_PENDING_OVERDUE
 
         return "On Track", False, None
@@ -1986,31 +2433,109 @@ def resolve_next_sla_state(
     created_at: Any,
     current_sla_status: Any,
     requested_sla_status: Any = None,
+    *,
+    status_reason: Any = None,
+    metadata: Any = None,
+    reference_time: datetime | None = None,
 ) -> tuple[str, bool, str | None]:
     normalized_status = sanitize_text(status)
     normalized_requested_sla_status = sanitize_text(requested_sla_status)
 
     if normalized_status in AUTO_MANAGED_SLA_STATUSES:
-        return derive_sla_state(normalized_status, created_at, current_sla_status)
+        return derive_sla_state(
+            normalized_status,
+            created_at,
+            current_sla_status,
+            status_reason=status_reason,
+            metadata=metadata,
+            reference_time=reference_time,
+        )
 
     if normalized_requested_sla_status in ALLOWED_SLA_STATUSES:
         return normalized_requested_sla_status, False, None
 
-    return derive_sla_state(normalized_status, created_at, current_sla_status)
+    return derive_sla_state(
+        normalized_status,
+        created_at,
+        current_sla_status,
+        status_reason=status_reason,
+        metadata=metadata,
+        reference_time=reference_time,
+    )
 
 
-def build_sla_metadata_patch(attention_required: bool, attention_reason: str | None) -> dict[str, Any]:
+def resolve_sla_policy_update(
+    ticket: dict[str, Any],
+    status: Any,
+    *,
+    status_reason: Any = None,
+    metadata: Any = None,
+    requested_sla_status: Any = None,
+    reference_time: datetime | None = None,
+) -> tuple[str, bool, str | None, dict[str, Any]]:
+    base_metadata = normalize_json_object(ticket.get("metadata") if metadata is None else metadata)
+    normalized_status = sanitize_text(status)
+    normalized_status_reason = sanitize_text(status_reason if status_reason is not None else ticket.get("status_reason"))
+    started_at = get_sla_started_at(base_metadata, ticket.get("created_at"))
+    if sanitize_text(ticket.get("status")) != normalized_status:
+        started_at = get_sla_comparison_now(reference_time)
+    if normalized_status == "Pending" and normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        due_at = (
+            coerce_datetime(base_metadata.get("support_session_requested_start_at"))
+            or coerce_datetime(base_metadata.get("requested_start_at"))
+            or coerce_datetime(base_metadata.get("scheduled_at"))
+        )
+    elif normalized_status == "Pending":
+        due_at = build_pending_age_due_at(started_at)
+    else:
+        due_at = None
+
+    next_sla_status, attention_required, attention_reason = resolve_next_sla_state(
+        normalized_status,
+        ticket.get("created_at"),
+        ticket.get("sla_status"),
+        requested_sla_status,
+        status_reason=normalized_status_reason,
+        metadata={
+            **base_metadata,
+            SLA_STARTED_AT_METADATA_KEY: serialize_datetime_value(started_at) if started_at else None,
+            SLA_DUE_AT_METADATA_KEY: serialize_datetime_value(due_at) if due_at else None,
+        },
+        reference_time=reference_time,
+    )
+    comparison_now = get_sla_comparison_now(reference_time)
+    policy_key = derive_sla_policy_key(normalized_status, normalized_status_reason)
+    metadata_patch = build_sla_metadata_patch(
+        attention_required,
+        attention_reason,
+        policy_key=policy_key,
+        started_at=started_at,
+        due_at=due_at,
+        breached_at=comparison_now if attention_required else None,
+        resolved_at=comparison_now if normalized_status == "Closed" else None,
+        outcome_status=normalize_sla_status(ticket.get("sla_status")) if normalized_status == "Closed" else None,
+    )
+    return next_sla_status, attention_required, attention_reason, {**base_metadata, **metadata_patch}
+
+
+def extract_sla_metadata_signature(metadata: Any) -> dict[str, Any]:
+    normalized_metadata = normalize_json_object(metadata)
     return {
-        "sla_attention_required": attention_required,
-        "sla_attention_reason": attention_reason,
-        "sla_attention_updated_at": datetime.now(timezone.utc).isoformat(),
+        "attentionRequired": normalize_bool(normalized_metadata.get("sla_attention_required")),
+        "attentionReason": sanitize_text(normalized_metadata.get("sla_attention_reason")) or None,
+        "policyKey": sanitize_text(normalized_metadata.get(SLA_POLICY_KEY_METADATA_KEY)),
+        "startedAt": sanitize_text(normalized_metadata.get(SLA_STARTED_AT_METADATA_KEY)),
+        "dueAt": sanitize_text(normalized_metadata.get(SLA_DUE_AT_METADATA_KEY)),
+        "breachedAt": sanitize_text(normalized_metadata.get(SLA_BREACHED_AT_METADATA_KEY)),
+        "resolvedAt": sanitize_text(normalized_metadata.get(SLA_RESOLVED_AT_METADATA_KEY)),
+        "outcomeStatus": sanitize_text(normalized_metadata.get(SLA_OUTCOME_STATUS_METADATA_KEY)),
     }
 
 
 def build_resolved_coverage_sla_metadata(metadata: Any) -> dict[str, Any]:
     next_metadata = {
         **normalize_json_object(metadata),
-        **build_sla_metadata_patch(False, None),
+        **build_sla_metadata_patch(False, None, policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE),
     }
     next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
     return next_metadata
@@ -2042,9 +2567,15 @@ def is_status_reason_allowed_for_status(status: str, status_reason: str) -> bool
 
 def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[str, Any]:
     metadata = normalize_json_object(row.get("metadata"))
-    current_sla_status = sanitize_text(row.get("sla_status")) or "Pending Review"
+    current_sla_status = normalize_sla_status(row.get("sla_status"))
     current_attention_required = normalize_bool(metadata.get("sla_attention_required"))
     current_attention_reason = sanitize_text(metadata.get("sla_attention_reason")) or None
+
+    if normalize_bool(row.get("is_archived")):
+        row["sla_status"] = current_sla_status
+        row["sla_attention_required"] = current_attention_required
+        row["metadata"] = metadata
+        return row
 
     if is_coverage_ticket_record(row):
         coverage_sla_state = get_coverage_sla_state(metadata)
@@ -2056,7 +2587,12 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
             )
         ):
             next_sla_status = "Breached"
-            metadata_patch = build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
+            metadata_patch = build_sla_metadata_patch(
+                True,
+                SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+                policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE,
+                breached_at=get_sla_comparison_now(),
+            )
             next_metadata = {**metadata, **metadata_patch}
             next_attention_required = True
             next_attention_reason = SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
@@ -2091,19 +2627,19 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
                     WHERE id = %s
                     """,
                     [next_sla_status, json.dumps(next_metadata), row["id"]],
-                )
+        )
         return row
 
-    next_sla_status, attention_required, attention_reason = derive_sla_state(
+    next_sla_status, attention_required, attention_reason, next_metadata = resolve_sla_policy_update(
+        row,
         row.get("status"),
-        row.get("created_at"),
-        current_sla_status,
+        status_reason=row.get("status_reason"),
+        metadata=metadata,
     )
-    metadata_patch = build_sla_metadata_patch(attention_required, attention_reason)
 
     row["sla_status"] = next_sla_status
     row["sla_attention_required"] = attention_required
-    row["metadata"] = {**metadata, **metadata_patch}
+    row["metadata"] = next_metadata
 
     if (
         persist
@@ -2112,6 +2648,7 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
             next_sla_status != current_sla_status
             or attention_required != current_attention_required
             or attention_reason != current_attention_reason
+            or extract_sla_metadata_signature(next_metadata) != extract_sla_metadata_signature(metadata)
         )
     ):
         with connection.cursor() as cursor:
@@ -2119,11 +2656,11 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
                 """
                 UPDATE tickets
                 SET sla_status = %s,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    metadata = %s::jsonb,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                [next_sla_status, json.dumps(metadata_patch), row["id"]],
+                [next_sla_status, json.dumps(next_metadata), row["id"]],
             )
 
     return row
@@ -2133,50 +2670,46 @@ def resolve_ticket_sla_update(
     ticket: dict[str, Any],
     status: Any,
     *,
+    status_reason: Any = None,
     metadata: Any = None,
     requested_sla_status: Any = None,
 ) -> tuple[str, bool, str | None, dict[str, Any]]:
     base_metadata = normalize_json_object(ticket.get("metadata") if metadata is None else metadata)
+    normalized_status_reason = sanitize_text(status_reason if status_reason is not None else ticket.get("status_reason"))
 
     if is_coverage_ticket_record(ticket):
         coverage_row = {
             **ticket,
             "status": sanitize_text(status),
+            "status_reason": normalized_status_reason,
             "metadata": base_metadata,
-            "sla_status": sanitize_text(ticket.get("sla_status")) or "Pending Review",
+            "sla_status": normalize_sla_status(ticket.get("sla_status")),
         }
         apply_ticket_sla_policy(coverage_row)
         resolved_metadata = normalize_json_object(coverage_row.get("metadata"))
         return (
-            sanitize_text(coverage_row.get("sla_status")) or "On Track",
+            normalize_sla_status(coverage_row.get("sla_status"), "On Track"),
             normalize_bool(coverage_row.get("sla_attention_required")),
             sanitize_text(resolved_metadata.get("sla_attention_reason")) or None,
             resolved_metadata,
         )
 
-    next_sla_status, attention_required, attention_reason = resolve_next_sla_state(
+    return resolve_sla_policy_update(
+        ticket,
         status,
-        ticket.get("created_at"),
-        ticket.get("sla_status"),
-        requested_sla_status,
-    )
-    return (
-        next_sla_status,
-        attention_required,
-        attention_reason,
-        {
-            **base_metadata,
-            **build_sla_metadata_patch(attention_required, attention_reason),
-        },
+        status_reason=normalized_status_reason,
+        metadata=base_metadata,
+        requested_sla_status=requested_sla_status,
     )
 
 
 def sync_auto_managed_ticket_sla_statuses() -> dict[str, int]:
     tickets = run_query(
         """
-        SELECT id, public_id, category, technical_subcategory, inquiry, status, status_reason, sla_status, metadata, created_at
+        SELECT id, public_id, category, technical_subcategory, inquiry, status, status_reason, sla_status, metadata, created_at, is_archived
         FROM tickets
         WHERE status = ANY(%s)
+          AND COALESCE(is_archived, FALSE) = FALSE
         ORDER BY id ASC
         """,
         [list(AUTO_MANAGED_SLA_STATUSES)],
@@ -2355,7 +2888,7 @@ def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> di
         coverage_sla_state = get_coverage_sla_state(metadata)
 
         if not session_start_at:
-            next_metadata = {**metadata, **build_sla_metadata_patch(False, None)}
+            next_metadata = {**metadata, **build_sla_metadata_patch(False, None, policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE)}
             next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
             if (
                 sanitize_text(ticket.get("sla_status")) != "On Track"
@@ -2378,7 +2911,7 @@ def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> di
 
         breach_deadline_at = session_start_at - COVERAGE_SLA_BREACH_LEAD_TIME
         if comparison_now < breach_deadline_at:
-            next_metadata = {**metadata, **build_sla_metadata_patch(False, None)}
+            next_metadata = {**metadata, **build_sla_metadata_patch(False, None, policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE)}
             next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
             if (
                 sanitize_text(ticket.get("sla_status")) != "On Track"
@@ -2430,7 +2963,13 @@ def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> di
         )
         next_metadata = {
             **metadata,
-            **build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE),
+            **build_sla_metadata_patch(
+                True,
+                SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+                policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE,
+                due_at=breach_deadline_at,
+                breached_at=breached_at,
+            ),
             COVERAGE_SLA_STATE_METADATA_KEY: next_state,
         }
 
@@ -5421,6 +5960,7 @@ def synchronize_coverage_tutor_workflow_ticket(
         next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
             ticket,
             next_status,
+            status_reason=next_status_reason,
             metadata=updated_ticket_metadata,
         )
 
@@ -6872,6 +7412,7 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "pendingTransferRequest": get_pending_transfer_request(ticket_metadata),
         "pendingEscalationNotification": get_pending_escalation_notification(ticket_metadata),
         "pendingTeamsCallNotification": get_pending_teams_call_notification(ticket_metadata),
+        "pendingSupportQueueNotification": get_pending_support_queue_notification(ticket_metadata),
         "pendingCoverageTicketNotification": get_pending_coverage_ticket_notification(ticket_metadata),
         "pendingLearningPlanTransferNotification": get_pending_learning_plan_transfer_notification(ticket_metadata),
         "teamsCallRequested": is_teams_call_requested(ticket_metadata),
@@ -8565,6 +9106,7 @@ def apply_ticket_chat_history_sync(
     next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
         ticket,
         status,
+        status_reason=next_status_reason,
     )
     updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
         updated_ticket_metadata,
@@ -13571,6 +14113,63 @@ def acknowledge_coverage_ticket_notification(public_id: str, payload: dict[str, 
     return detail
 
 
+def acknowledge_support_queue_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.technical_subcategory,
+              t.assigned_team,
+              t.metadata
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        require_actor_can_access_admin_ticket(actor_row, ticket)
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        if not get_pending_support_queue_notification(ticket_metadata):
+            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
+
+        ticket_metadata.pop(PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY, None)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
 def acknowledge_learning_plan_transfer_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
 
@@ -14931,6 +15530,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     learning_plan_transfer_webhook_ticket_id: int | None = None
     learning_plan_transfer_webhook_payload: dict[str, Any] | None = None
     learning_plan_transfer_notification_payload: dict[str, Any] | None = None
+    documentation_history_events: list[tuple[str, dict[str, Any]]] = []
 
     with transaction.atomic():
         ticket = run_query_one(
@@ -15151,6 +15751,10 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 previous_documentation_payload,
                 actor_row,
             )
+            documentation_history_events = build_documentation_card_history_events(
+                previous_documentation_payload,
+                documentation_payload,
+            )
             updated_ticket_metadata["admin_documentation"] = documentation_payload
 
         if is_escalation_notification and escalation_target_agent:
@@ -15205,6 +15809,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
             ticket,
             next_status,
+            status_reason=next_status_reason,
             metadata=updated_ticket_metadata,
             requested_sla_status=requested_sla_status,
         )
@@ -15410,6 +16015,9 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
 
         if note:
             insert_history_event(ticket["id"], "internal_note", actor, {"note": note})
+
+        for event_type, event_payload in documentation_history_events:
+            insert_history_event(ticket["id"], event_type, actor, event_payload)
 
         if is_escalation_notification and escalation_target_agent:
             insert_history_event(
@@ -15784,6 +16392,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     raise ApiError(500, "We could not create the ticket right now.")
 
                 public_id = build_public_ticket_id(int(ticket_row["id"]))
+                initial_sla_status = "On Track" if technical_subcategory == "Coverage" else ticket_row["sla_status"]
                 if technical_subcategory == "Coverage":
                     ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {
                         "ticketId": public_id,
@@ -15792,6 +16401,30 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         "requesterRole": requester_role,
                         "createdAt": serialize_datetime_value(ticket_row.get("created_at")) or serialize_datetime_value(datetime.now(timezone.utc)),
                     }
+                else:
+                    ticket_metadata[PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY] = build_support_queue_notification_payload(
+                        ticket_id=public_id,
+                        requester_name=requester.get("display_name") or learner.get("full_name") or learner["email"],
+                        requester_email=learner["email"],
+                        requester_role=requester_role,
+                        reason="support_ticket_created",
+                        created_at=ticket_row.get("created_at") or datetime.now(timezone.utc),
+                    )
+                if technical_subcategory == "Coverage":
+                    ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
+                else:
+                    _initial_sla_status, _initial_sla_attention_required, _initial_sla_attention_reason, ticket_metadata = resolve_sla_policy_update(
+                        {
+                            "status": ticket_row["status"],
+                            "status_reason": "",
+                            "created_at": ticket_row.get("created_at"),
+                            "sla_status": initial_sla_status,
+                            "metadata": ticket_metadata,
+                        },
+                        ticket_row["status"],
+                        status_reason="",
+                        metadata=ticket_metadata,
+                    )
                 ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
                     ticket_metadata,
                     {
@@ -15853,6 +16486,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     UPDATE tickets
                     SET public_id = %s,
                         conversation_id = %s,
+                        sla_status = %s,
                         metadata = %s::jsonb,
                         ticket_type = %s,
                         workflow_stage = %s,
@@ -15867,6 +16501,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     [
                         public_id,
                         conversation_id,
+                        initial_sla_status,
                         json.dumps(ticket_metadata),
                         *get_ticket_state_column_params(ticket_state_columns),
                         ticket_row["id"],
@@ -15970,7 +16605,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             "status": ticket_row["status"],
         "statusReason": "",
         "assignedTeam": ticket_row["assigned_team"],
-        "slaStatus": ticket_row["sla_status"],
+        "slaStatus": initial_sla_status,
         "createdAt": ticket_row["created_at"],
         "chatState": "open",
         "liveChatRequested": False,
@@ -17051,15 +17686,31 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             {"requestedDate": requested_date, "requestedTime": requested_time},
         )
 
+        support_session_ticket_metadata = {
+            **normalize_json_object(ticket.get("metadata")),
+            "support_session_requested_start_at": requested_datetime.isoformat(),
+            "support_session_requested_end_at": requested_end_at.isoformat(),
+        }
         next_sla_status, next_sla_attention_required, _next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
             ticket,
             "Pending",
+            status_reason=STATUS_REASON_AWAITING_MEETING,
+            metadata=support_session_ticket_metadata,
         )
         session_ticket_metadata_patch = {
             **updated_ticket_metadata,
             SUPPORT_FLOW_STAGE_METADATA_KEY: None,
             "booking_started_at": None,
         }
+        if not is_coverage_ticket_record(ticket):
+            session_ticket_metadata_patch[PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY] = build_support_queue_notification_payload(
+                ticket_id=ticket["public_id"],
+                requester_name=ticket.get("learner_full_name") or ticket.get("learner_email"),
+                requester_email=ticket.get("learner_email"),
+                requester_role=get_ticket_requester_role(session_ticket_metadata_patch),
+                reason="support_session_requested",
+                created_at=datetime.now(timezone.utc),
+            )
         session_ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
             session_ticket_metadata_patch,
             {
@@ -17300,6 +17951,7 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
     next_sla_status, next_sla_attention_required, _next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
         ticket,
         "Open",
+        status_reason="",
     )
     cancellation_metadata_patch = {
         "cancelled_at": datetime.now(timezone.utc).isoformat(),

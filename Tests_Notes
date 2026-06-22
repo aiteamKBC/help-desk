@@ -117,20 +117,46 @@ and his chatbox should be frozen, but he still get to document the case and chan
 ->Changed Coverage dasboard outlay to meet operation requirements (removed or combined columns + showed session dates + allowed order by priority dependent on closest session) [Done]
 ->Tutor e-mail field bug [Done]
 ->CC for coach choice in card [Done]
+->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)] [Connect to n8n] [done]
 
-->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no Action [Done][Connect to n8n]
-->In requesting e-mail, add e-mails CC: [Dr.Youssef, Eng.Elmasry, Eng.Ayman, Coach's(allow to be edited)] [Connect to n8n]
-->Add Delete in Archive [super admin only by Eng.Ayman] + deleting log?!
+->SLA 3 days before session Dr.youssef + 2 days before Eng. Elmasry if no
+Action [Done][Connect to n8n]
+->Add Delete in Archive [super admin only by Eng.Ayman][done] + Support Dashboard / Learning Plan Team / Chat Console [??????]
+->Add "Forced Close" to coverage ticket []
+-> add email and notification for transfer to learning plan team [Done]
+-> When trasfer add "from agent to learningplanTeam" and make unassigned, and in learningteam, who edits get assigned, all recorded in log
+-> check log.
+-> when closed ticket, cards cannot be collapsed, and only one card is saved in case of multiple.
 ->Coverage ticket, automatic sent to all replacements, if one accepted --> Tutor accepted, and all other tutors are informed if tried to accept or refuse
 ->check assignment in case for more than one member editing coverage ticket.
 => change sender to tutor in N8N, currently it is the student@Kent...org mail.
 ->Make sure that SLA is deactivated in archive
+-what if tutor replied instead of clicking
+->attachment for each session ???????????????????
 --------------------------------------
 *Ticket:
-->Add attachments in documentation
+->Assign quick tickets to Available[done]
+->in ticket documentation: Add attachments in documentation + ERROR ATTACHMENT ICON[done]
+->remove conversation from quick ticket[done]
+->Ensure documentation if filled to be persistent in same boxes through session till saved or session end[done]
+->Ensure more than one card can be saved, currently it shows only one. [done]
 ->Order things when it comes to assignment
 ->Order things when it comes to Transfer, unify logic
-->When closed ticket only leave one card in history. fix that.
+->Ensure attachments can be view on agent side, and sent on requester side.
+->add note to be sent at closure to requester with e-mail
+->Apply pending and closed reasons in ticket details.
+->Make filters work as inclusives or exclusives (add or subtract from view)
+->Freeze SLA in Archive
+->Reset SLA if ticket edited???
+->FIx first edit assignment to include any editor
+->Transfer logic (Agent to Agent Internally, conditional) (Agent to Teams, conditional: need notes and reason drop down menu)
+->Configuration dashboard: ex: activate transfer acceptance or refusal , activate note, activate transfer, activate archive or delete ... etc.
+->MAJOR CONCERNS: "NOTIFICATIONS" AND "TICKET LOGS" "STATUS REASONS" "TICKET_WORKFLOW_STAGE"
+-> add optional note to be send to requester after each update on the ticket (to communicate between agent and user ) + notify concerned coach if exists
+->add learner choice to coach submit
+->Subject of issue (limited)
+->
+
 --------------------------------------
 --------------------------------------
 *Knowledge base:

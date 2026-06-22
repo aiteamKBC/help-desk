@@ -171,6 +171,16 @@ interface PendingTeamsCallNotification {
   requestedAt: string;
 }
 
+interface PendingSupportQueueNotification {
+  ticketId: string;
+  requesterName: string;
+  requesterEmail: string;
+  requesterRole: string;
+  queue: string;
+  reason: string;
+  createdAt: string;
+}
+
 interface PendingCoverageTicketNotification {
   ticketId: string;
   requesterName: string;
@@ -290,6 +300,7 @@ interface TicketSummary {
   pendingTransferRequest?: PendingTransferRequest | null;
   pendingEscalationNotification?: PendingEscalationNotification | null;
   pendingTeamsCallNotification?: PendingTeamsCallNotification | null;
+  pendingSupportQueueNotification?: PendingSupportQueueNotification | null;
   pendingCoverageTicketNotification?: PendingCoverageTicketNotification | null;
   pendingLearningPlanTransferNotification?: PendingLearningPlanTransferNotification | null;
   teamsCallRequested?: boolean;
@@ -615,10 +626,15 @@ type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "mana
 type ManagementAccessTab = "support" | "operations" | "admins";
 type TicketAccessKind = "support" | "operations";
 type LearningPlanTeamSection = "coverage" | "others";
-type TicketDetailTab = "conversation" | "documentation" | "details";
-type CoverageWorkspaceTab = "documentation" | "details";
+type TicketDetailTab = "conversation" | "documentation" | "activity" | "details";
+type CoverageWorkspaceTab = "documentation" | "activity" | "details";
 const coverageCoachUnsetSelectValue = "__coverage_no_coach__";
 const coveragePresentationMaxFileBytes = 50 * 1024 * 1024;
+const nonRequesterAttachmentSources = new Set([
+  "documentation_card",
+  "coverage_tutor_request",
+  "coverage_tutor_follow_up",
+]);
 
 function getDefaultDashboardSortOrder(isLearningPlanCoverageSection: boolean): DashboardSortOrder {
   return isLearningPlanCoverageSection ? "priorityDesc" : "newest";
@@ -840,9 +856,7 @@ const AgentDashboard = () => {
   const trimmedNotes = notes.trim();
   const dashboardSessionAgentName = session?.fullName || session?.username || "Me";
   const isSlaAutoManaged = Boolean(activeDetail) && autoManagedSlaStatuses.has(draftStatus);
-  const effectiveDraftSlaStatus = activeDetail
-    ? deriveDashboardSlaStatus(draftStatus, activeDetail.ticket.createdAt, draftSlaStatus, isCoverageTicket(activeDetail.ticket))
-    : draftSlaStatus;
+  const effectiveDraftSlaStatus = draftSlaStatus;
   const isStatusChanging = Boolean(activeDetail) && draftStatus !== activeDetail.ticket.status;
   const canSubmitStatusChange = !isStatusChanging || Boolean(trimmedNotes);
   const normalizedConsoleSearch = normalizeConsoleSearchValue(consoleSearch);
@@ -1470,7 +1484,7 @@ const AgentDashboard = () => {
         && canReceiveTicketAssignment(agent, consoleDetail.ticket)
       ))
     : [];
-  const pendingTransferRequests = accessibleTickets
+  const pendingTransferRequests = activeAccessibleTickets
     .filter((ticket) => {
       const pendingTransferRequest = ticket.pendingTransferRequest;
       if (!pendingTransferRequest) {
@@ -1488,7 +1502,7 @@ const AgentDashboard = () => {
       const rightRequestedAt = Date.parse(rightTicket.pendingTransferRequest?.requestedAt || "");
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
-  const pendingEscalationNotifications = accessibleTickets
+  const pendingEscalationNotifications = activeAccessibleTickets
     .filter((ticket) => {
       const pendingEscalationNotification = ticket.pendingEscalationNotification;
       if (!pendingEscalationNotification) {
@@ -1506,7 +1520,7 @@ const AgentDashboard = () => {
       const rightRequestedAt = Date.parse(rightTicket.pendingEscalationNotification?.requestedAt || "");
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
-  const pendingTeamsCallNotifications = accessibleTickets
+  const pendingTeamsCallNotifications = activeAccessibleTickets
     .filter((ticket) => {
       const pendingTeamsCallNotification = ticket.pendingTeamsCallNotification;
       if (!pendingTeamsCallNotification) {
@@ -1525,7 +1539,7 @@ const AgentDashboard = () => {
       return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
     });
   const waitingLiveChatNotifications = canUseTicketReceiving && myActualConsoleStatus === "Off"
-    ? accessibleTickets
+    ? activeAccessibleTickets
       .filter((ticket) => (
         ticket.liveChatRequested
         && ticket.chatState !== "closed"
@@ -1538,7 +1552,7 @@ const AgentDashboard = () => {
         return (Number.isNaN(rightRequestedAt) ? 0 : rightRequestedAt) - (Number.isNaN(leftRequestedAt) ? 0 : leftRequestedAt);
       })
     : emptyTicketSummaryList;
-  const transferDecisionNotifications = accessibleTickets
+  const transferDecisionNotifications = activeAccessibleTickets
     .filter((ticket) => {
       const latestTransferDecision = ticket.latestTransferDecision;
       if (!latestTransferDecision || latestTransferDecision.requesterAcknowledged) {
@@ -1556,7 +1570,7 @@ const AgentDashboard = () => {
       const rightDecidedAt = Date.parse(rightTicket.latestTransferDecision?.decidedAt || "");
       return (Number.isNaN(rightDecidedAt) ? 0 : rightDecidedAt) - (Number.isNaN(leftDecidedAt) ? 0 : leftDecidedAt);
     });
-  const escalationClosureNotifications = accessibleTickets
+  const escalationClosureNotifications = activeAccessibleTickets
     .filter((ticket) => {
       const latestEscalationClosure = ticket.latestEscalationClosure;
       if (!latestEscalationClosure || latestEscalationClosure.requesterAcknowledged) {
@@ -1574,7 +1588,7 @@ const AgentDashboard = () => {
       const rightClosedAt = Date.parse(rightTicket.latestEscalationClosure?.closedAt || "");
       return (Number.isNaN(rightClosedAt) ? 0 : rightClosedAt) - (Number.isNaN(leftClosedAt) ? 0 : leftClosedAt);
     });
-  const coverageTutorResponseNotifications = accessibleTickets
+  const coverageTutorResponseNotifications = activeAccessibleTickets
     .filter((ticket) => {
       const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
       if (!latestCoverageTutorResponse || latestCoverageTutorResponse.requesterAcknowledged) {
@@ -1592,21 +1606,29 @@ const AgentDashboard = () => {
       const rightRespondedAt = Date.parse(rightTicket.latestCoverageTutorResponse?.respondedAt || "");
       return (Number.isNaN(rightRespondedAt) ? 0 : rightRespondedAt) - (Number.isNaN(leftRespondedAt) ? 0 : leftRespondedAt);
     });
-  const coverageTicketNotifications = accessibleTickets
+  const supportQueueNotifications = activeAccessibleTickets
+    .filter((ticket) => Boolean(ticket.pendingSupportQueueNotification))
+    .sort((leftTicket, rightTicket) => {
+      const leftCreatedAt = Date.parse(leftTicket.pendingSupportQueueNotification?.createdAt || leftTicket.createdAt || "");
+      const rightCreatedAt = Date.parse(rightTicket.pendingSupportQueueNotification?.createdAt || rightTicket.createdAt || "");
+      return (Number.isNaN(rightCreatedAt) ? 0 : rightCreatedAt) - (Number.isNaN(leftCreatedAt) ? 0 : leftCreatedAt);
+    });
+  const coverageTicketNotifications = activeAccessibleTickets
     .filter((ticket) => Boolean(ticket.pendingCoverageTicketNotification))
     .sort((leftTicket, rightTicket) => {
       const leftCreatedAt = Date.parse(leftTicket.pendingCoverageTicketNotification?.createdAt || leftTicket.createdAt || "");
       const rightCreatedAt = Date.parse(rightTicket.pendingCoverageTicketNotification?.createdAt || rightTicket.createdAt || "");
       return (Number.isNaN(rightCreatedAt) ? 0 : rightCreatedAt) - (Number.isNaN(leftCreatedAt) ? 0 : leftCreatedAt);
     });
-  const learningPlanTransferNotifications = accessibleTickets
+  const learningPlanTransferNotifications = activeAccessibleTickets
     .filter((ticket) => Boolean(ticket.pendingLearningPlanTransferNotification))
     .sort((leftTicket, rightTicket) => {
       const leftTransferredAt = Date.parse(leftTicket.pendingLearningPlanTransferNotification?.transferredAt || leftTicket.updatedAt || "");
       const rightTransferredAt = Date.parse(rightTicket.pendingLearningPlanTransferNotification?.transferredAt || rightTicket.updatedAt || "");
       return (Number.isNaN(rightTransferredAt) ? 0 : rightTransferredAt) - (Number.isNaN(leftTransferredAt) ? 0 : leftTransferredAt);
     });
-  const totalAdminNotificationCount = pendingTransferRequests.length
+  const totalAdminNotificationCount = supportQueueNotifications.length
+    + pendingTransferRequests.length
     + pendingEscalationNotifications.length
     + pendingTeamsCallNotifications.length
     + waitingLiveChatNotifications.length
@@ -1950,6 +1972,7 @@ const AgentDashboard = () => {
 
   useEffect(() => {
     const nextNotificationKeys = new Set<string>();
+    const newSupportQueueTickets: TicketSummary[] = [];
     const newCoverageTickets: TicketSummary[] = [];
     const newLearningPlanTransfers: TicketSummary[] = [];
     const newTransferRequests: TicketSummary[] = [];
@@ -1959,6 +1982,19 @@ const AgentDashboard = () => {
     const newTransferDecisions: TicketSummary[] = [];
     const newEscalationClosures: TicketSummary[] = [];
     const newCoverageTutorResponses: TicketSummary[] = [];
+
+    for (const ticket of supportQueueNotifications) {
+      const pendingSupportQueueNotification = ticket.pendingSupportQueueNotification;
+      if (!pendingSupportQueueNotification) {
+        continue;
+      }
+
+      const notificationKey = `support-queue:${ticket.id}:${pendingSupportQueueNotification.reason}:${pendingSupportQueueNotification.createdAt}`;
+      nextNotificationKeys.add(notificationKey);
+      if (!seenTransferNotificationKeysRef.current.has(notificationKey)) {
+        newSupportQueueTickets.push(ticket);
+      }
+    }
 
     for (const ticket of coverageTicketNotifications) {
       const pendingCoverageTicketNotification = ticket.pendingCoverageTicketNotification;
@@ -2076,6 +2112,21 @@ const AgentDashboard = () => {
       seenTransferNotificationKeysRef.current = nextNotificationKeys;
       hasHydratedTransferNotificationsRef.current = true;
       return;
+    }
+
+    for (const ticket of newSupportQueueTickets) {
+      const pendingSupportQueueNotification = ticket.pendingSupportQueueNotification;
+      if (!pendingSupportQueueNotification) {
+        continue;
+      }
+
+      const notificationTitle = getSupportQueueNotificationTitle(pendingSupportQueueNotification);
+      toast.info(`${notificationTitle} for ${ticket.id} from ${pendingSupportQueueNotification.requesterName || getRequesterDisplayName(ticket, "requester")}.`);
+      showAdminDesktopNotificationRef.current(
+        `support-queue:${ticket.id}:${pendingSupportQueueNotification.reason}:${pendingSupportQueueNotification.createdAt}`,
+        notificationTitle,
+        `${ticket.id} - ${pendingSupportQueueNotification.requesterName || getRequesterDisplayName(ticket)}`,
+      );
     }
 
     for (const ticket of newCoverageTickets) {
@@ -2217,7 +2268,8 @@ const AgentDashboard = () => {
     }
 
     if (
-      newCoverageTickets.length > 0
+      newSupportQueueTickets.length > 0
+      || newCoverageTickets.length > 0
       || newLearningPlanTransfers.length > 0
       || newTransferRequests.length > 0
       || newEscalationNotifications.length > 0
@@ -2231,7 +2283,7 @@ const AgentDashboard = () => {
     }
 
     seenTransferNotificationKeysRef.current = nextNotificationKeys;
-  }, [coverageTicketNotifications, coverageTutorResponseNotifications, escalationClosureNotifications, learningPlanTransferNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, transferDecisionNotifications, waitingLiveChatNotifications]);
+  }, [coverageTicketNotifications, coverageTutorResponseNotifications, escalationClosureNotifications, learningPlanTransferNotifications, pendingEscalationNotifications, pendingTeamsCallNotifications, pendingTransferRequests, supportQueueNotifications, transferDecisionNotifications, waitingLiveChatNotifications]);
 
   useEffect(() => {
     if (!documentationTicketStatus) {
@@ -2743,6 +2795,35 @@ const AgentDashboard = () => {
     return Boolean(ticket.pendingLearningPlanTransferNotification && session?.username);
   }
 
+  function shouldAutoAcknowledgeSupportQueueNotification(ticket: TicketSummary) {
+    return Boolean(ticket.pendingSupportQueueNotification && session?.username);
+  }
+
+  async function acknowledgeSupportQueueNotificationSilently(ticket: TicketSummary) {
+    if (!shouldAutoAcknowledgeSupportQueueNotification(ticket)) {
+      return null;
+    }
+
+    const response = await fetch(
+      `/api/admin/tickets/${encodeURIComponent(ticket.id)}/support-queue-notification/acknowledge`,
+      {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({}),
+      },
+    );
+
+    const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+    if (!response.ok || !payload?.ticket) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        return null;
+      }
+      return null;
+    }
+
+    return payload;
+  }
+
   async function acknowledgeCoverageTutorResponseSilently(ticket: TicketSummary) {
     if (!shouldAutoAcknowledgeCoverageTutorResponse(ticket)) {
       return null;
@@ -2827,6 +2908,10 @@ const AgentDashboard = () => {
 
     try {
       let payload = await fetchTicketDetail(ticketId);
+      const acknowledgedSupportQueuePayload = await acknowledgeSupportQueueNotificationSilently(payload.ticket);
+      if (acknowledgedSupportQueuePayload?.ticket) {
+        payload = acknowledgedSupportQueuePayload;
+      }
       const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
       if (acknowledgedCoverageTicketPayload?.ticket) {
         payload = acknowledgedCoverageTicketPayload;
@@ -2873,6 +2958,10 @@ const AgentDashboard = () => {
 
     try {
       let payload = await fetchTicketDetail(ticketId);
+      const acknowledgedSupportQueuePayload = await acknowledgeSupportQueueNotificationSilently(payload.ticket);
+      if (acknowledgedSupportQueuePayload?.ticket) {
+        payload = acknowledgedSupportQueuePayload;
+      }
       const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
       if (acknowledgedCoverageTicketPayload?.ticket) {
         payload = acknowledgedCoverageTicketPayload;
@@ -4153,6 +4242,45 @@ const AgentDashboard = () => {
     }
   }
 
+  async function handleSupportQueueNotificationAcknowledge(ticket: TicketSummary) {
+    if (!ticket.pendingSupportQueueNotification || !session?.username || activeTransferRequestTicketId) {
+      return;
+    }
+
+    setActiveTransferRequestTicketId(ticket.id);
+
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/support-queue-notification/acknowledge`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({}),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not clear this support queue alert right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      if (activeDetail?.ticket.id === ticket.id) {
+        syncDrafts(payload);
+      }
+      await refreshTicketsOnly(true);
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setActiveTransferRequestTicketId("");
+    }
+  }
+
   async function handleCoverageTicketNotificationAcknowledge(ticket: TicketSummary) {
     if (!ticket.pendingCoverageTicketNotification || !session?.username || activeTransferRequestTicketId) {
       return;
@@ -5384,6 +5512,7 @@ const AgentDashboard = () => {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="start" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
                       <AdminNotificationsPanel
+                        supportQueueTickets={supportQueueNotifications}
                         coverageTickets={coverageTicketNotifications}
                         learningPlanTransfers={learningPlanTransferNotifications}
                         requests={pendingTransferRequests}
@@ -5399,6 +5528,7 @@ const AgentDashboard = () => {
                         activeTicketId={activeTransferRequestTicketId}
                         onDecision={handleTransferRequestDecision}
                         onOpenTeamsCall={handleTeamsCallNotificationOpen}
+                        onAcknowledgeSupportQueueTicket={handleSupportQueueNotificationAcknowledge}
                         onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
                         onAcknowledgeLearningPlanTransfer={handleLearningPlanTransferNotificationAcknowledge}
                         onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
@@ -5447,6 +5577,7 @@ const AgentDashboard = () => {
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" sideOffset={8} className="w-[min(92vw,380px)] rounded-2xl p-2">
                         <AdminNotificationsPanel
+                          supportQueueTickets={supportQueueNotifications}
                           coverageTickets={coverageTicketNotifications}
                           learningPlanTransfers={learningPlanTransferNotifications}
                           requests={pendingTransferRequests}
@@ -5462,6 +5593,7 @@ const AgentDashboard = () => {
                           activeTicketId={activeTransferRequestTicketId}
                           onDecision={handleTransferRequestDecision}
                           onOpenTeamsCall={handleTeamsCallNotificationOpen}
+                          onAcknowledgeSupportQueueTicket={handleSupportQueueNotificationAcknowledge}
                           onAcknowledgeCoverageTicket={handleCoverageTicketNotificationAcknowledge}
                           onAcknowledgeLearningPlanTransfer={handleLearningPlanTransferNotificationAcknowledge}
                           onAcknowledgeEscalation={handleEscalationNotificationAcknowledge}
@@ -6379,7 +6511,7 @@ const AgentDashboard = () => {
                       onValueChange={(value) => setActiveTicketTab(value as TicketDetailTab)}
                       className="space-y-4"
                     >
-                  <TabsList className={cn("grid w-full", canShowActiveTicketConversation ? "grid-cols-3" : "grid-cols-2")}>
+                  <TabsList className={cn("grid w-full", canShowActiveTicketConversation ? "grid-cols-4" : "grid-cols-3")}>
                     {canShowActiveTicketConversation ? (
                       <TabsTrigger value="conversation">
                         <MessageSquareText className="mr-2 h-4 w-4" /> Conversation
@@ -6387,6 +6519,9 @@ const AgentDashboard = () => {
                     ) : null}
                     <TabsTrigger value="documentation">
                       <FileText className="mr-2 h-4 w-4" /> Documentation
+                    </TabsTrigger>
+                    <TabsTrigger value="activity">
+                      <Clock className="mr-2 h-4 w-4" /> Activity Log
                     </TabsTrigger>
                     <TabsTrigger value="details">
                       <TicketIcon className="mr-2 h-4 w-4" /> Ticket Details
@@ -6506,6 +6641,13 @@ const AgentDashboard = () => {
                     )}
                   </TabsContent>
 
+                  <TabsContent value="activity" className="space-y-5">
+                    <section>
+                      <Label className="mb-1.5 block">Activity log</Label>
+                      <ActivityLogTimeline history={activeDetail.history} />
+                    </section>
+                  </TabsContent>
+
                   <TabsContent value="details" className="space-y-5">
                     <div className="grid gap-3 md:grid-cols-3">
                       <div>
@@ -6604,11 +6746,6 @@ const AgentDashboard = () => {
                         />
                       ) : null}
                     </div>
-
-                    <section>
-                      <Label className="mb-1.5 block">Activity log</Label>
-                      <ActivityLogTimeline history={activeDetail.history} />
-                    </section>
 
                   </TabsContent>
                 </Tabs>
@@ -6962,13 +7099,10 @@ const AgentDashboard = () => {
 
           {chatPreviewAttachment && chatPreviewAttachmentUrl ? (
             chatPreviewAttachmentKind === "image" ? (
-              <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
-                <img
-                  src={chatPreviewAttachmentUrl}
-                  alt={chatPreviewAttachment.name}
-                  className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
-                />
-              </div>
+              <AttachmentImagePreview
+                src={chatPreviewAttachmentUrl}
+                alt={chatPreviewAttachment.name}
+              />
             ) : chatPreviewAttachmentKind === "pdf" ? (
               <div className="overflow-hidden rounded-2xl border bg-secondary/10">
                 <iframe
@@ -7248,6 +7382,7 @@ const AgentStatusLabel = ({
 };
 
 const AdminNotificationsPanel = ({
+  supportQueueTickets,
   coverageTickets,
   learningPlanTransfers,
   requests,
@@ -7263,6 +7398,7 @@ const AdminNotificationsPanel = ({
   activeTicketId,
   onDecision,
   onOpenTeamsCall,
+  onAcknowledgeSupportQueueTicket,
   onAcknowledgeCoverageTicket,
   onAcknowledgeLearningPlanTransfer,
   onAcknowledgeEscalation,
@@ -7272,6 +7408,7 @@ const AdminNotificationsPanel = ({
   onOpenTicket,
   onSetAvailable,
 }: {
+  supportQueueTickets: TicketSummary[];
   coverageTickets: TicketSummary[];
   learningPlanTransfers: TicketSummary[];
   requests: TicketSummary[];
@@ -7287,6 +7424,7 @@ const AdminNotificationsPanel = ({
   activeTicketId: string;
   onDecision: (ticket: TicketSummary, action: "accept" | "reject") => Promise<void>;
   onOpenTeamsCall: (ticket: TicketSummary) => Promise<void>;
+  onAcknowledgeSupportQueueTicket: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeCoverageTicket: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeLearningPlanTransfer: (ticket: TicketSummary) => Promise<void>;
   onAcknowledgeEscalation: (ticket: TicketSummary, openChat?: boolean) => Promise<void>;
@@ -7297,7 +7435,8 @@ const AdminNotificationsPanel = ({
   onSetAvailable: () => void;
 }) => {
   if (
-    coverageTickets.length === 0
+    supportQueueTickets.length === 0
+    && coverageTickets.length === 0
     && learningPlanTransfers.length === 0
     && requests.length === 0
     && escalations.length === 0
@@ -7322,10 +7461,71 @@ const AdminNotificationsPanel = ({
           Admin Notifications
         </div>
         <div className="mt-1 text-xs text-muted-foreground">
-          Review active alerts and the recent notification log for new coverage tickets, learning plan transfers, transfer requests, escalation, coverage tutor replies, Teams calls, and waiting live chat activity.
+          Review active queue alerts and the recent notification log for support tickets, coverage tickets, learning plan transfers, escalation, Teams calls, and waiting live chat activity.
         </div>
       </div>
       <div className="max-h-[420px] space-y-2 overflow-y-auto p-2">
+        {supportQueueTickets.length > 0 ? (
+          <div className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            New Support Queue
+          </div>
+        ) : null}
+        {supportQueueTickets.map((ticket) => {
+          const pendingSupportQueueNotification = ticket.pendingSupportQueueNotification;
+          if (!pendingSupportQueueNotification) {
+            return null;
+          }
+
+          const isBusy = activeTicketId === ticket.id;
+
+          return (
+            <div key={`${ticket.id}-${pendingSupportQueueNotification.reason}-${pendingSupportQueueNotification.createdAt}`} className="rounded-2xl border border-sky-200 bg-sky-50/70 px-3 py-3 shadow-soft">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-mono text-xs font-semibold text-sky-700">Ticket {pendingSupportQueueNotification.ticketId}</div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground">
+                    {pendingSupportQueueNotification.requesterName || getRequesterDisplayName(ticket)}
+                  </div>
+                  <div className="mt-2">
+                    <RequesterRoleBadge
+                      role={pendingSupportQueueNotification.requesterRole || ticket.requesterRole}
+                      source={ticket.requesterSource}
+                      className="border-sky-200 bg-white/80 text-sky-700"
+                    />
+                  </div>
+                  <div className="mt-1 text-xs text-sky-700/80">
+                    {getSupportQueueNotificationTitle(pendingSupportQueueNotification)} - {formatDateTime(pendingSupportQueueNotification.createdAt)}
+                  </div>
+                </div>
+                <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
+              </div>
+              {ticket.inquiryPreview ? (
+                <div className="mt-3 rounded-xl border border-sky-200/80 bg-background px-3 py-2 text-sm leading-6 text-foreground">
+                  {ticket.inquiryPreview}
+                </div>
+              ) : null}
+              <div className="mt-3 flex gap-2">
+                <Button
+                  size="sm"
+                  className="border-0 bg-sky-600 text-white hover:bg-sky-700"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onOpenTicket(ticket.id)}
+                >
+                  {isBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  Open Ticket
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={Boolean(activeTicketId)}
+                  onClick={() => void onAcknowledgeSupportQueueTicket(ticket)}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          );
+        })}
         {coverageTickets.length > 0 ? (
           <div className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
             New Coverage Tickets
@@ -8366,7 +8566,6 @@ const CoverageCloseTicketButton = ({
 
 const CoverageTicketDetailsPanel = ({
   ticket,
-  history,
   readOnly,
   isSaving,
   notes,
@@ -8388,7 +8587,6 @@ const CoverageTicketDetailsPanel = ({
   onSaveDetails,
 }: {
   ticket: TicketDetail;
-  history: HistoryItem[];
   readOnly: boolean;
   isSaving: boolean;
   notes: string;
@@ -8495,11 +8693,6 @@ const CoverageTicketDetailsPanel = ({
       <InfoCard label="Priority" value={ticket.priority} />
       <InfoCard label="Evidence Count" value={String(ticket.evidenceCount)} />
     </div>
-
-    <section>
-      <Label className="mb-1.5 block">Activity log</Label>
-      <ActivityLogTimeline history={history} />
-    </section>
 
     <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
       <div className="text-xs text-muted-foreground">
@@ -9170,9 +9363,12 @@ const CoverageTicketWorkspace = ({
   return (
     <div className="space-y-4 py-4">
       <Tabs value={workspaceTab} onValueChange={(value) => setWorkspaceTab(value as CoverageWorkspaceTab)} className="space-y-4">
-        <TabsList className="grid w-full grid-cols-2 rounded-2xl border border-primary/10 bg-white/80 p-1 shadow-soft">
+        <TabsList className="grid w-full grid-cols-3 rounded-2xl border border-primary/10 bg-white/80 p-1 shadow-soft">
           <TabsTrigger value="documentation" className="h-11 rounded-xl border border-transparent bg-transparent text-sm font-semibold data-[state=active]:border-primary/15 data-[state=active]:bg-primary/[0.08] data-[state=active]:text-primary">
             <FileText className="mr-2 h-4 w-4" /> Documentation
+          </TabsTrigger>
+          <TabsTrigger value="activity" className="h-11 rounded-xl border border-transparent bg-transparent text-sm font-semibold data-[state=active]:border-primary/15 data-[state=active]:bg-primary/[0.08] data-[state=active]:text-primary">
+            <Clock className="mr-2 h-4 w-4" /> Activity Log
           </TabsTrigger>
           <TabsTrigger value="details" className="h-11 rounded-xl border border-transparent bg-transparent text-sm font-semibold data-[state=active]:border-primary/15 data-[state=active]:bg-primary/[0.08] data-[state=active]:text-primary">
             <TicketIcon className="mr-2 h-4 w-4" /> Ticket Details
@@ -10013,10 +10209,16 @@ const CoverageTicketWorkspace = ({
       </div>
         </TabsContent>
 
+        <TabsContent value="activity" className="space-y-4">
+          <section>
+            <Label className="mb-1.5 block">Activity log</Label>
+            <ActivityLogTimeline history={history} />
+          </section>
+        </TabsContent>
+
         <TabsContent value="details" className="space-y-4">
           <CoverageTicketDetailsPanel
             ticket={ticket}
-            history={history}
             readOnly={readOnly}
             isSaving={isSavingDetails}
             notes={notes}
@@ -10051,13 +10253,10 @@ const CoverageTicketWorkspace = ({
 
           {previewAttachment ? (
             previewAttachmentKind === "image" ? (
-              <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
-                <img
-                  src={previewAttachmentSource}
-                  alt={previewAttachment.name}
-                  className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
-                />
-              </div>
+              <AttachmentImagePreview
+                src={previewAttachmentSource}
+                alt={previewAttachment.name}
+              />
             ) : previewAttachmentKind === "pdf" ? (
               <div className="overflow-hidden rounded-2xl border bg-secondary/10">
                 <iframe
@@ -10599,10 +10798,10 @@ const DocumentationAccordionEditor = ({
             </div>
           ) : null}
 
-          {attachments.length > 0 ? (
+          {getRequesterEvidenceAttachments(attachments).length > 0 ? (
             <div className="space-y-2">
               <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Existing ticket evidence</div>
-              {attachments.map((file) => (
+              {getRequesterEvidenceAttachments(attachments).map((file) => (
                 <div key={file.id} className="flex items-start justify-between gap-3 rounded-xl border bg-secondary/20 p-3">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-medium">{file.name}</div>
@@ -10732,6 +10931,7 @@ const StandardDocumentationWorkspace = ({
   const cardRefs = useRef<Record<string, HTMLElement | null>>({});
   const attachmentInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const cardsForDisplay = sortDocumentationWorkflowCardsForDisplay(draft.documentationCards);
+  const requesterAttachments = getRequesterEvidenceAttachments(attachments);
 
   useEffect(() => {
     setCollapsedCardIds(new Set());
@@ -10927,9 +11127,9 @@ const StandardDocumentationWorkspace = ({
             <Paperclip className="h-3.5 w-3.5" />
             Requester Attachments
           </div>
-          {attachments.length > 0 ? (
+          {requesterAttachments.length > 0 ? (
             <div className="grid gap-2">
-              {attachments.map((file) => (
+              {requesterAttachments.map((file) => (
                 <div key={file.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-primary/10 bg-white/85 px-3 py-2.5 shadow-sm">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-semibold text-foreground">{file.name}</div>
@@ -11211,6 +11411,18 @@ const DocumentationCardAttachmentsBlock = ({
   </div>
 );
 
+function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
+  return (
+    <div className="flex h-[72vh] max-h-[720px] min-h-[260px] items-center justify-center overflow-hidden rounded-2xl border bg-secondary/10 p-3">
+      <img
+        src={src}
+        alt={alt}
+        className="h-full w-full rounded-xl object-contain"
+      />
+    </div>
+  );
+}
+
 const AttachmentPreviewDialog = ({
   attachment,
   onClose,
@@ -11322,13 +11534,10 @@ const AttachmentPreviewDialog = ({
           </div>
         ) : attachment?.source && previewSource ? (
           previewKind === "image" ? (
-            <div className="overflow-auto rounded-2xl border bg-secondary/10 p-3">
-              <img
-                src={previewSource}
-                alt={attachment.name}
-                className="mx-auto max-h-[70vh] w-auto max-w-full rounded-xl object-contain"
-              />
-            </div>
+            <AttachmentImagePreview
+              src={previewSource}
+              alt={attachment.name}
+            />
           ) : previewKind === "pdf" ? (
             <div className="overflow-hidden rounded-2xl border bg-secondary/10">
               <iframe
@@ -11418,10 +11627,10 @@ const DocumentationAccordionReadOnly = ({
             </div>
           ) : null}
 
-          {attachments.length > 0 ? (
+          {getRequesterEvidenceAttachments(attachments).length > 0 ? (
             <div className="space-y-2">
               <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Existing ticket evidence</div>
-              {attachments.map((file) => (
+              {getRequesterEvidenceAttachments(attachments).map((file) => (
                 <div key={file.id} className="flex items-start justify-between gap-3 rounded-xl border bg-secondary/20 p-3">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-medium">{file.name}</div>
@@ -11606,7 +11815,7 @@ const ActivityLogTimeline = ({
 
   return (
     <div className="rounded-2xl border bg-card/50 p-4 shadow-soft">
-      <div className="relative max-h-72 overflow-y-auto pr-1">
+      <div className="relative pr-1">
         <div className="absolute bottom-0 left-[11px] top-2 w-px bg-border" />
         <div className="space-y-4">
           {history.map((item) => (
@@ -11734,6 +11943,14 @@ function isLearningPlanTicket(
 
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
   return ticket?.isArchived === true;
+}
+
+function getSupportQueueNotificationTitle(notification: PendingSupportQueueNotification) {
+  if (notification.reason === "support_session_requested") {
+    return "Support session requested";
+  }
+
+  return "New support ticket";
 }
 
 function getArchiveActionButtonClassName(isArchived: boolean, className?: string) {
@@ -12333,6 +12550,15 @@ function getCoverageAttachmentPreviewKind(file: Pick<CoverageCardAttachment, "mi
   }
 
   return "unsupported";
+}
+
+function getRequesterEvidenceAttachments(attachments: AttachmentItem[]): AttachmentItem[] {
+  return attachments.filter((attachment) => {
+    const source = typeof attachment.metadata?.source === "string"
+      ? attachment.metadata.source.trim().toLowerCase()
+      : "";
+    return !nonRequesterAttachmentSources.has(source);
+  });
 }
 
 function getAttachmentPreviewKind(file: Pick<AttachmentPreviewItem, "mimeType" | "source"> | null | undefined) {
@@ -13987,8 +14213,15 @@ interface ActivityPayloadEntry {
 const activityEventLabels: Record<string, string> = {
   assignment_changed: "Assignment Updated",
   chat_history_synced: "Chat History Synced",
+  coverage_attachment_added: "Coverage Attachment Added",
+  coverage_card_created: "Coverage Card Created",
+  coverage_card_updated: "Coverage Card Updated",
+  coverage_sla_alert: "Coverage SLA Alert",
   follow_up_ticket_created: "Follow-up Ticket Created",
   internal_note: "Internal Note",
+  documentation_attachment_added: "Documentation Attachment Added",
+  documentation_card_created: "Documentation Card Created",
+  documentation_card_updated: "Documentation Card Updated",
   live_chat_requested: "Live Chat Requested",
   sla_changed: "SLA Updated",
   status_changed: "Status Updated",
@@ -14007,8 +14240,14 @@ const activityEventLabels: Record<string, string> = {
   coverage_tutor_follow_up_sent: "Tutor Files Sent",
   coverage_tutor_follow_up_webhook_delivered: "Tutor Files Delivered",
   coverage_tutor_follow_up_webhook_failed: "Tutor Files Delivery Failed",
+  coverage_tutor_refusal_mail_failed: "Tutor Refusal Mail Failed",
+  coverage_tutor_refusal_mail_notified: "Tutor Refusal Mail Sent",
+  coverage_tutor_request_webhook_delivered: "Tutor Request Delivered",
+  coverage_tutor_request_webhook_failed: "Tutor Request Delivery Failed",
   coverage_tutor_response: "Tutor Reply",
   coverage_session_confirmed: "Session Confirmed",
+  learning_plan_ticket_transfer_notified: "Learning Plan Transfer Notified",
+  learning_plan_ticket_transfer_notification_failed: "Learning Plan Transfer Notification Failed",
   quick_ticket_confirmation_email_sent: "Requester Confirmation Sent",
   quick_ticket_confirmation_email_failed: "Requester Confirmation Failed",
   quick_ticket_closed_email_sent: "Requester Closure Sent",
@@ -14018,9 +14257,11 @@ const activityEventLabels: Record<string, string> = {
   escalation_closed: "Escalation Closed",
   escalation_notified: "Escalation Notified",
   teams_call_requested: "Teams Call Requested",
+  ticket_archived: "Ticket Archived",
   transfer_requested: "Transfer Requested",
   transfer_request_accepted: "Transfer Accepted",
   transfer_request_rejected: "Transfer Declined",
+  ticket_unarchived: "Ticket Restored",
 };
 
 const activityPayloadLabels: Record<string, string> = {
@@ -14028,12 +14269,25 @@ const activityPayloadLabels: Record<string, string> = {
   category: "Category",
   chatId: "Chat ID",
   cardId: "Card ID",
+  cardKind: "Card Area",
+  cardTitle: "Card Title",
+  cardType: "Card Type",
   closedAt: "Closed At",
   closedById: "Closed By ID",
   closedByName: "Closed By",
   closedByUsername: "Closed By Username",
   closedStatusReason: "Closed Status Reason",
   evidence_count: "Evidence Files",
+  addedAttachmentCount: "Added Attachments",
+  addedAttachments: "Added Attachment Details",
+  allAttachments: "All Attachment Details",
+  alertLevel: "Alert Level",
+  attachmentCount: "Total Attachments",
+  cardDetails: "Full Card Details",
+  changedFields: "Changed Fields",
+  currentValues: "Current Values",
+  fileCount: "Files",
+  fileNames: "File Names",
   followUpFrom: "Follow-up From",
   from: "From",
   fromAgentId: "Previous Agent ID",
@@ -14061,6 +14315,7 @@ const activityPayloadLabels: Record<string, string> = {
   toAgentName: "Assigned Agent",
   fromAgentName: "From Admin",
   fromAgentUsername: "From Username",
+  previousValues: "Previous Values",
   reason: "Transfer Reason",
   replyText: "Reply",
   requestedAt: "Requested At",
@@ -14075,6 +14330,7 @@ const activityPayloadLabels: Record<string, string> = {
   toTeam: "To Team",
   webhookDelivered: "Webhook Delivered",
   webhookStatus: "Webhook Status",
+  webhookConfigured: "Webhook Configured",
 };
 
 function getActivityEventLabel(eventType: string) {
@@ -14126,8 +14382,24 @@ function getActivityEventSummary(item: HistoryItem) {
   const requestedTime = getActivityPayloadTextValue(item.payload.requestedTime);
   const requesterName = getActivityPayloadTextValue(item.payload.requesterName);
   const tutor = getActivityPayloadTextValue(item.payload.tutor);
+  const cardTitle = getActivityPayloadTextValue(item.payload.cardTitle);
+  const cardType = getActivityPayloadTextValue(item.payload.cardType);
+  const addedAttachmentCount = getActivityPayloadTextValue(item.payload.addedAttachmentCount);
+  const fileCount = getActivityPayloadTextValue(item.payload.fileCount);
 
   switch (item.eventType) {
+    case "documentation_card_created":
+      return cardTitle ? `Documentation card created: ${cardTitle}` : "Documentation card created";
+    case "documentation_card_updated":
+      return cardTitle ? `Documentation card updated: ${cardTitle}${formatChangedFieldSummary(item.payload.changedFields)}` : `Documentation card updated${formatChangedFieldSummary(item.payload.changedFields)}`;
+    case "documentation_attachment_added":
+      return `${addedAttachmentCount || fileCount || "New"} documentation attachment${addedAttachmentCount === "1" || fileCount === "1" ? "" : "s"} added`;
+    case "coverage_card_created":
+      return cardType ? `Coverage ${humanizeActivityFieldLabel(cardType)} card created` : "Coverage card created";
+    case "coverage_card_updated":
+      return cardType ? `Coverage ${humanizeActivityFieldLabel(cardType)} card updated${formatChangedFieldSummary(item.payload.changedFields)}` : `Coverage card updated${formatChangedFieldSummary(item.payload.changedFields)}`;
+    case "coverage_attachment_added":
+      return `${addedAttachmentCount || fileCount || "New"} coverage attachment${addedAttachmentCount === "1" || fileCount === "1" ? "" : "s"} added`;
     case "status_changed":
       if (fromValue || toValue) {
         return `Status moved from ${fromValue || "Empty"} to ${toValue || "Empty"}`;
@@ -14326,6 +14598,19 @@ function getActivityPayloadSortRank(key: string) {
     "toTeam",
     "category",
     "technical_subcategory",
+    "cardKind",
+    "cardType",
+    "cardTitle",
+    "changedFields",
+    "previousValues",
+    "currentValues",
+    "cardDetails",
+    "attachmentCount",
+    "addedAttachmentCount",
+    "fileCount",
+    "fileNames",
+    "addedAttachments",
+    "allAttachments",
     "requestedDate",
     "requestedTime",
     "queuedAt",
@@ -14343,6 +14628,18 @@ function getActivityPayloadSortRank(key: string) {
 
 function getActivityPayloadTextValue(value: unknown) {
   return typeof value === "string" ? value.trim() : typeof value === "number" ? String(value) : "";
+}
+
+function formatChangedFieldSummary(value: unknown) {
+  const fields = Array.isArray(value)
+    ? value
+        .filter((field): field is string => typeof field === "string" && field.trim().length > 0)
+        .map((field) => humanizeActivityFieldLabel(field))
+    : [];
+  if (fields.length === 0) {
+    return "";
+  }
+  return ` (${fields.join(", ")})`;
 }
 
 function humanizeActivityFieldLabel(value: string) {
@@ -14382,6 +14679,9 @@ function formatActivityPayloadValue(key: string, value: unknown): string {
   }
 
   if (Array.isArray(value)) {
+    if (value.some((item) => typeof item === "object" && item !== null)) {
+      return JSON.stringify(value, null, 2);
+    }
     return value
       .map((item) => formatActivityPayloadValue(key, item))
       .filter(Boolean)
@@ -14396,7 +14696,16 @@ function getActivityPayloadKind(key: string, value: string): ActivityPayloadEntr
     return "link";
   }
 
-  if (key === "message" || key === "note" || value.length > 120) {
+  if (
+    key === "message"
+    || key === "note"
+    || key === "cardDetails"
+    || key === "previousValues"
+    || key === "currentValues"
+    || key === "addedAttachments"
+    || key === "allAttachments"
+    || value.length > 120
+  ) {
     return "multiline";
   }
 
@@ -14601,48 +14910,6 @@ function presenceDotClassName(status: AdminConsoleStatus) {
   if (status === "Busy") return "bg-amber-500";
   if (status === "Off") return "bg-slate-400";
   return "bg-emerald-500";
-}
-
-function deriveDashboardSlaStatus(
-  status: TicketSummary["status"],
-  createdAt: string,
-  fallback: TicketSummary["slaStatus"],
-  isCoverageManaged = false,
-): TicketSummary["slaStatus"] {
-  if (isCoverageManaged) {
-    if (status === "Closed") {
-      return "On Track";
-    }
-
-    if (status === "Pending") {
-      return fallback === "Breached" ? "Breached" : "On Track";
-    }
-
-    if (status === "Open") {
-      return "On Track";
-    }
-
-    return fallback;
-  }
-
-  if (status === "Open") {
-    return "Pending Review";
-  }
-
-  if (status === "Closed") {
-    return "On Track";
-  }
-
-  if (status === "Pending") {
-    const createdAtTime = new Date(createdAt).getTime();
-    if (!Number.isNaN(createdAtTime) && (Date.now() - createdAtTime) > (3 * 24 * 60 * 60 * 1000)) {
-      return "Breached";
-    }
-
-    return "On Track";
-  }
-
-  return fallback;
 }
 
 function slaStatusClassName(value: TicketSummary["slaStatus"]) {

@@ -22,6 +22,7 @@ from .services import (
     acknowledge_ticket_escalation_notification,
     acknowledge_ticket_teams_call_notification,
     acknowledge_ticket_transfer_decision,
+    acknowledge_support_queue_notification,
     acknowledge_coverage_ticket_notification,
     acknowledge_learning_plan_transfer_notification,
     acknowledge_coverage_tutor_response,
@@ -917,6 +918,14 @@ def admin_ticket_coverage_tutor_response_acknowledge(request, public_id: str):
 def admin_ticket_coverage_ticket_notification_acknowledge(request, public_id: str):
     try:
         return JsonResponse(acknowledge_coverage_ticket_notification(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_support_queue_notification_acknowledge(request, public_id: str):
+    try:
+        return JsonResponse(acknowledge_support_queue_notification(public_id, build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
