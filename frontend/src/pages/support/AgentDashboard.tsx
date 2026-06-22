@@ -3530,8 +3530,8 @@ const AgentDashboard = () => {
       return;
     }
 
-    if (targetCard.presentationFiles.some((file) => isCoverageAttachmentUploadFailed(file) || !isCoverageAttachmentReadyForSubmit(file))) {
-      toast.error("One or more presentation files failed to upload. Remove them and try again.");
+    if (targetCard.presentationFiles.some((file) => !isCoverageAttachmentReadyForSubmit(file))) {
+      toast.error("One or more presentation files are not ready. Remove them and try again.");
       return;
     }
 
@@ -3660,8 +3660,8 @@ const AgentDashboard = () => {
       return false;
     }
 
-    if (presentationFiles.some((file) => isCoverageAttachmentUploadFailed(file) || !isCoverageAttachmentReadyForSubmit(file))) {
-      toast.error("One or more follow-up files failed to upload. Remove them and try again.");
+    if (presentationFiles.some((file) => !isCoverageAttachmentReadyForSubmit(file))) {
+      toast.error("One or more follow-up files are not ready. Remove them and try again.");
       return false;
     }
 
@@ -9322,7 +9322,7 @@ const CoverageTicketWorkspace = ({
       toast.success(`${files.length} presentation file${files.length === 1 ? "" : "s"} uploaded.`);
     } catch (error) {
       updateCoveragePresentationFiles(cardId, (currentFiles) => applyCoverageUploadFailure(currentFiles, pendingIds, error));
-      toast.error(error instanceof Error ? error.message : "We could not upload one or more presentation files right now.");
+      toast.info("Pre-upload could not finish. The file will upload when you submit the request.");
     }
   };
 
@@ -9389,7 +9389,7 @@ const CoverageTicketWorkspace = ({
       toast.success(`${files.length} follow-up file${files.length === 1 ? "" : "s"} uploaded.`);
     } catch (error) {
       updatePendingFollowUpFiles(cardId, (currentFiles) => applyCoverageUploadFailure(currentFiles, pendingIds, error));
-      toast.error(error instanceof Error ? error.message : "We could not upload one or more follow-up files right now.");
+      toast.info("Pre-upload could not finish. The file will upload when you send the follow-up.");
     }
   };
 
@@ -9486,10 +9486,12 @@ const CoverageTicketWorkspace = ({
                   <span
                     className={cn(
                       "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold",
-                      file.uploadStatus === "failed"
+                      file.uploadStatus === "failed" && !file.file
                         ? "bg-red-50 text-red-700"
                         : isCoverageAttachmentUploadInProgress(file)
                           ? "bg-amber-100 text-amber-800"
+                          : file.uploadStatus === "failed"
+                            ? "bg-amber-50 text-amber-700"
                           : "bg-emerald-50 text-emerald-700",
                     )}
                   >
@@ -9529,7 +9531,6 @@ const CoverageTicketWorkspace = ({
             isSaving
             || pendingFollowUpFiles.length === 0
             || pendingFollowUpFiles.some(isCoverageAttachmentUploadInProgress)
-            || pendingFollowUpFiles.some(isCoverageAttachmentUploadFailed)
           }
           className="border-0 bg-amber-500 text-white hover:bg-amber-600"
         >
@@ -10303,10 +10304,12 @@ const CoverageTicketWorkspace = ({
                                     <span
                                       className={cn(
                                         "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold",
-                                        file.uploadStatus === "failed"
+                                        file.uploadStatus === "failed" && !file.file
                                           ? "bg-red-50 text-red-700"
                                           : isCoverageAttachmentUploadInProgress(file)
                                             ? "bg-primary/10 text-primary"
+                                            : file.uploadStatus === "failed"
+                                              ? "bg-amber-50 text-amber-700"
                                             : "bg-emerald-50 text-emerald-700",
                                       )}
                                     >
@@ -10358,7 +10361,6 @@ const CoverageTicketWorkspace = ({
                           || isTutorEmailLoading
                           || isCoachEmailLoading
                           || card.presentationFiles.some(isCoverageAttachmentUploadInProgress)
-                          || card.presentationFiles.some(isCoverageAttachmentUploadFailed)
                         }
                         className="border-0 gradient-primary"
                       >
@@ -14422,16 +14424,16 @@ function isCoverageAttachmentUploadInProgress(file: CoverageCardAttachment) {
   return file.uploadStatus === "pending" || file.uploadStatus === "uploading";
 }
 
-function isCoverageAttachmentUploadFailed(file: CoverageCardAttachment) {
-  return file.uploadStatus === "failed";
-}
-
 function isCoverageAttachmentReadyForSubmit(file: CoverageCardAttachment) {
-  return Boolean(file.attachmentId || file.storageKey || file.storageUrl || file.dataUrl) && !isCoverageAttachmentUploadInProgress(file);
+  return Boolean(file.file || file.attachmentId || file.storageKey || file.storageUrl || file.dataUrl) && !isCoverageAttachmentUploadInProgress(file);
 }
 
 function getCoverageAttachmentUploadLabel(file: CoverageCardAttachment) {
   if (file.uploadStatus === "failed") {
+    if (file.file) {
+      return "Will upload on submit";
+    }
+
     return file.uploadError || "Upload failed";
   }
 
