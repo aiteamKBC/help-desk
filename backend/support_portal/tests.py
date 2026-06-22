@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib import parse as urllib_parse
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -9949,6 +9950,43 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         mock_connection.cursor.return_value = cursor_context
         return mock_connection, cursor
 
+    @override_settings(SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net")
+    def test_public_coverage_attachment_signed_link_resolves_file(self):
+        with TemporaryDirectory() as temp_dir:
+            storage_key = "KBC-000045/2026/06/deck.pdf"
+            attachment_path = Path(temp_dir) / storage_key
+            attachment_path.parent.mkdir(parents=True)
+            attachment_path.write_bytes(b"deck")
+            download_url = services.build_public_coverage_attachment_download_url("KBC-000045", 101)
+            parsed_url = urllib_parse.urlparse(download_url)
+            token = urllib_parse.parse_qs(parsed_url.query)["token"][0]
+
+            with (
+                patch.object(services, "get_support_attachment_root", return_value=Path(temp_dir)),
+                patch.object(
+                    services,
+                    "run_query_one",
+                    return_value={
+                        "id": 101,
+                        "file_name": "deck.pdf",
+                        "mime_type": "application/pdf",
+                        "file_size": 4,
+                        "storage_url": storage_key,
+                        "attachment_metadata": {"source": "coverage_tutor_request"},
+                        "public_id": "KBC-000045",
+                        "technical_subcategory": "Coverage",
+                        "assigned_team": "Learning Plan Team",
+                        "metadata": {},
+                    },
+                ),
+            ):
+                attachment = services.get_public_coverage_attachment_file("KBC-000045", 101, token)
+
+        self.assertEqual(attachment["fileName"], "deck.pdf")
+        self.assertEqual(attachment["mimeType"], "application/pdf")
+        self.assertEqual(attachment["fileSize"], 4)
+        self.assertTrue(download_url.startswith("https://technicalsupport.kentbusinesscollege.net/api/public/coverage-attachments/KBC-000045/101/download?token="))
+
     def test_send_coverage_tutor_request_webhook_uses_short_timeout(self):
         with (
             patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
@@ -10002,15 +10040,107 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         post_json_webhook.assert_not_called()
         post_multipart_webhook.assert_called_once()
         self.assertEqual(post_multipart_webhook.call_args.args[0], "https://n8n.example/webhook")
-        self.assertEqual(post_multipart_webhook.call_args.args[2], payload["request"]["presentationFiles"])
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["id"], "file-1")
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["deliveryMode"], "attachment")
         sent_payload = post_multipart_webhook.call_args.args[1]
         self.assertNotIn("dataUrl", sent_payload["request"]["presentationFiles"][0])
         post_multipart_webhook.assert_called_once_with(
             "https://n8n.example/webhook",
             sent_payload,
-            payload["request"]["presentationFiles"],
+            post_multipart_webhook.call_args.args[2],
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
+
+    def test_send_coverage_tutor_request_webhook_includes_session_files_in_multipart(self):
+        general_file = {
+            "id": "file-1",
+            "name": "overview.pdf",
+            "mimeType": "application/pdf",
+            "size": 128,
+            "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+        }
+        session_file = {
+            "id": "file-2",
+            "name": "session-1.pdf",
+            "mimeType": "application/pdf",
+            "size": 256,
+            "dataUrl": "data:application/pdf;base64,c2Vzc2lvbg==",
+        }
+        payload = {
+            "ticketId": "KBC-000001",
+            "request": {
+                "presentationFiles": [general_file],
+                "sessionFiles": [
+                    {
+                        "id": "session-1",
+                        "label": "Session 1",
+                        "attachments": [session_file],
+                    }
+                ],
+            },
+        }
+
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(
+                services,
+                "post_multipart_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_request_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_called_once()
+        self.assertEqual([file["id"] for file in post_multipart_webhook.call_args.args[2]], ["file-1", "file-2"])
+        self.assertEqual([file["deliveryMode"] for file in post_multipart_webhook.call_args.args[2]], ["attachment", "attachment"])
+        sent_payload = post_multipart_webhook.call_args.args[1]
+        self.assertNotIn("dataUrl", sent_payload["request"]["presentationFiles"][0])
+        self.assertNotIn("dataUrl", sent_payload["request"]["sessionFiles"][0]["attachments"][0])
+
+    @override_settings(
+        SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net",
+        COVERAGE_WEBHOOK_ATTACHMENT_MAX_FILE_BYTES=8 * 1024 * 1024,
+        COVERAGE_WEBHOOK_ATTACHMENT_MAX_TOTAL_BYTES=18 * 1024 * 1024,
+    )
+    def test_send_coverage_tutor_request_webhook_converts_large_files_to_signed_links(self):
+        payload = {
+            "ticketId": "KBC-000045",
+            "request": {
+                "presentationFiles": [
+                    {
+                        "id": "file-1",
+                        "attachmentId": 101,
+                        "name": "large-deck.pptx",
+                        "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "size": 11 * 1024 * 1024,
+                        "storageKey": "KBC-000045/2026/06/large-deck.pptx",
+                    }
+                ],
+                "sessionFiles": [],
+            },
+        }
+
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+            patch.object(services, "post_multipart_webhook") as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_request_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_not_called()
+        post_json_webhook.assert_called_once()
+        sent_payload = post_json_webhook.call_args.args[1]
+        sent_file = sent_payload["request"]["presentationFiles"][0]
+        self.assertEqual(sent_file["deliveryMode"], "link")
+        self.assertEqual(sent_file["deliveryReason"], "file_size_limit")
+        self.assertIn("/api/public/coverage-attachments/KBC-000045/101/download?token=", sent_file["downloadUrl"])
+        self.assertNotIn("storageKey", sent_file)
 
     def test_send_coverage_tutor_follow_up_webhook_uses_attachment_reply_url(self):
         payload = {
@@ -10046,15 +10176,73 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertTrue(response["delivered"])
         post_multipart_webhook.assert_called_once()
         self.assertEqual(post_multipart_webhook.call_args.args[0], "https://n8n.example/attachment-reply")
-        self.assertEqual(post_multipart_webhook.call_args.args[2], payload["followUp"]["presentationFiles"])
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["id"], "file-2")
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["deliveryMode"], "attachment")
         sent_payload = post_multipart_webhook.call_args.args[1]
         self.assertNotIn("dataUrl", sent_payload["followUp"]["presentationFiles"][0])
         post_multipart_webhook.assert_called_once_with(
             "https://n8n.example/attachment-reply",
             sent_payload,
-            payload["followUp"]["presentationFiles"],
+            post_multipart_webhook.call_args.args[2],
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
+
+    @override_settings(
+        SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net",
+        COVERAGE_WEBHOOK_ATTACHMENT_MAX_FILE_BYTES=8 * 1024 * 1024,
+    )
+    def test_send_coverage_tutor_follow_up_webhook_converts_large_files_to_signed_links(self):
+        payload = {
+            "event": "coverage_tutor_follow_up",
+            "ticketId": "KBC-000045",
+            "attachments": [
+                {
+                    "id": "file-2",
+                    "attachmentId": 202,
+                    "name": "large-follow-up.pptx",
+                    "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "size": 12 * 1024 * 1024,
+                    "storageKey": "KBC-000045/2026/06/large-follow-up.pptx",
+                }
+            ],
+            "followUp": {
+                "presentationFiles": [
+                    {
+                        "id": "file-2",
+                        "attachmentId": 202,
+                        "name": "large-follow-up.pptx",
+                        "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "size": 12 * 1024 * 1024,
+                        "storageKey": "KBC-000045/2026/06/large-follow-up.pptx",
+                    }
+                ],
+            },
+        }
+
+        with (
+            patch.object(
+                services,
+                "get_coverage_tutor_attachment_reply_webhook_url",
+                return_value="https://n8n.example/attachment-reply",
+            ),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+            patch.object(services, "post_multipart_webhook") as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_follow_up_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_not_called()
+        post_json_webhook.assert_called_once()
+        sent_payload = post_json_webhook.call_args.args[1]
+        sent_file = sent_payload["followUp"]["presentationFiles"][0]
+        self.assertEqual(sent_file["deliveryMode"], "link")
+        self.assertIn("/api/public/coverage-attachments/KBC-000045/202/download?token=", sent_file["downloadUrl"])
+        self.assertEqual(sent_payload["attachments"][0]["deliveryMode"], "link")
+        self.assertNotIn("storageKey", sent_file)
 
     def test_queue_coverage_tutor_request_webhook_delivery_starts_background_thread(self):
         thread = MagicMock()
@@ -10988,8 +11176,108 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_card["requestStatus"], "requested")
         self.assertEqual(persisted_card["requestSubmittedByAgentId"], 7)
         self.assertTrue(persisted_card["responseToken"])
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "pending")
         self.assertEqual(persisted_card["coach"], "Mona Adel")
         self.assertEqual(persisted_card["coachEmail"], "mona.adel@example.com")
+
+    def test_record_coverage_tutor_request_email_delivery_status_marks_card_sent(self):
+        token = services.build_coverage_tutor_email_delivery_callback_token("KBC-000041", "card-1", "response-token-1")
+        ticket = {
+            "id": 41,
+            "public_id": "KBC-000041",
+            "metadata": {
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "pending",
+                        }
+                    ]
+                }
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.record_coverage_tutor_request_email_delivery_status(
+                {
+                    "ticketId": "KBC-000041",
+                    "cardId": "card-1",
+                    "status": "sent",
+                    "messageId": "gmail-message-1",
+                    "threadId": "gmail-thread-1",
+                    "token": token,
+                }
+            )
+
+        self.assertEqual(result["emailDeliveryStatus"], "sent")
+        persisted_metadata = json.loads(cursor.execute.call_args.args[1][0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "sent")
+        self.assertEqual(persisted_card["emailDeliveryMessageId"], "gmail-message-1")
+        self.assertEqual(persisted_card["emailDeliveryThreadId"], "gmail-thread-1")
+        self.assertEqual(persisted_card["emailDeliveryError"], "")
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_sent")
+
+    def test_record_coverage_tutor_request_email_delivery_status_marks_card_failed(self):
+        token = services.build_coverage_tutor_email_delivery_callback_token("KBC-000041", "card-1", "response-token-1")
+        ticket = {
+            "id": 41,
+            "public_id": "KBC-000041",
+            "metadata": {
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "pending",
+                        }
+                    ]
+                }
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.record_coverage_tutor_request_email_delivery_status(
+                {
+                    "ticketId": "KBC-000041",
+                    "cardId": "card-1",
+                    "status": "failed",
+                    "error": "Gmail rejected the message",
+                    "token": token,
+                }
+            )
+
+        self.assertEqual(result["emailDeliveryStatus"], "failed")
+        persisted_metadata = json.loads(cursor.execute.call_args.args[1][0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "failed")
+        self.assertEqual(persisted_card["emailDeliveryError"], "Gmail rejected the message")
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_failed")
 
     def test_submit_coverage_tutor_request_uses_compact_card_payload_files(self):
         ticket = {
@@ -11215,6 +11503,118 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(insert_metadata["coverageCardId"], "card-uploaded")
         self.assertEqual(insert_metadata["uploadPhase"], "pre_submit")
         self.assertEqual(insert_metadata["uploadedByAgentId"], 7)
+
+    def test_submit_coverage_tutor_request_stores_session_fallback_files(self):
+        ticket = {
+            "id": 46,
+            "public_id": "KBC-000046",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {"technical_subcategory": "Coverage", "admin_documentation": {}},
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        card_payload = {
+            "id": "card-session-uploaded",
+            "type": "tutor_choice",
+            "tutor": "Ray",
+            "tutorEmail": "ray@example.com",
+            "sessionDetails": "Module: PMP",
+            "presentationFiles": [],
+            "sessionFiles": [
+                {
+                    "id": "session-1",
+                    "label": "Session 1",
+                    "date": "Monday 06 Mar 2028",
+                    "number": "1",
+                    "subject": "test",
+                    "attachments": [],
+                }
+            ],
+        }
+        uploaded_file = SimpleUploadedFile("session-plan.pdf", b"session", content_type="application/pdf")
+        stored_request_file = {
+            "name": "session-plan.pdf",
+            "mimeType": "application/pdf",
+            "size": 7,
+            "storageKey": "KBC-000046/2026/06/session-plan.pdf",
+            "metadata": {"originalName": "session-plan.pdf", "storage": "local_filesystem"},
+        }
+        mock_connection, cursor = self.build_mock_connection()
+        cursor.fetchone.return_value = (303,)
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_request_file]) as store_files,
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000046"}}),
+        ):
+            services.submit_coverage_tutor_request(
+                "KBC-000046",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-session-uploaded",
+                    "card": card_payload,
+                    "documentation": {
+                        "inquiry": "Coverage request",
+                        "ticketId": "KBC-000046",
+                        "coverageCards": [card_payload],
+                    },
+                    "sessionPresentationFileMetadata": [
+                        {
+                            "sessionId": "session-1",
+                            "fileId": "local-session-file",
+                            "label": "Session 1",
+                            "date": "Monday 06 Mar 2028",
+                            "number": "1",
+                            "subject": "test",
+                        }
+                    ],
+                },
+                uploaded_session_files=[uploaded_file],
+            )
+
+        store_files.assert_called_once_with("KBC-000046", [uploaded_file])
+        insert_attachment_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        insert_metadata = json.loads(insert_attachment_call.args[1][5])
+        self.assertEqual(insert_metadata["source"], "coverage_tutor_request")
+        self.assertEqual(insert_metadata["coverageCardId"], "card-session-uploaded")
+        self.assertEqual(insert_metadata["coverageSessionId"], "session-1")
+        self.assertEqual(insert_metadata["uploadPhase"], "submit_fallback")
+
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        session_files = webhook_payload["request"]["sessionFiles"]
+        self.assertEqual(len(session_files), 1)
+        self.assertEqual(session_files[0]["attachments"][0]["attachmentId"], 303)
+
+        update_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0]
+        )
+        persisted_metadata = json.loads(update_call.args[1][5])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["sessionFiles"][0]["attachments"][0]["attachmentId"], 303)
+        self.assertEqual(persisted_card["sessionFiles"][0]["attachments"][0]["id"], "local-session-file")
 
     def test_submit_coverage_tutor_request_falls_back_to_database_email_lookup(self):
         ticket = {
@@ -12382,6 +12782,24 @@ class BookingContextTests(SimpleTestCase):
                                 "dataUrl": "https://example.com/file.txt",
                             },
                         ],
+                        "sessionFiles": [
+                            {
+                                "id": "session-1",
+                                "label": "Session 1",
+                                "date": "Wednesday 01 Jul 2026",
+                                "number": "3",
+                                "subject": "Intro",
+                                "attachments": [
+                                    {
+                                        "id": "session-file-1",
+                                        "name": "session.pdf",
+                                        "mimeType": "application/pdf",
+                                        "size": 64,
+                                        "dataUrl": "data:application/pdf;base64,c2Vzc2lvbg==",
+                                    }
+                                ],
+                            }
+                        ],
                     },
                     {
                         "id": "card-2",
@@ -12406,6 +12824,8 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(normalized_documentation["coverageCards"][0]["createdByAgentName"], "Ahmed Hamamo")
         self.assertEqual(normalized_documentation["coverageCards"][0]["updatedByAgentName"], "Omar Helmy")
         self.assertEqual(len(normalized_documentation["coverageCards"][0]["presentationFiles"]), 1)
+        self.assertEqual(len(normalized_documentation["coverageCards"][0]["sessionFiles"]), 1)
+        self.assertEqual(normalized_documentation["coverageCards"][0]["sessionFiles"][0]["attachments"][0]["name"], "session.pdf")
         self.assertEqual(normalized_documentation["coverageCards"][1]["type"], "note")
         self.assertEqual(normalized_documentation["coverageCards"][1]["note"], "Follow up with another tutor if needed.")
 

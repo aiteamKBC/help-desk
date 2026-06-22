@@ -414,8 +414,18 @@ interface CoverageCardAttachment {
   uploadError?: string;
 }
 
+interface CoverageSessionAttachmentGroup {
+  id: string;
+  label: string;
+  date: string;
+  number: string;
+  subject: string;
+  attachments: CoverageCardAttachment[];
+}
+
 type CoverageWorkflowCardType = "tutor_choice" | "tutor_reply" | "note";
 type CoverageTutorRequestStatus = "draft" | "requested" | "accepted" | "refused";
+type CoverageTutorEmailDeliveryStatus = "" | "pending" | "sent" | "failed";
 type CoverageTutorReplyOutcome = "" | "accepted" | "refused";
 type CoveragePresentationUploadSource = "coverage_tutor_request" | "coverage_tutor_follow_up";
 
@@ -448,6 +458,11 @@ interface CoverageWorkflowCard {
   requestSubmittedByAgentName?: string;
   requestSubmittedByAgentUsername?: string;
   responseToken?: string;
+  emailDeliveryStatus?: CoverageTutorEmailDeliveryStatus;
+  emailDeliveryUpdatedAt?: string;
+  emailDeliveryMessageId?: string;
+  emailDeliveryThreadId?: string;
+  emailDeliveryError?: string;
   sessionStartAt?: string;
   sessionEndAt?: string;
   confirmedAt?: string;
@@ -455,6 +470,7 @@ interface CoverageWorkflowCard {
   confirmedByAgentName?: string;
   confirmedByAgentUsername?: string;
   presentationFiles: CoverageCardAttachment[];
+  sessionFiles: CoverageSessionAttachmentGroup[];
 }
 
 interface DocumentationWorkflowCard {
@@ -3535,18 +3551,43 @@ const AgentDashboard = () => {
       return;
     }
 
+    const targetSessionFiles = buildCoverageSessionFileGroups(currentDraft.inquiry, targetCard.sessionFiles);
+    const targetSessionAttachments = targetSessionFiles.flatMap((group) => group.attachments);
+
+    if (targetSessionAttachments.some(isCoverageAttachmentUploadInProgress)) {
+      toast.error("Please wait until session files finish uploading.");
+      return;
+    }
+
+    if (targetSessionAttachments.some((file) => !isCoverageAttachmentReadyForSubmit(file))) {
+      toast.error("One or more session files are not ready. Remove them and try again.");
+      return;
+    }
+
     const presentationFileMetadata = targetCard.presentationFiles
       .filter((file) => !file.file)
       .map(serializeCoverageCardAttachmentForRequest);
+    const sessionFileMetadata = serializeCoverageSessionFileGroupsForRequest(targetSessionFiles);
+    const syncedSessionDetails = buildCoverageTutorSessionDetailsFromGroups(
+      currentDraft.inquiry,
+      targetCard.sessionDetails,
+      targetSessionFiles,
+    );
     const compactTargetCard: CoverageWorkflowCard = {
       ...targetCard,
+      sessionDetails: syncedSessionDetails,
       presentationFiles: presentationFileMetadata,
+      sessionFiles: sessionFileMetadata,
     };
     const lightweightDocumentation: AdminDocumentation = {
       ...currentDraft,
       coverageCards: currentDraft.coverageCards.map((card) => ({
         ...card,
+        sessionDetails: card.id === cardId ? syncedSessionDetails : card.sessionDetails,
         presentationFiles: card.id === cardId ? presentationFileMetadata : [],
+        sessionFiles: card.id === cardId
+          ? sessionFileMetadata
+          : serializeCoverageSessionFileGroupsForRequest(card.sessionFiles),
       })),
     };
 
@@ -3555,7 +3596,7 @@ const AgentDashboard = () => {
       return;
     }
 
-    if (!targetCard.sessionDetails.trim()) {
+    if (!syncedSessionDetails.trim()) {
       toast.error("Add the session details before submitting the request.");
       return;
     }
@@ -3592,6 +3633,36 @@ const AgentDashboard = () => {
           formData.append("presentationFiles", file.file, file.name || "attachment");
         }
       });
+      const sessionPresentationFileMetadata: Array<{
+        sessionId: string;
+        fileId: string;
+        label: string;
+        date: string;
+        number: string;
+        subject: string;
+        name: string;
+      }> = [];
+      targetSessionFiles.forEach((sessionGroup) => {
+        sessionGroup.attachments.forEach((file) => {
+          if (!file.file) {
+            return;
+          }
+
+          formData.append("sessionPresentationFiles", file.file, file.name || "attachment");
+          sessionPresentationFileMetadata.push({
+            sessionId: sessionGroup.id,
+            fileId: file.id,
+            label: sessionGroup.label,
+            date: sessionGroup.date,
+            number: sessionGroup.number,
+            subject: sessionGroup.subject,
+            name: file.name || "attachment",
+          });
+        });
+      });
+      if (sessionPresentationFileMetadata.length > 0) {
+        formData.append("sessionPresentationFileMetadata", JSON.stringify(sessionPresentationFileMetadata));
+      }
 
       const response = await fetch(
         `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-request`,
@@ -3628,6 +3699,7 @@ const AgentDashboard = () => {
     files: File[],
     source: CoveragePresentationUploadSource,
     onProgress: (progress: number) => void,
+    sessionId?: string,
   ) {
     if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
       throw new Error("Coverage ticket is not available right now.");
@@ -3639,6 +3711,7 @@ const AgentDashboard = () => {
       source,
       files,
       onProgress,
+      sessionId,
     });
   }
 
@@ -8845,6 +8918,7 @@ const CoverageTicketWorkspace = ({
     files: File[],
     source: CoveragePresentationUploadSource,
     onProgress: (progress: number) => void,
+    sessionId?: string,
   ) => Promise<CoverageCardAttachment[]>;
   onSendTutorFollowUpFiles: (cardId: string, presentationFiles: CoverageCardAttachment[]) => Promise<boolean>;
   onConfirmTutorSession: (cardId: string) => void;
@@ -8862,6 +8936,7 @@ const CoverageTicketWorkspace = ({
   const [editingCoachEmailCardIds, setEditingCoachEmailCardIds] = useState<Set<string>>(new Set());
   const [loadingCoachEmailCardIds, setLoadingCoachEmailCardIds] = useState<Set<string>>(new Set());
   const [collapsedCoverageCardIds, setCollapsedCoverageCardIds] = useState<Set<string>>(new Set());
+  const [expandedSessionDetailsCardIds, setExpandedSessionDetailsCardIds] = useState<Set<string>>(new Set());
   const [pendingFollowUpFilesByCardId, setPendingFollowUpFilesByCardId] = useState<Record<string, CoverageCardAttachment[]>>({});
   const pendingFollowUpFilesRef = useRef<Record<string, CoverageCardAttachment[]>>({});
   const [workspaceTab, setWorkspaceTab] = useState<CoverageWorkspaceTab>("documentation");
@@ -8901,6 +8976,7 @@ const CoverageTicketWorkspace = ({
 
   useEffect(() => {
     setCollapsedCoverageCardIds(new Set());
+    setExpandedSessionDetailsCardIds(new Set());
   }, [ticket.id]);
 
   useEffect(() => {
@@ -9131,6 +9207,66 @@ const CoverageTicketWorkspace = ({
     }));
   };
 
+  const updateCoverageSessionFiles = (
+    cardId: string,
+    updater: (groups: CoverageSessionAttachmentGroup[]) => CoverageSessionAttachmentGroup[],
+  ) => {
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => (
+        card.id === cardId
+          ? {
+              ...card,
+              sessionFiles: updater(buildCoverageSessionFileGroups(currentDraft.inquiry, card.sessionFiles)),
+              updatedAt: new Date().toISOString(),
+              ...buildCoverageCardActorFields(currentAdmin, "updated"),
+            }
+          : card
+      )),
+    }));
+  };
+
+  const updateCoverageSessionGroupDetails = (
+    cardId: string,
+    sessionId: string,
+    updates: Partial<Pick<CoverageSessionAttachmentGroup, "date" | "number" | "subject">>,
+  ) => {
+    const timestamp = new Date().toISOString();
+    expandCoverageHistoryCards();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => {
+        if (card.id !== cardId) {
+          return card;
+        }
+
+        const currentGroups = buildCoverageSessionFileGroups(currentDraft.inquiry, card.sessionFiles);
+        const nextGroups = currentGroups.map((group) => (
+          group.id === sessionId
+            ? {
+                ...group,
+                ...(updates.date !== undefined ? { date: updates.date } : {}),
+                ...(updates.number !== undefined ? { number: normalizeCoverageSessionNumberValue(updates.number) } : {}),
+                ...(updates.subject !== undefined ? { subject: updates.subject } : {}),
+              }
+            : group
+        ));
+
+        return {
+          ...card,
+          sessionFiles: nextGroups,
+          sessionDetails: buildCoverageTutorSessionDetailsFromGroups(
+            currentDraft.inquiry,
+            card.sessionDetails,
+            nextGroups,
+          ),
+          updatedAt: timestamp,
+          ...buildCoverageCardActorFields(currentAdmin, "updated"),
+        };
+      }),
+    }));
+  };
+
   const updatePendingFollowUpFiles = (
     cardId: string,
     updater: (files: CoverageCardAttachment[]) => CoverageCardAttachment[],
@@ -9348,6 +9484,79 @@ const CoverageTicketWorkspace = ({
     }));
   };
 
+  const handleSessionFilesAdded = async (
+    cardId: string,
+    sessionId: string,
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = "";
+
+    if (files.length === 0) {
+      return;
+    }
+
+    const oversizedFiles = getOversizedCoveragePresentationFiles(files);
+    if (oversizedFiles.length > 0) {
+      toast.error(`Each session file must be ${formatBytes(coveragePresentationMaxFileBytes)} or smaller.`);
+      return;
+    }
+
+    const nextFiles = files.map((file) => ({
+      ...createPendingCoverageCardAttachment(file),
+      uploadStatus: "uploading" as const,
+      uploadProgress: 1,
+    }));
+    const pendingIds = new Set(nextFiles.map((file) => file.id));
+    const updateSessionAttachments = (
+      updater: (files: CoverageCardAttachment[]) => CoverageCardAttachment[],
+    ) => updateCoverageSessionFiles(cardId, (groups) => groups.map((group) => (
+      group.id === sessionId
+        ? { ...group, attachments: updater(group.attachments) }
+        : group
+    )));
+
+    try {
+      expandCoverageHistoryCards();
+      updateSessionAttachments((currentFiles) => [...currentFiles, ...nextFiles]);
+
+      const uploadedFiles = await onUploadPresentationFiles(
+        cardId,
+        files,
+        "coverage_tutor_request",
+        (progress) => updateSessionAttachments(
+          (currentFiles) => applyCoverageUploadProgress(currentFiles, pendingIds, progress),
+        ),
+        sessionId,
+      );
+
+      updateSessionAttachments((currentFiles) => applyCoverageUploadSuccess(currentFiles, nextFiles, uploadedFiles));
+      toast.success(`${files.length} session file${files.length === 1 ? "" : "s"} uploaded.`);
+    } catch (error) {
+      updateSessionAttachments((currentFiles) => applyCoverageUploadFailure(currentFiles, pendingIds, error));
+      toast.info("Pre-upload could not finish. The session file will upload when you submit the request.");
+    }
+  };
+
+  const removeSessionFile = (cardId: string, sessionId: string, fileId: string) => {
+    expandCoverageHistoryCards();
+    const currentCard = draftRef.current.coverageCards.find((card) => card.id === cardId);
+    buildCoverageSessionFileGroups(draftRef.current.inquiry, currentCard?.sessionFiles || [])
+      .find((group) => group.id === sessionId)
+      ?.attachments
+      .filter((file) => file.id === fileId)
+      .forEach(revokeCoverageAttachmentObjectUrl);
+
+    updateCoverageSessionFiles(cardId, (groups) => groups.map((group) => (
+      group.id === sessionId
+        ? {
+            ...group,
+            attachments: group.attachments.filter((file) => file.id !== fileId),
+          }
+        : group
+    )));
+  };
+
   const handleFollowUpFilesAdded = async (cardId: string, event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || []);
     event.target.value = "";
@@ -9552,6 +9761,81 @@ const CoverageTicketWorkspace = ({
       return nextIds;
     });
   };
+
+  const toggleSessionDetailsExpanded = (cardId: string) => {
+    setExpandedSessionDetailsCardIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      if (nextIds.has(cardId)) {
+        nextIds.delete(cardId);
+      } else {
+        nextIds.add(cardId);
+      }
+      return nextIds;
+    });
+  };
+
+  const renderCoverageSessionMeta = (sessionGroup: CoverageSessionAttachmentGroup) => {
+    const detailItems = [
+      { label: "Date", value: sessionGroup.date },
+      { label: "Session number", value: sessionGroup.number },
+      { label: "Topic", value: sessionGroup.subject },
+    ].filter((item) => item.value.trim());
+
+    if (detailItems.length === 0) {
+      return <p className="mt-2 text-xs text-muted-foreground">Session-specific files</p>;
+    }
+
+    return (
+      <div className="mt-2 space-y-1.5 text-sm leading-6 text-foreground">
+        {detailItems.map((item) => (
+          <div key={item.label} className="whitespace-normal break-words">
+            <span className="font-semibold text-muted-foreground">{item.label}: </span>
+            <span className="font-medium">{item.value}</span>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const renderCoverageTutorEmailDeliveryBadge = (card: CoverageWorkflowCard) => {
+    const status = normalizeCoverageTutorEmailDeliveryStatus(card.emailDeliveryStatus);
+    if (!card.submittedAt || !status) {
+      return null;
+    }
+
+    const badgeMeta = {
+      pending: {
+        label: "Email pending",
+        className: "border-amber-200 bg-amber-50 text-amber-800",
+      },
+      sent: {
+        label: "Email sent",
+        className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+      },
+      failed: {
+        label: "Email failed",
+        className: "border-destructive/20 bg-destructive/10 text-destructive",
+      },
+    }[status];
+
+    return (
+      <div className="flex flex-col items-start gap-1 sm:items-end">
+        <span className={cn("inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold", badgeMeta.className)}>
+          {badgeMeta.label}
+        </span>
+        {status === "failed" && card.emailDeliveryError ? (
+          <span className="max-w-[260px] text-xs leading-5 text-destructive sm:text-right">
+            {card.emailDeliveryError}
+          </span>
+        ) : card.emailDeliveryUpdatedAt ? (
+          <span className="text-xs text-muted-foreground">
+            {formatDateTime(card.emailDeliveryUpdatedAt)}
+          </span>
+        ) : null}
+      </div>
+    );
+  };
+
   const coverageCardsForDisplay = sortCoverageWorkflowCardsForDisplay(draft.coverageCards);
   const hasOpenTutorChoiceDraft = draft.coverageCards.some(isOpenCoverageTutorChoiceDraft);
   const hasCoverageFollowUpOpportunity = !isArchived && draft.coverageCards.some(canSendCoverageTutorFollowUp);
@@ -9934,12 +10218,23 @@ const CoverageTicketWorkspace = ({
             const normalizedTutorRequestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
             const tutorChoiceStatusLabel = normalizedTutorRequestStatus === "draft" ? "" : getCoverageTutorRequestLabel(normalizedTutorRequestStatus);
             const showCompactTutorChoice = cardReadOnly;
-            const compactTutorRequestSummary = summarizeCoverageTutorRequestDetails(card.sessionDetails);
             const linkedTutorReplyCard = draft.coverageCards.find((candidate) => (
               candidate.type === "tutor_reply" && candidate.relatedTutorChoiceCardId === card.id
             ));
             const canSendFollowUpFiles = !isArchived && canSendCoverageTutorFollowUp(card);
             const pendingFollowUpFiles = pendingFollowUpFilesByCardId[card.id] || [];
+            const sessionFileGroups = buildCoverageSessionFileGroups(draft.inquiry, card.sessionFiles);
+            const syncedSessionDetails = buildCoverageTutorSessionDetailsFromGroups(
+              draft.inquiry,
+              card.sessionDetails,
+              sessionFileGroups,
+            );
+            const compactTutorRequestSummary = summarizeCoverageTutorRequestDetails(syncedSessionDetails);
+            const hasSessionFilesUploading = sessionFileGroups.some((group) => (
+              group.attachments.some(isCoverageAttachmentUploadInProgress)
+            ));
+            const hasSessionAttachments = sessionFileGroups.some((group) => group.attachments.length > 0);
+            const isSessionDetailsExpanded = expandedSessionDetailsCardIds.has(card.id);
 
             if (showCompactTutorChoice && linkedTutorReplyCard) {
               return null;
@@ -10033,8 +10328,11 @@ const CoverageTicketWorkspace = ({
                           </div>
                         </div>
                         {card.submittedAt ? (
-                          <div className="text-xs text-muted-foreground">
-                            Submitted {formatDateTime(card.submittedAt)}
+                          <div className="flex flex-col items-start gap-2 sm:items-end">
+                            <div className="text-xs text-muted-foreground">
+                              Submitted {formatDateTime(card.submittedAt)}
+                            </div>
+                            {renderCoverageTutorEmailDeliveryBadge(card)}
                           </div>
                         ) : null}
                       </div>
@@ -10059,9 +10357,9 @@ const CoverageTicketWorkspace = ({
                             ))}
                           </div>
                         </div>
-                      ) : card.sessionDetails ? (
+                      ) : syncedSessionDetails ? (
                         <div className="mt-3 whitespace-pre-wrap rounded-xl border border-primary/10 bg-white/85 px-3 py-2 text-sm leading-7 text-foreground">
-                          {card.sessionDetails}
+                          {syncedSessionDetails}
                         </div>
                       ) : null}
                       {card.presentationFiles.length > 0 ? (
@@ -10078,9 +10376,44 @@ const CoverageTicketWorkspace = ({
                             </button>
                           ))}
                         </div>
-                      ) : canSendFollowUpFiles ? (
+                      ) : canSendFollowUpFiles && !hasSessionAttachments ? (
                         <div className="mt-3 rounded-xl border border-dashed border-primary/15 bg-white/70 px-3 py-2 text-sm text-muted-foreground">
                           No presentation files have been shared with this recipient yet.
+                        </div>
+                      ) : null}
+                      {hasSessionAttachments ? (
+                        <div className="mt-3 space-y-2">
+                          <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                            Session Files
+                          </div>
+                          <div className="grid gap-2 md:grid-cols-2">
+                            {sessionFileGroups
+                              .filter((sessionGroup) => sessionGroup.attachments.length > 0)
+                              .map((sessionGroup, sessionIndex) => (
+                                <div
+                                  key={sessionGroup.id}
+                                  className="rounded-xl border border-primary/10 bg-white/85 px-3 py-2"
+                                >
+                                  <div className="text-xs font-semibold text-foreground">
+                                    {sessionGroup.label || `Session ${sessionIndex + 1}`}
+                                  </div>
+                                  {renderCoverageSessionMeta(sessionGroup)}
+                                  <div className="mt-2 flex flex-wrap gap-2">
+                                    {sessionGroup.attachments.map((file) => (
+                                      <button
+                                        key={file.id}
+                                        type="button"
+                                        onClick={() => setPreviewAttachment(file)}
+                                        className="inline-flex max-w-full items-center gap-2 rounded-full border bg-background px-3 py-1.5 text-xs shadow-sm"
+                                      >
+                                        <span className="truncate font-medium text-primary">{file.name}</span>
+                                        <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
                         </div>
                       ) : null}
                     </div>
@@ -10256,8 +10589,63 @@ const CoverageTicketWorkspace = ({
                     </div>
 
                     <div className="mt-3 grid gap-3 lg:grid-cols-2">
-                      <div className="space-y-2 lg:col-span-2">
-                        <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Presentation Upload</Label>
+                      <div className="order-1 space-y-2 lg:col-span-2">
+                        <div className="rounded-2xl border border-primary/10 bg-white/90 p-3 shadow-sm">
+                          <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                            <div className="min-w-0">
+                              <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                Session Summary
+                              </Label>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {compactTutorRequestSummary.moduleLine ? (
+                                  <span className="rounded-full border border-primary/10 bg-primary/[0.05] px-3 py-1 text-xs font-semibold text-primary">
+                                    {compactTutorRequestSummary.moduleLine}
+                                  </span>
+                                ) : null}
+                                {compactTutorRequestSummary.preferredTimeLine ? (
+                                  <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-800">
+                                    {compactTutorRequestSummary.preferredTimeLine}
+                                  </span>
+                                ) : null}
+                                <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
+                                  {sessionFileGroups.length || compactTutorRequestSummary.sessionCount || 0} session
+                                  {(sessionFileGroups.length || compactTutorRequestSummary.sessionCount) === 1 ? "" : "s"}
+                                </span>
+                              </div>
+                              <p className="mt-2 text-xs text-muted-foreground">
+                                Update Date, Session number, or Topic in the session cards below. Raw details stay in sync automatically.
+                              </p>
+                            </div>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => toggleSessionDetailsExpanded(card.id)}
+                              className="shrink-0 rounded-xl"
+                            >
+                              {isSessionDetailsExpanded ? "Hide raw details" : "Show raw details"}
+                              <ChevronDown className={cn("ml-2 h-4 w-4 transition-transform", isSessionDetailsExpanded && "rotate-180")} />
+                            </Button>
+                          </div>
+
+                          {isSessionDetailsExpanded ? (
+                            <div className="mt-3 border-t border-primary/10 pt-3">
+                              <Textarea
+                                value={syncedSessionDetails}
+                                readOnly
+                                placeholder="Add the session details the tutor should review..."
+                                className="min-h-[110px] resize-none bg-background font-mono text-xs leading-5"
+                              />
+                              <p className="mt-2 text-xs text-muted-foreground">
+                                This text is generated from Sessions to Cover and will be sent to the tutor.
+                              </p>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      <div className="order-3 space-y-2 lg:col-span-2">
+                        <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">General Presentation Upload</Label>
                         <div className="rounded-2xl border border-primary/12 bg-gradient-to-br from-white via-primary/[0.02] to-violet-50/40 p-3 shadow-sm">
                           <input
                             id={`coverage-presentation-${card.id}`}
@@ -10277,12 +10665,12 @@ const CoverageTicketWorkspace = ({
                               )}
                             >
                               <Paperclip className="h-4 w-4" />
-                              {card.presentationFiles.length > 0 ? "Add More Files" : "Attach Presentation Files"}
+                              {card.presentationFiles.length > 0 ? "Add More Files" : "Attach General Files"}
                             </label>
                             <div className="text-sm text-muted-foreground xl:text-right">
                               {card.presentationFiles.length > 0
                                 ? `${card.presentationFiles.length} file${card.presentationFiles.length === 1 ? "" : "s"} selected`
-                                : "PDF, PPT, PPTX, ODP, Keynote, or image files"}
+                                : "Shared across all requested sessions"}
                             </div>
                           </div>
                           {card.presentationFiles.length > 0 ? (
@@ -10329,21 +10717,141 @@ const CoverageTicketWorkspace = ({
                             </div>
                           ) : null}
                           <p className="mt-3 text-xs text-muted-foreground">
-                            Presentation files are optional for the first tutor request. You can send them later as a follow-up if they are not ready yet.
+                            Use this only when the same file applies to every requested session.
                           </p>
+                        </div>
+                      </div>
+
+                      {sessionFileGroups.length > 0 ? (
+                        <div className="order-2 space-y-2 lg:col-span-2">
+                          <div className="flex flex-wrap items-end justify-between gap-2">
+                            <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Sessions to Cover</Label>
+                            <span className="text-xs text-muted-foreground">Attach files only to the sessions that need specific coverage.</span>
+                          </div>
+                          <div className="grid gap-3 xl:grid-cols-2">
+                            {sessionFileGroups.map((sessionGroup, sessionIndex) => {
+                              const inputId = `coverage-session-${card.id}-${sessionGroup.id}`;
+
+                              return (
+                                <div
+                                  key={sessionGroup.id}
+                                  className="rounded-2xl border border-primary/10 bg-white/90 p-3 shadow-sm"
+                                >
+                                  <input
+                                    id={inputId}
+                                    type="file"
+                                    multiple
+                                    accept=".pdf,.ppt,.pptx,.odp,.key,image/*"
+                                    disabled={isSaving}
+                                    onChange={(event) => void handleSessionFilesAdded(card.id, sessionGroup.id, event)}
+                                    className="sr-only"
+                                  />
+                                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                                    <div className="min-w-0">
+                                      <div className="text-sm font-semibold text-foreground">
+                                        {sessionGroup.label || `Session ${sessionIndex + 1}`}
+                                      </div>
+                                    </div>
+                                    <label
+                                      htmlFor={inputId}
+                                      className={cn(
+                                        "inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-primary/15 bg-primary/[0.04] px-3 py-2 text-xs font-semibold text-primary transition hover:border-primary/30 hover:bg-primary/[0.08]",
+                                        isSaving && "cursor-not-allowed opacity-60",
+                                      )}
+                                    >
+                                      <Paperclip className="h-3.5 w-3.5" />
+                                      {sessionGroup.attachments.length > 0 ? "Add Files" : "Attach Files"}
+                                    </label>
+                                  </div>
+                                  <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                    <div className="space-y-1.5">
+                                      <Label className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                        Date
+                                      </Label>
+                                      <Input
+                                        value={sessionGroup.date}
+                                        onChange={(event) => updateCoverageSessionGroupDetails(card.id, sessionGroup.id, { date: event.target.value })}
+                                        disabled={isSaving}
+                                        placeholder="Monday 10 Apr 2028"
+                                        className="h-10 bg-white/95 text-sm"
+                                      />
+                                    </div>
+                                    <div className="space-y-1.5 md:max-w-[220px]">
+                                      <Label className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                        Session number
+                                      </Label>
+                                      <Input
+                                        value={sessionGroup.number}
+                                        onChange={(event) => updateCoverageSessionGroupDetails(card.id, sessionGroup.id, { number: event.target.value })}
+                                        disabled={isSaving}
+                                        placeholder="5"
+                                        className="h-10 bg-white/95 text-sm"
+                                      />
+                                    </div>
+                                    <div className="space-y-1.5 md:col-span-2">
+                                      <Label className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                        Topic
+                                      </Label>
+                                      <Textarea
+                                        value={sessionGroup.subject}
+                                        onChange={(event) => updateCoverageSessionGroupDetails(card.id, sessionGroup.id, { subject: event.target.value })}
+                                        disabled={isSaving}
+                                        placeholder="Session topic or notes for this covered session"
+                                        className="min-h-[72px] resize-y bg-white/95 text-sm leading-6"
+                                      />
+                                    </div>
+                                  </div>
+                                  {sessionGroup.attachments.length > 0 ? (
+                                    <div className="mt-3 flex min-w-0 flex-wrap gap-2">
+                                      {sessionGroup.attachments.map((file) => (
+                                        <div
+                                          key={file.id}
+                                          className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-full border border-primary/10 bg-slate-50 px-3 py-1.5 text-xs"
+                                        >
+                                          <button
+                                            type="button"
+                                            onClick={() => setPreviewAttachment(file)}
+                                            className="truncate font-medium text-primary underline-offset-4 hover:underline"
+                                          >
+                                            {file.name}
+                                          </button>
+                                          <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                                          {getCoverageSessionAttachmentUploadLabel(file) ? (
+                                            <span
+                                              className={cn(
+                                                "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                                                file.uploadStatus === "failed" && !file.file
+                                                  ? "bg-red-50 text-red-700"
+                                                  : isCoverageAttachmentUploadInProgress(file)
+                                                    ? "bg-primary/10 text-primary"
+                                                    : file.uploadStatus === "failed"
+                                                      ? "bg-amber-50 text-amber-700"
+                                                    : "bg-emerald-50 text-emerald-700",
+                                              )}
+                                            >
+                                              {getCoverageSessionAttachmentUploadLabel(file)}
+                                            </span>
+                                          ) : null}
+                                          <button
+                                            type="button"
+                                            onClick={() => removeSessionFile(card.id, sessionGroup.id, file.id)}
+                                            className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition hover:bg-secondary hover:text-foreground"
+                                            aria-label={`Remove ${file.name}`}
+                                          >
+                                            <X className="h-3 w-3" />
+                                          </button>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="mt-3 text-xs text-muted-foreground">No files attached to this session yet.</p>
+                                  )}
+                                </div>
+                              );
+                            })}
                           </div>
                         </div>
-
-                      <div className="space-y-2 lg:col-span-2">
-                        <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Session Details</Label>
-                        <Textarea
-                          value={card.sessionDetails}
-                          onChange={(event) => updateCoverageCard(card.id, { sessionDetails: event.target.value })}
-                          readOnly={false}
-                          placeholder="Add the session details the tutor should review..."
-                          className="min-h-[130px] bg-background"
-                        />
-                      </div>
+                      ) : null}
                     </div>
 
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t pt-3">
@@ -10361,6 +10869,7 @@ const CoverageTicketWorkspace = ({
                           || isTutorEmailLoading
                           || isCoachEmailLoading
                           || card.presentationFiles.some(isCoverageAttachmentUploadInProgress)
+                          || hasSessionFilesUploading
                         }
                         className="border-0 gradient-primary"
                       >
@@ -12553,6 +13062,19 @@ function createCoverageCardId() {
   return `coverage-card-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function normalizeCoverageSessionNumberValue(value: string) {
+  return value.replace(/^\s*No\.?\s*/i, "");
+}
+
+function extractCoverageSessionDetailHeaderValue(sessionDetails: string, label: string) {
+  const line = sessionDetails
+    .split("\n")
+    .map((item) => item.trim())
+    .find((item) => item.toLowerCase().startsWith(`${label.toLowerCase()}:`));
+
+  return line ? line.slice(label.length + 1).trim() : "";
+}
+
 function buildCoverageTutorSessionDetails(inquiry: string) {
   const parsedInquiry = parseCoverageInquiry(inquiry);
   if (!parsedInquiry) {
@@ -12584,6 +13106,123 @@ function buildCoverageTutorSessionDetails(inquiry: string) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function buildCoverageTutorSessionDetailsFromGroups(
+  inquiry: string,
+  currentSessionDetails: string,
+  groups: CoverageSessionAttachmentGroup[],
+) {
+  const parsedInquiry = parseCoverageInquiry(inquiry);
+  const moduleValue = extractCoverageSessionDetailHeaderValue(currentSessionDetails, "Module")
+    || parsedInquiry?.module
+    || "";
+  const preferredTimeValue = extractCoverageSessionDetailHeaderValue(currentSessionDetails, "Preferred Time")
+    || parsedInquiry?.time
+    || "";
+  const sessionLines = groups
+    .map((group, index) => {
+      const sessionNumber = normalizeCoverageSessionNumberValue(group.number).trim();
+      const sessionParts = [
+        group.date.trim(),
+        sessionNumber ? `No. ${sessionNumber}` : "",
+        group.subject.trim(),
+      ].filter(Boolean);
+
+      return sessionParts.length > 0 ? `${index + 1}. ${sessionParts.join(" | ")}` : "";
+    })
+    .filter(Boolean);
+
+  return [
+    moduleValue ? `Module: ${moduleValue}` : "",
+    preferredTimeValue ? `Preferred Time: ${preferredTimeValue}` : "",
+    sessionLines.length > 0 ? "Sessions:" : "",
+    ...sessionLines,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildCoverageSessionFileGroups(
+  inquiry: string,
+  existingGroups: CoverageSessionAttachmentGroup[] = [],
+): CoverageSessionAttachmentGroup[] {
+  const parsedInquiry = parseCoverageInquiry(inquiry);
+  if (!parsedInquiry) {
+    return existingGroups;
+  }
+
+  const sessionDates = parsedInquiry.sessionDates || [];
+  const sessionNumbers = parsedInquiry.sessionNumbers || [];
+  const sessionSubjects = parsedInquiry.sessionSubjects || [];
+  const sessionCount = Math.max(sessionDates.length, sessionNumbers.length, sessionSubjects.length, existingGroups.length);
+  if (sessionCount === 0) {
+    return existingGroups;
+  }
+
+  const existingById = new Map(existingGroups.map((group) => [group.id, group]));
+
+  return Array.from({ length: sessionCount }).map((_, index) => {
+    const id = `session-${index + 1}`;
+    const existingGroup = existingById.get(id) || existingGroups[index];
+    const date = existingGroup ? existingGroup.date : sessionDates[index]?.trim() || "";
+    const number = existingGroup ? existingGroup.number : sessionNumbers[index]?.trim() || "";
+    const subject = existingGroup ? existingGroup.subject : sessionSubjects[index]?.trim() || "";
+
+    return {
+      id,
+      label: existingGroup?.label || `Session ${index + 1}`,
+      date,
+      number,
+      subject,
+      attachments: existingGroup?.attachments || [],
+    };
+  });
+}
+
+function normalizeCoverageSessionFileGroups(
+  groups: CoverageSessionAttachmentGroup[] | null | undefined,
+  inquiry = "",
+): CoverageSessionAttachmentGroup[] {
+  const normalizedGroups = Array.isArray(groups)
+    ? groups.flatMap((group, index) => {
+        if (!group || typeof group !== "object") {
+          return [];
+        }
+
+        const attachments = Array.isArray(group.attachments)
+          ? group.attachments
+            .map((file) => normalizeCoverageCardAttachment(file))
+            .filter((file): file is CoverageCardAttachment => Boolean(file))
+          : [];
+
+        return [{
+          id: group.id || `session-${index + 1}`,
+          label: group.label || `Session ${index + 1}`,
+          date: group.date || "",
+          number: group.number || "",
+          subject: group.subject || "",
+          attachments,
+        }];
+      })
+    : [];
+
+  return buildCoverageSessionFileGroups(inquiry, normalizedGroups);
+}
+
+function serializeCoverageSessionFileGroupsForRequest(
+  groups: CoverageSessionAttachmentGroup[] | null | undefined,
+): CoverageSessionAttachmentGroup[] {
+  return (groups || []).map((group, index) => ({
+    id: group.id || `session-${index + 1}`,
+    label: group.label || `Session ${index + 1}`,
+    date: group.date || "",
+    number: group.number || "",
+    subject: group.subject || "",
+    attachments: (group.attachments || [])
+      .filter((attachment) => !attachment.file)
+      .map(serializeCoverageCardAttachmentForRequest),
+  }));
 }
 
 function CoverageInquirySummary({ inquiry }: { inquiry: string }) {
@@ -12721,6 +13360,11 @@ function createCoverageTutorChoiceCard(
     requestSubmittedByAgentName: "",
     requestSubmittedByAgentUsername: "",
     responseToken: "",
+    emailDeliveryStatus: "",
+    emailDeliveryUpdatedAt: "",
+    emailDeliveryMessageId: "",
+    emailDeliveryThreadId: "",
+    emailDeliveryError: "",
     sessionStartAt: "",
     sessionEndAt: "",
     confirmedAt: "",
@@ -12728,6 +13372,7 @@ function createCoverageTutorChoiceCard(
     confirmedByAgentName: "",
     confirmedByAgentUsername: "",
     presentationFiles: [],
+    sessionFiles: buildCoverageSessionFileGroups(inquiry),
   };
 }
 
@@ -12761,6 +13406,11 @@ function createCoverageNoteCard(
     requestSubmittedByAgentName: "",
     requestSubmittedByAgentUsername: "",
     responseToken: "",
+    emailDeliveryStatus: "",
+    emailDeliveryUpdatedAt: "",
+    emailDeliveryMessageId: "",
+    emailDeliveryThreadId: "",
+    emailDeliveryError: "",
     sessionStartAt: "",
     sessionEndAt: "",
     confirmedAt: "",
@@ -12768,6 +13418,7 @@ function createCoverageNoteCard(
     confirmedByAgentName: "",
     confirmedByAgentUsername: "",
     presentationFiles: [],
+    sessionFiles: [],
   };
 }
 
@@ -12829,6 +13480,25 @@ function normalizeCoverageTutorRequestStatus(status: unknown): CoverageTutorRequ
   }
 }
 
+function normalizeCoverageTutorEmailDeliveryStatus(status: unknown): CoverageTutorEmailDeliveryStatus {
+  switch (status) {
+    case "pending":
+    case "queued":
+      return "pending";
+    case "sent":
+    case "delivered":
+    case "success":
+    case "succeeded":
+      return "sent";
+    case "failed":
+    case "failure":
+    case "error":
+      return "failed";
+    default:
+      return "";
+  }
+}
+
 function normalizeCoverageTutorReplyOutcome(outcome: unknown): CoverageTutorReplyOutcome {
   switch (outcome) {
     case "accepted":
@@ -12851,12 +13521,14 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
         }
 
         const requestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
+        const emailDeliveryStatus = normalizeCoverageTutorEmailDeliveryStatus(card.emailDeliveryStatus);
         const replyOutcome = normalizeCoverageTutorReplyOutcome(card.replyOutcome);
         const presentationFiles = Array.isArray(card.presentationFiles)
           ? card.presentationFiles
             .map((file) => normalizeCoverageCardAttachment(file))
             .filter((file): file is CoverageCardAttachment => Boolean(file))
           : [];
+        const sessionFiles = normalizeCoverageSessionFileGroups(card.sessionFiles);
 
         return [{
           id: card.id || createCoverageCardId(),
@@ -12887,6 +13559,11 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           requestSubmittedByAgentName: card.requestSubmittedByAgentName || "",
           requestSubmittedByAgentUsername: card.requestSubmittedByAgentUsername || "",
           responseToken: card.responseToken || "",
+          emailDeliveryStatus,
+          emailDeliveryUpdatedAt: card.emailDeliveryUpdatedAt || "",
+          emailDeliveryMessageId: card.emailDeliveryMessageId || "",
+          emailDeliveryThreadId: card.emailDeliveryThreadId || "",
+          emailDeliveryError: card.emailDeliveryError || "",
           sessionStartAt: card.sessionStartAt || "",
           sessionEndAt: card.sessionEndAt || "",
           confirmedAt: card.confirmedAt || "",
@@ -12894,6 +13571,7 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           confirmedByAgentName: card.confirmedByAgentName || "",
           confirmedByAgentUsername: card.confirmedByAgentUsername || "",
           presentationFiles,
+          sessionFiles,
         }];
       })
     : [];
@@ -13086,6 +13764,7 @@ function serializeCoverageDocumentationForRequest(documentation: AdminDocumentat
     coverageCards: documentation.coverageCards.map((card) => ({
       ...card,
       presentationFiles: card.presentationFiles.map(serializeCoverageCardAttachmentForRequest),
+      sessionFiles: serializeCoverageSessionFileGroupsForRequest(card.sessionFiles),
     })),
     documentationCards: documentation.documentationCards.map((card) => ({
       ...card,
@@ -13439,13 +14118,17 @@ function buildCoverageDocumentationDraft(
   ticket: Pick<TicketDetail, "id" | "inquiry" | "chatId" | "documentation">,
 ): AdminDocumentation {
   const normalizedDocumentation = normalizeDocumentationDraft(ticket.documentation);
+  const coverageInquiry = normalizedDocumentation.inquiry || ticket.inquiry || "";
   const coverageCards = normalizedDocumentation.coverageCards.length > 0
-    ? normalizedDocumentation.coverageCards
-    : [createCoverageTutorChoiceCard(ticket.inquiry || normalizedDocumentation.inquiry)];
+    ? normalizedDocumentation.coverageCards.map((card) => ({
+        ...card,
+        sessionFiles: buildCoverageSessionFileGroups(coverageInquiry, card.sessionFiles),
+      }))
+    : [createCoverageTutorChoiceCard(coverageInquiry)];
 
   return {
     ...normalizedDocumentation,
-    inquiry: normalizedDocumentation.inquiry || ticket.inquiry || "",
+    inquiry: coverageInquiry,
     chatId: normalizedDocumentation.chatId || ticket.chatId || "",
     ticketId: normalizedDocumentation.ticketId || ticket.id || "",
     coverageCards,
@@ -14448,18 +15131,24 @@ function getCoverageAttachmentUploadLabel(file: CoverageCardAttachment) {
   return "";
 }
 
+function getCoverageSessionAttachmentUploadLabel(file: CoverageCardAttachment) {
+  return getCoverageAttachmentUploadLabel(file);
+}
+
 function uploadCoveragePresentationFilesWithProgress({
   ticketId,
   cardId,
   source,
   files,
   onProgress,
+  sessionId,
 }: {
   ticketId: string;
   cardId: string;
   source: CoveragePresentationUploadSource;
   files: File[];
   onProgress: (progress: number) => void;
+  sessionId?: string;
 }): Promise<CoverageCardAttachment[]> {
   return new Promise((resolve, reject) => {
     if (files.length === 0) {
@@ -14471,6 +15160,9 @@ function uploadCoveragePresentationFilesWithProgress({
     const formData = new FormData();
     formData.append("cardId", cardId);
     formData.append("source", source);
+    if (sessionId) {
+      formData.append("sessionId", sessionId);
+    }
     files.forEach((file) => {
       formData.append("presentationFiles", file, file.name || "attachment");
     });
@@ -14914,6 +15606,9 @@ const activityEventLabels: Record<string, string> = {
   coverage_tutor_follow_up_webhook_failed: "Tutor Files Delivery Failed",
   coverage_tutor_refusal_mail_failed: "Tutor Refusal Mail Failed",
   coverage_tutor_refusal_mail_notified: "Tutor Refusal Mail Sent",
+  coverage_tutor_request_email_failed: "Tutor Request Email Failed",
+  coverage_tutor_request_email_pending: "Tutor Request Email Pending",
+  coverage_tutor_request_email_sent: "Tutor Request Email Sent",
   coverage_tutor_request_webhook_delivered: "Tutor Request Delivered",
   coverage_tutor_request_webhook_failed: "Tutor Request Delivery Failed",
   coverage_tutor_response: "Tutor Reply",
@@ -15003,6 +15698,10 @@ const activityPayloadLabels: Record<string, string> = {
   webhookDelivered: "Webhook Delivered",
   webhookStatus: "Webhook Status",
   webhookConfigured: "Webhook Configured",
+  emailDeliveryStatus: "Email Delivery Status",
+  emailDeliveryMessageId: "Email Message ID",
+  emailDeliveryThreadId: "Email Thread ID",
+  emailDeliveryError: "Email Delivery Error",
 };
 
 function getActivityEventLabel(eventType: string) {

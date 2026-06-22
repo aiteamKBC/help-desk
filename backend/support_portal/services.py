@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import logging
 import mimetypes
@@ -20,6 +21,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
+from django.core import signing
 from django.db import close_old_connections, connection, transaction
 from django.utils import timezone as django_timezone
 
@@ -258,6 +260,11 @@ CHAT_MESSAGE_ID_METADATA_KEY = "client_message_id"
 CHAT_ATTACHMENTS_METADATA_KEY = "attachments"
 CHAT_ATTACHMENT_STORAGE_SEGMENT = "chat"
 COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 30
+COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
+COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES = 18 * 1024 * 1024
+COVERAGE_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS = 60 * 24 * 60 * 60
+COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT = "support_portal.coverage_attachment_download"
+COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT = "support_portal.coverage_tutor_email_delivery"
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_SLA_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS = 8
@@ -306,6 +313,41 @@ def get_support_attachment_max_file_bytes() -> int:
         normalized_value = DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES
 
     return max(normalized_value, 1024)
+
+
+def get_int_setting(name: str, default: int, *, minimum: int = 0) -> int:
+    configured_value = getattr(settings, name, default)
+
+    try:
+        normalized_value = int(configured_value)
+    except (TypeError, ValueError):
+        normalized_value = default
+
+    return max(normalized_value, minimum)
+
+
+def get_coverage_webhook_attachment_max_file_bytes() -> int:
+    return get_int_setting(
+        "COVERAGE_WEBHOOK_ATTACHMENT_MAX_FILE_BYTES",
+        COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_FILE_BYTES,
+        minimum=0,
+    )
+
+
+def get_coverage_webhook_attachment_max_total_bytes() -> int:
+    return get_int_setting(
+        "COVERAGE_WEBHOOK_ATTACHMENT_MAX_TOTAL_BYTES",
+        COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES,
+        minimum=0,
+    )
+
+
+def get_coverage_public_attachment_link_max_age_seconds() -> int:
+    return get_int_setting(
+        "COVERAGE_PUBLIC_ATTACHMENT_LINK_MAX_AGE_SECONDS",
+        COVERAGE_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS,
+        minimum=60,
+    )
 
 
 def get_open_ticket_inactivity_sync_min_interval_seconds() -> int:
@@ -391,6 +433,96 @@ def delete_support_attachment_file(storage_key: str) -> None:
 
 def build_admin_ticket_attachment_download_url(public_id: str, attachment_id: int) -> str:
     return f"/api/admin/tickets/{urllib_parse.quote(public_id)}/attachments/{attachment_id}/download"
+
+
+def build_public_coverage_attachment_token(public_id: str, attachment_id: int) -> str:
+    normalized_public_id = sanitize_text(public_id)
+    try:
+        normalized_attachment_id = int(attachment_id)
+    except (TypeError, ValueError):
+        normalized_attachment_id = 0
+
+    if not normalized_public_id or normalized_attachment_id <= 0:
+        return ""
+
+    return signing.dumps(
+        {
+            "ticketId": normalized_public_id,
+            "attachmentId": normalized_attachment_id,
+        },
+        salt=COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+        compress=True,
+    )
+
+
+def decode_public_coverage_attachment_token(token: Any) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        raise ApiError(403, "Attachment link is invalid.")
+
+    try:
+        payload = signing.loads(
+            normalized_token,
+            salt=COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+            max_age=get_coverage_public_attachment_link_max_age_seconds(),
+        )
+    except signing.SignatureExpired as error:
+        raise ApiError(410, "Attachment link has expired.") from error
+    except signing.BadSignature as error:
+        raise ApiError(403, "Attachment link is invalid.") from error
+
+    return normalize_json_object(payload)
+
+
+def build_public_coverage_attachment_download_url(public_id: str, attachment_id: int) -> str:
+    token = build_public_coverage_attachment_token(public_id, attachment_id)
+    public_base_url = get_support_portal_public_base_url("")
+    if not token or not public_base_url:
+        return ""
+
+    return (
+        f"{public_base_url}/api/public/coverage-attachments/"
+        f"{urllib_parse.quote(sanitize_text(public_id))}/{int(attachment_id)}/download?"
+        f"{urllib_parse.urlencode({'token': token})}"
+    )
+
+
+def build_coverage_tutor_email_delivery_callback_token(
+    ticket_public_id: Any,
+    card_id: Any,
+    response_token: Any,
+) -> str:
+    normalized_ticket_public_id = sanitize_text(ticket_public_id)
+    normalized_card_id = sanitize_text(card_id)
+    normalized_response_token = sanitize_text(response_token)
+    if not normalized_ticket_public_id or not normalized_card_id:
+        return ""
+
+    return signing.dumps(
+        {
+            "ticketId": normalized_ticket_public_id,
+            "cardId": normalized_card_id,
+            "responseToken": normalized_response_token,
+        },
+        salt=COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT,
+        compress=True,
+    )
+
+
+def decode_coverage_tutor_email_delivery_callback_token(token: Any) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        raise ApiError(403, "Email delivery callback token is required.")
+
+    try:
+        return normalize_json_object(
+            signing.loads(
+                normalized_token,
+                salt=COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT,
+            )
+        )
+    except signing.BadSignature as error:
+        raise ApiError(403, "Email delivery callback token is invalid.") from error
 
 
 def build_ticket_chat_attachment_download_url(public_id: str, client_attachment_id: str) -> str:
@@ -596,7 +728,9 @@ def get_admin_ticket_attachment_file(
           a.id,
           a.file_name,
           a.mime_type,
+          a.file_size,
           a.storage_url,
+          a.metadata AS attachment_metadata,
           t.public_id,
           t.technical_subcategory,
           t.assigned_team,
@@ -628,8 +762,41 @@ def get_admin_ticket_attachment_file(
     return {
         "fileName": sanitize_support_attachment_name(attachment.get("file_name")),
         "mimeType": sanitize_text(attachment.get("mime_type")) or None,
+        "fileSize": int(attachment.get("file_size") or 0),
+        "metadata": normalize_json_object(attachment.get("attachment_metadata")),
+        "technicalSubcategory": sanitize_text(attachment.get("technical_subcategory")),
         "path": attachment_path,
     }
+
+
+def is_public_coverage_attachment_allowed(attachment: dict[str, Any]) -> bool:
+    if sanitize_text(attachment.get("technicalSubcategory")) == "Coverage":
+        return True
+
+    metadata = normalize_json_object(attachment.get("metadata"))
+    source = sanitize_text(metadata.get("source"))
+    return source.startswith("coverage_")
+
+
+def get_public_coverage_attachment_file(public_id: str, attachment_id: int, token: Any) -> dict[str, Any]:
+    token_payload = decode_public_coverage_attachment_token(token)
+
+    try:
+        normalized_token_attachment_id = int(token_payload.get("attachmentId") or 0)
+    except (TypeError, ValueError):
+        normalized_token_attachment_id = 0
+
+    if (
+        sanitize_text(token_payload.get("ticketId")) != sanitize_text(public_id)
+        or normalized_token_attachment_id != int(attachment_id)
+    ):
+        raise ApiError(403, "Attachment link is invalid.")
+
+    attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
+    if not is_public_coverage_attachment_allowed(attachment):
+        raise ApiError(404, "Attachment not found.")
+
+    return attachment
 
 
 def get_ticket_chat_attachment_file(
@@ -1484,12 +1651,99 @@ def normalize_coverage_card_attachment(value: Any, *, allow_pending_upload: bool
     }
 
 
+def normalize_coverage_session_file_groups(value: Any) -> list[dict[str, Any]]:
+    raw_groups = value if isinstance(value, list) else []
+    normalized_groups: list[dict[str, Any]] = []
+
+    for index, item in enumerate(raw_groups):
+        source = normalize_json_object(item)
+        if not source:
+            continue
+
+        raw_attachments = source.get("attachments") if isinstance(source.get("attachments"), list) else []
+        attachments = []
+        for attachment in raw_attachments:
+            normalized_attachment = normalize_coverage_card_attachment(attachment)
+            if normalized_attachment:
+                attachments.append(normalized_attachment)
+
+        normalized_groups.append(
+            {
+                "id": sanitize_text(source.get("id")) or f"session-{index + 1}",
+                "label": sanitize_text(source.get("label")) or f"Session {index + 1}",
+                "date": sanitize_text(source.get("date")),
+                "number": sanitize_text(source.get("number")),
+                "subject": sanitize_text(source.get("subject")),
+                "attachments": attachments,
+            }
+        )
+
+    return normalized_groups
+
+
+def merge_coverage_session_attachments(
+    groups: Any,
+    uploaded_by_session_id: dict[str, list[dict[str, Any]]],
+    metadata_by_session_id: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_groups = normalize_coverage_session_file_groups(groups)
+    metadata_by_session_id = metadata_by_session_id or {}
+    group_index_by_id = {
+        sanitize_text(group.get("id")): index
+        for index, group in enumerate(normalized_groups)
+        if sanitize_text(group.get("id"))
+    }
+
+    for session_id, attachments in uploaded_by_session_id.items():
+        normalized_session_id = sanitize_text(session_id)
+        if not normalized_session_id or not attachments:
+            continue
+
+        if normalized_session_id not in group_index_by_id:
+            metadata = metadata_by_session_id.get(normalized_session_id, {})
+            group_index_by_id[normalized_session_id] = len(normalized_groups)
+            normalized_groups.append(
+                {
+                    "id": normalized_session_id,
+                    "label": sanitize_text(metadata.get("label")) or f"Session {len(normalized_groups) + 1}",
+                    "date": sanitize_text(metadata.get("date")),
+                    "number": sanitize_text(metadata.get("number")),
+                    "subject": sanitize_text(metadata.get("subject")),
+                    "attachments": [],
+                }
+            )
+
+        group = normalized_groups[group_index_by_id[normalized_session_id]]
+        existing_keys = {
+            sanitize_text(attachment.get("id"))
+            or sanitize_text(attachment.get("attachmentId"))
+            or sanitize_text(attachment.get("storageKey"))
+            for attachment in group.get("attachments") or []
+        }
+        next_attachments = list(group.get("attachments") or [])
+        for attachment in attachments:
+            attachment_key = (
+                sanitize_text(attachment.get("id"))
+                or sanitize_text(attachment.get("attachmentId"))
+                or sanitize_text(attachment.get("storageKey"))
+            )
+            if attachment_key and attachment_key in existing_keys:
+                continue
+            next_attachments.append(attachment)
+            if attachment_key:
+                existing_keys.add(attachment_key)
+        group["attachments"] = next_attachments
+
+    return normalized_groups
+
+
 def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
     raw_cards = value if isinstance(value, list) else []
     normalized_cards: list[dict[str, Any]] = []
     allowed_types = {"tutor_choice", "tutor_reply", "note"}
     allowed_request_statuses = {"draft", "requested", "pending", "accepted", "refused"}
     allowed_reply_outcomes = {"accepted", "refused"}
+    allowed_email_delivery_statuses = {"", "pending", "sent", "failed"}
 
     for item in raw_cards:
         source = normalize_json_object(item)
@@ -1513,6 +1767,14 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
         reply_outcome = sanitize_text(source.get("replyOutcome")).lower()
         if reply_outcome not in allowed_reply_outcomes:
             reply_outcome = ""
+
+        email_delivery_status = sanitize_text(source.get("emailDeliveryStatus")).lower()
+        if email_delivery_status in {"delivered", "success", "succeeded"}:
+            email_delivery_status = "sent"
+        elif email_delivery_status in {"error", "failure"}:
+            email_delivery_status = "failed"
+        if email_delivery_status not in allowed_email_delivery_statuses:
+            email_delivery_status = ""
 
         normalized_cards.append(
             {
@@ -1544,6 +1806,11 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "requestSubmittedByAgentName": sanitize_text(source.get("requestSubmittedByAgentName")),
                 "requestSubmittedByAgentUsername": sanitize_text(source.get("requestSubmittedByAgentUsername")),
                 "responseToken": sanitize_text(source.get("responseToken")),
+                "emailDeliveryStatus": email_delivery_status,
+                "emailDeliveryUpdatedAt": serialize_datetime_value(coerce_datetime(source.get("emailDeliveryUpdatedAt"))),
+                "emailDeliveryMessageId": sanitize_text(source.get("emailDeliveryMessageId")),
+                "emailDeliveryThreadId": sanitize_text(source.get("emailDeliveryThreadId")),
+                "emailDeliveryError": sanitize_text(source.get("emailDeliveryError")),
                 "sessionStartAt": serialize_datetime_value(coerce_datetime(source.get("sessionStartAt"))),
                 "sessionEndAt": serialize_datetime_value(coerce_datetime(source.get("sessionEndAt"))),
                 "confirmedAt": serialize_datetime_value(coerce_datetime(source.get("confirmedAt"))),
@@ -1551,6 +1818,7 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "confirmedByAgentName": sanitize_text(source.get("confirmedByAgentName")),
                 "confirmedByAgentUsername": sanitize_text(source.get("confirmedByAgentUsername")),
                 "presentationFiles": attachments,
+                "sessionFiles": normalize_coverage_session_file_groups(source.get("sessionFiles")),
             }
         )
 
@@ -3946,6 +4214,14 @@ def build_coverage_tutor_public_result_base_url(fallback_origin: Any = "") -> st
     return f"{public_base_url}/coverage/tutor-response/result"
 
 
+def build_coverage_tutor_email_delivery_status_callback_url(fallback_origin: Any = "") -> str:
+    public_base_url = get_support_portal_public_base_url(fallback_origin)
+    if not public_base_url:
+        return ""
+
+    return f"{public_base_url}/api/integrations/coverage/tutor-request-email-status"
+
+
 def build_coverage_tutor_public_response_action_url(
     public_response_base_url: Any,
     *,
@@ -4022,6 +4298,12 @@ def build_coverage_tutor_request_webhook_payload(
         result_base_url,
         action="refuse",
     )
+    email_delivery_callback_url = build_coverage_tutor_email_delivery_status_callback_url()
+    email_delivery_callback_token = build_coverage_tutor_email_delivery_callback_token(
+        ticket.get("public_id"),
+        card.get("id"),
+        card.get("responseToken"),
+    )
 
     return {
         "event": "coverage_tutor_requested",
@@ -4052,6 +4334,7 @@ def build_coverage_tutor_request_webhook_payload(
             "sessionDetails": card.get("sessionDetails"),
             "notes": documentation.get("coverageNotes") or "",
             "presentationFiles": card.get("presentationFiles") or [],
+            "sessionFiles": card.get("sessionFiles") or [],
         },
         "requestedBy": {
             "agentId": int(actor_row["id"]),
@@ -4072,6 +4355,13 @@ def build_coverage_tutor_request_webhook_payload(
                 "acceptUrl": accept_result_url,
                 "refuseUrl": refuse_result_url,
             },
+        },
+        "emailDeliveryCallback": {
+            "url": email_delivery_callback_url,
+            "token": email_delivery_callback_token,
+            "ticketId": ticket["public_id"],
+            "cardId": card["id"],
+            "responseToken": card.get("responseToken"),
         },
     }
 
@@ -4167,6 +4457,7 @@ def build_coverage_tutor_follow_up_webhook_payload(
             "sessionDetails": card.get("sessionDetails"),
             "notes": documentation.get("coverageNotes") or "",
             "presentationFiles": card.get("presentationFiles") or [],
+            "sessionFiles": card.get("sessionFiles") or [],
         },
         "followUp": {
             "sentAt": sent_at,
@@ -4194,21 +4485,190 @@ def strip_webhook_attachment_binary_fields(value: Any) -> Any:
     return value
 
 
+def parse_attachment_file_size(value: Any) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_attachment_id(value: Any) -> int | None:
+    try:
+        attachment_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return attachment_id if attachment_id > 0 else None
+
+
+def has_webhook_binary_source(file: dict[str, Any]) -> bool:
+    return bool(sanitize_text(file.get("dataUrl")) or sanitize_text(file.get("storageKey")))
+
+
+def build_coverage_file_public_download_url(ticket_public_id: str, file: dict[str, Any]) -> str:
+    attachment_id = parse_attachment_id(file.get("attachmentId"))
+    if not attachment_id:
+        return ""
+    return build_public_coverage_attachment_download_url(ticket_public_id, attachment_id)
+
+
+def prepare_coverage_webhook_file_delivery(
+    file: dict[str, Any],
+    *,
+    ticket_public_id: str,
+    current_total_bytes: int,
+) -> tuple[dict[str, Any], bool, int]:
+    prepared_file = normalize_json_object(file)
+    file_size = parse_attachment_file_size(prepared_file.get("size"))
+    max_file_bytes = get_coverage_webhook_attachment_max_file_bytes()
+    max_total_bytes = get_coverage_webhook_attachment_max_total_bytes()
+    download_url = build_coverage_file_public_download_url(ticket_public_id, prepared_file)
+    can_attach_binary = has_webhook_binary_source(prepared_file)
+    within_file_limit = max_file_bytes <= 0 or file_size <= max_file_bytes
+    within_total_limit = max_total_bytes <= 0 or (current_total_bytes + file_size) <= max_total_bytes
+
+    if download_url:
+        prepared_file["downloadUrl"] = download_url
+
+    if can_attach_binary and within_file_limit and within_total_limit:
+        prepared_file["deliveryMode"] = "attachment"
+        return prepared_file, True, file_size
+
+    if download_url:
+        prepared_file["deliveryMode"] = "link"
+        if not within_file_limit:
+            prepared_file["deliveryReason"] = "file_size_limit"
+        elif not within_total_limit:
+            prepared_file["deliveryReason"] = "total_size_limit"
+        elif not can_attach_binary:
+            prepared_file["deliveryReason"] = "download_link_only"
+        return prepared_file, False, 0
+
+    # Last-resort fallback for legacy unsaved dataUrl payloads. It may still fail externally,
+    # but it avoids silently dropping a file that cannot yet be linked.
+    if can_attach_binary:
+        prepared_file["deliveryMode"] = "attachment"
+        prepared_file["deliveryReason"] = "no_public_link_available"
+        return prepared_file, True, file_size
+
+    prepared_file["deliveryMode"] = "metadata_only"
+    return prepared_file, False, 0
+
+
+def prepare_coverage_webhook_attachment_list(
+    files: Any,
+    *,
+    ticket_public_id: str,
+    current_total_bytes: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    prepared_files: list[dict[str, Any]] = []
+    files_to_attach: list[dict[str, Any]] = []
+    running_total = current_total_bytes
+
+    if not isinstance(files, list):
+        return prepared_files, files_to_attach, running_total
+
+    for file in files:
+        prepared_file, should_attach, attached_size = prepare_coverage_webhook_file_delivery(
+            normalize_json_object(file),
+            ticket_public_id=ticket_public_id,
+            current_total_bytes=running_total,
+        )
+        prepared_files.append(prepared_file)
+        if should_attach:
+            files_to_attach.append(prepared_file)
+            running_total += attached_size
+
+    return prepared_files, files_to_attach, running_total
+
+
+def prepare_coverage_request_webhook_delivery_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prepared_payload = copy.deepcopy(payload)
+    if "request" not in prepared_payload:
+        return prepared_payload, []
+
+    ticket_public_id = sanitize_text(prepared_payload.get("ticketId"))
+    request_payload = normalize_json_object(prepared_payload.get("request"))
+    files_to_attach: list[dict[str, Any]] = []
+    running_total = 0
+
+    prepared_general_files, general_files_to_attach, running_total = prepare_coverage_webhook_attachment_list(
+        request_payload.get("presentationFiles"),
+        ticket_public_id=ticket_public_id,
+        current_total_bytes=running_total,
+    )
+    request_payload["presentationFiles"] = prepared_general_files
+    files_to_attach.extend(general_files_to_attach)
+
+    prepared_session_groups: list[dict[str, Any]] = []
+    session_file_groups = request_payload.get("sessionFiles")
+    if isinstance(session_file_groups, list):
+        for group in session_file_groups:
+            prepared_group = normalize_json_object(group)
+            prepared_session_files, session_files_to_attach, running_total = prepare_coverage_webhook_attachment_list(
+                prepared_group.get("attachments"),
+                ticket_public_id=ticket_public_id,
+                current_total_bytes=running_total,
+            )
+            prepared_group["attachments"] = prepared_session_files
+            prepared_session_groups.append(prepared_group)
+            files_to_attach.extend(session_files_to_attach)
+    request_payload["sessionFiles"] = prepared_session_groups
+    prepared_payload["request"] = request_payload
+
+    return prepared_payload, files_to_attach
+
+
+def prepare_coverage_follow_up_webhook_delivery_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prepared_payload = copy.deepcopy(payload)
+    ticket_public_id = sanitize_text(prepared_payload.get("ticketId"))
+    follow_up_payload = normalize_json_object(prepared_payload.get("followUp"))
+    prepared_files, files_to_attach, _running_total = prepare_coverage_webhook_attachment_list(
+        follow_up_payload.get("presentationFiles") or prepared_payload.get("attachments"),
+        ticket_public_id=ticket_public_id,
+        current_total_bytes=0,
+    )
+    follow_up_payload["presentationFiles"] = prepared_files
+    prepared_payload["followUp"] = follow_up_payload
+    prepared_payload["attachments"] = prepared_files
+
+    prepared_by_id = {
+        sanitize_text(file.get("id")): file
+        for file in prepared_files
+        if sanitize_text(file.get("id"))
+    }
+    request_payload = normalize_json_object(prepared_payload.get("request"))
+    request_files = request_payload.get("presentationFiles")
+    if isinstance(request_files, list) and prepared_by_id:
+        prepared_request_files = []
+        for file in request_files:
+            normalized_file = normalize_json_object(file)
+            prepared_request_files.append(
+                {
+                    **normalized_file,
+                    **prepared_by_id.get(sanitize_text(normalized_file.get("id")), {}),
+                }
+            )
+        request_payload["presentationFiles"] = prepared_request_files
+        prepared_payload["request"] = request_payload
+
+    return prepared_payload, files_to_attach
+
+
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_request_webhook_url()
-    request_payload = normalize_json_object(payload.get("request"))
-    files = request_payload.get("presentationFiles") if isinstance(request_payload.get("presentationFiles"), list) else []
+    prepared_payload, files = prepare_coverage_request_webhook_delivery_payload(payload)
+    outbound_payload = strip_webhook_attachment_binary_fields(prepared_payload)
     if files:
         configured, delivered, status, response_payload = post_multipart_webhook(
             url,
-            strip_webhook_attachment_binary_fields(payload),
+            outbound_payload,
             files,
             timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
     else:
         configured, delivered, status, response_payload = post_json_webhook(
             url,
-            payload,
+            outbound_payload,
             timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
     return {
@@ -4221,22 +4681,186 @@ def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, An
 
 def send_coverage_tutor_follow_up_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_attachment_reply_webhook_url()
-    follow_up_payload = normalize_json_object(payload.get("followUp"))
-    files = follow_up_payload.get("presentationFiles") if isinstance(follow_up_payload.get("presentationFiles"), list) else []
-    if not files and isinstance(payload.get("attachments"), list):
-        files = payload["attachments"]
-    configured, delivered, status, response_payload = post_multipart_webhook(
-        url,
-        strip_webhook_attachment_binary_fields(payload),
-        files,
-        timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
-    )
+    prepared_payload, files = prepare_coverage_follow_up_webhook_delivery_payload(payload)
+    outbound_payload = strip_webhook_attachment_binary_fields(prepared_payload)
+    if files:
+        configured, delivered, status, response_payload = post_multipart_webhook(
+            url,
+            outbound_payload,
+            files,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+    else:
+        configured, delivered, status, response_payload = post_json_webhook(
+            url,
+            outbound_payload,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
         "response": response_payload,
     }
+
+
+def normalize_coverage_tutor_email_delivery_status_from_payload(payload: dict[str, Any]) -> str:
+    if isinstance(payload.get("success"), bool):
+        return "sent" if payload.get("success") else "failed"
+    if isinstance(payload.get("delivered"), bool):
+        return "sent" if payload.get("delivered") else "failed"
+
+    raw_status = sanitize_text(
+        payload.get("emailDeliveryStatus")
+        or payload.get("deliveryStatus")
+        or payload.get("status")
+        or payload.get("outcome")
+    ).lower()
+    if raw_status in {"sent", "delivered", "success", "succeeded", "ok"}:
+        return "sent"
+    if raw_status in {"failed", "failure", "error", "errored", "bounced"}:
+        return "failed"
+    if raw_status in {"pending", "queued"}:
+        return "pending"
+    return ""
+
+
+def build_coverage_tutor_email_delivery_history_payload(
+    *,
+    ticket_public_id: str,
+    card_id: str,
+    status: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ticketId": ticket_public_id,
+        "cardId": card_id,
+        "emailDeliveryStatus": status,
+        "emailDeliveryMessageId": sanitize_text(payload.get("messageId") or payload.get("gmailMessageId") or payload.get("id")),
+        "emailDeliveryThreadId": sanitize_text(payload.get("threadId") or payload.get("gmailThreadId")),
+        "emailDeliveryError": sanitize_text(payload.get("error") or payload.get("message")),
+        "webhookStatus": payload.get("webhookStatus"),
+        "webhookDelivered": payload.get("webhookDelivered"),
+    }
+
+
+def update_coverage_tutor_request_email_delivery_status(
+    *,
+    ticket_public_id: str,
+    card_id: str,
+    status: str,
+    payload: dict[str, Any] | None = None,
+    token_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_ticket_public_id = sanitize_text(ticket_public_id)
+    normalized_card_id = sanitize_text(card_id)
+    normalized_status = normalize_coverage_tutor_email_delivery_status_from_payload({"status": status})
+    payload = normalize_json_object(payload)
+    token_payload = normalize_json_object(token_payload)
+
+    if not normalized_ticket_public_id or not normalized_card_id:
+        raise ApiError(400, "Ticket id and coverage card id are required.")
+    if normalized_status not in {"pending", "sent", "failed"}:
+        raise ApiError(400, "Email delivery status must be pending, sent, or failed.")
+
+    timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT id, public_id, metadata
+            FROM tickets
+            WHERE public_id = %s
+            LIMIT 1
+            """,
+            [normalized_ticket_public_id],
+        )
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation = normalize_admin_documentation(ticket_metadata.get("admin_documentation"))
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=normalized_card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(target_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "Only tutor request cards can receive email delivery updates.")
+
+        expected_response_token = sanitize_text(token_payload.get("responseToken"))
+        if expected_response_token and expected_response_token != sanitize_text(target_card.get("responseToken")):
+            raise ApiError(403, "Email delivery callback token does not match this request.")
+
+        message_id = sanitize_text(payload.get("messageId") or payload.get("gmailMessageId") or payload.get("id"))
+        thread_id = sanitize_text(payload.get("threadId") or payload.get("gmailThreadId"))
+        error_message = sanitize_text(payload.get("error") or payload.get("message"))
+        updated_card = {
+            **target_card,
+            "emailDeliveryStatus": normalized_status,
+            "emailDeliveryUpdatedAt": timestamp,
+            "emailDeliveryMessageId": message_id if normalized_status == "sent" else sanitize_text(target_card.get("emailDeliveryMessageId")),
+            "emailDeliveryThreadId": thread_id if normalized_status == "sent" else sanitize_text(target_card.get("emailDeliveryThreadId")),
+            "emailDeliveryError": error_message if normalized_status == "failed" else "",
+        }
+        coverage_cards[card_index] = updated_card
+        documentation["coverageCards"] = coverage_cards
+        ticket_metadata["admin_documentation"] = documentation
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+        event_type = {
+            "sent": "coverage_tutor_request_email_sent",
+            "failed": "coverage_tutor_request_email_failed",
+        }.get(normalized_status, "coverage_tutor_request_email_pending")
+        insert_history_event(
+            ticket["id"],
+            event_type,
+            {"role": "system", "label": "System"},
+            build_coverage_tutor_email_delivery_history_payload(
+                ticket_public_id=normalized_ticket_public_id,
+                card_id=normalized_card_id,
+                status=normalized_status,
+                payload=payload,
+            ),
+        )
+
+    return {
+        "ok": True,
+        "ticketId": normalized_ticket_public_id,
+        "cardId": normalized_card_id,
+        "emailDeliveryStatus": normalized_status,
+    }
+
+
+def record_coverage_tutor_request_email_delivery_status(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_payload = normalize_json_object(payload)
+    token_payload = decode_coverage_tutor_email_delivery_callback_token(
+        normalized_payload.get("token") or normalized_payload.get("callbackToken")
+    )
+    ticket_public_id = sanitize_text(normalized_payload.get("ticketId")) or sanitize_text(token_payload.get("ticketId"))
+    card_id = sanitize_text(normalized_payload.get("cardId")) or sanitize_text(token_payload.get("cardId"))
+    status = normalize_coverage_tutor_email_delivery_status_from_payload(normalized_payload)
+
+    if sanitize_text(token_payload.get("ticketId")) != ticket_public_id or sanitize_text(token_payload.get("cardId")) != card_id:
+        raise ApiError(403, "Email delivery callback token does not match this request.")
+
+    return update_coverage_tutor_request_email_delivery_status(
+        ticket_public_id=ticket_public_id,
+        card_id=card_id,
+        status=status,
+        payload=normalized_payload,
+        token_payload=token_payload,
+    )
 
 
 def ensure_coverage_tutor_request_webhook_configured() -> None:
@@ -4277,11 +4901,28 @@ def queue_coverage_tutor_request_webhook_delivery(
                     "webhookConfigured": bool(result.get("configured")),
                     "webhookDelivered": bool(result.get("delivered")),
                     "webhookStatus": result.get("status"),
+                    "webhookResponse": result.get("response"),
                 },
             )
         except Exception:
             # Webhook delivery must never break the saved tutor request.
             return
+
+        if not result.get("delivered"):
+            try:
+                update_coverage_tutor_request_email_delivery_status(
+                    ticket_public_id=ticket_public_id,
+                    card_id=card_id,
+                    status="failed",
+                    payload={
+                        "message": extract_external_service_message(result.get("response"))
+                        or "Tutor request webhook was not accepted by n8n.",
+                        "webhookDelivered": bool(result.get("delivered")),
+                        "webhookStatus": result.get("status"),
+                    },
+                )
+            except Exception:
+                return
 
     thread = threading.Thread(
         target=deliver,
@@ -4319,6 +4960,7 @@ def queue_coverage_tutor_follow_up_webhook_delivery(
                     "webhookConfigured": bool(result.get("configured")),
                     "webhookDelivered": bool(result.get("delivered")),
                     "webhookStatus": result.get("status"),
+                    "webhookResponse": result.get("response"),
                 },
             )
         except Exception:
@@ -13186,6 +13828,7 @@ def submit_coverage_tutor_request(
     payload: dict[str, Any],
     *,
     uploaded_files: list[Any] | None = None,
+    uploaded_session_files: list[Any] | None = None,
 ) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     card_id = sanitize_text(payload.get("cardId"))
@@ -13194,6 +13837,12 @@ def submit_coverage_tutor_request(
     requested_card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else None
     raw_request_files = payload.get("presentationFiles") if isinstance(payload.get("presentationFiles"), list) else []
     uploaded_request_files = list(uploaded_files or [])
+    uploaded_session_request_files = list(uploaded_session_files or [])
+    raw_session_file_metadata = (
+        payload.get("sessionPresentationFileMetadata")
+        if isinstance(payload.get("sessionPresentationFileMetadata"), list)
+        else []
+    )
     webhook_delivery: dict[str, Any] | None = None
     stored_attachment_keys: list[str] = []
 
@@ -13335,23 +13984,76 @@ def submit_coverage_tutor_request(
             if (normalized_attachment := normalize_coverage_card_attachment(attachment))
         ]
         uploaded_presentation_files: list[dict[str, Any]] = []
-        if uploaded_request_files:
+        uploaded_session_files_by_session_id: dict[str, list[dict[str, Any]]] = {}
+        session_upload_metadata_by_session_id: dict[str, dict[str, Any]] = {}
+        if uploaded_request_files or uploaded_session_request_files:
             try:
-                stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_request_files)
-                stored_attachment_keys = [
-                    attachment.get("storageKey")
-                    for attachment in stored_attachment_rows
-                    if sanitize_text(attachment.get("storageKey"))
-                ]
-                uploaded_presentation_files = insert_ticket_attachment_rows(
-                    int(ticket["id"]),
-                    ticket["public_id"],
-                    stored_attachment_rows,
-                    metadata_overrides={
-                        "source": "coverage_tutor_request",
-                        "coverageCardId": card_id,
-                    },
-                )
+                if uploaded_request_files:
+                    stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_request_files)
+                    stored_attachment_keys.extend(
+                        attachment.get("storageKey")
+                        for attachment in stored_attachment_rows
+                        if sanitize_text(attachment.get("storageKey"))
+                    )
+                    uploaded_presentation_files = insert_ticket_attachment_rows(
+                        int(ticket["id"]),
+                        ticket["public_id"],
+                        stored_attachment_rows,
+                        metadata_overrides={
+                            "source": "coverage_tutor_request",
+                            "coverageCardId": card_id,
+                            "uploadPhase": "submit_fallback",
+                        },
+                    )
+
+                if uploaded_session_request_files:
+                    stored_session_attachment_rows = store_uploaded_ticket_attachments(
+                        ticket["public_id"],
+                        uploaded_session_request_files,
+                    )
+                    stored_attachment_keys.extend(
+                        attachment.get("storageKey")
+                        for attachment in stored_session_attachment_rows
+                        if sanitize_text(attachment.get("storageKey"))
+                    )
+                    for index, stored_attachment_row in enumerate(stored_session_attachment_rows):
+                        metadata = normalize_json_object(
+                            raw_session_file_metadata[index] if index < len(raw_session_file_metadata) else {}
+                        )
+                        session_id = sanitize_text(metadata.get("sessionId"))
+                        if not session_id:
+                            uploaded_presentation_files.extend(
+                                insert_ticket_attachment_rows(
+                                    int(ticket["id"]),
+                                    ticket["public_id"],
+                                    [stored_attachment_row],
+                                    metadata_overrides={
+                                        "source": "coverage_tutor_request",
+                                        "coverageCardId": card_id,
+                                        "uploadPhase": "submit_fallback",
+                                    },
+                                )
+                            )
+                            continue
+
+                        file_id = sanitize_text(metadata.get("fileId")) or sanitize_text(metadata.get("id"))
+                        stored_attachment_payload = {
+                            **stored_attachment_row,
+                            **({"id": file_id} if file_id else {}),
+                        }
+                        inserted_session_attachments = insert_ticket_attachment_rows(
+                            int(ticket["id"]),
+                            ticket["public_id"],
+                            [stored_attachment_payload],
+                            metadata_overrides={
+                                "source": "coverage_tutor_request",
+                                "coverageCardId": card_id,
+                                "coverageSessionId": session_id,
+                                "uploadPhase": "submit_fallback",
+                            },
+                        )
+                        uploaded_session_files_by_session_id.setdefault(session_id, []).extend(inserted_session_attachments)
+                        session_upload_metadata_by_session_id[session_id] = metadata
             except Exception:
                 for storage_key in stored_attachment_keys:
                     delete_support_attachment_file(storage_key)
@@ -13360,6 +14062,15 @@ def submit_coverage_tutor_request(
             target_card = {
                 **target_card,
                 "presentationFiles": [*existing_presentation_files, *uploaded_presentation_files],
+            }
+        if uploaded_session_files_by_session_id:
+            target_card = {
+                **target_card,
+                "sessionFiles": merge_coverage_session_attachments(
+                    target_card.get("sessionFiles"),
+                    uploaded_session_files_by_session_id,
+                    session_upload_metadata_by_session_id,
+                ),
             }
 
         current_assigned_agent_id = parse_assigned_agent_id(ticket.get("assigned_agent_id"))
@@ -13408,6 +14119,11 @@ def submit_coverage_tutor_request(
             "requestSubmittedByAgentId": int(actor_row["id"]),
             "requestSubmittedByAgentName": actor_row.get("full_name") or actor_row["username"],
             "requestSubmittedByAgentUsername": actor_row["username"],
+            "emailDeliveryStatus": "pending",
+            "emailDeliveryUpdatedAt": timestamp,
+            "emailDeliveryMessageId": "",
+            "emailDeliveryThreadId": "",
+            "emailDeliveryError": "",
         }
         coverage_cards[card_index] = updated_target_card
         documentation["coverageCards"] = coverage_cards
@@ -13544,6 +14260,8 @@ def submit_coverage_tutor_request(
                 "coachEmail": coach_email,
                 "requestedAt": updated_target_card["submittedAt"],
                 "sessionDetails": session_details,
+                "presentationFiles": updated_target_card.get("presentationFiles") or [],
+                "sessionFiles": updated_target_card.get("sessionFiles") or [],
             },
         )
 
@@ -13565,6 +14283,7 @@ def upload_coverage_presentation_files(
 ) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     card_id = sanitize_text(payload.get("cardId"))
+    session_id = sanitize_text(payload.get("sessionId"))
     source = sanitize_text(payload.get("source")).lower() or "coverage_tutor_request"
     presentation_files = list(uploaded_files or [])
     stored_attachment_keys: list[str] = []
@@ -13616,6 +14335,7 @@ def upload_coverage_presentation_files(
                 metadata_overrides={
                     "source": source,
                     "coverageCardId": card_id,
+                    **({"coverageSessionId": session_id} if session_id else {}),
                     "uploadPhase": "pre_submit",
                     "uploadedByAgentId": int(actor_row["id"]),
                     "uploadedByAgentName": actor_row.get("full_name") or actor_row["username"],
@@ -17060,8 +17780,11 @@ def execute_http_request(request: urllib_request.Request, *, timeout_seconds: in
         return True, False, error.code, parsed or sanitize_text(body)
     except TimeoutError:
         return True, False, None, {"message": "Request timed out."}
-    except Exception:
-        return True, False, None, None
+    except Exception as error:
+        return True, False, None, {
+            "message": sanitize_text(str(error)) or "Request failed.",
+            "type": error.__class__.__name__,
+        }
 
 
 def post_form_request(url: str, payload: dict[str, Any]) -> tuple[bool, bool, int | None, Any]:
