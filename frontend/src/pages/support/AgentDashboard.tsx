@@ -13,6 +13,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
+  Download,
+  ExternalLink,
   FileText,
   Hash,
   Headphones,
@@ -36,6 +38,8 @@ import {
   UserRound,
   Users,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -11412,13 +11416,89 @@ const DocumentationCardAttachmentsBlock = ({
 );
 
 function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
+  const [zoomLevel, setZoomLevel] = useState(1);
+  const isZoomed = zoomLevel > 1;
+  const fileName = alt || "attachment";
+
+  function zoomOut() {
+    setZoomLevel((currentZoom) => Math.max(1, Number((currentZoom - 0.5).toFixed(1))));
+  }
+
+  function zoomIn() {
+    setZoomLevel((currentZoom) => Math.min(3, Number((currentZoom + 0.5).toFixed(1))));
+  }
+
   return (
-    <div className="flex h-[72vh] max-h-[720px] min-h-[260px] items-center justify-center overflow-hidden rounded-2xl border bg-secondary/10 p-3">
-      <img
-        src={src}
-        alt={alt}
-        className="h-full w-full rounded-xl object-contain"
-      />
+    <div className="rounded-2xl border bg-secondary/10 p-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="text-xs font-medium text-muted-foreground">
+          Zoom {Math.round(zoomLevel * 100)}%
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full px-3 text-xs"
+            onClick={() => setZoomLevel(1)}
+            disabled={!isZoomed}
+          >
+            Fit
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="h-8 w-8 rounded-full"
+            onClick={zoomOut}
+            disabled={zoomLevel <= 1}
+            aria-label="Zoom out"
+          >
+            <ZoomOut className="h-4 w-4" />
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            className="h-8 w-8 rounded-full"
+            onClick={zoomIn}
+            disabled={zoomLevel >= 3}
+            aria-label="Zoom in"
+          >
+            <ZoomIn className="h-4 w-4" />
+          </Button>
+          <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-3 text-xs">
+            <a href={src} target="_blank" rel="noopener noreferrer">
+              <ExternalLink className="mr-2 h-3.5 w-3.5" />
+              Open
+            </a>
+          </Button>
+          <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-3 text-xs">
+            <a href={src} download={fileName}>
+              <Download className="mr-2 h-3.5 w-3.5" />
+              Download
+            </a>
+          </Button>
+        </div>
+      </div>
+      <div className={cn(
+        "flex h-[72vh] max-h-[720px] min-h-[260px] rounded-xl bg-background",
+        isZoomed ? "items-start justify-start overflow-auto" : "items-center justify-center overflow-hidden",
+      )}>
+        <div
+          className={isZoomed ? "shrink-0" : "h-full w-full"}
+          style={isZoomed ? { width: `${zoomLevel * 100}%` } : undefined}
+        >
+          <img
+            src={src}
+            alt={alt}
+            className={cn(
+              "rounded-xl",
+              isZoomed ? "h-auto w-full max-w-none" : "h-full w-full object-contain",
+            )}
+          />
+        </div>
+      </div>
     </div>
   );
 }
