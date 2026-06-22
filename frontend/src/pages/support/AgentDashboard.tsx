@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Archive,
@@ -11420,10 +11420,20 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
   const [previewMode, setPreviewMode] = useState<"smart" | "original">("smart");
   const [smartPreviewSource, setSmartPreviewSource] = useState("");
   const [isPreparingSmartPreview, setIsPreparingSmartPreview] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
+  const panContainerRef = useRef<HTMLDivElement | null>(null);
+  const panStateRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
   const isZoomed = zoomLevel > 1;
   const isUsingSmartPreview = previewMode === "smart" && Boolean(smartPreviewSource);
   const displaySource = isUsingSmartPreview ? smartPreviewSource : src;
   const fileName = alt || "attachment";
+  const downloadFileName = isUsingSmartPreview ? getSmartPreviewDownloadName(fileName) : fileName;
 
   useEffect(() => {
     let isCancelled = false;
@@ -11502,6 +11512,49 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
     setZoomLevel(1);
   }
 
+  function stopPanning(event?: ReactPointerEvent<HTMLDivElement>) {
+    if (event && panStateRef.current?.pointerId === event.pointerId) {
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // The pointer may already be released by the browser.
+      }
+    }
+
+    panStateRef.current = null;
+    setIsPanning(false);
+  }
+
+  function handlePanPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!isZoomed || event.button !== 0 || !panContainerRef.current) {
+      return;
+    }
+
+    panStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      scrollLeft: panContainerRef.current.scrollLeft,
+      scrollTop: panContainerRef.current.scrollTop,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsPanning(true);
+    event.preventDefault();
+  }
+
+  function handlePanPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const panState = panStateRef.current;
+    const panContainer = panContainerRef.current;
+
+    if (!panState || !panContainer || panState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    panContainer.scrollLeft = panState.scrollLeft - (event.clientX - panState.startX);
+    panContainer.scrollTop = panState.scrollTop - (event.clientY - panState.startY);
+    event.preventDefault();
+  }
+
   return (
     <div className="rounded-2xl border bg-secondary/10 p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -11563,23 +11616,35 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
             <ZoomIn className="h-4 w-4" />
           </Button>
           <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-3 text-xs">
-            <a href={src} target="_blank" rel="noopener noreferrer">
+            <a href={displaySource} target="_blank" rel="noopener noreferrer">
               <ExternalLink className="mr-2 h-3.5 w-3.5" />
               Open
             </a>
           </Button>
           <Button asChild variant="outline" size="sm" className="h-8 rounded-full px-3 text-xs">
-            <a href={src} download={fileName}>
+            <a href={displaySource} download={downloadFileName}>
               <Download className="mr-2 h-3.5 w-3.5" />
               Download
             </a>
           </Button>
         </div>
       </div>
-      <div className={cn(
-        "flex h-[72vh] max-h-[720px] min-h-[260px] rounded-xl bg-background",
-        isZoomed ? "items-start justify-start overflow-auto" : "items-center justify-center overflow-hidden",
-      )}>
+      <div
+        ref={panContainerRef}
+        className={cn(
+          "flex h-[72vh] max-h-[720px] min-h-[260px] select-none rounded-xl bg-background",
+          isZoomed
+            ? isPanning
+              ? "cursor-grabbing items-start justify-start overflow-auto"
+              : "cursor-grab items-start justify-start overflow-auto"
+            : "cursor-default items-center justify-center overflow-hidden",
+        )}
+        onPointerDown={handlePanPointerDown}
+        onPointerMove={handlePanPointerMove}
+        onPointerUp={stopPanning}
+        onPointerCancel={stopPanning}
+        onPointerLeave={stopPanning}
+      >
         <div
           className={isZoomed ? "shrink-0" : "h-full w-full"}
           style={isZoomed ? { width: `${zoomLevel * 100}%` } : undefined}
@@ -11591,6 +11656,7 @@ function AttachmentImagePreview({ src, alt }: { src: string; alt: string }) {
               "rounded-xl",
               isZoomed ? "h-auto w-full max-w-none" : "h-full w-full object-contain",
             )}
+            draggable={false}
           />
         </div>
       </div>
@@ -11706,6 +11772,17 @@ async function createSmartImagePreviewObjectUrl(image: HTMLImageElement): Promis
       resolve(blob ? URL.createObjectURL(blob) : null);
     }, "image/png");
   });
+}
+
+function getSmartPreviewDownloadName(fileName: string) {
+  const safeFileName = fileName.trim() || "attachment";
+  const extensionIndex = safeFileName.lastIndexOf(".");
+
+  if (extensionIndex <= 0) {
+    return `${safeFileName}-smart-preview.png`;
+  }
+
+  return `${safeFileName.slice(0, extensionIndex)}-smart-preview.png`;
 }
 
 const AttachmentPreviewDialog = ({
