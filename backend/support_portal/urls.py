@@ -37,6 +37,7 @@ urlpatterns = [
     path("admin/tickets/<str:public_id>/teams-call-notification/acknowledge", views.admin_ticket_teams_call_notification_acknowledge, name="admin-ticket-teams-call-notification-acknowledge"),
     path("admin/tickets/<str:public_id>/escalation-notification/acknowledge", views.admin_ticket_escalation_notification_acknowledge, name="admin-ticket-escalation-notification-acknowledge"),
     path("admin/tickets/<str:public_id>/escalation-closure/acknowledge", views.admin_ticket_escalation_closure_acknowledge, name="admin-ticket-escalation-closure-acknowledge"),
+    path("admin/tickets/<str:public_id>/coverage-presentation-upload", views.admin_ticket_coverage_presentation_upload, name="admin-ticket-coverage-presentation-upload"),
     path("admin/tickets/<str:public_id>/coverage-tutor-request", views.admin_ticket_coverage_tutor_request, name="admin-ticket-coverage-tutor-request"),
     path("admin/tickets/<str:public_id>/coverage-tutor-follow-up", views.admin_ticket_coverage_tutor_follow_up, name="admin-ticket-coverage-tutor-follow-up"),
     path("admin/tickets/<str:public_id>/support-queue-notification/acknowledge", views.admin_ticket_support_queue_notification_acknowledge, name="admin-ticket-support-queue-notification-acknowledge"),

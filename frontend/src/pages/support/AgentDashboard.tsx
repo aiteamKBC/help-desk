@@ -409,11 +409,15 @@ interface CoverageCardAttachment {
   attachmentId?: number | null;
   objectUrl?: string;
   file?: File;
+  uploadProgress?: number;
+  uploadStatus?: "pending" | "uploading" | "uploaded" | "failed";
+  uploadError?: string;
 }
 
 type CoverageWorkflowCardType = "tutor_choice" | "tutor_reply" | "note";
 type CoverageTutorRequestStatus = "draft" | "requested" | "accepted" | "refused";
 type CoverageTutorReplyOutcome = "" | "accepted" | "refused";
+type CoveragePresentationUploadSource = "coverage_tutor_request" | "coverage_tutor_follow_up";
 
 interface CoverageWorkflowCard {
   id: string;
@@ -3521,6 +3525,16 @@ const AgentDashboard = () => {
       return;
     }
 
+    if (targetCard.presentationFiles.some(isCoverageAttachmentUploadInProgress)) {
+      toast.error("Please wait until presentation files finish uploading.");
+      return;
+    }
+
+    if (targetCard.presentationFiles.some((file) => isCoverageAttachmentUploadFailed(file) || !isCoverageAttachmentReadyForSubmit(file))) {
+      toast.error("One or more presentation files failed to upload. Remove them and try again.");
+      return;
+    }
+
     const presentationFileMetadata = targetCard.presentationFiles
       .filter((file) => !file.file)
       .map(serializeCoverageCardAttachmentForRequest);
@@ -3609,6 +3623,25 @@ const AgentDashboard = () => {
     }
   }
 
+  async function uploadActiveCoveragePresentationFiles(
+    cardId: string,
+    files: File[],
+    source: CoveragePresentationUploadSource,
+    onProgress: (progress: number) => void,
+  ) {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      throw new Error("Coverage ticket is not available right now.");
+    }
+
+    return uploadCoveragePresentationFilesWithProgress({
+      ticketId: activeDetail.ticket.id,
+      cardId,
+      source,
+      files,
+      onProgress,
+    });
+  }
+
   async function sendActiveCoverageTutorFollowUpFiles(
     cardId: string,
     presentationFiles: CoverageCardAttachment[],
@@ -3619,6 +3652,16 @@ const AgentDashboard = () => {
 
     if (presentationFiles.length === 0) {
       toast.error("Add at least one presentation file before sending the follow-up.");
+      return false;
+    }
+
+    if (presentationFiles.some(isCoverageAttachmentUploadInProgress)) {
+      toast.error("Please wait until follow-up files finish uploading.");
+      return false;
+    }
+
+    if (presentationFiles.some((file) => isCoverageAttachmentUploadFailed(file) || !isCoverageAttachmentReadyForSubmit(file))) {
+      toast.error("One or more follow-up files failed to upload. Remove them and try again.");
       return false;
     }
 
@@ -6504,6 +6547,7 @@ const AgentDashboard = () => {
                   onCloseTicket={closeActiveCoverageTicket}
                   onArchiveToggle={() => void updateTicketArchiveState(activeDetail.ticket, !activeTicketIsArchived)}
                   onSubmitTutorChoiceCard={(cardId) => void submitActiveCoverageTutorChoiceCard(cardId)}
+                  onUploadPresentationFiles={uploadActiveCoveragePresentationFiles}
                   onSendTutorFollowUpFiles={sendActiveCoverageTutorFollowUpFiles}
                   onConfirmTutorSession={(cardId) => void confirmActiveCoverageTutorSession(cardId)}
                 />
@@ -8759,6 +8803,7 @@ const CoverageTicketWorkspace = ({
   onCloseTicket,
   onArchiveToggle,
   onSubmitTutorChoiceCard,
+  onUploadPresentationFiles,
   onSendTutorFollowUpFiles,
   onConfirmTutorSession,
 }: {
@@ -8795,6 +8840,12 @@ const CoverageTicketWorkspace = ({
   onCloseTicket: () => Promise<boolean>;
   onArchiveToggle: () => void;
   onSubmitTutorChoiceCard: (cardId: string) => void;
+  onUploadPresentationFiles: (
+    cardId: string,
+    files: File[],
+    source: CoveragePresentationUploadSource,
+    onProgress: (progress: number) => void,
+  ) => Promise<CoverageCardAttachment[]>;
   onSendTutorFollowUpFiles: (cardId: string, presentationFiles: CoverageCardAttachment[]) => Promise<boolean>;
   onConfirmTutorSession: (cardId: string) => void;
 }) => {
@@ -9061,6 +9112,91 @@ const CoverageTicketWorkspace = ({
     });
   };
 
+  const updateCoveragePresentationFiles = (
+    cardId: string,
+    updater: (files: CoverageCardAttachment[]) => CoverageCardAttachment[],
+  ) => {
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => (
+        card.id === cardId
+          ? {
+              ...card,
+              presentationFiles: updater(card.presentationFiles),
+              updatedAt: new Date().toISOString(),
+              ...buildCoverageCardActorFields(currentAdmin, "updated"),
+            }
+          : card
+      )),
+    }));
+  };
+
+  const updatePendingFollowUpFiles = (
+    cardId: string,
+    updater: (files: CoverageCardAttachment[]) => CoverageCardAttachment[],
+  ) => {
+    setPendingFollowUpFilesByCardId((current) => ({
+      ...current,
+      [cardId]: updater(current[cardId] || []),
+    }));
+  };
+
+  const applyCoverageUploadProgress = (
+    files: CoverageCardAttachment[],
+    pendingIds: Set<string>,
+    progress: number,
+  ) => files.map((file) => (
+    pendingIds.has(file.id)
+      ? {
+          ...file,
+          uploadStatus: "uploading" as const,
+          uploadProgress: progress,
+          uploadError: "",
+        }
+      : file
+  ));
+
+  const applyCoverageUploadSuccess = (
+    files: CoverageCardAttachment[],
+    pendingFiles: CoverageCardAttachment[],
+    uploadedFiles: CoverageCardAttachment[],
+  ) => {
+    const uploadedFilesByPendingId = new Map(
+      pendingFiles.map((pendingFile, index) => [pendingFile.id, uploadedFiles[index]]),
+    );
+
+    return files.map((file) => {
+      const uploadedFile = uploadedFilesByPendingId.get(file.id);
+      if (!uploadedFile) {
+        return file;
+      }
+
+      return {
+        ...uploadedFile,
+        id: file.id,
+        objectUrl: file.objectUrl,
+        uploadStatus: "uploaded" as const,
+        uploadProgress: 100,
+        uploadError: "",
+      };
+    });
+  };
+
+  const applyCoverageUploadFailure = (
+    files: CoverageCardAttachment[],
+    pendingIds: Set<string>,
+    error: unknown,
+  ) => files.map((file) => (
+    pendingIds.has(file.id)
+      ? {
+          ...file,
+          uploadStatus: "failed" as const,
+          uploadProgress: 0,
+          uploadError: error instanceof Error ? error.message : "Upload failed. Remove and try again.",
+        }
+      : file
+  ));
+
   const handleTutorEmailChange = (cardId: string, tutorEmail: string) => {
     setTutorEmailEditing(cardId, true);
     updateCoverageCard(cardId, { tutorEmail });
@@ -9158,29 +9294,45 @@ const CoverageTicketWorkspace = ({
       return;
     }
 
+    const nextFiles = files.map((file) => ({
+      ...createPendingCoverageCardAttachment(file),
+      uploadStatus: "uploading" as const,
+      uploadProgress: 1,
+    }));
+    const pendingIds = new Set(nextFiles.map((file) => file.id));
+
     try {
       expandCoverageHistoryCards();
-      const nextFiles = files.map(createPendingCoverageCardAttachment);
-      onDraftUpdate((currentDraft) => ({
-        ...currentDraft,
-        coverageCards: currentDraft.coverageCards.map((card) => (
-          card.id === cardId
-            ? {
-                ...card,
-                presentationFiles: [...card.presentationFiles, ...nextFiles],
-                updatedAt: new Date().toISOString(),
-                ...buildCoverageCardActorFields(currentAdmin, "updated"),
-              }
-            : card
-        )),
-      }));
-    } catch {
-      toast.error("We could not read one or more presentation files right now.");
+      updateCoveragePresentationFiles(cardId, (currentFiles) => [...currentFiles, ...nextFiles]);
+
+      const uploadedFiles = await onUploadPresentationFiles(
+        cardId,
+        files,
+        "coverage_tutor_request",
+        (progress) => updateCoveragePresentationFiles(
+          cardId,
+          (currentFiles) => applyCoverageUploadProgress(currentFiles, pendingIds, progress),
+        ),
+      );
+
+      updateCoveragePresentationFiles(
+        cardId,
+        (currentFiles) => applyCoverageUploadSuccess(currentFiles, nextFiles, uploadedFiles),
+      );
+      toast.success(`${files.length} presentation file${files.length === 1 ? "" : "s"} uploaded.`);
+    } catch (error) {
+      updateCoveragePresentationFiles(cardId, (currentFiles) => applyCoverageUploadFailure(currentFiles, pendingIds, error));
+      toast.error(error instanceof Error ? error.message : "We could not upload one or more presentation files right now.");
     }
   };
 
   const removePresentationFile = (cardId: string, fileId: string) => {
     expandCoverageHistoryCards();
+    draftRef.current.coverageCards
+      .find((card) => card.id === cardId)
+      ?.presentationFiles
+      .filter((file) => file.id === fileId)
+      .forEach(revokeCoverageAttachmentObjectUrl);
     onDraftUpdate((currentDraft) => ({
       ...currentDraft,
       coverageCards: currentDraft.coverageCards.map((card) => (
@@ -9210,14 +9362,34 @@ const CoverageTicketWorkspace = ({
       return;
     }
 
+    const nextFiles = files.map((file) => ({
+      ...createPendingCoverageCardAttachment(file),
+      uploadStatus: "uploading" as const,
+      uploadProgress: 1,
+    }));
+    const pendingIds = new Set(nextFiles.map((file) => file.id));
+
     try {
-      const nextFiles = files.map(createPendingCoverageCardAttachment);
-      setPendingFollowUpFilesByCardId((currentFiles) => ({
-        ...currentFiles,
-        [cardId]: [...(currentFiles[cardId] || []), ...nextFiles],
-      }));
-    } catch {
-      toast.error("We could not read one or more presentation files right now.");
+      updatePendingFollowUpFiles(cardId, (currentFiles) => [...currentFiles, ...nextFiles]);
+
+      const uploadedFiles = await onUploadPresentationFiles(
+        cardId,
+        files,
+        "coverage_tutor_follow_up",
+        (progress) => updatePendingFollowUpFiles(
+          cardId,
+          (currentFiles) => applyCoverageUploadProgress(currentFiles, pendingIds, progress),
+        ),
+      );
+
+      updatePendingFollowUpFiles(
+        cardId,
+        (currentFiles) => applyCoverageUploadSuccess(currentFiles, nextFiles, uploadedFiles),
+      );
+      toast.success(`${files.length} follow-up file${files.length === 1 ? "" : "s"} uploaded.`);
+    } catch (error) {
+      updatePendingFollowUpFiles(cardId, (currentFiles) => applyCoverageUploadFailure(currentFiles, pendingIds, error));
+      toast.error(error instanceof Error ? error.message : "We could not upload one or more follow-up files right now.");
     }
   };
 
@@ -9310,6 +9482,20 @@ const CoverageTicketWorkspace = ({
                   {file.name}
                 </button>
                 <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                {getCoverageAttachmentUploadLabel(file) ? (
+                  <span
+                    className={cn(
+                      "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                      file.uploadStatus === "failed"
+                        ? "bg-red-50 text-red-700"
+                        : isCoverageAttachmentUploadInProgress(file)
+                          ? "bg-amber-100 text-amber-800"
+                          : "bg-emerald-50 text-emerald-700",
+                    )}
+                  >
+                    {getCoverageAttachmentUploadLabel(file)}
+                  </span>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => removePendingFollowUpFile(cardId, file.id)}
@@ -9339,7 +9525,12 @@ const CoverageTicketWorkspace = ({
               }
             });
           }}
-          disabled={isSaving || pendingFollowUpFiles.length === 0}
+          disabled={
+            isSaving
+            || pendingFollowUpFiles.length === 0
+            || pendingFollowUpFiles.some(isCoverageAttachmentUploadInProgress)
+            || pendingFollowUpFiles.some(isCoverageAttachmentUploadFailed)
+          }
           className="border-0 bg-amber-500 text-white hover:bg-amber-600"
         >
           {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
@@ -10108,6 +10299,20 @@ const CoverageTicketWorkspace = ({
                                     {file.name}
                                   </button>
                                   <span className="shrink-0 text-muted-foreground">{formatBytes(file.size)}</span>
+                                  {getCoverageAttachmentUploadLabel(file) ? (
+                                    <span
+                                      className={cn(
+                                        "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                                        file.uploadStatus === "failed"
+                                          ? "bg-red-50 text-red-700"
+                                          : isCoverageAttachmentUploadInProgress(file)
+                                            ? "bg-primary/10 text-primary"
+                                            : "bg-emerald-50 text-emerald-700",
+                                      )}
+                                    >
+                                      {getCoverageAttachmentUploadLabel(file)}
+                                    </span>
+                                  ) : null}
                                   <button
                                     type="button"
                                     onClick={() => removePresentationFile(card.id, file.id)}
@@ -10146,7 +10351,15 @@ const CoverageTicketWorkspace = ({
                       </div>
                       <Button
                         onClick={() => void onSubmitTutorChoiceCard(card.id)}
-                        disabled={isSaving || isLoadingTutorOptions || isLoadingCoachOptions || isTutorEmailLoading || isCoachEmailLoading}
+                        disabled={
+                          isSaving
+                          || isLoadingTutorOptions
+                          || isLoadingCoachOptions
+                          || isTutorEmailLoading
+                          || isCoachEmailLoading
+                          || card.presentationFiles.some(isCoverageAttachmentUploadInProgress)
+                          || card.presentationFiles.some(isCoverageAttachmentUploadFailed)
+                        }
                         className="border-0 gradient-primary"
                       >
                         {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
@@ -14190,6 +14403,8 @@ function createPendingCoverageCardAttachment(file: File): CoverageCardAttachment
     size: file.size,
     objectUrl,
     file,
+    uploadProgress: 0,
+    uploadStatus: "pending",
   };
 }
 
@@ -14201,6 +14416,99 @@ function revokeCoverageAttachmentObjectUrl(file: CoverageCardAttachment) {
 
 function getOversizedCoveragePresentationFiles(files: File[]) {
   return files.filter((file) => file.size > coveragePresentationMaxFileBytes);
+}
+
+function isCoverageAttachmentUploadInProgress(file: CoverageCardAttachment) {
+  return file.uploadStatus === "pending" || file.uploadStatus === "uploading";
+}
+
+function isCoverageAttachmentUploadFailed(file: CoverageCardAttachment) {
+  return file.uploadStatus === "failed";
+}
+
+function isCoverageAttachmentReadyForSubmit(file: CoverageCardAttachment) {
+  return Boolean(file.attachmentId || file.storageKey || file.storageUrl || file.dataUrl) && !isCoverageAttachmentUploadInProgress(file);
+}
+
+function getCoverageAttachmentUploadLabel(file: CoverageCardAttachment) {
+  if (file.uploadStatus === "failed") {
+    return file.uploadError || "Upload failed";
+  }
+
+  if (isCoverageAttachmentUploadInProgress(file)) {
+    return `Uploading ${Math.max(0, Math.min(100, Math.round(file.uploadProgress || 0)))}%`;
+  }
+
+  if (file.uploadStatus === "uploaded") {
+    return "Uploaded";
+  }
+
+  return "";
+}
+
+function uploadCoveragePresentationFilesWithProgress({
+  ticketId,
+  cardId,
+  source,
+  files,
+  onProgress,
+}: {
+  ticketId: string;
+  cardId: string;
+  source: CoveragePresentationUploadSource;
+  files: File[];
+  onProgress: (progress: number) => void;
+}): Promise<CoverageCardAttachment[]> {
+  return new Promise((resolve, reject) => {
+    if (files.length === 0) {
+      resolve([]);
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append("cardId", cardId);
+    formData.append("source", source);
+    files.forEach((file) => {
+      formData.append("presentationFiles", file, file.name || "attachment");
+    });
+
+    xhr.open("POST", `/api/admin/tickets/${encodeURIComponent(ticketId)}/coverage-presentation-upload`);
+    const csrfHeaders = buildCsrfHeaders() as Record<string, string>;
+    Object.entries(csrfHeaders).forEach(([header, value]) => {
+      xhr.setRequestHeader(header, value);
+    });
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) {
+        onProgress(5);
+        return;
+      }
+
+      onProgress(Math.min(99, Math.max(1, Math.round((event.loaded / event.total) * 100))));
+    };
+
+    xhr.onload = () => {
+      let payload: { attachments?: CoverageCardAttachment[]; message?: string } | null = null;
+      try {
+        payload = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        payload = null;
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300 && payload?.attachments) {
+        onProgress(100);
+        resolve(payload.attachments);
+        return;
+      }
+
+      reject(new Error(payload?.message || "We could not upload the presentation files right now."));
+    };
+
+    xhr.onerror = () => reject(new Error("We could not connect to the server while uploading presentation files."));
+    xhr.ontimeout = () => reject(new Error("Presentation file upload timed out. Please try again."));
+    xhr.send(formData);
+  });
 }
 
 function readImageFileAsDocumentationImage(file: File): Promise<DocumentationImage> {

@@ -72,6 +72,7 @@ from .services import (
     set_ticket_booking_progress,
     send_coverage_tutor_follow_up_files,
     submit_coverage_tutor_request,
+    upload_coverage_presentation_files,
     update_admin_ticket,
     update_admin_ticket_archive_state,
     update_agent_operations_access,
@@ -885,6 +886,21 @@ def admin_ticket_coverage_tutor_request(request, public_id: str):
                 public_id,
                 build_session_bound_admin_payload(request, payload=payload),
                 uploaded_files=uploaded_files,
+            )
+        )
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_presentation_upload(request, public_id: str):
+    try:
+        payload = {key: value for key, value in request.POST.items()}
+        return JsonResponse(
+            upload_coverage_presentation_files(
+                public_id,
+                build_session_bound_admin_payload(request, payload=payload),
+                uploaded_files=list(request.FILES.getlist("presentationFiles")),
             )
         )
     except Exception as error:

@@ -11161,6 +11161,61 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_card["presentationFiles"][0]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/101/download")
         self.assertFalse(persisted_card["presentationFiles"][0]["dataUrl"])
 
+    def test_upload_coverage_presentation_files_stores_pre_submit_metadata(self):
+        ticket = {
+            "id": 45,
+            "public_id": "KBC-000045",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "is_archived": False,
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        uploaded_file = SimpleUploadedFile(
+            "coverage-plan.pptx",
+            b"slides",
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        stored_request_file = {
+            "name": "coverage-plan.pptx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "size": 6,
+            "storageKey": "KBC-000045/2026/06/coverage-plan.pptx",
+            "metadata": {"originalName": "coverage-plan.pptx", "storage": "local_filesystem"},
+        }
+        mock_connection, cursor = self.build_mock_connection()
+        cursor.fetchone.return_value = (202,)
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_request_file]) as store_files,
+            patch.object(services, "connection", mock_connection),
+        ):
+            response = services.upload_coverage_presentation_files(
+                "KBC-000045",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-uploaded",
+                    "source": "coverage_tutor_request",
+                },
+                uploaded_files=[uploaded_file],
+            )
+
+        store_files.assert_called_once_with("KBC-000045", [uploaded_file])
+        self.assertEqual(response["attachments"][0]["attachmentId"], 202)
+        self.assertEqual(response["attachments"][0]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/202/download")
+        insert_attachment_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        insert_metadata = json.loads(insert_attachment_call.args[1][5])
+        self.assertEqual(insert_metadata["source"], "coverage_tutor_request")
+        self.assertEqual(insert_metadata["coverageCardId"], "card-uploaded")
+        self.assertEqual(insert_metadata["uploadPhase"], "pre_submit")
+        self.assertEqual(insert_metadata["uploadedByAgentId"], 7)
+
     def test_submit_coverage_tutor_request_falls_back_to_database_email_lookup(self):
         ticket = {
             "id": 42,

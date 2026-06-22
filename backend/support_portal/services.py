@@ -13557,6 +13557,79 @@ def submit_coverage_tutor_request(
     return detail
 
 
+def upload_coverage_presentation_files(
+    public_id: str,
+    payload: dict[str, Any],
+    *,
+    uploaded_files: list[Any] | None = None,
+) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+    source = sanitize_text(payload.get("source")).lower() or "coverage_tutor_request"
+    presentation_files = list(uploaded_files or [])
+    stored_attachment_keys: list[str] = []
+
+    if source not in {"coverage_tutor_request", "coverage_tutor_follow_up"}:
+        raise ApiError(400, "Invalid coverage upload source.")
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+    if not presentation_files:
+        raise ApiError(400, "Add at least one presentation file before uploading.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    try:
+        with transaction.atomic():
+            ticket = run_query_one(
+                """
+                SELECT id, public_id, category, technical_subcategory, is_archived
+                FROM tickets
+                WHERE public_id = %s
+                LIMIT 1
+                """,
+                [public_id],
+            )
+
+            if not ticket:
+                raise ApiError(404, "Ticket not found.")
+            if not is_coverage_ticket_record(ticket):
+                raise ApiError(409, "Presentation files can only be uploaded for coverage tickets.")
+            if normalize_bool(ticket.get("is_archived")):
+                raise ApiError(409, "Restore this ticket before uploading presentation files.")
+
+            stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], presentation_files)
+            stored_attachment_keys = [
+                attachment.get("storageKey")
+                for attachment in stored_attachment_rows
+                if sanitize_text(attachment.get("storageKey"))
+            ]
+            uploaded_attachments = insert_ticket_attachment_rows(
+                int(ticket["id"]),
+                ticket["public_id"],
+                stored_attachment_rows,
+                metadata_overrides={
+                    "source": source,
+                    "coverageCardId": card_id,
+                    "uploadPhase": "pre_submit",
+                    "uploadedByAgentId": int(actor_row["id"]),
+                    "uploadedByAgentName": actor_row.get("full_name") or actor_row["username"],
+                    "uploadedByAgentUsername": actor_row["username"],
+                },
+            )
+    except Exception:
+        for storage_key in stored_attachment_keys:
+            delete_support_attachment_file(storage_key)
+        raise
+
+    return {"attachments": uploaded_attachments}
+
+
 def send_coverage_tutor_follow_up_files(
     public_id: str,
     payload: dict[str, Any],
