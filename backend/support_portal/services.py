@@ -1775,6 +1775,10 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
             email_delivery_status = "failed"
         if email_delivery_status not in allowed_email_delivery_statuses:
             email_delivery_status = ""
+        try:
+            email_delivery_retry_count = max(int(source.get("emailDeliveryRetryCount") or 0), 0)
+        except (TypeError, ValueError):
+            email_delivery_retry_count = 0
 
         normalized_cards.append(
             {
@@ -1811,6 +1815,7 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "emailDeliveryMessageId": sanitize_text(source.get("emailDeliveryMessageId")),
                 "emailDeliveryThreadId": sanitize_text(source.get("emailDeliveryThreadId")),
                 "emailDeliveryError": sanitize_text(source.get("emailDeliveryError")),
+                "emailDeliveryRetryCount": email_delivery_retry_count,
                 "sessionStartAt": serialize_datetime_value(coerce_datetime(source.get("sessionStartAt"))),
                 "sessionEndAt": serialize_datetime_value(coerce_datetime(source.get("sessionEndAt"))),
                 "confirmedAt": serialize_datetime_value(coerce_datetime(source.get("confirmedAt"))),
@@ -4863,6 +4868,169 @@ def record_coverage_tutor_request_email_delivery_status(payload: dict[str, Any])
     )
 
 
+def retry_coverage_tutor_request_email(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+    callback_origin = sanitize_text(payload.get("origin"))
+    webhook_delivery: dict[str, Any] | None = None
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    ensure_coverage_tutor_request_webhook_configured()
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.category,
+              t.technical_subcategory,
+              t.inquiry,
+              t.status,
+              t.status_reason,
+              t.assigned_team,
+              t.assigned_agent_id,
+              t.sla_status,
+              t.metadata,
+              t.is_archived,
+              l.full_name AS learner_name,
+              l.email AS learner_email
+            FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not is_coverage_ticket_record(ticket):
+            raise ApiError(409, "This ticket is not a coverage ticket.")
+        if normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Restore this ticket before retrying the tutor request e-mail.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation = normalize_admin_documentation(
+            ticket_metadata.get("admin_documentation"),
+            fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+            fallback_ticket_id=ticket["public_id"],
+        )
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(target_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "Only tutor request cards can be retried.")
+
+        request_status = sanitize_text(target_card.get("requestStatus")).lower()
+        if request_status == "pending":
+            request_status = "requested"
+        if request_status != "requested":
+            raise ApiError(409, "Only requested tutor e-mails can be retried.")
+
+        email_delivery_status = sanitize_text(target_card.get("emailDeliveryStatus")).lower()
+        if email_delivery_status != "failed":
+            raise ApiError(409, "Only failed tutor request e-mails can be retried.")
+
+        response_token = sanitize_text(target_card.get("responseToken"))
+        tutor_email = normalize_email(target_card.get("tutorEmail"))
+        if not response_token:
+            raise ApiError(409, "This tutor request cannot be retried because it has no response token.")
+        if not tutor_email or not is_valid_email(tutor_email):
+            raise ApiError(400, "Please enter a valid recipient e-mail before retrying the request.")
+
+        timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+        try:
+            retry_count = max(int(target_card.get("emailDeliveryRetryCount") or 0), 0) + 1
+        except (TypeError, ValueError):
+            retry_count = 1
+
+        previous_error = sanitize_text(target_card.get("emailDeliveryError"))
+        updated_target_card = {
+            **target_card,
+            "tutorEmail": tutor_email,
+            "emailDeliveryStatus": "pending",
+            "emailDeliveryUpdatedAt": timestamp,
+            "emailDeliveryMessageId": "",
+            "emailDeliveryThreadId": "",
+            "emailDeliveryError": "",
+            "emailDeliveryRetryCount": retry_count,
+            "updatedAt": timestamp,
+            **build_coverage_card_actor_stamp(actor_row, "updated"),
+        }
+        coverage_cards[card_index] = updated_target_card
+        documentation["coverageCards"] = coverage_cards
+        ticket_metadata["admin_documentation"] = documentation
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+        actor = {
+            "id": actor_row["id"],
+            "role": actor_row["role"],
+            "label": actor_row.get("full_name") or actor_row["username"],
+        }
+        insert_history_event(
+            ticket["id"],
+            "coverage_tutor_request_email_retry",
+            actor,
+            {
+                "ticketId": ticket["public_id"],
+                "cardId": updated_target_card["id"],
+                "tutor": sanitize_text(updated_target_card.get("tutor")),
+                "tutorEmail": tutor_email,
+                "emailDeliveryStatus": "pending",
+                "emailDeliveryRetryCount": retry_count,
+                "previousEmailDeliveryError": previous_error,
+            },
+        )
+
+        webhook_delivery = {
+            "ticket_id": int(ticket["id"]),
+            "ticket_public_id": ticket["public_id"],
+            "card_id": updated_target_card["id"],
+            "payload": build_coverage_tutor_request_webhook_payload(
+                ticket,
+                documentation,
+                updated_target_card,
+                actor_row,
+                callback_url=build_coverage_tutor_public_response_base_url(callback_origin),
+                result_base_url=build_coverage_tutor_public_result_base_url(callback_origin),
+            ),
+        }
+
+    if webhook_delivery:
+        queue_coverage_tutor_request_webhook_delivery(**webhook_delivery)
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
 def ensure_coverage_tutor_request_webhook_configured() -> None:
     if not get_coverage_tutor_request_webhook_url():
         raise ApiError(503, "The tutor request webhook is not configured on the server.")
@@ -4974,7 +5142,7 @@ def queue_coverage_tutor_follow_up_webhook_delivery(
     thread.start()
 
 
-def build_coverage_tutor_refusal_mail_webhook_payload(
+def build_coverage_tutor_response_mail_webhook_payload(
     *,
     ticket: dict[str, Any],
     tutor_choice_card: dict[str, Any],
@@ -4987,9 +5155,11 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
     session_details = sanitize_text(tutor_choice_card.get("sessionDetails")) or sanitize_text(
         latest_response_payload.get("sessionDetails")
     )
+    outcome = sanitize_text(latest_response_payload.get("outcome")).lower()
+    was_accepted = outcome == "accepted"
 
     return {
-        "event": "coverage_tutor_refused",
+        "event": "coverage_tutor_accepted" if was_accepted else "coverage_tutor_refused",
         "source": "support_portal",
         "ticket": {
             "id": ticket["public_id"],
@@ -5012,7 +5182,7 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
             "presentationFiles": tutor_choice_card.get("presentationFiles") or [],
         },
         "response": {
-            "outcome": "rejected",
+            "outcome": "accepted" if was_accepted else "rejected",
             "respondedAt": latest_response_payload.get("respondedAt"),
             "replyText": latest_response_payload.get("replyText") or "",
         },
@@ -5022,6 +5192,26 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
             "agentUsername": tutor_choice_card.get("requestSubmittedByAgentUsername") or "",
         },
     }
+
+
+def build_coverage_tutor_refusal_mail_webhook_payload(
+    *,
+    ticket: dict[str, Any],
+    tutor_choice_card: dict[str, Any],
+    latest_response_payload: dict[str, Any],
+    next_status: str,
+    next_status_reason: str,
+) -> dict[str, Any]:
+    return build_coverage_tutor_response_mail_webhook_payload(
+        ticket=ticket,
+        tutor_choice_card=tutor_choice_card,
+        latest_response_payload={
+            **latest_response_payload,
+            "outcome": "rejected",
+        },
+        next_status=next_status,
+        next_status_reason=next_status_reason,
+    )
 
 
 def send_coverage_tutor_response_mail_webhook(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5038,7 +5228,7 @@ def send_coverage_tutor_response_mail_webhook(payload: dict[str, Any]) -> dict[s
     }
 
 
-def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+def notify_coverage_tutor_response_mail_webhook(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     if not get_coverage_tutor_response_mail_webhook_url():
         return {"configured": False, "delivered": False, "status": None, "response": None}
 
@@ -5047,10 +5237,16 @@ def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str
     except Exception:
         webhook_result = {"configured": True, "delivered": False, "status": None, "response": None}
 
+    response_outcome = sanitize_text(payload.get("response", {}).get("outcome")).lower()
+    event_prefix = (
+        "coverage_tutor_acceptance_mail"
+        if response_outcome == "accepted"
+        else "coverage_tutor_refusal_mail"
+    )
     event_type = (
-        "coverage_tutor_refusal_mail_notified"
+        f"{event_prefix}_notified"
         if webhook_result["delivered"]
-        else "coverage_tutor_refusal_mail_failed"
+        else f"{event_prefix}_failed"
     )
     try:
         insert_history_event(
@@ -5061,6 +5257,7 @@ def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str
                 "ticketId": payload.get("ticket", {}).get("id"),
                 "tutor": payload.get("tutor", {}).get("name"),
                 "tutorEmail": payload.get("tutor", {}).get("email"),
+                "responseOutcome": response_outcome,
                 "webhookStatus": webhook_result.get("status"),
                 "webhookDelivered": webhook_result.get("delivered"),
             },
@@ -5069,6 +5266,10 @@ def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str
         pass
 
     return webhook_result
+
+
+def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    return notify_coverage_tutor_response_mail_webhook(ticket_id, payload)
 
 
 def find_coverage_card_index(
@@ -14439,6 +14640,9 @@ def send_coverage_tutor_follow_up_files(
                 request_status = "requested"
             if request_status not in {"requested", "accepted"}:
                 raise ApiError(409, "Follow-up files can only be sent for requested or accepted tutor requests.")
+            email_delivery_status = sanitize_text(target_card.get("emailDeliveryStatus")).lower()
+            if request_status == "requested" and email_delivery_status in {"pending", "failed"}:
+                raise ApiError(409, "Send the tutor request e-mail successfully before sending follow-up files.")
 
             if uploaded_follow_up_files:
                 stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_follow_up_files)
@@ -14562,8 +14766,8 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
 
     requested_card_id = sanitize_text(payload.get("cardId") or payload.get("relatedTutorChoiceCardId"))
     response_token = sanitize_text(payload.get("responseToken"))
-    refusal_mail_webhook_ticket_id: int | None = None
-    refusal_mail_webhook_payload: dict[str, Any] | None = None
+    response_mail_webhook_ticket_id: int | None = None
+    response_mail_webhook_payload: dict[str, Any] | None = None
 
     with transaction.atomic():
         ticket = run_query_one(
@@ -14684,15 +14888,14 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             responded_at=responded_at,
         )
         updated_ticket_metadata[LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY] = latest_response_payload
-        if outcome == "rejected":
-            refusal_mail_webhook_ticket_id = int(ticket["id"])
-            refusal_mail_webhook_payload = build_coverage_tutor_refusal_mail_webhook_payload(
-                ticket=ticket,
-                tutor_choice_card=updated_tutor_choice_card,
-                latest_response_payload=latest_response_payload,
-                next_status=next_status,
-                next_status_reason=next_status_reason,
-            )
+        response_mail_webhook_ticket_id = int(ticket["id"])
+        response_mail_webhook_payload = build_coverage_tutor_response_mail_webhook_payload(
+            ticket=ticket,
+            tutor_choice_card=updated_tutor_choice_card,
+            latest_response_payload=latest_response_payload,
+            next_status=next_status,
+            next_status_reason=next_status_reason,
+        )
         updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
             updated_ticket_metadata,
             {
@@ -14776,8 +14979,8 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             )
         insert_history_event(ticket["id"], "coverage_tutor_response", None, latest_response_payload)
 
-    if refusal_mail_webhook_ticket_id and refusal_mail_webhook_payload:
-        notify_coverage_tutor_refusal_mail_webhook(refusal_mail_webhook_ticket_id, refusal_mail_webhook_payload)
+    if response_mail_webhook_ticket_id and response_mail_webhook_payload:
+        notify_coverage_tutor_response_mail_webhook(response_mail_webhook_ticket_id, response_mail_webhook_payload)
 
     detail = fetch_admin_ticket_detail(ticket_public_id)
     if not detail:

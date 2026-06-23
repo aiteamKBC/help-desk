@@ -463,6 +463,7 @@ interface CoverageWorkflowCard {
   emailDeliveryMessageId?: string;
   emailDeliveryThreadId?: string;
   emailDeliveryError?: string;
+  emailDeliveryRetryCount?: number;
   sessionStartAt?: string;
   sessionEndAt?: string;
   confirmedAt?: string;
@@ -3796,6 +3797,46 @@ const AgentDashboard = () => {
     }
   }
 
+  async function retryActiveCoverageTutorRequestEmail(cardId: string) {
+    if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
+      return;
+    }
+
+    setIsSavingActiveDocumentation(true);
+    try {
+      const response = await fetch(
+        `/api/admin/tickets/${encodeURIComponent(activeDetail.ticket.id)}/coverage-tutor-request/retry-email`,
+        {
+          method: "POST",
+          headers: buildAdminJsonHeaders(),
+          body: JSON.stringify({
+            cardId,
+            origin: window.location.origin,
+          }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+
+      if (!response.ok || !payload?.ticket) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not retry this tutor request e-mail right now.");
+        return;
+      }
+
+      syncDetailAcrossViews(payload);
+      syncDrafts(payload);
+      setActiveDocumentationDraft(buildCoverageDocumentationDraft(payload.ticket));
+      toast.success("Tutor request e-mail retry started.");
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsSavingActiveDocumentation(false);
+    }
+  }
+
   async function confirmActiveCoverageTutorSession(cardId: string) {
     if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
       return;
@@ -6622,6 +6663,7 @@ const AgentDashboard = () => {
                   onSubmitTutorChoiceCard={(cardId) => void submitActiveCoverageTutorChoiceCard(cardId)}
                   onUploadPresentationFiles={uploadActiveCoveragePresentationFiles}
                   onSendTutorFollowUpFiles={sendActiveCoverageTutorFollowUpFiles}
+                  onRetryTutorRequestEmail={(cardId) => void retryActiveCoverageTutorRequestEmail(cardId)}
                   onConfirmTutorSession={(cardId) => void confirmActiveCoverageTutorSession(cardId)}
                 />
               ) : (
@@ -8878,6 +8920,7 @@ const CoverageTicketWorkspace = ({
   onSubmitTutorChoiceCard,
   onUploadPresentationFiles,
   onSendTutorFollowUpFiles,
+  onRetryTutorRequestEmail,
   onConfirmTutorSession,
 }: {
   ticket: TicketDetail;
@@ -8921,6 +8964,7 @@ const CoverageTicketWorkspace = ({
     sessionId?: string,
   ) => Promise<CoverageCardAttachment[]>;
   onSendTutorFollowUpFiles: (cardId: string, presentationFiles: CoverageCardAttachment[]) => Promise<boolean>;
+  onRetryTutorRequestEmail: (cardId: string) => void;
   onConfirmTutorSession: (cardId: string) => void;
 }) => {
   const [tutorOptions, setTutorOptions] = useState<string[]>([]);
@@ -10216,12 +10260,16 @@ const CoverageTicketWorkspace = ({
             const displayedCoachOptions = Array.from(new Set([...coachOptions, card.coach].map((value) => value.trim()).filter(Boolean)));
             const isLoadingCoverageRecipientOptions = isLoadingTutorOptions || isLoadingCoachOptions;
             const normalizedTutorRequestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
-            const tutorChoiceStatusLabel = normalizedTutorRequestStatus === "draft" ? "" : getCoverageTutorRequestLabel(normalizedTutorRequestStatus);
+            const normalizedEmailDeliveryStatus = normalizeCoverageTutorEmailDeliveryStatus(card.emailDeliveryStatus);
+            const tutorChoiceStatusLabel = normalizedTutorRequestStatus === "draft"
+              ? ""
+              : getCoverageTutorCardStatusLabel(normalizedTutorRequestStatus, normalizedEmailDeliveryStatus);
             const showCompactTutorChoice = cardReadOnly;
             const linkedTutorReplyCard = draft.coverageCards.find((candidate) => (
               candidate.type === "tutor_reply" && candidate.relatedTutorChoiceCardId === card.id
             ));
             const canSendFollowUpFiles = !isArchived && canSendCoverageTutorFollowUp(card);
+            const canRetryTutorRequestEmail = !isArchived && canRetryCoverageTutorRequestEmail(card);
             const pendingFollowUpFiles = pendingFollowUpFilesByCardId[card.id] || [];
             const sessionFileGroups = buildCoverageSessionFileGroups(draft.inquiry, card.sessionFiles);
             const syncedSessionDetails = buildCoverageTutorSessionDetailsFromGroups(
@@ -10259,7 +10307,7 @@ const CoverageTicketWorkspace = ({
                       {tutorChoiceStatusLabel ? (
                         <div className={cn(
                           "rounded-full border px-2.5 py-0.5 text-[11px] font-medium",
-                          getCoverageTutorRequestBadgeClassName(normalizedTutorRequestStatus),
+                          getCoverageTutorCardStatusBadgeClassName(normalizedTutorRequestStatus, normalizedEmailDeliveryStatus),
                         )}>
                           {tutorChoiceStatusLabel}
                         </div>
@@ -10333,6 +10381,19 @@ const CoverageTicketWorkspace = ({
                               Submitted {formatDateTime(card.submittedAt)}
                             </div>
                             {renderCoverageTutorEmailDeliveryBadge(card)}
+                            {canRetryTutorRequestEmail ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                disabled={isSaving}
+                                onClick={() => onRetryTutorRequestEmail(card.id)}
+                                className="h-8 gap-1.5 border-destructive/20 bg-white text-destructive hover:bg-destructive/10 hover:text-destructive"
+                              >
+                                <RefreshCw className={cn("h-3.5 w-3.5", isSaving && "animate-spin")} />
+                                Retry Email
+                              </Button>
+                            ) : null}
                           </div>
                         ) : null}
                       </div>
@@ -13564,6 +13625,7 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           emailDeliveryMessageId: card.emailDeliveryMessageId || "",
           emailDeliveryThreadId: card.emailDeliveryThreadId || "",
           emailDeliveryError: card.emailDeliveryError || "",
+          emailDeliveryRetryCount: Math.max(Number(card.emailDeliveryRetryCount || 0) || 0, 0),
           sessionStartAt: card.sessionStartAt || "",
           sessionEndAt: card.sessionEndAt || "",
           confirmedAt: card.confirmedAt || "",
@@ -13985,6 +14047,38 @@ function getCoverageTutorRequestLabel(status: CoverageTutorRequestStatus) {
   }
 }
 
+function getCoverageTutorCardStatusLabel(
+  requestStatus: CoverageTutorRequestStatus,
+  emailDeliveryStatus: CoverageTutorEmailDeliveryStatus,
+) {
+  if (requestStatus === "requested") {
+    if (emailDeliveryStatus === "failed") {
+      return "Delivery Failed";
+    }
+    if (emailDeliveryStatus === "pending") {
+      return "Sending Email";
+    }
+  }
+
+  return getCoverageTutorRequestLabel(requestStatus);
+}
+
+function getCoverageTutorCardStatusBadgeClassName(
+  requestStatus: CoverageTutorRequestStatus,
+  emailDeliveryStatus: CoverageTutorEmailDeliveryStatus,
+) {
+  if (requestStatus === "requested") {
+    if (emailDeliveryStatus === "failed") {
+      return "border-destructive/20 bg-destructive/10 text-destructive";
+    }
+    if (emailDeliveryStatus === "pending") {
+      return "border-amber-200 bg-amber-50 text-amber-800";
+    }
+  }
+
+  return getCoverageTutorRequestBadgeClassName(requestStatus);
+}
+
 function normalizeCoverageTutorOptionKey(value: string) {
   return value.trim().toLowerCase();
 }
@@ -14088,7 +14182,21 @@ function canSendCoverageTutorFollowUp(card: CoverageWorkflowCard) {
   }
 
   const requestStatus = normalizeCoverageTutorRequestStatus(card.requestStatus);
-  return requestStatus === "requested" || requestStatus === "accepted";
+  const emailDeliveryStatus = normalizeCoverageTutorEmailDeliveryStatus(card.emailDeliveryStatus);
+  if (requestStatus === "accepted") {
+    return true;
+  }
+
+  return requestStatus === "requested" && (!emailDeliveryStatus || emailDeliveryStatus === "sent");
+}
+
+function canRetryCoverageTutorRequestEmail(card: CoverageWorkflowCard) {
+  if (card.type !== "tutor_choice") {
+    return false;
+  }
+
+  return normalizeCoverageTutorRequestStatus(card.requestStatus) === "requested"
+    && normalizeCoverageTutorEmailDeliveryStatus(card.emailDeliveryStatus) === "failed";
 }
 
 function getCoverageReplyOutcomeLabel(outcome: CoverageTutorReplyOutcome) {
@@ -15604,10 +15712,13 @@ const activityEventLabels: Record<string, string> = {
   coverage_tutor_follow_up_sent: "Tutor Files Sent",
   coverage_tutor_follow_up_webhook_delivered: "Tutor Files Delivered",
   coverage_tutor_follow_up_webhook_failed: "Tutor Files Delivery Failed",
+  coverage_tutor_acceptance_mail_failed: "Tutor Acceptance Mail Failed",
+  coverage_tutor_acceptance_mail_notified: "Tutor Acceptance Mail Sent",
   coverage_tutor_refusal_mail_failed: "Tutor Refusal Mail Failed",
   coverage_tutor_refusal_mail_notified: "Tutor Refusal Mail Sent",
   coverage_tutor_request_email_failed: "Tutor Request Email Failed",
   coverage_tutor_request_email_pending: "Tutor Request Email Pending",
+  coverage_tutor_request_email_retry: "Tutor Request Email Retry",
   coverage_tutor_request_email_sent: "Tutor Request Email Sent",
   coverage_tutor_request_webhook_delivered: "Tutor Request Delivered",
   coverage_tutor_request_webhook_failed: "Tutor Request Delivery Failed",
@@ -15702,6 +15813,8 @@ const activityPayloadLabels: Record<string, string> = {
   emailDeliveryMessageId: "Email Message ID",
   emailDeliveryThreadId: "Email Thread ID",
   emailDeliveryError: "Email Delivery Error",
+  emailDeliveryRetryCount: "Email Retry Count",
+  previousEmailDeliveryError: "Previous Email Error",
 };
 
 function getActivityEventLabel(eventType: string) {
@@ -15841,6 +15954,14 @@ function getActivityEventSummary(item: HistoryItem) {
       return tutor ? `Tutor request sent to ${tutor}` : "Tutor request sent";
     case "coverage_tutor_follow_up_sent":
       return tutor ? `Follow-up files sent to ${tutor}` : "Follow-up files sent";
+    case "coverage_tutor_acceptance_mail_notified":
+      return tutor ? `Tutor acceptance update sent for ${tutor}` : "Tutor acceptance update sent";
+    case "coverage_tutor_acceptance_mail_failed":
+      return tutor ? `Tutor acceptance update failed for ${tutor}` : "Tutor acceptance update failed";
+    case "coverage_tutor_refusal_mail_notified":
+      return tutor ? `Tutor refusal update sent for ${tutor}` : "Tutor refusal update sent";
+    case "coverage_tutor_refusal_mail_failed":
+      return tutor ? `Tutor refusal update failed for ${tutor}` : "Tutor refusal update failed";
     case "quick_ticket_confirmation_email_sent":
       return "Requester confirmation email sent";
     case "quick_ticket_confirmation_email_failed":
@@ -15898,6 +16019,14 @@ function getAdminNotificationLogDetail(item: AdminNotificationLogItem) {
       return decidedByName ? `${decidedByName} declined this transfer request.` : "Transfer request declined.";
     case "coverage_tutor_requested":
       return sessionDetails;
+    case "coverage_tutor_acceptance_mail_notified":
+      return "Operations team was notified that the tutor accepted this request.";
+    case "coverage_tutor_acceptance_mail_failed":
+      return "Operations team notification failed after the tutor accepted this request.";
+    case "coverage_tutor_refusal_mail_notified":
+      return "Operations team was notified that the tutor refused this request.";
+    case "coverage_tutor_refusal_mail_failed":
+      return "Operations team notification failed after the tutor refused this request.";
     case "coverage_tutor_response":
       return [sessionDetails, replyText].filter(Boolean).join(" ");
     case "coverage_session_confirmed":

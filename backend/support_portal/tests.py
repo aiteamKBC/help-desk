@@ -11279,6 +11279,152 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         insert_history_event.assert_called_once()
         self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_failed")
 
+    def test_retry_coverage_tutor_request_email_sets_pending_and_requeues_webhook(self):
+        ticket = {
+            "id": 41,
+            "public_id": "KBC-000041",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "assigned_team": "Learning Plan Team",
+            "assigned_agent_id": 7,
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "failed",
+                            "emailDeliveryError": "Request timed out.",
+                            "emailDeliveryRetryCount": 2,
+                        }
+                    ]
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000041"}}),
+        ):
+            response = services.retry_coverage_tutor_request_email(
+                "KBC-000041",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-1",
+                    "origin": "https://technicalsupport.kentbusinesscollege.net",
+                },
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000041")
+        update_params = cursor.execute.call_args.args[1]
+        persisted_metadata = json.loads(update_params[0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["requestStatus"], "requested")
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "pending")
+        self.assertEqual(persisted_card["emailDeliveryError"], "")
+        self.assertEqual(persisted_card["emailDeliveryRetryCount"], 3)
+
+        queue_webhook.assert_called_once()
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(webhook_payload["event"], "coverage_tutor_requested")
+        self.assertEqual(webhook_payload["ticketId"], "KBC-000041")
+        self.assertEqual(webhook_payload["cardId"], "card-1")
+        self.assertEqual(webhook_payload["responseToken"], "response-token-1")
+        self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
+        self.assertTrue(webhook_payload["emailDeliveryCallback"]["token"])
+
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_retry")
+        self.assertEqual(insert_history_event.call_args.args[3]["previousEmailDeliveryError"], "Request timed out.")
+
+    def test_send_coverage_tutor_follow_up_files_rejects_failed_email_delivery(self):
+        ticket = {
+            "id": 45,
+            "public_id": "KBC-000045",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "failed",
+                            "emailDeliveryError": "Request timed out.",
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_follow_up_webhook_configured"),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.send_coverage_tutor_follow_up_files(
+                    "KBC-000045",
+                    {
+                        "actorUsername": "ahmed",
+                        "cardId": "card-1",
+                        "presentationFiles": [
+                            {
+                                "id": "file-1",
+                                "name": "follow-up.pdf",
+                                "mimeType": "application/pdf",
+                                "size": 512,
+                                "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+                            }
+                        ],
+                    },
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 409)
+        self.assertEqual(
+            raised_error.exception.message,
+            "Send the tutor request e-mail successfully before sending follow-up files.",
+        )
+
     def test_submit_coverage_tutor_request_uses_compact_card_payload_files(self):
         ticket = {
             "id": 44,
@@ -12211,6 +12357,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000052"}}),
         ):
             response = services.process_coverage_tutor_response(
@@ -12236,6 +12383,14 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_cards[1]["type"], "tutor_reply")
         self.assertEqual(persisted_cards[1]["replyOutcome"], "accepted")
         self.assertEqual(persisted_cards[1]["sessionDetails"], "Friday 09:00 - 11:00")
+        notify_response_mail.assert_called_once()
+        self.assertEqual(notify_response_mail.call_args.args[0], 52)
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["event"], "coverage_tutor_accepted")
+        self.assertEqual(webhook_payload["ticket"]["id"], "KBC-000052")
+        self.assertEqual(webhook_payload["ticket"]["statusReason"], "Tutor Accepted")
+        self.assertEqual(webhook_payload["response"]["outcome"], "accepted")
+        self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
 
     def test_process_coverage_tutor_response_sends_refusal_mail_webhook_on_rejection(self):
         ticket = {
@@ -12291,7 +12446,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
-            patch.object(services, "notify_coverage_tutor_refusal_mail_webhook") as notify_refusal_mail,
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000053"}}),
         ):
             response = services.process_coverage_tutor_response(
@@ -12316,12 +12471,13 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_metadata["latest_coverage_tutor_response"]["outcome"], "rejected")
         self.assertEqual(persisted_cards[0]["requestStatus"], "refused")
         self.assertEqual(persisted_cards[1]["replyOutcome"], "refused")
-        notify_refusal_mail.assert_called_once()
-        self.assertEqual(notify_refusal_mail.call_args.args[0], 53)
-        webhook_payload = notify_refusal_mail.call_args.args[1]
+        notify_response_mail.assert_called_once()
+        self.assertEqual(notify_response_mail.call_args.args[0], 53)
+        webhook_payload = notify_response_mail.call_args.args[1]
         self.assertEqual(webhook_payload["event"], "coverage_tutor_refused")
         self.assertEqual(webhook_payload["ticket"]["id"], "KBC-000053")
         self.assertEqual(webhook_payload["ticket"]["statusReason"], "Tutor Rejected")
+        self.assertEqual(webhook_payload["response"]["outcome"], "rejected")
         self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
         self.assertEqual(webhook_payload["requestedBy"]["agentUsername"], "ahmed")
 

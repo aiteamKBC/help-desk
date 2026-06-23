@@ -32,6 +32,7 @@ from .services import (
     reject_ticket_transfer_request,
     process_coverage_tutor_response,
     record_coverage_tutor_request_email_delivery_status,
+    retry_coverage_tutor_request_email,
     request_support_teams_call,
     request_ticket_transfer,
     cancel_support_session_request,
@@ -915,6 +916,19 @@ def admin_ticket_coverage_tutor_request(request, public_id: str):
                 build_session_bound_admin_payload(request, payload=payload),
                 uploaded_files=uploaded_files,
                 uploaded_session_files=uploaded_session_files,
+            )
+        )
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_tutor_request_retry_email(request, public_id: str):
+    try:
+        return JsonResponse(
+            retry_coverage_tutor_request_email(
+                public_id,
+                build_session_bound_admin_payload(request, payload=parse_json_body(request)),
             )
         )
     except Exception as error:
