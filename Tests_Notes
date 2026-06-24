@@ -140,8 +140,8 @@ Action [Done][Connect to n8n]
 ->remove conversation from quick ticket[done]
 ->Ensure documentation if filled to be persistent in same boxes through session till saved or session end[done]
 ->Ensure more than one card can be saved, currently it shows only one. [done]
-->Order things when it comes to assignment
-->Order things when it comes to Transfer, unify logic
+->Order things when it comes to assignment [Done]
+->Order things when it comes to Transfer, unify logic [Done]
 ->Ensure attachments can be view on agent side, and sent on requester side.
 ->add note to be sent at closure to requester with e-mail
 ->Apply pending and closed reasons in ticket details.
@@ -155,7 +155,11 @@ Action [Done][Connect to n8n]
 -> add optional note to be send to requester after each update on the ticket (to communicate between agent and user ) + notify concerned coach if exists
 ->add learner choice to coach submit
 ->Subject of issue (limited)
-->
+->Asssign auto for already created tickets when agent comes on
+->SLA for unassigned
+->Create Ticket transaction flow
+->When to close ticket? Who to Notify Admins?! Agents? Supers? (Need Eng. Ayman and Elamsry Input)
+
 
 --------------------------------------
 --------------------------------------

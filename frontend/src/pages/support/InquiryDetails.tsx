@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, ArrowRight, ChevronDown, FileText, Paperclip, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronDown, FileText, Paperclip, Search, UserRound, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -11,6 +11,8 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -28,9 +30,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
-  type Category,
   type EvidenceFile,
-  type RequesterSource,
+  type SubmittedForLearner,
   type TechnicalSubcategory,
 } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
@@ -42,7 +43,6 @@ import {
   parseCoverageInquiry,
   type CoverageTimeOption,
 } from "@/lib/coverageSupport";
-import { quickTicketReason } from "@/lib/supportFlow";
 import { toast } from "sonner";
 
 const textExtensions = new Set([
@@ -147,14 +147,29 @@ const getDefaultCoverageSessionNumber = (sessionDate: string, sessionDateOptions
   return sessionIndex >= 0 ? String(sessionIndex + 1) : "";
 };
 
+type RequestForMode = "self" | "learner";
+const SUBJECT_MAX_LENGTH = 120;
+const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+
 const InquiryDetails = () => {
   const navigate = useNavigate();
   const { ticket, updateTicket, clearBookingSummary } = useSupport();
   const initialCoverageDetails = parseCoverageInquiry(ticket.inquiry);
   const [technicalSubcategory, setTechnicalSubcategory] = useState<TechnicalSubcategory>(ticket.technicalSubcategory);
+  const [subject, setSubject] = useState(ticket.subject);
   const [inquiry, setInquiry] = useState(
     isCoverageSubcategory(ticket.technicalSubcategory) && initialCoverageDetails ? "" : ticket.inquiry,
   );
+  const [requestFor, setRequestFor] = useState<RequestForMode>(ticket.submittedForLearner ? "learner" : "self");
+  const [learnerSearch, setLearnerSearch] = useState("");
+  const [learnerResults, setLearnerResults] = useState<SubmittedForLearner[]>([]);
+  const [selectedSubmittedForLearner, setSelectedSubmittedForLearner] = useState<SubmittedForLearner | null>(ticket.submittedForLearner);
+  const [submittedForNotificationEmail, setSubmittedForNotificationEmail] = useState(
+    ticket.submittedForLearner?.notificationEmail || ticket.submittedForLearner?.email || "",
+  );
+  const [notifySubmittedForLearner, setNotifySubmittedForLearner] = useState(ticket.notifySubmittedForLearner);
+  const [isSearchingLearners, setIsSearchingLearners] = useState(false);
+  const [learnerSearchError, setLearnerSearchError] = useState("");
   const [coverageTutor, setCoverageTutor] = useState(initialCoverageDetails?.tutor || "");
   const [coverageModule, setCoverageModule] = useState(initialCoverageDetails?.module || "");
   const [coverageTime, setCoverageTime] = useState(initialCoverageDetails?.time || "");
@@ -184,6 +199,7 @@ const InquiryDetails = () => {
   const fileRef = useRef<HTMLInputElement>(null);
   const coverageSessionDateRequestRef = useRef(0);
   const canUseCoverage = ticket.requesterSource !== "kbc_users_data";
+  const canSubmitForLearner = ticket.requesterSource !== "kbc_users_data" || ticket.requesterRole === "coach" || ticket.requesterRole === "employer";
   const availableInquiryPlatforms = canUseCoverage
     ? inquiryPlatforms
     : inquiryPlatforms.filter((item) => item !== "Coverage");
@@ -196,15 +212,24 @@ const InquiryDetails = () => {
   const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
 
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
+  const hasSubmittedForLearner = requestFor !== "learner" || Boolean(selectedSubmittedForLearner);
+  const trimmedSubmittedForNotificationEmail = submittedForNotificationEmail.trim();
+  const hasValidSubmittedForNotificationEmail = !notifySubmittedForLearner
+    || (Boolean(selectedSubmittedForLearner) && isValidEmailFormat(trimmedSubmittedForNotificationEmail));
+  const hasSubject = subject.trim().length > 0;
   const canSubmit = isCoverageFlow
     ? Boolean(
-      coverageTutor
+      hasSubject
+      && hasSubmittedForLearner
+      && hasValidSubmittedForNotificationEmail
+      && technicalSubcategory
+      && coverageTutor
       && coverageModule
       && coverageTime
       && coverageSessionDates.length > 0
       && selectedCoverageSessionSubjects.every((value) => value.length > 0),
     )
-    : Boolean(technicalSubcategory && inquiry.trim().length > 0);
+    : Boolean(hasSubject && hasSubmittedForLearner && hasValidSubmittedForNotificationEmail && technicalSubcategory && inquiry.trim().length > 0);
 
   const loadCoverageSessionDateOptions = (tutorValue: string, moduleValue: string, timeValue: string) => {
     if (!isCoverageFlow || !tutorValue || !moduleValue || !timeValue) {
@@ -264,6 +289,85 @@ const InquiryDetails = () => {
       setTechnicalSubcategory("");
     }
   }, [canUseCoverage, technicalSubcategory]);
+
+  useEffect(() => {
+    if (!canSubmitForLearner) {
+      setRequestFor("self");
+      setSelectedSubmittedForLearner(null);
+      setSubmittedForNotificationEmail("");
+      setNotifySubmittedForLearner(false);
+      setLearnerSearch("");
+      setLearnerResults([]);
+      setLearnerSearchError("");
+    }
+  }, [canSubmitForLearner]);
+
+  useEffect(() => {
+    if (!canSubmitForLearner || requestFor !== "learner") {
+      setLearnerResults([]);
+      setLearnerSearchError("");
+      setIsSearchingLearners(false);
+      return;
+    }
+
+    const normalizedQuery = learnerSearch.trim();
+    if (normalizedQuery.length < 2) {
+      setLearnerResults([]);
+      setLearnerSearchError("");
+      setIsSearchingLearners(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setIsSearchingLearners(true);
+      setLearnerSearchError("");
+
+      const searchParams = new URLSearchParams({
+        q: normalizedQuery,
+        limit: "12",
+        requesterEmail: ticket.email,
+      });
+
+      void fetch(`/api/learners/search?${searchParams.toString()}`)
+        .then(async (response) => {
+          const payload = (await response.json().catch(() => null)) as
+            | {
+                message?: string;
+                learners?: SubmittedForLearner[];
+              }
+            | null;
+
+          if (cancelled) {
+            return;
+          }
+
+          if (!response.ok) {
+            setLearnerResults([]);
+            setLearnerSearchError(payload?.message || "We could not search learners right now.");
+            return;
+          }
+
+          setLearnerResults(Array.isArray(payload?.learners) ? payload.learners : []);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLearnerResults([]);
+            setLearnerSearchError("We could not connect to the learner search service.");
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setIsSearchingLearners(false);
+          }
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [canSubmitForLearner, learnerSearch, requestFor]);
 
   useEffect(() => {
     if (!isCoverageFlow) {
@@ -504,7 +608,6 @@ const InquiryDetails = () => {
     setIsSubmitting(true);
 
     try {
-      const hasExistingTicket = Boolean(ticket.id);
       const submittedInquiry = isCoverageFlow
         ? buildCoverageInquiry({
             tutor: coverageTutor,
@@ -516,160 +619,42 @@ const InquiryDetails = () => {
             sessionSubject: selectedCoverageSessionSubjects.join("; "),
           })
         : inquiry.trim();
-
-      if (!isCoverageFlow && !hasExistingTicket) {
-        clearBookingSummary();
-        updateTicket({
-          id: "",
-          learnerName: ticket.learnerName,
-          email: ticket.email,
-          requesterRole: ticket.requesterRole,
-          requesterSource: ticket.requesterSource,
-          category: "Technical",
-          technicalSubcategory,
-          inquiry: submittedInquiry,
-          evidence,
-          status: "Open",
-          statusReason: "",
-          assignedAgentId: null,
-          assignedTeam: "Unassigned",
-          slaStatus: "Pending Review",
-          createdAt: "",
-          chatState: "open",
-          liveChatRequested: false,
-          chatHistory: [],
-        });
-        navigate("/support/options");
-        return;
-      }
-
-      const formData = new FormData();
-      if (!hasExistingTicket) {
-        formData.set("email", ticket.email);
-      }
-      formData.set("requesterRole", ticket.requesterRole);
-      formData.set("category", "Technical");
-      formData.set("technicalSubcategory", technicalSubcategory);
-      formData.set("inquiry", submittedInquiry);
-      evidence.forEach((file) => {
-        if (file.file) {
-          formData.append("evidenceFiles", file.file, file.name);
-        }
-      });
-
-      const response = await fetch(hasExistingTicket ? `/api/tickets/${encodeURIComponent(ticket.id)}` : "/api/tickets", {
-        method: "POST",
-        body: formData,
-      });
-
-      const payload = (await response.json().catch(() => null)) as
-        | {
-            message?: string;
-            ticket?: {
-              id: string;
-              learnerName?: string;
-              email: string;
-              requesterRole?: "user" | "coach" | "employer";
-              requesterSource?: RequesterSource;
-              category: Category;
-              technicalSubcategory: TechnicalSubcategory;
-              inquiry: string;
-              status: "Open" | "Pending" | "Closed";
-              statusReason?: string;
-              assignedAgentId?: number | null;
-              assignedTeam: string;
-              slaStatus: string;
-              createdAt: string;
-              chatState?: "open" | "closed";
-              liveChatRequested?: boolean;
-            };
-          }
-        | null;
-
-      if (!response.ok || !payload?.ticket) {
-        toast.error(payload?.message || `We could not ${hasExistingTicket ? "update" : "create"} the ticket right now.`);
-        return;
-      }
-
-      const nextRequesterRole = payload.ticket.requesterRole || ticket.requesterRole;
-      const nextRequesterSource = payload.ticket.requesterSource || ticket.requesterSource;
-      const nextTicketState = {
-        id: payload.ticket.id,
-        learnerName: payload.ticket.learnerName || ticket.learnerName,
-        email: payload.ticket.email,
-        requesterRole: nextRequesterRole,
-        requesterSource: nextRequesterSource,
-        category: payload.ticket.category,
-        technicalSubcategory: payload.ticket.technicalSubcategory,
-        inquiry: payload.ticket.inquiry || submittedInquiry,
-        evidence,
-        statusReason: payload.ticket.statusReason || ticket.statusReason,
-        assignedAgentId: payload.ticket.assignedAgentId ?? (hasExistingTicket ? ticket.assignedAgentId : null),
-        createdAt: payload.ticket.createdAt,
-        status: payload.ticket.status,
-        assignedTeam: payload.ticket.assignedTeam,
-        slaStatus: payload.ticket.slaStatus,
-        liveChatRequested: payload.ticket.liveChatRequested ?? (hasExistingTicket ? ticket.liveChatRequested : false),
-        chatState: payload.ticket.chatState ?? (hasExistingTicket ? ticket.chatState : "open"),
-        chatHistory: hasExistingTicket ? ticket.chatHistory : [],
-      } as const;
-
-      updateTicket(nextTicketState);
-
-      if (isCoverageFlow) {
-        const directSubmitResponse = await fetch(`/api/tickets/${encodeURIComponent(payload.ticket.id)}/chat-history`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            status: "Pending",
-            statusReason: quickTicketReason,
-            messages: nextTicketState.chatHistory.map((message) => ({
-              sender: message.sender,
-              text: message.text,
-              timestamp: message.timestamp,
-            })),
-          }),
-        });
-
-        const directSubmitPayload = (await directSubmitResponse.json().catch(() => null)) as
-          | {
-              message?: string;
-              ticket?: {
-                status?: "Open" | "Pending" | "Closed";
-                statusReason?: string;
-                assignedTeam?: string;
-                slaStatus?: string;
-                createdAt?: string;
-                chatState?: "open" | "closed";
-              };
+      const submittedForLearner = canSubmitForLearner && requestFor === "learner"
+        ? selectedSubmittedForLearner
+          ? {
+              ...selectedSubmittedForLearner,
+              notificationEmail: trimmedSubmittedForNotificationEmail || selectedSubmittedForLearner.email,
             }
-          | null;
+          : null
+        : null;
 
-        if (!directSubmitResponse.ok || !directSubmitPayload?.ticket) {
-          toast.error(directSubmitPayload?.message || "We could not submit the ticket right now.");
-          return;
-        }
-
-        clearBookingSummary();
-        updateTicket({
-          ...nextTicketState,
-          status: directSubmitPayload.ticket.status || "Pending",
-          statusReason: directSubmitPayload.ticket.statusReason || quickTicketReason,
-          assignedTeam: directSubmitPayload.ticket.assignedTeam || nextTicketState.assignedTeam,
-          slaStatus: directSubmitPayload.ticket.slaStatus || nextTicketState.slaStatus,
-          createdAt: directSubmitPayload.ticket.createdAt || nextTicketState.createdAt,
-          chatState: directSubmitPayload.ticket.chatState || nextTicketState.chatState,
-        });
-        toast.success("Your ticket has been submitted directly for team review.");
-        navigate("/support/status");
-        return;
-      }
-
+      clearBookingSummary();
+      updateTicket({
+        id: ticket.id || "",
+        learnerName: ticket.learnerName,
+        email: ticket.email,
+        requesterRole: ticket.requesterRole,
+        requesterSource: ticket.requesterSource,
+        category: "Technical",
+        technicalSubcategory,
+        subject: subject.trim(),
+        inquiry: submittedInquiry,
+        submittedForLearner,
+        notifySubmittedForLearner: Boolean(submittedForLearner && notifySubmittedForLearner && isValidEmailFormat(submittedForLearner.notificationEmail || "")),
+        evidence,
+        status: ticket.id ? ticket.status : "Open",
+        statusReason: ticket.id ? ticket.statusReason : "",
+        assignedAgentId: ticket.id ? ticket.assignedAgentId : null,
+        assignedTeam: ticket.id ? ticket.assignedTeam : "Unassigned",
+        slaStatus: ticket.id ? ticket.slaStatus : "Pending Review",
+        createdAt: ticket.id ? ticket.createdAt : "",
+        chatState: ticket.id ? ticket.chatState : "open",
+        liveChatRequested: ticket.id ? ticket.liveChatRequested : false,
+        chatHistory: ticket.id ? ticket.chatHistory : [],
+      });
       navigate("/support/options");
     } catch {
-      toast.error("We could not connect to the server. Please try again.");
+      toast.error("We could not save these inquiry details. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -677,8 +662,8 @@ const InquiryDetails = () => {
 
   const previewKind = previewFile ? getPreviewKind(previewFile) : null;
   const pageDescription = isCoverageFlow
-    ? "Choose the inquiry category, then select the tutor, module, time, session date, and session details."
-    : "Choose the inquiry category and describe your issue.";
+    ? "Add a subject, then select the tutor, module, time, session date, and session details."
+    : "Choose the inquiry category, add a subject, and describe the issue.";
 
   const handleCoverageTutorChange = (value: string) => {
     setCoverageTutor(value);
@@ -751,6 +736,205 @@ const InquiryDetails = () => {
           </p>
 
           <div className="space-y-5">
+            {canSubmitForLearner && (
+              <div className="space-y-3 rounded-2xl border border-primary/10 bg-white/70 p-4 shadow-sm">
+                <div>
+                  <Label>Who is this request for?</Label>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    Keep yourself as the requester, or attach the ticket to a learner who asked you for help.
+                  </p>
+                </div>
+
+                <RadioGroup
+                  value={requestFor}
+                  onValueChange={(value) => {
+                    const nextRequestFor = value as RequestForMode;
+                    setRequestFor(nextRequestFor);
+                    if (nextRequestFor === "self") {
+                      setSelectedSubmittedForLearner(null);
+                      setSubmittedForNotificationEmail("");
+                      setNotifySubmittedForLearner(false);
+                      setLearnerSearch("");
+                      setLearnerResults([]);
+                    }
+                  }}
+                  className="grid gap-3 sm:grid-cols-2"
+                >
+                  <Label
+                    htmlFor="request-for-self"
+                    className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                      requestFor === "self"
+                        ? "border-primary bg-primary/[0.06] text-primary shadow-soft"
+                        : "border-primary/10 bg-white hover:border-primary/25"
+                    }`}
+                  >
+                    <RadioGroupItem id="request-for-self" value="self" className="mt-1" />
+                    <span>
+                      <span className="block font-semibold">For myself</span>
+                      <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                        The ticket is about the signed-in requester.
+                      </span>
+                    </span>
+                  </Label>
+
+                  <Label
+                    htmlFor="request-for-learner"
+                    className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                      requestFor === "learner"
+                        ? "border-primary bg-primary/[0.06] text-primary shadow-soft"
+                        : "border-primary/10 bg-white hover:border-primary/25"
+                    }`}
+                  >
+                    <RadioGroupItem id="request-for-learner" value="learner" className="mt-1" />
+                    <span>
+                      <span className="block font-semibold">For a learner</span>
+                      <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                        Search KBC learners and keep the requester linked as the submitter.
+                      </span>
+                    </span>
+                  </Label>
+                </RadioGroup>
+
+                {requestFor === "learner" && (
+                  <div className="space-y-3 rounded-2xl border border-primary/10 bg-background/80 p-4">
+                    {selectedSubmittedForLearner ? (
+                      <div className="rounded-2xl border border-primary/15 bg-white p-4">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="flex min-w-0 items-start gap-3">
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/[0.08] text-primary">
+                              <UserRound className="h-5 w-5" />
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-semibold text-foreground">
+                                {selectedSubmittedForLearner.fullName}
+                              </div>
+                              <div className="mt-1 break-all text-sm text-muted-foreground">
+                                Official email: {selectedSubmittedForLearner.email}
+                              </div>
+                              {selectedSubmittedForLearner.externalLearnerId && (
+                                <div className="mt-1 text-xs text-muted-foreground">
+                                  Learner ID: {selectedSubmittedForLearner.externalLearnerId}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="rounded-full"
+                            onClick={() => {
+                              setSelectedSubmittedForLearner(null);
+                              setSubmittedForNotificationEmail("");
+                              setNotifySubmittedForLearner(false);
+                              setLearnerSearch("");
+                            }}
+                          >
+                            Change
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <Label htmlFor="learner-search">Search learner</Label>
+                        <div className="relative">
+                          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                          <Input
+                            id="learner-search"
+                            value={learnerSearch}
+                            onChange={(event) => setLearnerSearch(event.target.value)}
+                            placeholder="Type learner name, email, or learner ID..."
+                            className="h-11 rounded-xl pl-10"
+                          />
+                        </div>
+
+                        {learnerSearch.trim().length > 0 && learnerSearch.trim().length < 2 && (
+                          <p className="text-xs text-muted-foreground">Type at least 2 characters to search.</p>
+                        )}
+                        {isSearchingLearners && (
+                          <p className="text-xs text-muted-foreground">Searching learners...</p>
+                        )}
+                        {learnerSearchError && (
+                          <p className="text-xs text-destructive">{learnerSearchError}</p>
+                        )}
+                        {!isSearchingLearners && learnerSearch.trim().length >= 2 && !learnerSearchError && learnerResults.length === 0 && (
+                          <p className="text-xs text-muted-foreground">No matching learners found.</p>
+                        )}
+
+                        {learnerResults.length > 0 && (
+                          <div className="overflow-hidden rounded-2xl border border-primary/10 bg-white shadow-soft">
+                            {learnerResults.map((learner) => (
+                              <button
+                                key={learner.id}
+                                type="button"
+                                onClick={() => {
+                                  setSelectedSubmittedForLearner(learner);
+                                  setSubmittedForNotificationEmail(learner.notificationEmail || learner.email);
+                                  setLearnerResults([]);
+                                  setLearnerSearch("");
+                                }}
+                                className="flex w-full flex-col gap-1 border-b border-primary/8 px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-primary/[0.05]"
+                              >
+                                <span className="font-semibold text-foreground">{learner.fullName}</span>
+                                <span className="break-all text-xs text-muted-foreground">
+                                  {learner.email}
+                                  {learner.externalLearnerId ? ` • ID: ${learner.externalLearnerId}` : ""}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {selectedSubmittedForLearner ? (
+                      <div className="space-y-2 rounded-2xl border border-primary/10 bg-white px-4 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <Label htmlFor="submitted-for-notification-email">Notification email</Label>
+                          <span className="rounded-full border border-primary/10 bg-primary/[0.05] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-primary">
+                            Ticket only
+                          </span>
+                        </div>
+                        <Input
+                          id="submitted-for-notification-email"
+                          type="email"
+                          value={submittedForNotificationEmail}
+                          onChange={(event) => setSubmittedForNotificationEmail(event.target.value)}
+                          placeholder={selectedSubmittedForLearner.email}
+                          className="h-11 rounded-xl"
+                        />
+                        <p className="text-xs leading-5 text-muted-foreground">
+                          This does not update the learner official record. It is used only if learner notification is enabled for this ticket.
+                        </p>
+                        {notifySubmittedForLearner && !hasValidSubmittedForNotificationEmail ? (
+                          <p className="text-xs font-medium text-destructive">
+                            Please enter a valid notification email before continuing.
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    <label className={`flex items-start gap-3 rounded-2xl border border-primary/10 bg-white px-4 py-3 text-sm ${
+                      selectedSubmittedForLearner ? "cursor-pointer" : "cursor-not-allowed opacity-70"
+                    }`}
+                    >
+                      <Checkbox
+                        checked={notifySubmittedForLearner}
+                        disabled={!selectedSubmittedForLearner}
+                        onCheckedChange={(checked) => setNotifySubmittedForLearner(Boolean(checked))}
+                        className="mt-1"
+                      />
+                      <span>
+                        <span className="block font-semibold text-foreground">Notify learner by email</span>
+                        <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                          Off by default. If selected, the learner receives an email after the ticket is submitted.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="space-y-2">
               <Label>Inquiry Category</Label>
               <Select
@@ -766,6 +950,27 @@ const InquiryDetails = () => {
                   ))}
                 </SelectContent>
               </Select>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-end justify-between gap-3">
+                <Label htmlFor="ticket-subject">Subject</Label>
+                <span className="text-xs text-muted-foreground">
+                  {subject.length}/{SUBJECT_MAX_LENGTH}
+                </span>
+              </div>
+              <Input
+                id="ticket-subject"
+                required
+                maxLength={SUBJECT_MAX_LENGTH}
+                value={subject}
+                onChange={(event) => setSubject(event.target.value)}
+                placeholder="Write a short title for this issue..."
+                className="h-11 rounded-xl"
+              />
+              <p className="text-xs leading-5 text-muted-foreground">
+                Keep this as a short title. Add the full explanation in Issue Details below.
+              </p>
             </div>
 
             {isCoverageFlow ? (
@@ -1007,7 +1212,7 @@ const InquiryDetails = () => {
               </div>
             ) : (
               <div className="space-y-2">
-                <Label>Inquiry</Label>
+                <Label>Issue Details</Label>
                 <Textarea
                   rows={6}
                   placeholder="Please describe your issue in detail..."
@@ -1078,7 +1283,7 @@ const InquiryDetails = () => {
                 onClick={() => void handleNext()}
                 className="w-full border-0 gradient-primary sm:w-auto"
               >
-                {isSubmitting ? (isCoverageFlow && !ticket.id ? "Creating..." : "Saving...") : "Next"}
+                {isSubmitting ? "Saving..." : "Next"}
                 {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
               </Button>
             </div>

@@ -274,6 +274,15 @@ interface TicketState {
   resolutionReason: string;
 }
 
+interface SubmittedForLearnerSummary {
+  id: number;
+  externalLearnerId?: string;
+  fullName: string;
+  email: string;
+  notificationEmail?: string;
+  notifyByEmail?: boolean;
+}
+
 interface TicketSummary {
   id: string;
   learnerName: string;
@@ -284,6 +293,9 @@ interface TicketSummary {
   priority: string;
   category: string;
   technicalSubcategory: string;
+  subject?: string;
+  submittedForLearner?: SubmittedForLearnerSummary | null;
+  notifySubmittedForLearner?: boolean;
   inquiryPreview: string;
   status: "Open" | "Pending" | "Closed";
   statusReason: string;
@@ -1153,6 +1165,10 @@ const AgentDashboard = () => {
       formatRequesterRoleLabel(ticket.requesterRole),
       ticket.category,
       ticket.technicalSubcategory,
+      ticket.subject,
+      ticket.submittedForLearner?.fullName,
+      ticket.submittedForLearner?.email,
+      ticket.submittedForLearner?.externalLearnerId,
       ticket.inquiryPreview,
     ];
 
@@ -1347,6 +1363,10 @@ const AgentDashboard = () => {
         getDisplayedChatReference(ticket),
         ticket.id,
         ...getDashboardRequesterColumnSummary(ticket, { preferCoverageInquiry: isLearningPlanCoverageSection }).searchTerms,
+        ticket.subject,
+        ticket.submittedForLearner?.fullName,
+        ticket.submittedForLearner?.email,
+        ticket.submittedForLearner?.externalLearnerId,
         formatRequesterRoleLabel(ticket.requesterRole),
       ];
 
@@ -6894,6 +6914,15 @@ const AgentDashboard = () => {
 
                     <div className="grid gap-4 text-sm sm:grid-cols-2">
                       <InfoCard label="Requester E-mail" value={activeDetail.ticket.email} />
+                      {activeDetail.ticket.submittedForLearner ? (
+                        <InfoCard
+                          label="Submitted For"
+                          value={`${activeDetail.ticket.submittedForLearner.fullName || activeDetail.ticket.submittedForLearner.email} (${activeDetail.ticket.submittedForLearner.email})`}
+                        />
+                      ) : null}
+                      {activeDetail.ticket.subject ? (
+                        <InfoCard label="Subject" value={activeDetail.ticket.subject} />
+                      ) : null}
                       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(activeDetail.ticket.requesterRole)} />
                       <InfoCard label="Assigned Team" value={activeDetail.ticket.assignedTeam} />
                       <InfoCard label="Category" value={formatCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)} />
@@ -8847,6 +8876,15 @@ const CoverageTicketDetailsPanel = ({
 
     <div className="grid gap-4 text-sm sm:grid-cols-2">
       <InfoCard label="Requester E-mail" value={ticket.email} />
+      {ticket.submittedForLearner ? (
+        <InfoCard
+          label="Submitted For"
+          value={`${ticket.submittedForLearner.fullName || ticket.submittedForLearner.email} (${ticket.submittedForLearner.email})`}
+        />
+      ) : null}
+      {ticket.subject ? (
+        <InfoCard label="Subject" value={ticket.subject} />
+      ) : null}
       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(ticket.requesterRole)} />
       <InfoCard label="Assigned Team" value={ticket.assignedTeam} />
       <InfoCard label="Category" value={formatCategoryLabel(ticket.category, ticket.technicalSubcategory)} />
@@ -11696,6 +11734,75 @@ const documentationCardFields: {
   { key: "resources", label: "Resources", placeholder: "Add links, resources, or follow-up notes..." },
 ];
 
+const RequestSubmissionContextPanel = ({ ticket }: { ticket: TicketDetail }) => {
+  const submittedByName = ticket.requesterName || ticket.learnerName || ticket.email || "Requester";
+  const submittedByEmail = ticket.email || "";
+  const submittedFor = ticket.submittedForLearner || null;
+
+  return (
+    <div className="mt-4 grid gap-3 md:grid-cols-2">
+      <div className="rounded-2xl border border-primary/10 bg-white/80 p-4 shadow-sm">
+        <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+          <UserRound className="h-3.5 w-3.5" />
+          Submitted by
+        </div>
+        <div className="text-sm font-semibold text-foreground">{submittedByName}</div>
+        {submittedByEmail ? (
+          <div className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <Mail className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate" title={submittedByEmail}>{submittedByEmail}</span>
+          </div>
+        ) : null}
+        <div className="mt-2 inline-flex rounded-full border border-primary/10 bg-primary/[0.05] px-2.5 py-1 text-[11px] font-semibold text-primary">
+          {formatRequesterRoleLabel(ticket.requesterRole)}
+        </div>
+      </div>
+
+      <div
+        className={cn(
+          "rounded-2xl border p-4 shadow-sm",
+          submittedFor
+            ? "border-emerald-200 bg-emerald-50/70"
+            : "border-primary/10 bg-white/80",
+        )}
+      >
+        <div className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+          <Users className="h-3.5 w-3.5" />
+          Submitted for
+        </div>
+        {submittedFor ? (
+          <>
+            <div className="text-sm font-semibold text-foreground">{submittedFor.fullName || submittedFor.email}</div>
+            <div className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+              <Mail className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate" title={submittedFor.email}>Official: {submittedFor.email}</span>
+            </div>
+            {submittedFor.notificationEmail && submittedFor.notificationEmail !== submittedFor.email ? (
+              <div className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-emerald-700">
+                <SendHorizontal className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate" title={submittedFor.notificationEmail}>Notify: {submittedFor.notificationEmail}</span>
+              </div>
+            ) : null}
+            {submittedFor.externalLearnerId ? (
+              <div className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                <Hash className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">Learner ID: {submittedFor.externalLearnerId}</span>
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <div className="text-sm font-semibold text-foreground">Self</div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              This ticket is about the requester who submitted it.
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const StandardDocumentationWorkspace = ({
   ticket,
   draft,
@@ -11907,8 +12014,31 @@ const StandardDocumentationWorkspace = ({
           </div>
         </div>
 
-        <div className="mt-4 rounded-2xl border border-primary/10 bg-white/90 p-4 text-sm leading-6 text-foreground shadow-sm">
-          {ticket.inquiry?.trim() ? ticket.inquiry : "No inquiry text was submitted."}
+        <RequestSubmissionContextPanel ticket={ticket} />
+
+        <div className="mt-4 rounded-2xl border border-primary/10 bg-white/90 p-4 shadow-sm">
+          <div className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+            <FileText className="h-3.5 w-3.5" />
+            Requester Message
+          </div>
+          <div className="space-y-3">
+            <div>
+              <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                Subject
+              </div>
+              <div className="mt-1 text-sm font-semibold leading-6 text-foreground">
+                {ticket.subject?.trim() ? ticket.subject : "No subject was submitted."}
+              </div>
+            </div>
+            <div className="border-t border-primary/10 pt-3">
+              <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                Issue Details
+              </div>
+              <div className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">
+                {ticket.inquiry?.trim() ? ticket.inquiry : "No inquiry text was submitted."}
+              </div>
+            </div>
+          </div>
         </div>
 
         <div className="mt-4">

@@ -48,7 +48,10 @@ interface PublicTicketPayload {
   requesterSource?: RequesterSource;
   category: Category;
   technicalSubcategory: TechnicalSubcategory;
+  subject?: string;
   inquiry: string;
+  submittedForLearner?: Ticket["submittedForLearner"];
+  notifySubmittedForLearner?: boolean;
   status: Ticket["status"];
   statusReason?: string;
   assignedAgentId?: number | null;
@@ -171,37 +174,93 @@ const SupportOptions = () => {
     };
   }, [isCoachRequester, ticket.id]);
 
-  const buildTicketStateFromPayload = (payloadTicket: PublicTicketPayload, currentTicket: Ticket): Ticket => ({
-    ...currentTicket,
-    id: payloadTicket.id,
-    learnerName: payloadTicket.learnerName || currentTicket.learnerName,
-    email: payloadTicket.email || currentTicket.email,
-    requesterRole: payloadTicket.requesterRole || currentTicket.requesterRole,
-    requesterSource: payloadTicket.requesterSource || currentTicket.requesterSource,
-    category: payloadTicket.category || currentTicket.category,
-    technicalSubcategory: payloadTicket.technicalSubcategory || currentTicket.technicalSubcategory,
-    inquiry: payloadTicket.inquiry || currentTicket.inquiry,
-    status: payloadTicket.status || currentTicket.status,
-    statusReason: payloadTicket.statusReason || currentTicket.statusReason,
-    assignedAgentId: payloadTicket.assignedAgentId ?? currentTicket.assignedAgentId,
-    assignedTeam: payloadTicket.assignedTeam || currentTicket.assignedTeam,
-    slaStatus: payloadTicket.slaStatus || currentTicket.slaStatus,
-    createdAt: payloadTicket.createdAt || currentTicket.createdAt,
-    chatState: payloadTicket.chatState ?? currentTicket.chatState,
-    liveChatRequested: payloadTicket.liveChatRequested ?? currentTicket.liveChatRequested,
-  });
+  const buildTicketStateFromPayload = (payloadTicket: PublicTicketPayload, currentTicket: Ticket): Ticket => {
+    const hasSubmittedForLearner = Object.prototype.hasOwnProperty.call(payloadTicket, "submittedForLearner");
+    const hasNotifySubmittedForLearner = Object.prototype.hasOwnProperty.call(payloadTicket, "notifySubmittedForLearner");
+
+    return {
+      ...currentTicket,
+      id: payloadTicket.id,
+      learnerName: payloadTicket.learnerName || currentTicket.learnerName,
+      email: payloadTicket.email || currentTicket.email,
+      requesterRole: payloadTicket.requesterRole || currentTicket.requesterRole,
+      requesterSource: payloadTicket.requesterSource || currentTicket.requesterSource,
+      category: payloadTicket.category || currentTicket.category,
+      technicalSubcategory: payloadTicket.technicalSubcategory || currentTicket.technicalSubcategory,
+      subject: payloadTicket.subject || currentTicket.subject,
+      inquiry: payloadTicket.inquiry || currentTicket.inquiry,
+      submittedForLearner: hasSubmittedForLearner ? payloadTicket.submittedForLearner ?? null : currentTicket.submittedForLearner,
+      notifySubmittedForLearner: hasNotifySubmittedForLearner ? Boolean(payloadTicket.notifySubmittedForLearner) : currentTicket.notifySubmittedForLearner,
+      status: payloadTicket.status || currentTicket.status,
+      statusReason: payloadTicket.statusReason || currentTicket.statusReason,
+      assignedAgentId: payloadTicket.assignedAgentId ?? currentTicket.assignedAgentId,
+      assignedTeam: payloadTicket.assignedTeam || currentTicket.assignedTeam,
+      slaStatus: payloadTicket.slaStatus || currentTicket.slaStatus,
+      createdAt: payloadTicket.createdAt || currentTicket.createdAt,
+      chatState: payloadTicket.chatState ?? currentTicket.chatState,
+      liveChatRequested: payloadTicket.liveChatRequested ?? currentTicket.liveChatRequested,
+    };
+  };
+
+  const buildTicketDraftFormData = (currentTicket: Ticket) => {
+    const formData = new FormData();
+    formData.set("email", currentTicket.email);
+    formData.set("requesterRole", currentTicket.requesterRole);
+    formData.set("category", currentTicket.category);
+    formData.set("technicalSubcategory", currentTicket.technicalSubcategory);
+    formData.set("subject", currentTicket.subject);
+    formData.set("inquiry", currentTicket.inquiry);
+    formData.set("submittedForLearnerId", currentTicket.submittedForLearner ? String(currentTicket.submittedForLearner.id) : "");
+    formData.set("notifySubmittedForLearner", String(Boolean(currentTicket.submittedForLearner && currentTicket.notifySubmittedForLearner)));
+    formData.set(
+      "submittedForNotificationEmail",
+      currentTicket.submittedForLearner
+        ? currentTicket.submittedForLearner.notificationEmail || currentTicket.submittedForLearner.email
+        : "",
+    );
+    currentTicket.evidence.forEach((file) => {
+      if (file.file) {
+        formData.append("evidenceFiles", file.file, file.name);
+      }
+    });
+    return formData;
+  };
 
   const ensureTicketCreated = async () => {
     const currentTicket = ticketRef.current;
     if (currentTicket.id) {
-      return currentTicket;
+      try {
+        const response = await fetch(`/api/tickets/${encodeURIComponent(currentTicket.id)}`, {
+          method: "PATCH",
+          body: buildTicketDraftFormData(currentTicket),
+        });
+        const payload = (await response.json().catch(() => null)) as
+          | {
+              message?: string;
+              ticket?: PublicTicketPayload;
+            }
+          | null;
+
+        if (!response.ok || !payload?.ticket) {
+          toast.error(payload?.message || "We could not update the ticket details right now.");
+          return null;
+        }
+
+        const nextTicket = buildTicketStateFromPayload(payload.ticket, currentTicket);
+        ticketRef.current = nextTicket;
+        updateTicket(nextTicket);
+        return nextTicket;
+      } catch {
+        toast.error("We could not connect to the server. Please try again.");
+        return null;
+      }
     }
 
     if (pendingTicketCreationRef.current) {
       return pendingTicketCreationRef.current;
     }
 
-    if (!currentTicket.email || !currentTicket.category || !currentTicket.inquiry.trim()) {
+    if (!currentTicket.email || !currentTicket.category || !currentTicket.subject.trim() || !currentTicket.inquiry.trim()) {
       toast.error("Please complete the inquiry details before choosing a support path.");
       navigate(currentTicket.email ? "/support/inquiry" : "/support");
       return null;
@@ -211,17 +270,7 @@ const SupportOptions = () => {
       setIsCreatingTicket(true);
 
       try {
-        const formData = new FormData();
-        formData.set("email", currentTicket.email);
-        formData.set("requesterRole", currentTicket.requesterRole);
-        formData.set("category", currentTicket.category);
-        formData.set("technicalSubcategory", currentTicket.technicalSubcategory);
-        formData.set("inquiry", currentTicket.inquiry);
-        currentTicket.evidence.forEach((file) => {
-          if (file.file) {
-            formData.append("evidenceFiles", file.file, file.name);
-          }
-        });
+        const formData = buildTicketDraftFormData(currentTicket);
 
         const response = await fetch("/api/tickets", {
           method: "POST",
@@ -510,6 +559,12 @@ const SupportOptions = () => {
       label: "Requester",
       value: ticket.learnerName || ticket.email || "Requester",
     },
+    ...(ticket.submittedForLearner
+      ? [{
+          label: "Submitted for",
+          value: ticket.submittedForLearner.fullName || ticket.submittedForLearner.email,
+        }]
+      : []),
     {
       label: "Issue Type",
       value: ticket.category
@@ -517,10 +572,17 @@ const SupportOptions = () => {
         : "Not selected",
     },
     {
+      label: "Subject",
+      value: ticket.subject || "Not added",
+    },
+    {
       label: "Current Status",
       value: ticket.id ? (ticket.status || "Open") : "Not submitted yet",
     },
   ];
+  const ticketSummaryGridClassName = ticketSummaryItems.length >= 5
+    ? "grid gap-3 sm:grid-cols-2 xl:grid-cols-5"
+    : "grid gap-3 sm:grid-cols-2 xl:grid-cols-4";
 
   const getSupportActionCardLayout = (actionId: string, index: number) => {
     if (!isCoachRequester) {
@@ -556,27 +618,27 @@ const SupportOptions = () => {
             </Button>
           </div>
 
-          <div className="relative mt-6 grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.15fr)] lg:items-end">
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight text-primary md:text-3xl">
-                {pageTitle}
-              </h1>
-              <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground md:text-base">
-                {pageDescription}
-              </p>
-            </div>
+          <div className="relative mt-6">
+            <h1 className="text-2xl font-bold tracking-tight text-primary md:text-3xl">
+              {pageTitle}
+            </h1>
+            <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground md:text-base">
+              {pageDescription}
+            </p>
 
-            <div className="grid gap-3 rounded-[26px] border border-primary/10 bg-white/70 p-4 shadow-soft backdrop-blur sm:grid-cols-3">
-              {ticketSummaryItems.map((item) => (
-                <div key={item.label} className="rounded-2xl border border-primary/10 bg-white/80 px-4 py-3">
-                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    {item.label}
+            <div className="mt-5 rounded-[26px] border border-primary/10 bg-white/72 p-3 shadow-soft backdrop-blur md:p-4">
+              <div className={ticketSummaryGridClassName}>
+                {ticketSummaryItems.map((item) => (
+                  <div key={item.label} className="min-w-0 rounded-2xl border border-primary/10 bg-white/85 px-4 py-3">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                      {item.label}
+                    </div>
+                    <div className="mt-1 truncate text-sm font-semibold text-foreground" title={item.value}>
+                      {item.value}
+                    </div>
                   </div>
-                  <div className="mt-1 truncate text-sm font-semibold text-foreground" title={item.value}>
-                    {item.value}
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
 

@@ -202,6 +202,8 @@ LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY = "latest_coverage_tutor_response"
 QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_confirmation_email_sent_at"
 QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_closed_email_sent_at"
 LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailable_operations_notified_at"
+SUBMITTED_FOR_LEARNER_METADATA_KEY = "submitted_for_learner"
+NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY = "notify_submitted_for_learner"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
@@ -1562,6 +1564,51 @@ def can_requester_submit_coverage_ticket(requester_source: Any) -> bool:
 def ensure_requester_can_submit_coverage_ticket(requester_source: Any) -> None:
     if not can_requester_submit_coverage_ticket(requester_source):
         raise ApiError(403, "Coverage requests are not available for standard KBC learner accounts.")
+
+
+def can_requester_submit_for_learner(requester_role: Any, requester_source: Any) -> bool:
+    if normalize_public_requester_source(requester_source) != KBC_USERS_DATA_REQUESTER_SOURCE:
+        return True
+    return normalize_public_requester_role(requester_role) in {ROLE_COACH, ROLE_EMPLOYER}
+
+
+def resolve_submitted_for_learner(
+    submitted_for_learner_id: Any,
+    *,
+    requester_role: Any,
+    requester_source: Any,
+) -> dict[str, Any] | None:
+    normalized_learner_id = parse_int(submitted_for_learner_id)
+    if normalized_learner_id <= 0:
+        return None
+
+    if not can_requester_submit_for_learner(requester_role, requester_source):
+        raise ApiError(403, "Standard learner accounts cannot submit tickets on behalf of another learner.")
+
+    learner = fetch_local_learner_by_id(normalized_learner_id)
+    if not learner or not is_kbc_learner_record(learner):
+        raise ApiError(400, "Please choose a valid learner from the KBC learner records.")
+
+    return learner
+
+
+def build_submitted_for_learner_payload(
+    learner: dict[str, Any] | None,
+    *,
+    notify_by_email: bool = False,
+    notification_email: Any = "",
+) -> dict[str, Any] | None:
+    if not learner:
+        return None
+
+    payload = {
+        **serialize_public_learner_search_result(learner),
+        "notifyByEmail": bool(notify_by_email),
+    }
+    normalized_notification_email = normalize_email(notification_email)
+    if normalized_notification_email:
+        payload["notificationEmail"] = normalized_notification_email
+    return payload
 
 
 def get_ticket_sort_timestamp(value: Any) -> float:
@@ -3413,6 +3460,86 @@ def fetch_local_learner_by_email(email: str) -> dict[str, Any] | None:
     )
 
 
+def fetch_local_learner_by_id(learner_id: Any) -> dict[str, Any] | None:
+    normalized_learner_id = parse_int(learner_id)
+    if normalized_learner_id <= 0:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, external_learner_id, support_account_id, full_name, email, phone, source, metadata
+        FROM learners
+        WHERE id = %s
+        LIMIT 1
+        """,
+        [normalized_learner_id],
+    )
+
+
+def is_kbc_learner_record(learner: dict[str, Any] | None) -> bool:
+    if not learner:
+        return False
+
+    metadata = normalize_json_object(learner.get("metadata"))
+    source = sanitize_text(learner.get("source")).lower()
+    legacy_source = sanitize_text(metadata.get("legacy_source")).lower()
+    return source in {"kbc_users_data", "legacy_kbc_users_data"} or legacy_source == "kbc_users_data"
+
+
+def serialize_public_learner_search_result(learner: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(learner["id"]),
+        "externalLearnerId": sanitize_text(learner.get("external_learner_id")),
+        "fullName": sanitize_text(learner.get("full_name")) or sanitize_text(learner.get("email")),
+        "email": sanitize_text(learner.get("email")),
+    }
+
+
+def search_local_kbc_learners(query: str, limit: int) -> list[dict[str, Any]]:
+    normalized_query = sanitize_text(query).lower()
+    if len(normalized_query) < 2:
+        return []
+
+    search_pattern = f"%{normalized_query}%"
+    starts_with_pattern = f"{normalized_query}%"
+    return run_query(
+        """
+        SELECT id, external_learner_id, support_account_id, full_name, email, phone, source, metadata
+        FROM learners
+        WHERE (
+            LOWER(COALESCE(full_name, '')) LIKE %s
+            OR LOWER(COALESCE(email, '')) LIKE %s
+            OR LOWER(COALESCE(external_learner_id, '')) LIKE %s
+          )
+          AND (
+            LOWER(COALESCE(source, '')) IN ('kbc_users_data', 'legacy_kbc_users_data')
+            OR LOWER(COALESCE(metadata ->> 'legacy_source', '')) = 'kbc_users_data'
+          )
+        ORDER BY
+          CASE
+            WHEN LOWER(COALESCE(full_name, '')) = %s THEN 0
+            WHEN LOWER(COALESCE(email, '')) = %s THEN 1
+            WHEN LOWER(COALESCE(full_name, '')) LIKE %s THEN 2
+            WHEN LOWER(COALESCE(email, '')) LIKE %s THEN 3
+            ELSE 4
+          END,
+          full_name NULLS LAST,
+          email
+        LIMIT %s
+        """,
+        [
+            search_pattern,
+            search_pattern,
+            search_pattern,
+            normalized_query,
+            normalized_query,
+            starts_with_pattern,
+            starts_with_pattern,
+            limit,
+        ],
+    )
+
+
 def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
     if not settings.LEGACY_DATABASE_URL:
         return None
@@ -3448,6 +3575,98 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
         "email": normalized_email,
         "phone": phone,
     }
+
+
+def fetch_legacy_learners_by_search(query: str, limit: int) -> list[dict[str, Any]]:
+    normalized_query = sanitize_text(query).lower()
+    if len(normalized_query) < 2 or not settings.LEGACY_DATABASE_URL:
+        return []
+
+    search_pattern = f"%{normalized_query}%"
+
+    try:
+        with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT
+                      NULLIF(TRIM("ID"::text), '') AS external_learner_id,
+                      NULLIF(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName"))), '') AS full_name,
+                      LOWER(TRIM("Email")) AS email,
+                      NULLIF(TRIM(COALESCE("Learner_Phone", "learner-phone")), '') AS phone
+                    FROM kbc_users_data
+                    WHERE
+                      LOWER(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName")))) LIKE %s
+                      OR LOWER(TRIM("Email")) LIKE %s
+                      OR LOWER(TRIM("ID"::text)) LIKE %s
+                    LIMIT %s
+                    """,
+                    [search_pattern, search_pattern, search_pattern, limit],
+                )
+                rows = cursor.fetchall()
+    except Exception:
+        logger.warning("Legacy learner search failed; returning local learner matches only.", exc_info=True)
+        return []
+
+    learners: list[dict[str, Any]] = []
+    for external_learner_id, full_name, normalized_email, phone in rows:
+        if not normalized_email:
+            continue
+        learners.append(
+            {
+                "external_learner_id": external_learner_id,
+                "full_name": full_name,
+                "email": normalized_email,
+                "phone": phone,
+            }
+        )
+    return learners
+
+
+def search_kbc_learners(query: str, limit: int = 12, requester_email: Any = "") -> dict[str, Any]:
+    normalized_query = sanitize_text(query)
+    normalized_limit = min(max(parse_int(limit, 12), 1), 25)
+    if len(normalized_query) < 2:
+        return {"learners": []}
+
+    normalized_requester_email = normalize_email(requester_email)
+    if not is_valid_email(normalized_requester_email):
+        raise ApiError(400, "Requester email is required before searching learners.")
+
+    requester = resolve_public_support_requester(normalized_requester_email)
+    if not requester:
+        raise ApiError(404, "This requester email is not registered in our records.")
+
+    requester_role = requester["role"]
+    requester_source = get_public_requester_source(requester)
+    if not can_requester_submit_for_learner(requester_role, requester_source):
+        raise ApiError(403, "This requester cannot submit tickets on behalf of another learner.")
+
+    matches = search_local_kbc_learners(normalized_query, normalized_limit)
+    seen_emails = {normalize_email(row.get("email")) for row in matches if normalize_email(row.get("email"))}
+
+    if len(matches) < normalized_limit:
+        for legacy_learner in fetch_legacy_learners_by_search(normalized_query, normalized_limit - len(matches)):
+            email = normalize_email(legacy_learner.get("email"))
+            if not email or email in seen_emails:
+                continue
+
+            synced_learner = upsert_learner_record(
+                legacy_learner,
+                source="legacy_kbc_users_data",
+                metadata={
+                    "legacy_source": "kbc_users_data",
+                    "synced_on_demand": True,
+                },
+            )
+            if synced_learner:
+                matches.append(synced_learner)
+                seen_emails.add(email)
+
+            if len(matches) >= normalized_limit:
+                break
+
+    return {"learners": [serialize_public_learner_search_result(learner) for learner in matches[:normalized_limit]]}
 
 
 def run_communication_centre_query(
@@ -5601,10 +5820,14 @@ def build_coverage_ticket_operations_webhook_payload(
     requester_role: str,
     category: str,
     technical_subcategory: str,
+    subject: str,
     inquiry: str,
     priority: str,
     evidence_count: int,
     attachment_rows: list[dict[str, Any]] | None = None,
+    submitted_for_learner: dict[str, Any] | None = None,
+    notify_submitted_for_learner: bool = False,
+    submitted_for_notification_email: Any = "",
 ) -> dict[str, Any]:
     parsed_inquiry = parse_coverage_inquiry_details(inquiry) or {}
     public_base_url = get_support_portal_public_base_url("")
@@ -5620,6 +5843,7 @@ def build_coverage_ticket_operations_webhook_payload(
             "statusReason": "Coverage Ticket",
             "category": category,
             "technicalSubcategory": technical_subcategory,
+            "subject": subject,
             "priority": priority,
             "assignedTeam": ticket_row.get("assigned_team") or "Unassigned",
             "slaStatus": ticket_row.get("sla_status") or "",
@@ -5631,6 +5855,11 @@ def build_coverage_ticket_operations_webhook_payload(
             "email": learner.get("email") or "",
             "role": requester_role,
         },
+        "submittedFor": build_submitted_for_learner_payload(
+            submitted_for_learner,
+            notify_by_email=notify_submitted_for_learner,
+            notification_email=submitted_for_notification_email,
+        ),
         "coverage": {
             "tutor": parsed_inquiry.get("tutor") or "",
             "module": parsed_inquiry.get("module") or "",
@@ -5907,6 +6136,20 @@ def build_support_notification_webhook_payload(
     )
     notification_status = status or sanitize_text(ticket.get("status"))
     notification_status_reason = status_reason if status_reason is not None else sanitize_text(ticket.get("status_reason"))
+    submitted_for_payload = normalize_json_object(ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+    if not submitted_for_payload and ticket.get("submitted_for_learner_id"):
+        submitted_for_payload = {
+            "id": int(ticket["submitted_for_learner_id"]),
+            "externalLearnerId": sanitize_text(ticket.get("submitted_for_external_learner_id")),
+            "fullName": sanitize_text(ticket.get("submitted_for_learner_name")) or sanitize_text(ticket.get("submitted_for_learner_email")),
+            "email": sanitize_text(ticket.get("submitted_for_learner_email")),
+        }
+    if submitted_for_payload:
+        submitted_for_payload["notifyByEmail"] = normalize_bool(
+            submitted_for_payload.get("notifyByEmail")
+            if "notifyByEmail" in submitted_for_payload
+            else ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY)
+        )
 
     return {
         "event": event,
@@ -5918,6 +6161,7 @@ def build_support_notification_webhook_payload(
             "statusReason": notification_status_reason,
             "category": ticket.get("category"),
             "technicalSubcategory": ticket.get("technical_subcategory") or "",
+            "subject": sanitize_text(ticket.get("subject")) or sanitize_text(ticket_metadata.get("subject")),
             "priority": ticket.get("priority") or "",
             "assignedTeam": ticket.get("assigned_team") or "Unassigned",
             "slaStatus": ticket.get("sla_status") or "",
@@ -5930,6 +6174,7 @@ def build_support_notification_webhook_payload(
             "role": requester_role,
             "source": requester_source,
         },
+        "submittedFor": submitted_for_payload or None,
         "liveChat": {
             "requestedAt": serialize_datetime_value(requested_at) if requested_at else "",
             "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
@@ -7590,6 +7835,8 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           t.public_id,
           t.category,
           t.technical_subcategory,
+          t.subject,
+          t.submitted_for_learner_id,
           t.inquiry,
           t.status,
           t.status_reason,
@@ -8191,6 +8438,20 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
     requester_name = row.get("learner_name") or ""
+    submitted_for_payload = normalize_json_object(ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+    if not submitted_for_payload and row.get("submitted_for_learner_id"):
+        submitted_for_payload = {
+            "id": int(row["submitted_for_learner_id"]),
+            "externalLearnerId": sanitize_text(row.get("submitted_for_external_learner_id")),
+            "fullName": sanitize_text(row.get("submitted_for_learner_name")) or sanitize_text(row.get("submitted_for_learner_email")),
+            "email": sanitize_text(row.get("submitted_for_learner_email")),
+        }
+    if submitted_for_payload:
+        submitted_for_payload["notifyByEmail"] = normalize_bool(
+            submitted_for_payload.get("notifyByEmail")
+            if "notifyByEmail" in submitted_for_payload
+            else ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY)
+        )
     documentation = normalize_admin_documentation(
         row.get("_resolved_documentation", ticket_metadata.get("admin_documentation")),
         fallback_inquiry=sanitize_text(row.get("inquiry")),
@@ -8234,6 +8495,9 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "priority": normalize_ticket_priority(row.get("priority")),
         "category": row["category"],
         "technicalSubcategory": row.get("technical_subcategory") or "",
+        "subject": sanitize_text(row.get("subject")) or sanitize_text(ticket_metadata.get("subject")),
+        "submittedForLearner": submitted_for_payload or None,
+        "notifySubmittedForLearner": normalize_bool(submitted_for_payload.get("notifyByEmail")) if submitted_for_payload else False,
         "inquiryPreview": sanitize_text(row.get("inquiry")),
         "status": row["status"],
         "statusReason": row.get("status_reason") or "",
@@ -11918,6 +12182,9 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
+          submitted_for.external_learner_id AS submitted_for_external_learner_id,
+          submitted_for.full_name AS submitted_for_learner_name,
+          submitted_for.email AS submitted_for_learner_email,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name,
@@ -11926,6 +12193,8 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
+        LEFT JOIN learners submitted_for
+          ON submitted_for.id = t.submitted_for_learner_id
         LEFT JOIN conversations c
           ON c.id = t.conversation_id
         LEFT JOIN LATERAL (
@@ -12116,6 +12385,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         "requesterRole": existing_ticket_requester_role,
         "category": existing_ticket["category"],
         "technicalSubcategory": existing_ticket.get("technical_subcategory") or "",
+        "subject": sanitize_text(existing_ticket.get("subject")),
         "inquiry": existing_ticket.get("inquiry") or "",
         "status": existing_ticket["status"],
         "statusReason": existing_ticket.get("status_reason") or "",
@@ -12948,6 +13218,8 @@ def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
           t.category,
           t.inquiry,
           t.technical_subcategory,
+          t.subject,
+          t.submitted_for_learner_id,
           t.status,
           t.status_reason,
           t.priority,
@@ -12970,6 +13242,9 @@ def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
+          submitted_for.external_learner_id AS submitted_for_external_learner_id,
+          submitted_for.full_name AS submitted_for_learner_name,
+          submitted_for.email AS submitted_for_learner_email,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name,
@@ -12978,6 +13253,8 @@ def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
+        LEFT JOIN learners submitted_for
+          ON submitted_for.id = t.submitted_for_learner_id
         LEFT JOIN conversations c
           ON c.id = t.conversation_id
         LEFT JOIN LATERAL (
@@ -17302,6 +17579,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
     category = sanitize_text(payload.get("category"))
     technical_subcategory = normalize_technical_subcategory(payload.get("technicalSubcategory"))
     inquiry = sanitize_text(payload.get("inquiry"))
+    subject = sanitize_text(payload.get("subject"))
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
     uploaded_files = list(uploaded_files or [])
     evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
@@ -17318,6 +17596,8 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
         raise ApiError(400, "Technical sub category can only be used with Technical inquiries.")
     if not inquiry:
         raise ApiError(400, "Inquiry details are required.")
+    if not subject:
+        subject = sanitize_text((inquiry.splitlines() or [""])[0])[:140] or technical_subcategory or category
 
     try:
         with transaction.atomic():
@@ -17331,13 +17611,38 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 ensure_requester_can_submit_coverage_ticket(requester_source)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
+            submitted_for_learner = resolve_submitted_for_learner(
+                payload.get("submittedForLearnerId"),
+                requester_role=requester_role,
+                requester_source=requester_source,
+            )
+            notify_submitted_for_learner = bool(
+                submitted_for_learner and normalize_bool(payload.get("notifySubmittedForLearner"))
+            )
+            submitted_for_notification_email = ""
+            if submitted_for_learner:
+                raw_submitted_for_notification_email = sanitize_text(payload.get("submittedForNotificationEmail"))
+                submitted_for_notification_email = normalize_email(raw_submitted_for_notification_email) or normalize_email(submitted_for_learner.get("email"))
+                if raw_submitted_for_notification_email and not is_valid_email(submitted_for_notification_email):
+                    raise ApiError(400, "Please enter a valid learner notification email.")
+                if notify_submitted_for_learner and not is_valid_email(submitted_for_notification_email):
+                    raise ApiError(400, "Please enter a valid learner notification email before enabling learner notifications.")
             managed_account = requester.get("account")
             ticket_metadata = {
                 "source": "support_portal",
                 "technical_subcategory": technical_subcategory or None,
                 "requester_role": requester_role,
                 "requester_source": requester_source or None,
+                "subject": subject,
             }
+            submitted_for_payload = build_submitted_for_learner_payload(
+                submitted_for_learner,
+                notify_by_email=notify_submitted_for_learner,
+                notification_email=submitted_for_notification_email,
+            )
+            if submitted_for_payload:
+                ticket_metadata[SUBMITTED_FOR_LEARNER_METADATA_KEY] = submitted_for_payload
+                ticket_metadata[NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY] = notify_submitted_for_learner
             if managed_account:
                 ticket_metadata.update(
                     {
@@ -17364,12 +17669,14 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                       learner_id,
                       category,
                       technical_subcategory,
+                      subject,
                       inquiry,
+                      submitted_for_learner_id,
                       priority,
                       evidence_count,
                       metadata
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     RETURNING id, status, assigned_team, sla_status, created_at
                     """,
                     [
@@ -17377,7 +17684,9 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         learner["id"],
                         category,
                         technical_subcategory or None,
+                        subject,
                         inquiry,
+                        submitted_for_learner["id"] if submitted_for_learner else None,
                         ticket_priority,
                         evidence_count,
                         json.dumps(ticket_metadata),
@@ -17466,8 +17775,10 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                                 "ticket_public_id": public_id,
                                 "learner_id": learner["id"],
                                 "technical_subcategory": technical_subcategory or None,
+                                "subject": subject,
                                 "requester_role": requester_role,
                                 "requester_source": requester_source or None,
+                                "submitted_for_learner": submitted_for_payload,
                                 "requester_account_id": int(managed_account["id"]) if managed_account else None,
                                 "requester_username": sanitize_text(managed_account.get("username")) if managed_account else "",
                             }
@@ -17561,7 +17872,9 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 {
                     "category": category,
                     "technical_subcategory": technical_subcategory or None,
+                    "subject": subject,
                     "evidence_count": evidence_count,
+                    "submitted_for_learner": submitted_for_payload,
                 },
             )
     except Exception:
@@ -17580,10 +17893,14 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 requester_role=requester_role,
                 category=category,
                 technical_subcategory=technical_subcategory,
+                subject=subject,
                 inquiry=inquiry,
                 priority=ticket_priority,
                 evidence_count=evidence_count,
                 attachment_rows=attachment_rows,
+                submitted_for_learner=submitted_for_learner,
+                notify_submitted_for_learner=notify_submitted_for_learner,
+                submitted_for_notification_email=submitted_for_notification_email,
             ),
         )
 
@@ -17597,15 +17914,18 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             "requesterSource": requester_source,
             "category": category,
             "technicalSubcategory": technical_subcategory,
+            "subject": subject,
             "inquiry": inquiry,
+            "submittedForLearner": submitted_for_payload,
+            "notifySubmittedForLearner": notify_submitted_for_learner,
             "status": ticket_row["status"],
-        "statusReason": "",
-        "assignedTeam": ticket_row["assigned_team"],
-        "slaStatus": initial_sla_status,
-        "createdAt": ticket_row["created_at"],
-        "chatState": "open",
-        "liveChatRequested": False,
-    }
+            "statusReason": "",
+            "assignedTeam": ticket_row["assigned_team"],
+            "slaStatus": initial_sla_status,
+            "createdAt": ticket_row["created_at"],
+            "chatState": "open",
+            "liveChatRequested": False,
+        }
     }
 
 
@@ -17613,11 +17933,15 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
     category = sanitize_text(payload.get("category"))
     technical_subcategory = normalize_technical_subcategory(payload.get("technicalSubcategory"))
     inquiry = sanitize_text(payload.get("inquiry"))
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    subject = sanitize_text(payload.get("subject"))
     uploaded_files = list(uploaded_files or [])
-    evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
+    raw_evidence = payload.get("evidence")
+    evidence = raw_evidence if isinstance(raw_evidence, list) else []
+    should_replace_attachments = bool(uploaded_files) or isinstance(raw_evidence, list)
     stored_attachment_keys: list[str] = []
     existing_attachment_storage_keys: list[str] = []
+    submitted_for_payload: dict[str, Any] | None = None
+    notify_submitted_for_learner = False
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -17629,6 +17953,8 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
         raise ApiError(400, "Technical sub category can only be used with Technical inquiries.")
     if not inquiry:
         raise ApiError(400, "Inquiry details are required.")
+    if not subject:
+        subject = sanitize_text((inquiry.splitlines() or [""])[0])[:140] or technical_subcategory or category
 
     try:
         with transaction.atomic():
@@ -17642,10 +17968,12 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                   t.priority,
                   t.assigned_team,
                   t.sla_status,
+                  t.evidence_count,
                   t.metadata,
                   t.created_at,
                   t.conversation_id,
                   t.technical_subcategory,
+                  t.submitted_for_learner_id,
                   l.full_name AS learner_name,
                   l.email,
                   l.source AS learner_source,
@@ -17671,6 +17999,66 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                 ensure_requester_can_submit_coverage_ticket(requester_source)
             next_priority = derive_requester_ticket_priority(requester_role, existing_ticket.get("priority"))
             existing_attachment_storage_keys = list_ticket_attachment_storage_keys(int(existing_ticket["id"]))
+            evidence_count = (
+                len(uploaded_files)
+                if uploaded_files
+                else len(evidence)
+                if should_replace_attachments
+                else int(existing_ticket.get("evidence_count") or 0)
+            )
+            should_update_submitted_for = any(
+                key in payload
+                for key in {
+                    "submittedForLearnerId",
+                    "notifySubmittedForLearner",
+                    "submittedForNotificationEmail",
+                }
+            )
+            next_submitted_for_learner_id = existing_ticket.get("submitted_for_learner_id")
+            updated_ticket_metadata = normalize_json_object(existing_ticket.get("metadata"))
+            updated_ticket_metadata.update(
+                {
+                    **({"requester_source": requester_source} if requester_source else {}),
+                    "subject": subject,
+                }
+            )
+            if should_update_submitted_for:
+                submitted_for_learner = resolve_submitted_for_learner(
+                    payload.get("submittedForLearnerId"),
+                    requester_role=requester_role,
+                    requester_source=requester_source,
+                )
+                notify_submitted_for_learner = bool(
+                    submitted_for_learner and normalize_bool(payload.get("notifySubmittedForLearner"))
+                )
+                submitted_for_notification_email = ""
+                if submitted_for_learner:
+                    raw_submitted_for_notification_email = sanitize_text(payload.get("submittedForNotificationEmail"))
+                    submitted_for_notification_email = normalize_email(raw_submitted_for_notification_email) or normalize_email(submitted_for_learner.get("email"))
+                    if raw_submitted_for_notification_email and not is_valid_email(submitted_for_notification_email):
+                        raise ApiError(400, "Please enter a valid learner notification email.")
+                    if notify_submitted_for_learner and not is_valid_email(submitted_for_notification_email):
+                        raise ApiError(400, "Please enter a valid learner notification email before enabling learner notifications.")
+
+                submitted_for_payload = build_submitted_for_learner_payload(
+                    submitted_for_learner,
+                    notify_by_email=notify_submitted_for_learner,
+                    notification_email=submitted_for_notification_email,
+                )
+                next_submitted_for_learner_id = submitted_for_learner["id"] if submitted_for_learner else None
+                if submitted_for_payload:
+                    updated_ticket_metadata[SUBMITTED_FOR_LEARNER_METADATA_KEY] = submitted_for_payload
+                    updated_ticket_metadata[NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY] = notify_submitted_for_learner
+                else:
+                    updated_ticket_metadata.pop(SUBMITTED_FOR_LEARNER_METADATA_KEY, None)
+                    updated_ticket_metadata.pop(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY, None)
+            else:
+                submitted_for_payload = normalize_json_object(updated_ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+                notify_submitted_for_learner = (
+                    normalize_bool(submitted_for_payload.get("notifyByEmail"))
+                    if submitted_for_payload
+                    else normalize_bool(updated_ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY))
+                )
 
             apply_ticket_sla_policy(existing_ticket, persist=True)
 
@@ -17681,20 +18069,24 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                     SET
                       category = %s,
                       technical_subcategory = %s,
+                      subject = %s,
                       inquiry = %s,
+                      submitted_for_learner_id = %s,
                       priority = %s,
                       evidence_count = %s,
-                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                      metadata = %s::jsonb,
                       updated_at = NOW()
                     WHERE id = %s
                     """,
                     [
                         category,
                         technical_subcategory or None,
+                        subject,
                         inquiry,
+                        next_submitted_for_learner_id,
                         next_priority,
                         evidence_count,
-                        json.dumps({"requester_source": requester_source} if requester_source else {}),
+                        json.dumps(updated_ticket_metadata),
                         existing_ticket["id"],
                     ],
                 )
@@ -17722,53 +18114,56 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                                     "latest_inquiry": inquiry,
                                     "evidence_count": evidence_count,
                                     "requester_source": requester_source or None,
+                                    "submitted_for_learner": submitted_for_payload,
                                 }
                             ),
                             existing_ticket["conversation_id"],
                         ],
                     )
 
-                attachment_rows = [normalize_ticket_attachment_row_payload(file) for file in evidence]
-                if uploaded_files:
-                    attachment_rows = store_uploaded_ticket_attachments(existing_ticket["public_id"], uploaded_files)
-                    stored_attachment_keys = [
-                        attachment.get("storageKey")
-                        for attachment in attachment_rows
-                        if sanitize_text(attachment.get("storageKey"))
-                    ]
+                if should_replace_attachments:
+                    attachment_rows = [normalize_ticket_attachment_row_payload(file) for file in evidence]
+                    if uploaded_files:
+                        attachment_rows = store_uploaded_ticket_attachments(existing_ticket["public_id"], uploaded_files)
+                        stored_attachment_keys = [
+                            attachment.get("storageKey")
+                            for attachment in attachment_rows
+                            if sanitize_text(attachment.get("storageKey"))
+                        ]
 
-                cursor.execute("DELETE FROM ticket_attachments WHERE ticket_id = %s", [existing_ticket["id"]])
+                    cursor.execute("DELETE FROM ticket_attachments WHERE ticket_id = %s", [existing_ticket["id"]])
 
-                for file in attachment_rows:
-                    normalized_file = normalize_ticket_attachment_row_payload(file)
-                    cursor.execute(
-                        """
-                        INSERT INTO ticket_attachments (
-                          ticket_id,
-                          file_name,
-                          mime_type,
-                          file_size,
-                          storage_url,
-                          metadata
+                    for file in attachment_rows:
+                        normalized_file = normalize_ticket_attachment_row_payload(file)
+                        cursor.execute(
+                            """
+                            INSERT INTO ticket_attachments (
+                              ticket_id,
+                              file_name,
+                              mime_type,
+                              file_size,
+                              storage_url,
+                              metadata
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                            """,
+                            [
+                                existing_ticket["id"],
+                                normalized_file["name"],
+                                normalized_file["mimeType"],
+                                normalized_file["size"],
+                                normalized_file["storageKey"],
+                                json.dumps(normalized_file["metadata"]),
+                            ],
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-                        """,
-                        [
-                            existing_ticket["id"],
-                            normalized_file["name"],
-                            normalized_file["mimeType"],
-                            normalized_file["size"],
-                            normalized_file["storageKey"],
-                            json.dumps(normalized_file["metadata"]),
-                        ],
-                    )
 
-            transaction.on_commit(
-                lambda old_storage_keys=list(existing_attachment_storage_keys): [
-                    delete_support_attachment_file(storage_key)
-                    for storage_key in old_storage_keys
-                ]
-            )
+            if should_replace_attachments:
+                transaction.on_commit(
+                    lambda old_storage_keys=list(existing_attachment_storage_keys): [
+                        delete_support_attachment_file(storage_key)
+                        for storage_key in old_storage_keys
+                    ]
+                )
 
             insert_history_event(
                 int(existing_ticket["id"]),
@@ -17777,6 +18172,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                 {
                     "category": category,
                     "technical_subcategory": technical_subcategory or None,
+                    "subject": subject,
                     "priority": next_priority,
                     "evidence_count": evidence_count,
                 },
@@ -17796,7 +18192,10 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
             "requesterSource": requester_source,
             "category": category,
             "technicalSubcategory": technical_subcategory,
+            "subject": subject,
             "inquiry": inquiry,
+            "submittedForLearner": submitted_for_payload or None,
+            "notifySubmittedForLearner": normalize_bool(submitted_for_payload.get("notifyByEmail")) if submitted_for_payload else False,
             "status": existing_ticket["status"],
             "statusReason": existing_ticket.get("status_reason") or "",
             "assignedTeam": existing_ticket["assigned_team"],
@@ -17829,6 +18228,8 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
               t.conversation_id,
               t.category,
               t.technical_subcategory,
+              t.subject,
+              t.submitted_for_learner_id,
               t.priority,
               t.status,
               t.status_reason,
@@ -17841,12 +18242,17 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
               l.email AS learner_email,
               l.source AS learner_source,
               l.metadata AS learner_metadata,
+              submitted_for.external_learner_id AS submitted_for_external_learner_id,
+              submitted_for.full_name AS submitted_for_learner_name,
+              submitted_for.email AS submitted_for_learner_email,
               c.status AS conversation_status,
               a.full_name AS assigned_agent_name,
               a.username AS assigned_agent_username
             FROM tickets t
             JOIN learners l
               ON l.id = t.learner_id
+            LEFT JOIN learners submitted_for
+              ON submitted_for.id = t.submitted_for_learner_id
             LEFT JOIN conversations c
               ON c.id = t.conversation_id
             LEFT JOIN support_accounts a

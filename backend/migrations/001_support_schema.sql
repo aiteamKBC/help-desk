@@ -135,7 +135,9 @@ CREATE TABLE IF NOT EXISTS tickets (
   conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
   category TEXT NOT NULL,
   technical_subcategory TEXT,
+  subject TEXT NOT NULL DEFAULT '',
   inquiry TEXT NOT NULL,
+  submitted_for_learner_id BIGINT REFERENCES learners(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'Open',
   status_reason TEXT NOT NULL DEFAULT '',
   assigned_agent_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL,
@@ -160,6 +162,12 @@ CREATE TABLE IF NOT EXISTS tickets (
 
 ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS technical_subcategory TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS submitted_for_learner_id BIGINT REFERENCES learners(id) ON DELETE SET NULL;
 
 ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS status_reason TEXT NOT NULL DEFAULT '';
@@ -305,6 +313,7 @@ CREATE TABLE IF NOT EXISTS support_session_requests (
 CREATE INDEX IF NOT EXISTS idx_learners_source ON learners(source);
 CREATE INDEX IF NOT EXISTS idx_learners_support_account_id ON learners(support_account_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_learner_id ON tickets(learner_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_submitted_for_learner_id ON tickets(submitted_for_learner_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_agent_id ON tickets(assigned_agent_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_is_archived ON tickets(is_archived);

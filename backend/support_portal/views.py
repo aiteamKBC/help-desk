@@ -68,6 +68,7 @@ from .services import (
     request_live_chat,
     save_chat_history,
     sanitize_text,
+    search_kbc_learners,
     send_admin_ai_agent_message,
     send_chatbot_message,
     serialize_agent,
@@ -1021,6 +1022,20 @@ def tickets_update(request, public_id: str):
     try:
         payload, uploaded_files = parse_public_ticket_submission_request(request)
         return JsonResponse(update_ticket(public_id, payload, uploaded_files=uploaded_files))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_GET
+def learners_search(request):
+    try:
+        return JsonResponse(
+            search_kbc_learners(
+                request.GET.get("q", ""),
+                request.GET.get("limit", 12),
+                request.GET.get("requesterEmail", ""),
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 

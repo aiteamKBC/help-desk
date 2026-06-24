@@ -91,7 +91,10 @@ interface RestoredTicketPayload {
   requesterSource?: RequesterSource;
   category: "" | "Learning" | "Technical" | "Others";
   technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+  subject?: string;
   inquiry: string;
+  submittedForLearner?: Ticket["submittedForLearner"];
+  notifySubmittedForLearner?: boolean;
   status: "Open" | "Pending" | "Closed";
   statusReason?: string;
   assignedAgentId?: number | null;
@@ -114,7 +117,10 @@ function buildRestoredTicket(
     requesterSource: restoredTicket.requesterSource || "",
     category: restoredTicket.category,
     technicalSubcategory: restoredTicket.technicalSubcategory,
+    subject: restoredTicket.subject || "",
     inquiry: restoredTicket.inquiry,
+    submittedForLearner: restoredTicket.submittedForLearner || null,
+    notifySubmittedForLearner: restoredTicket.notifySubmittedForLearner || false,
     evidence: [],
     status: restoredTicket.status,
     statusReason: restoredTicket.statusReason || "",
@@ -178,7 +184,10 @@ const EmailVerification = () => {
       requesterSource,
       category: "",
       technicalSubcategory: "",
+      subject: "",
       inquiry: "",
+      submittedForLearner: null,
+      notifySubmittedForLearner: false,
       evidence: [],
       status: "Open",
       statusReason: "",
@@ -220,7 +229,10 @@ const EmailVerification = () => {
               requesterSource?: RequesterSource;
               category: "" | "Learning" | "Technical" | "Others";
               technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+              subject?: string;
               inquiry: string;
+              submittedForLearner?: Ticket["submittedForLearner"];
+              notifySubmittedForLearner?: boolean;
               status: "Open" | "Pending" | "Closed";
               statusReason?: string;
               assignedAgentId?: number | null;

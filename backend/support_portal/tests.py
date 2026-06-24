@@ -1835,7 +1835,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             if "INSERT INTO tickets" in call.args[0]
         )
         ticket_insert_params = ticket_insert_call.args[1]
-        self.assertEqual(ticket_insert_params[6], 1)
+        self.assertEqual(ticket_insert_params[8], 1)
 
         attachment_insert_call = next(
             call for call in cursor.execute.call_args_list
@@ -1910,7 +1910,7 @@ class SupportSessionValidationTests(SimpleTestCase):
         )
         ticket_insert_params = ticket_insert_call.args[1]
         self.assertEqual(ticket_insert_params[3], "Others")
-        ticket_metadata = json.loads(ticket_insert_params[7])
+        ticket_metadata = json.loads(ticket_insert_params[9])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Others")
         ticket_update_call = next(
             call for call in cursor.execute.call_args_list
@@ -2003,7 +2003,7 @@ class SupportSessionValidationTests(SimpleTestCase):
         )
         ticket_insert_params = ticket_insert_call.args[1]
         self.assertEqual(ticket_insert_params[3], "Coverage")
-        ticket_metadata = json.loads(ticket_insert_params[7])
+        ticket_metadata = json.loads(ticket_insert_params[9])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Coverage")
         self.assertEqual(ticket_metadata["requester_source"], "microsoft_entra")
         ticket_update_call = next(
@@ -2115,7 +2115,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             if "INSERT INTO tickets" in call.args[0]
         )
         ticket_insert_params = ticket_insert_call.args[1]
-        self.assertEqual(ticket_insert_params[5], "High")
+        self.assertEqual(ticket_insert_params[7], "High")
 
     def test_create_ticket_sets_high_priority_for_coach_requester(self):
         requester = {
@@ -2166,7 +2166,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             if "INSERT INTO tickets" in call.args[0]
         )
         ticket_insert_params = ticket_insert_call.args[1]
-        self.assertEqual(ticket_insert_params[5], "High")
+        self.assertEqual(ticket_insert_params[7], "High")
 
     def test_create_ticket_does_not_auto_prepare_support_teams_call_for_coach_requester(self):
         requester = {

@@ -28,6 +28,14 @@ export interface EvidenceFile {
   file?: File;
 }
 
+export interface SubmittedForLearner {
+  id: number;
+  externalLearnerId?: string;
+  fullName: string;
+  email: string;
+  notificationEmail?: string;
+}
+
 export interface Ticket {
   id: string;
   learnerName: string;
@@ -36,7 +44,10 @@ export interface Ticket {
   requesterSource: RequesterSource;
   category: Category;
   technicalSubcategory: TechnicalSubcategory;
+  subject: string;
   inquiry: string;
+  submittedForLearner: SubmittedForLearner | null;
+  notifySubmittedForLearner: boolean;
   evidence: EvidenceFile[];
   status: TicketStatus;
   statusReason: string;
@@ -69,7 +80,10 @@ const defaultTicket: Ticket = {
   requesterSource: "",
   category: "",
   technicalSubcategory: "",
+  subject: "",
   inquiry: "",
+  submittedForLearner: null,
+  notifySubmittedForLearner: false,
   evidence: [],
   status: "Open",
   statusReason: "",
@@ -173,6 +187,29 @@ function normalizeRequesterSource(
   return fallback;
 }
 
+function normalizeSubmittedForLearner(value: unknown): SubmittedForLearner | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const learner = value as Partial<SubmittedForLearner>;
+  const id = typeof learner.id === "number" && Number.isFinite(learner.id) ? learner.id : 0;
+  const email = normalizeString(learner.email);
+  const fullName = normalizeString(learner.fullName, email);
+
+  if (!id || !email) {
+    return null;
+  }
+
+  return {
+    id,
+    externalLearnerId: normalizeString(learner.externalLearnerId),
+    fullName,
+    email,
+    notificationEmail: normalizeString(learner.notificationEmail),
+  };
+}
+
 function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
   const nextTicket = { ...defaultTicket, ...(ticket || {}) };
 
@@ -184,7 +221,10 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
     email: normalizeString(nextTicket.email),
     category: normalizeCategory(nextTicket.category),
     technicalSubcategory: normalizeTechnicalSubcategory(nextTicket.technicalSubcategory),
+    subject: normalizeString(nextTicket.subject),
     inquiry: normalizeString(nextTicket.inquiry),
+    submittedForLearner: normalizeSubmittedForLearner(nextTicket.submittedForLearner),
+    notifySubmittedForLearner: Boolean(nextTicket.notifySubmittedForLearner),
     evidence: Array.isArray(nextTicket.evidence) ? nextTicket.evidence : [],
     status: normalizeTicketStatus(nextTicket.status),
     statusReason: normalizeString(nextTicket.statusReason),
@@ -204,7 +244,9 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     || ticket.learnerName
     || ticket.category
     || ticket.technicalSubcategory
-    || ticket.inquiry,
+    || ticket.subject
+    || ticket.inquiry
+    || ticket.submittedForLearner,
   );
 
   if (!ticket.id && !hasDraftDetails) {
@@ -219,7 +261,10 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     requesterSource: ticket.requesterSource,
     category: ticket.category,
     technicalSubcategory: ticket.technicalSubcategory,
+    subject: ticket.subject,
     inquiry: ticket.inquiry,
+    submittedForLearner: ticket.submittedForLearner,
+    notifySubmittedForLearner: ticket.notifySubmittedForLearner,
     status: ticket.status,
     statusReason: ticket.statusReason,
     assignedAgentId: ticket.assignedAgentId,

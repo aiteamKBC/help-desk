@@ -49,6 +49,7 @@ urlpatterns = [
     path("admin/tickets/<str:public_id>/coverage-tutor-response/acknowledge", views.admin_ticket_coverage_tutor_response_acknowledge, name="admin-ticket-coverage-tutor-response-acknowledge"),
     path("admin/tickets/<str:public_id>/coverage-confirm-session", views.admin_ticket_coverage_confirm_session, name="admin-ticket-coverage-confirm-session"),
     path("admin/tickets/<str:public_id>", views.admin_ticket_detail, name="admin-ticket-detail"),
+    path("learners/search", views.learners_search, name="learners-search"),
     path("tickets", views.tickets_create, name="tickets-create"),
     path("tickets/<str:public_id>", views.tickets_update, name="tickets-update"),
     path("tickets/<str:public_id>/chat-history", views.ticket_chat_history, name="ticket-chat-history"),
