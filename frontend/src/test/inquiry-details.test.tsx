@@ -183,6 +183,7 @@ describe("InquiryDetails", () => {
           email: "omar2@gmail.com",
           requesterRole: "user",
           requesterSource: "microsoft_entra",
+          subject: "Coverage session request",
           technicalSubcategory: "Coverage",
           inquiry: buildCoverageInquiry({
             tutor: "Ray",
@@ -252,6 +253,7 @@ describe("InquiryDetails", () => {
           email: "omar2@gmail.com",
           requesterRole: "user",
           requesterSource: "microsoft_entra",
+          subject: "Coverage session request",
           technicalSubcategory: "Coverage",
           inquiry: buildCoverageInquiry({
             tutor: "Ray",
@@ -280,6 +282,12 @@ describe("InquiryDetails", () => {
     fireEvent.click(screen.getByRole("button", { name: /next/i }));
 
     await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(
+        "/api/tickets",
+        expect.objectContaining({
+          method: "POST",
+        }),
+      );
       expect(global.fetch).toHaveBeenCalledWith(
         "/api/tickets/KBC-000321/chat-history",
         expect.objectContaining({

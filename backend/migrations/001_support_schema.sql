@@ -135,11 +135,20 @@ CREATE TABLE IF NOT EXISTS tickets (
   conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
   category TEXT NOT NULL,
   technical_subcategory TEXT,
+  subject TEXT NOT NULL DEFAULT '',
   inquiry TEXT NOT NULL,
+  submitted_for_learner_id BIGINT REFERENCES learners(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'Open',
   status_reason TEXT NOT NULL DEFAULT '',
   assigned_agent_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL,
   assigned_team TEXT NOT NULL DEFAULT 'Unassigned',
+  ticket_type TEXT,
+  workflow_stage TEXT,
+  queue_scope TEXT,
+  dashboard_bucket TEXT,
+  can_show_conversation BOOLEAN,
+  can_receive_chat BOOLEAN,
+  resolution_reason TEXT,
   sla_status TEXT NOT NULL DEFAULT 'Pending Review',
   priority TEXT NOT NULL DEFAULT 'Normal',
   evidence_count INTEGER NOT NULL DEFAULT 0,
@@ -155,6 +164,12 @@ ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS technical_subcategory TEXT;
 
 ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS submitted_for_learner_id BIGINT REFERENCES learners(id) ON DELETE SET NULL;
+
+ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS status_reason TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE tickets
@@ -165,6 +180,51 @@ ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 
 ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS archived_by_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS ticket_type TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS workflow_stage TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS queue_scope TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS dashboard_bucket TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS can_show_conversation BOOLEAN;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS can_receive_chat BOOLEAN;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS resolution_reason TEXT;
+
+UPDATE tickets
+SET ticket_type = COALESCE(NULLIF(ticket_type, ''), NULLIF(metadata #>> '{ticket_state,ticketType}', '')),
+    workflow_stage = COALESCE(NULLIF(workflow_stage, ''), NULLIF(metadata #>> '{ticket_state,workflowStage}', '')),
+    queue_scope = COALESCE(NULLIF(queue_scope, ''), NULLIF(metadata #>> '{ticket_state,queueScope}', '')),
+    dashboard_bucket = COALESCE(NULLIF(dashboard_bucket, ''), NULLIF(metadata #>> '{ticket_state,dashboardBucket}', '')),
+    can_show_conversation = COALESCE(
+      can_show_conversation,
+      CASE
+        WHEN LOWER(COALESCE(metadata #>> '{ticket_state,canShowConversation}', '')) IN ('true', 'false')
+          THEN (metadata #>> '{ticket_state,canShowConversation}')::boolean
+        ELSE NULL
+      END
+    ),
+    can_receive_chat = COALESCE(
+      can_receive_chat,
+      CASE
+        WHEN LOWER(COALESCE(metadata #>> '{ticket_state,canReceiveChat}', '')) IN ('true', 'false')
+          THEN (metadata #>> '{ticket_state,canReceiveChat}')::boolean
+        ELSE NULL
+      END
+    ),
+    resolution_reason = COALESCE(NULLIF(resolution_reason, ''), NULLIF(metadata #>> '{ticket_state,resolutionReason}', ''))
+WHERE metadata ? 'ticket_state';
 
 ALTER TABLE tickets
 DROP CONSTRAINT IF EXISTS tickets_conversation_id_key;
@@ -253,6 +313,7 @@ CREATE TABLE IF NOT EXISTS support_session_requests (
 CREATE INDEX IF NOT EXISTS idx_learners_source ON learners(source);
 CREATE INDEX IF NOT EXISTS idx_learners_support_account_id ON learners(support_account_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_learner_id ON tickets(learner_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_submitted_for_learner_id ON tickets(submitted_for_learner_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_agent_id ON tickets(assigned_agent_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_is_archived ON tickets(is_archived);

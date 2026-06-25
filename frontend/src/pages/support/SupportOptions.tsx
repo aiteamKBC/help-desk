@@ -13,19 +13,16 @@ import { Button } from "@/components/ui/button";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import {
-  type Category,
-  type RequesterSource,
-  type TechnicalSubcategory,
   type Ticket,
 } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
 import {
   getSupportResumePath,
   isCoachRequesterRole,
-  quickTicketReason,
   shouldShowStatusStep,
   type SupportChatEntryAction,
 } from "@/lib/supportFlow";
+import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/supportTicketDraft";
 import { setTicketBookingProgress } from "@/lib/supportTicketProgress";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -38,25 +35,6 @@ interface SupportOptionAction {
   onClick: () => void | Promise<void>;
   disabled?: boolean;
   statusText?: string;
-}
-
-interface PublicTicketPayload {
-  id: string;
-  learnerName?: string;
-  email: string;
-  requesterRole?: Ticket["requesterRole"];
-  requesterSource?: RequesterSource;
-  category: Category;
-  technicalSubcategory: TechnicalSubcategory;
-  inquiry: string;
-  status: Ticket["status"];
-  statusReason?: string;
-  assignedAgentId?: number | null;
-  assignedTeam: string;
-  slaStatus: string;
-  createdAt: string;
-  chatState?: Ticket["chatState"];
-  liveChatRequested?: boolean;
 }
 
 const SupportOptions = () => {
@@ -171,37 +149,25 @@ const SupportOptions = () => {
     };
   }, [isCoachRequester, ticket.id]);
 
-  const buildTicketStateFromPayload = (payloadTicket: PublicTicketPayload, currentTicket: Ticket): Ticket => ({
-    ...currentTicket,
-    id: payloadTicket.id,
-    learnerName: payloadTicket.learnerName || currentTicket.learnerName,
-    email: payloadTicket.email || currentTicket.email,
-    requesterRole: payloadTicket.requesterRole || currentTicket.requesterRole,
-    requesterSource: payloadTicket.requesterSource || currentTicket.requesterSource,
-    category: payloadTicket.category || currentTicket.category,
-    technicalSubcategory: payloadTicket.technicalSubcategory || currentTicket.technicalSubcategory,
-    inquiry: payloadTicket.inquiry || currentTicket.inquiry,
-    status: payloadTicket.status || currentTicket.status,
-    statusReason: payloadTicket.statusReason || currentTicket.statusReason,
-    assignedAgentId: payloadTicket.assignedAgentId ?? currentTicket.assignedAgentId,
-    assignedTeam: payloadTicket.assignedTeam || currentTicket.assignedTeam,
-    slaStatus: payloadTicket.slaStatus || currentTicket.slaStatus,
-    createdAt: payloadTicket.createdAt || currentTicket.createdAt,
-    chatState: payloadTicket.chatState ?? currentTicket.chatState,
-    liveChatRequested: payloadTicket.liveChatRequested ?? currentTicket.liveChatRequested,
-  });
-
   const ensureTicketCreated = async () => {
     const currentTicket = ticketRef.current;
     if (currentTicket.id) {
-      return currentTicket;
+      try {
+        const nextTicket = await persistTicketDraft(currentTicket);
+        ticketRef.current = nextTicket;
+        updateTicket(nextTicket);
+        return nextTicket;
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "We could not connect to the server. Please try again.");
+        return null;
+      }
     }
 
     if (pendingTicketCreationRef.current) {
       return pendingTicketCreationRef.current;
     }
 
-    if (!currentTicket.email || !currentTicket.category || !currentTicket.inquiry.trim()) {
+    if (!currentTicket.email || !currentTicket.category || !currentTicket.subject.trim() || !currentTicket.inquiry.trim()) {
       toast.error("Please complete the inquiry details before choosing a support path.");
       navigate(currentTicket.email ? "/support/inquiry" : "/support");
       return null;
@@ -211,40 +177,12 @@ const SupportOptions = () => {
       setIsCreatingTicket(true);
 
       try {
-        const formData = new FormData();
-        formData.set("email", currentTicket.email);
-        formData.set("requesterRole", currentTicket.requesterRole);
-        formData.set("category", currentTicket.category);
-        formData.set("technicalSubcategory", currentTicket.technicalSubcategory);
-        formData.set("inquiry", currentTicket.inquiry);
-        currentTicket.evidence.forEach((file) => {
-          if (file.file) {
-            formData.append("evidenceFiles", file.file, file.name);
-          }
-        });
-
-        const response = await fetch("/api/tickets", {
-          method: "POST",
-          body: formData,
-        });
-        const payload = (await response.json().catch(() => null)) as
-          | {
-              message?: string;
-              ticket?: PublicTicketPayload;
-            }
-          | null;
-
-        if (!response.ok || !payload?.ticket) {
-          toast.error(payload?.message || "We could not create the ticket right now.");
-          return null;
-        }
-
-        const nextTicket = buildTicketStateFromPayload(payload.ticket, currentTicket);
+        const nextTicket = await persistTicketDraft(currentTicket);
         ticketRef.current = nextTicket;
         updateTicket(nextTicket);
         return nextTicket;
-      } catch {
-        toast.error("We could not connect to the server. Please try again.");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "We could not connect to the server. Please try again.");
         return null;
       } finally {
         pendingTicketCreationRef.current = null;
@@ -367,52 +305,14 @@ const SupportOptions = () => {
         return;
       }
 
-      const response = await fetch(`/api/tickets/${encodeURIComponent(targetTicket.id)}/chat-history`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          status: "Pending",
-          statusReason: quickTicketReason,
-          messages: targetTicket.chatHistory.map((message) => ({
-            sender: message.sender,
-            text: message.text,
-            timestamp: message.timestamp,
-          })),
-        }),
-      });
-
-      const payload = (await response.json().catch(() => null)) as
-        | {
-            message?: string;
-            ticket?: {
-              status?: "Open" | "Pending" | "Closed";
-              statusReason?: string;
-              assignedTeam?: string;
-              slaStatus?: string;
-              createdAt?: string;
-            };
-          }
-        | null;
-
-      if (!response.ok || !payload?.ticket) {
-        toast.error(payload?.message || "We could not submit the ticket right now.");
-        return;
-      }
-
+      const submittedTicket = await submitTicketDirectlyForReview(targetTicket);
       clearBookingSummary();
-      updateTicket({
-        status: payload.ticket.status || "Pending",
-        statusReason: payload.ticket.statusReason || quickTicketReason,
-        assignedTeam: payload.ticket.assignedTeam || targetTicket.assignedTeam,
-        slaStatus: payload.ticket.slaStatus || targetTicket.slaStatus,
-        createdAt: payload.ticket.createdAt || targetTicket.createdAt,
-      });
+      ticketRef.current = submittedTicket;
+      updateTicket(submittedTicket);
       toast.success("Your ticket has been submitted directly for team review.");
       navigate("/support/status");
-    } catch {
-      toast.error("We could not connect to the server. Please try again.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "We could not connect to the server. Please try again.");
     } finally {
       setIsQuickSubmitting(false);
     }
@@ -510,6 +410,12 @@ const SupportOptions = () => {
       label: "Requester",
       value: ticket.learnerName || ticket.email || "Requester",
     },
+    ...(ticket.submittedForLearner
+      ? [{
+          label: "Submitted for",
+          value: ticket.submittedForLearner.fullName || ticket.submittedForLearner.email,
+        }]
+      : []),
     {
       label: "Issue Type",
       value: ticket.category
@@ -517,10 +423,17 @@ const SupportOptions = () => {
         : "Not selected",
     },
     {
+      label: "Subject",
+      value: ticket.subject || "Not added",
+    },
+    {
       label: "Current Status",
       value: ticket.id ? (ticket.status || "Open") : "Not submitted yet",
     },
   ];
+  const ticketSummaryGridClassName = ticketSummaryItems.length >= 5
+    ? "grid gap-3 sm:grid-cols-2 xl:grid-cols-5"
+    : "grid gap-3 sm:grid-cols-2 xl:grid-cols-4";
 
   const getSupportActionCardLayout = (actionId: string, index: number) => {
     if (!isCoachRequester) {
@@ -556,27 +469,27 @@ const SupportOptions = () => {
             </Button>
           </div>
 
-          <div className="relative mt-6 grid gap-6 lg:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.15fr)] lg:items-end">
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight text-primary md:text-3xl">
-                {pageTitle}
-              </h1>
-              <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground md:text-base">
-                {pageDescription}
-              </p>
-            </div>
+          <div className="relative mt-6">
+            <h1 className="text-2xl font-bold tracking-tight text-primary md:text-3xl">
+              {pageTitle}
+            </h1>
+            <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground md:text-base">
+              {pageDescription}
+            </p>
 
-            <div className="grid gap-3 rounded-[26px] border border-primary/10 bg-white/70 p-4 shadow-soft backdrop-blur sm:grid-cols-3">
-              {ticketSummaryItems.map((item) => (
-                <div key={item.label} className="rounded-2xl border border-primary/10 bg-white/80 px-4 py-3">
-                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                    {item.label}
+            <div className="mt-5 rounded-[26px] border border-primary/10 bg-white/72 p-3 shadow-soft backdrop-blur md:p-4">
+              <div className={ticketSummaryGridClassName}>
+                {ticketSummaryItems.map((item) => (
+                  <div key={item.label} className="min-w-0 rounded-2xl border border-primary/10 bg-white/85 px-4 py-3">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                      {item.label}
+                    </div>
+                    <div className="mt-1 truncate text-sm font-semibold text-foreground" title={item.value}>
+                      {item.value}
+                    </div>
                   </div>
-                  <div className="mt-1 truncate text-sm font-semibold text-foreground" title={item.value}>
-                    {item.value}
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
 

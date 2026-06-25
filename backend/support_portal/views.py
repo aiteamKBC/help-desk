@@ -22,6 +22,7 @@ from .services import (
     acknowledge_ticket_escalation_notification,
     acknowledge_ticket_teams_call_notification,
     acknowledge_ticket_transfer_decision,
+    acknowledge_support_queue_notification,
     acknowledge_coverage_ticket_notification,
     acknowledge_learning_plan_transfer_notification,
     acknowledge_coverage_tutor_response,
@@ -30,6 +31,8 @@ from .services import (
     confirm_coverage_tutor_session,
     reject_ticket_transfer_request,
     process_coverage_tutor_response,
+    record_coverage_tutor_request_email_delivery_status,
+    retry_coverage_tutor_request_email,
     request_support_teams_call,
     request_ticket_transfer,
     cancel_support_session_request,
@@ -41,6 +44,7 @@ from .services import (
     get_admin_login_response,
     get_admin_microsoft_login_response,
     get_admin_ticket_attachment_file,
+    get_public_coverage_attachment_file,
     get_ticket_chat_attachment_file,
     list_admin_notifications,
     get_admin_ticket_detail_response,
@@ -64,6 +68,7 @@ from .services import (
     request_live_chat,
     save_chat_history,
     sanitize_text,
+    search_kbc_learners,
     send_admin_ai_agent_message,
     send_chatbot_message,
     serialize_agent,
@@ -71,8 +76,10 @@ from .services import (
     set_ticket_booking_progress,
     send_coverage_tutor_follow_up_files,
     submit_coverage_tutor_request,
+    upload_coverage_presentation_files,
     update_admin_ticket,
     update_admin_ticket_archive_state,
+    update_agent_operations_access,
     update_agent_support_access,
     update_ticket,
 )
@@ -283,7 +290,7 @@ def parse_chat_submission_request(request, *, file_field_name: str = "attachment
     return parse_json_body(request), []
 
 
-def parse_coverage_tutor_request(request) -> tuple[dict, list]:
+def parse_coverage_tutor_request(request) -> tuple[dict, list, list]:
     content_type = (request.content_type or "").strip().lower()
     if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
         payload: dict[str, object] = {}
@@ -300,11 +307,21 @@ def parse_coverage_tutor_request(request) -> tuple[dict, list]:
                 except json.JSONDecodeError as error:
                     raise ApiError(400, "Invalid presentation file metadata.") from error
                 continue
+            if key == "sessionPresentationFileMetadata":
+                try:
+                    payload[key] = json.loads(value) if value else []
+                except json.JSONDecodeError as error:
+                    raise ApiError(400, "Invalid session presentation file metadata.") from error
+                continue
             payload[key] = value
 
-        return payload, list(request.FILES.getlist("presentationFiles"))
+        return (
+            payload,
+            list(request.FILES.getlist("presentationFiles")),
+            list(request.FILES.getlist("sessionPresentationFiles")),
+        )
 
-    return parse_json_body(request), []
+    return parse_json_body(request), [], []
 
 
 def parse_coverage_tutor_follow_up_request(request) -> tuple[dict, list]:
@@ -678,10 +695,14 @@ def admin_account_detail(request, account_id: int):
             remove_agent(account_id)
             return JsonResponse({"ok": True})
         payload = parse_json_body(request)
-        if "supportAccess" not in payload:
-            raise ApiError(400, "supportAccess field is required.")
-        support_access = bool(payload["supportAccess"])
-        agent = update_agent_support_access(account_id, support_access=support_access)
+        has_support_access_patch = "supportAccess" in payload
+        has_operations_access_patch = "operationsAccess" in payload
+        if has_support_access_patch == has_operations_access_patch:
+            raise ApiError(400, "Send exactly one ticket access field.")
+        if has_support_access_patch:
+            agent = update_agent_support_access(account_id, support_access=bool(payload["supportAccess"]))
+        else:
+            agent = update_agent_operations_access(account_id, operations_access=bool(payload["operationsAccess"]))
         return JsonResponse({"agent": agent})
     except Exception as error:
         return handle_api_error(error)
@@ -754,6 +775,22 @@ def admin_ticket_attachment_download(request, public_id: str, attachment_id: int
     try:
         actor, _session_payload = require_request_admin_session(request)
         attachment = get_admin_ticket_attachment_file(public_id, attachment_id, actor=actor)
+        response = FileResponse(
+            attachment["path"].open("rb"),
+            as_attachment=False,
+            filename=attachment["fileName"],
+            content_type=attachment.get("mimeType") or "application/octet-stream",
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def public_coverage_attachment_download(request, public_id: str, attachment_id: int):
+    try:
+        attachment = get_public_coverage_attachment_file(public_id, attachment_id, request.GET.get("token"))
         response = FileResponse(
             attachment["path"].open("rb"),
             as_attachment=False,
@@ -873,12 +910,41 @@ def admin_ticket_escalation_closure_acknowledge(request, public_id: str):
 @require_http_methods(["POST"])
 def admin_ticket_coverage_tutor_request(request, public_id: str):
     try:
-        payload, uploaded_files = parse_coverage_tutor_request(request)
+        payload, uploaded_files, uploaded_session_files = parse_coverage_tutor_request(request)
         return JsonResponse(
             submit_coverage_tutor_request(
                 public_id,
                 build_session_bound_admin_payload(request, payload=payload),
                 uploaded_files=uploaded_files,
+                uploaded_session_files=uploaded_session_files,
+            )
+        )
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_tutor_request_retry_email(request, public_id: str):
+    try:
+        return JsonResponse(
+            retry_coverage_tutor_request_email(
+                public_id,
+                build_session_bound_admin_payload(request, payload=parse_json_body(request)),
+            )
+        )
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_ticket_coverage_presentation_upload(request, public_id: str):
+    try:
+        payload = {key: value for key, value in request.POST.items()}
+        return JsonResponse(
+            upload_coverage_presentation_files(
+                public_id,
+                build_session_bound_admin_payload(request, payload=payload),
+                uploaded_files=list(request.FILES.getlist("presentationFiles")),
             )
         )
     except Exception as error:
@@ -917,6 +983,14 @@ def admin_ticket_coverage_ticket_notification_acknowledge(request, public_id: st
 
 
 @require_http_methods(["POST"])
+def admin_ticket_support_queue_notification_acknowledge(request, public_id: str):
+    try:
+        return JsonResponse(acknowledge_support_queue_notification(public_id, build_session_bound_admin_payload(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
 def admin_ticket_learning_plan_transfer_notification_acknowledge(request, public_id: str):
     try:
         return JsonResponse(acknowledge_learning_plan_transfer_notification(public_id, build_session_bound_admin_payload(request)))
@@ -948,6 +1022,20 @@ def tickets_update(request, public_id: str):
     try:
         payload, uploaded_files = parse_public_ticket_submission_request(request)
         return JsonResponse(update_ticket(public_id, payload, uploaded_files=uploaded_files))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_GET
+def learners_search(request):
+    try:
+        return JsonResponse(
+            search_kbc_learners(
+                request.GET.get("q", ""),
+                request.GET.get("limit", 12),
+                request.GET.get("requesterEmail", ""),
+            )
+        )
     except Exception as error:
         return handle_api_error(error)
 
@@ -1119,6 +1207,15 @@ def coverage_tutor_response(request):
 @require_GET
 def coverage_tutor_response_result(request):
     return build_coverage_tutor_response_result_page_from_payload(parse_query_params(request))
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def coverage_tutor_request_email_status(request):
+    try:
+        return JsonResponse(record_coverage_tutor_request_email_delivery_status(parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
 
 
 @csrf_exempt

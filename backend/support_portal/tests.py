@@ -6,14 +6,15 @@ from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib import parse as urllib_parse
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.utils import OperationalError as DjangoOperationalError
 from django.core.management import call_command
-from django.test import RequestFactory, SimpleTestCase
+from django.test import RequestFactory, SimpleTestCase, override_settings
 from psycopg import OperationalError as PsycopgOperationalError
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from config import env as config_env
@@ -1426,6 +1427,54 @@ class AdminSessionViewTests(SimpleTestCase):
         )
         add_entra_agent.assert_called_once_with({"email": "agent@example.com"})
 
+    def test_admin_account_detail_patch_allows_operations_access_update(self):
+        request = self.factory.patch(
+            "/api/admin/accounts/24",
+            data=json.dumps({"operationsAccess": True}),
+            content_type="application/json",
+        )
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 7,
+                    "username": "admin1",
+                    "full_name": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                },
+            ) as require_agent_session_actor,
+            patch.object(
+                views,
+                "update_agent_operations_access",
+                return_value={"id": 24, "legacyOperationsAccess": True},
+            ) as update_agent_operations_access,
+        ):
+            response = views.admin_account_detail(request, 24)
+
+        self.assertEqual(response.status_code, 200)
+        require_agent_session_actor.assert_called_once_with(
+            "admin1",
+            "instance-1",
+            allowed_roles=views.ADMIN_ACCESS_ROLES,
+        )
+        update_agent_operations_access.assert_called_once_with(24, operations_access=True)
+
     def test_admin_ticket_detail_uses_server_session_actor_for_updates(self):
         request = self.factory.patch(
             "/api/admin/tickets/KBC-000001",
@@ -1470,6 +1519,7 @@ class AdminSessionViewTests(SimpleTestCase):
                 "actorUsername": "fatma",
                 "instanceId": "current-instance",
             },
+            uploaded_files=[],
         )
 
     def test_admin_ticket_chat_history_uses_server_session_actor(self):
@@ -1785,7 +1835,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             if "INSERT INTO tickets" in call.args[0]
         )
         ticket_insert_params = ticket_insert_call.args[1]
-        self.assertEqual(ticket_insert_params[6], 1)
+        self.assertEqual(ticket_insert_params[8], 1)
 
         attachment_insert_call = next(
             call for call in cursor.execute.call_args_list
@@ -1840,6 +1890,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             ),
             patch.object(services, "build_public_ticket_id", return_value="KBC-000072"),
             patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_ticket_operations_team") as notify_operations_team,
             patch.object(services.connection, "cursor", return_value=cursor_manager),
         ):
             response = services.create_ticket(
@@ -1859,8 +1910,23 @@ class SupportSessionValidationTests(SimpleTestCase):
         )
         ticket_insert_params = ticket_insert_call.args[1]
         self.assertEqual(ticket_insert_params[3], "Others")
-        ticket_metadata = json.loads(ticket_insert_params[7])
+        ticket_metadata = json.loads(ticket_insert_params[9])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Others")
+        ticket_update_call = next(
+            call for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0] and "SET public_id" in call.args[0]
+        )
+        persisted_metadata = json.loads(ticket_update_call.args[1][3])
+        self.assertEqual(
+            persisted_metadata["pending_support_queue_notification"]["ticketId"],
+            "KBC-000072",
+        )
+        self.assertEqual(
+            persisted_metadata["pending_support_queue_notification"]["reason"],
+            "support_ticket_created",
+        )
+        self.assertNotIn("pending_coverage_ticket_notification", persisted_metadata)
+        notify_operations_team.assert_not_called()
 
     def test_create_ticket_accepts_coverage_for_entra_requester(self):
         requester = {
@@ -1937,9 +2003,20 @@ class SupportSessionValidationTests(SimpleTestCase):
         )
         ticket_insert_params = ticket_insert_call.args[1]
         self.assertEqual(ticket_insert_params[3], "Coverage")
-        ticket_metadata = json.loads(ticket_insert_params[7])
+        ticket_metadata = json.loads(ticket_insert_params[9])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Coverage")
         self.assertEqual(ticket_metadata["requester_source"], "microsoft_entra")
+        ticket_update_call = next(
+            call for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0] and "SET public_id" in call.args[0]
+        )
+        self.assertEqual(ticket_update_call.args[1][2], "On Track")
+        persisted_metadata = json.loads(ticket_update_call.args[1][3])
+        self.assertEqual(
+            persisted_metadata["pending_coverage_ticket_notification"]["ticketId"],
+            "KBC-000073",
+        )
+        self.assertNotIn("pending_support_queue_notification", persisted_metadata)
         notify_operations_team.assert_called_once()
         notification_ticket_id, notification_payload = notify_operations_team.call_args.args
         self.assertEqual(notification_ticket_id, 73)
@@ -2038,7 +2115,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             if "INSERT INTO tickets" in call.args[0]
         )
         ticket_insert_params = ticket_insert_call.args[1]
-        self.assertEqual(ticket_insert_params[5], "High")
+        self.assertEqual(ticket_insert_params[7], "High")
 
     def test_create_ticket_sets_high_priority_for_coach_requester(self):
         requester = {
@@ -2089,7 +2166,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             if "INSERT INTO tickets" in call.args[0]
         )
         ticket_insert_params = ticket_insert_call.args[1]
-        self.assertEqual(ticket_insert_params[5], "High")
+        self.assertEqual(ticket_insert_params[7], "High")
 
     def test_create_ticket_does_not_auto_prepare_support_teams_call_for_coach_requester(self):
         requester = {
@@ -2769,6 +2846,19 @@ class SupportSessionValidationTests(SimpleTestCase):
         )
         insert_params = insert_call.args[1]
         self.assertEqual(json.loads(insert_params[3])["return_path"], "/support/options")
+        ticket_update_call = next(
+            call for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0] and "SET status" in call.args[0]
+        )
+        persisted_metadata = json.loads(ticket_update_call.args[1][3])
+        self.assertEqual(
+            persisted_metadata["pending_support_queue_notification"]["ticketId"],
+            "KBC-000077",
+        )
+        self.assertEqual(
+            persisted_metadata["pending_support_queue_notification"]["reason"],
+            "support_session_requested",
+        )
 
     def test_cancel_support_session_request_reopens_ticket_after_cancellation(self):
         ticket = {
@@ -2869,6 +2959,11 @@ class SupportSessionValidationTests(SimpleTestCase):
             ),
             patch.object(
                 services,
+                "get_coverage_ticket_operations_webhook_secret",
+                return_value="",
+            ),
+            patch.object(
+                services,
                 "post_json_webhook",
                 return_value=(True, True, 200, {"ok": True}),
             ) as post_json_webhook,
@@ -2920,6 +3015,11 @@ class SupportSessionValidationTests(SimpleTestCase):
                 services,
                 "get_coverage_ticket_operations_webhook_url",
                 return_value="https://n8n.example/coverage-ticket",
+            ),
+            patch.object(
+                services,
+                "get_coverage_ticket_operations_webhook_secret",
+                return_value="",
             ),
             patch.object(
                 services,
@@ -3039,6 +3139,138 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertEqual(sla_status, "Breached")
         self.assertTrue(attention_required)
         self.assertEqual(attention_reason, services.SLA_ATTENTION_REASON_PENDING_OVERDUE)
+
+    def test_awaiting_support_meeting_does_not_breach_by_ticket_age(self):
+        created_at = datetime.now(timezone.utc) - timedelta(days=8)
+
+        sla_status, attention_required, attention_reason = services.derive_sla_state(
+            "Pending",
+            created_at,
+            "Pending Review",
+            status_reason=services.STATUS_REASON_AWAITING_MEETING,
+        )
+
+        self.assertEqual(sla_status, "On Track")
+        self.assertFalse(attention_required)
+        self.assertIsNone(attention_reason)
+
+    def test_resolve_ticket_sla_update_records_meeting_policy_context(self):
+        requested_start_at = datetime.now(timezone.utc) + timedelta(days=5)
+        ticket = {
+            "id": 61,
+            "public_id": "KBC-000061",
+            "status": "Open",
+            "status_reason": "",
+            "sla_status": "Pending Review",
+            "created_at": datetime.now(timezone.utc) - timedelta(days=8),
+            "metadata": {
+                "support_session_requested_start_at": requested_start_at.isoformat(),
+            },
+        }
+
+        sla_status, attention_required, attention_reason, metadata = services.resolve_ticket_sla_update(
+            ticket,
+            "Pending",
+            status_reason=services.STATUS_REASON_AWAITING_MEETING,
+            metadata=ticket["metadata"],
+        )
+
+        self.assertEqual(sla_status, "On Track")
+        self.assertFalse(attention_required)
+        self.assertIsNone(attention_reason)
+        self.assertEqual(metadata["sla_policy_key"], services.SLA_POLICY_AWAITING_SUPPORT_MEETING)
+        self.assertEqual(metadata["sla_due_at"], services.serialize_datetime_value(requested_start_at))
+
+    def test_awaiting_support_meeting_breaches_three_days_after_meeting(self):
+        requested_start_at = datetime.now(timezone.utc) - timedelta(days=3, minutes=1)
+        ticket = {
+            "id": 65,
+            "public_id": "KBC-000065",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_AWAITING_MEETING,
+            "sla_status": "On Track",
+            "created_at": datetime.now(timezone.utc) - timedelta(days=10),
+            "metadata": {
+                "support_session_requested_start_at": requested_start_at.isoformat(),
+            },
+        }
+
+        sla_status, attention_required, attention_reason, metadata = services.resolve_ticket_sla_update(
+            ticket,
+            "Pending",
+            status_reason=services.STATUS_REASON_AWAITING_MEETING,
+            metadata=ticket["metadata"],
+        )
+
+        self.assertEqual(sla_status, "Breached")
+        self.assertTrue(attention_required)
+        self.assertEqual(attention_reason, services.SLA_ATTENTION_REASON_MEETING_OVERDUE)
+        self.assertEqual(metadata["sla_policy_key"], services.SLA_POLICY_AWAITING_SUPPORT_MEETING)
+        self.assertEqual(metadata["sla_due_at"], services.serialize_datetime_value(requested_start_at))
+
+    def test_resolve_ticket_sla_update_preserves_breached_outcome_when_closed(self):
+        ticket = {
+            "id": 64,
+            "public_id": "KBC-000064",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "sla_status": "Breached",
+            "created_at": datetime.now(timezone.utc) - timedelta(days=4),
+            "metadata": {
+                "sla_attention_required": True,
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_PENDING_OVERDUE,
+            },
+        }
+
+        sla_status, attention_required, attention_reason, metadata = services.resolve_ticket_sla_update(
+            ticket,
+            "Closed",
+            status_reason=services.STATUS_REASON_CLOSED_BY_AGENT,
+        )
+
+        self.assertEqual(sla_status, "On Track")
+        self.assertFalse(attention_required)
+        self.assertIsNone(attention_reason)
+        self.assertEqual(metadata["sla_policy_key"], services.SLA_POLICY_CLOSED)
+        self.assertEqual(metadata["sla_outcome_status"], "Breached")
+        self.assertTrue(metadata["sla_resolved_at"])
+
+    def test_apply_ticket_sla_policy_freezes_archived_ticket(self):
+        ticket = {
+            "id": 62,
+            "public_id": "KBC-000062",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "sla_status": "On Track",
+            "metadata": {"sla_attention_required": False},
+            "created_at": datetime.now(timezone.utc) - timedelta(days=8),
+            "is_archived": True,
+        }
+
+        result = services.apply_ticket_sla_policy(ticket, persist=True)
+
+        self.assertEqual(result["sla_status"], "On Track")
+        self.assertFalse(result["sla_attention_required"])
+        self.assertNotIn("sla_policy_key", result["metadata"])
+
+    def test_apply_ticket_sla_policy_records_pending_age_context(self):
+        started_at = datetime.now(timezone.utc) - timedelta(days=4)
+        ticket = {
+            "id": 63,
+            "public_id": "KBC-000063",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "sla_status": "On Track",
+            "metadata": {"sla_started_at": started_at.isoformat()},
+            "created_at": started_at,
+        }
+
+        result = services.apply_ticket_sla_policy(ticket)
+
+        self.assertEqual(result["sla_status"], "Breached")
+        self.assertTrue(result["sla_attention_required"])
+        self.assertEqual(result["metadata"]["sla_policy_key"], services.SLA_POLICY_PENDING_AGE)
+        self.assertEqual(result["metadata"]["sla_due_at"], services.serialize_datetime_value(started_at + services.PENDING_SLA_BREACH_AFTER))
 
     def test_apply_ticket_sla_policy_does_not_breach_waiting_coverage_ticket_by_age(self):
         old_created_at = datetime.now(timezone.utc) - timedelta(days=6)
@@ -3402,6 +3634,32 @@ class SlaPolicyTests(SimpleTestCase):
         run_query.assert_called_once()
         self.assertEqual(apply_ticket_sla_policy.call_count, 2)
 
+    def test_team_routing_policy_maps_ticket_scope_and_receiver_access(self):
+        support_ticket = {"assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK}
+        learning_plan_ticket = {"assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN}
+        coverage_ticket_with_legacy_team = {
+            "technical_subcategory": "Coverage",
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+        }
+        support_agent = {
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True, "legacy_operations_access": False},
+        }
+        operations_agent = {
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": False, "legacy_operations_access": True},
+        }
+
+        self.assertEqual(services.get_ticket_receiver_scope(support_ticket), "support")
+        self.assertEqual(services.get_ticket_receiver_scope(learning_plan_ticket), "operations")
+        self.assertEqual(services.get_ticket_receiver_scope(coverage_ticket_with_legacy_team), "operations")
+        self.assertTrue(services.account_can_receive_ticket_assignment(support_agent, support_ticket))
+        self.assertFalse(services.account_can_receive_ticket_assignment(support_agent, learning_plan_ticket))
+        self.assertTrue(services.account_can_receive_ticket_assignment(operations_agent, learning_plan_ticket))
+        self.assertTrue(services.account_can_receive_ticket_assignment(operations_agent, coverage_ticket_with_legacy_team))
+
     def test_serialize_ticket_summary_marks_chat_active_only_when_conversation_is_active(self):
         ticket_row = {
             "public_id": "KBC-000123",
@@ -3436,8 +3694,357 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertEqual(summary["requesterRole"], "user")
         self.assertEqual(summary["requesterName"], "Ali Test")
         self.assertEqual(summary["priority"], "Normal")
+        self.assertEqual(summary["ticketState"]["ticketType"], "live_chat")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "awaiting_agent")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "live_chat")
+        self.assertTrue(summary["ticketState"]["canShowConversation"])
+        self.assertTrue(summary["ticketState"]["canReceiveChat"])
         self.assertFalse(inactive_summary["chatIsActive"])
         self.assertFalse(inactive_summary["liveChatRequested"])
+
+    def test_serialize_ticket_summary_includes_standard_chatbot_ticket_state(self):
+        ticket_row = {
+            "public_id": "KBC-000122",
+            "learner_name": "Mona Standard",
+            "learner_email": "mona@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "Aptem",
+            "inquiry": "Chatbot help",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Unassigned",
+            "conversation_id": 10,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {},
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "standard")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "active")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "support")
+        self.assertEqual(summary["ticketState"]["queueScope"], "support")
+        self.assertTrue(summary["ticketState"]["canShowConversation"])
+        self.assertFalse(summary["ticketState"]["canReceiveChat"])
+
+    def test_serialize_ticket_summary_prefers_persisted_ticket_state_metadata(self):
+        ticket_row = {
+            "public_id": "KBC-000131",
+            "learner_name": "Persisted State",
+            "learner_email": "persisted@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "State should not come from status reason",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Learning Plan Team",
+            "conversation_id": 10,
+            "conversation_status": "open",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {
+                services.TICKET_STATE_METADATA_KEY: {
+                    "ticketType": "learning_plan",
+                    "workflowStage": "learning_plan_review",
+                    "queueScope": "operations",
+                    "dashboardBucket": "learning_plan",
+                    "canShowConversation": False,
+                    "canReceiveChat": False,
+                    "resolutionReason": "",
+                }
+            },
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "learning_plan_review")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["queueScope"], "operations")
+
+    def test_serialize_ticket_summary_prefers_ticket_state_columns_over_metadata(self):
+        ticket_row = {
+            "public_id": "KBC-000133",
+            "learner_name": "Column State",
+            "learner_email": "column@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Columns should be preferred",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Support Desk",
+            "conversation_id": 10,
+            "conversation_status": "open",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {
+                services.TICKET_STATE_METADATA_KEY: {
+                    "ticketType": "quick",
+                    "workflowStage": "awaiting_review",
+                    "queueScope": "support",
+                    "dashboardBucket": "quick",
+                    "canShowConversation": False,
+                    "canReceiveChat": False,
+                    "resolutionReason": "",
+                }
+            },
+            "ticket_type": "learning_plan",
+            "workflow_stage": "learning_plan_review",
+            "queue_scope": "operations",
+            "dashboard_bucket": "learning_plan",
+            "can_show_conversation": False,
+            "can_receive_chat": False,
+            "resolution_reason": "",
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "learning_plan_review")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "learning_plan")
+        self.assertEqual(summary["ticketState"]["queueScope"], "operations")
+
+    def test_with_ticket_state_metadata_persists_current_state_snapshot(self):
+        metadata = services.with_ticket_state_metadata(
+            {"technical_subcategory": "Coverage"},
+            {
+                "public_id": "KBC-000132",
+                "category": "Technical",
+                "technical_subcategory": "Coverage",
+                "status": "Pending",
+                "status_reason": "Tutor Requested",
+                "assigned_agent_id": None,
+                "assigned_team": "Learning Plan Team",
+                "metadata": {"technical_subcategory": "Coverage"},
+            },
+        )
+
+        self.assertEqual(
+            metadata[services.TICKET_STATE_METADATA_KEY],
+            {
+                "ticketType": "coverage",
+                "workflowStage": "tutor_requested",
+                "queueScope": "operations",
+                "dashboardBucket": "coverage",
+                "canShowConversation": False,
+                "canReceiveChat": False,
+                "resolutionReason": "",
+            },
+        )
+
+    def test_serialize_ticket_summary_includes_assigned_live_chat_ticket_state(self):
+        ticket_row = {
+            "public_id": "KBC-000127",
+            "learner_name": "Omar Live",
+            "learner_email": "omar@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "Teams",
+            "inquiry": "Need an agent",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_agent_id": 5,
+            "assigned_agent_name": "Omar Agent",
+            "assigned_agent_username": "omar.agent",
+            "assigned_team": "Support Desk",
+            "conversation_id": 14,
+            "conversation_status": "open",
+            "conversation_metadata": {
+                "is_active_conversation": True,
+                "live_chat_requested": True,
+            },
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {},
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "live_chat")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "with_agent")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "live_chat")
+        self.assertTrue(summary["ticketState"]["canShowConversation"])
+        self.assertTrue(summary["ticketState"]["canReceiveChat"])
+
+    def test_serialize_ticket_summary_includes_booking_ticket_state(self):
+        ticket_row = {
+            "public_id": "KBC-000128",
+            "learner_name": "Nour Booking",
+            "learner_email": "nour@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Need a meeting",
+            "status": "Pending",
+            "status_reason": "Awaiting support meeting",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Support Desk",
+            "conversation_id": 15,
+            "conversation_status": "pending",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {},
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "booking")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "awaiting_meeting")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "pending")
+        self.assertEqual(summary["ticketState"]["queueScope"], "support")
+        self.assertTrue(summary["ticketState"]["canShowConversation"])
+        self.assertFalse(summary["ticketState"]["canReceiveChat"])
+
+    def test_serialize_ticket_summary_includes_quick_ticket_state(self):
+        ticket_row = {
+            "public_id": "KBC-000124",
+            "learner_name": "Sara Quick",
+            "learner_email": "sara@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Quick help",
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Support Desk",
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {},
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "quick")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "awaiting_review")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "quick")
+        self.assertEqual(summary["ticketState"]["queueScope"], "support")
+        self.assertFalse(summary["ticketState"]["canShowConversation"])
+
+    def test_serialize_ticket_summary_includes_coverage_ticket_state(self):
+        ticket_row = {
+            "public_id": "KBC-000126",
+            "learner_name": "Ray Ops",
+            "learner_email": "ray@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Learning Plan Team",
+            "conversation_id": None,
+            "conversation_status": None,
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {"technical_subcategory": "Coverage"},
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["ticketState"]["ticketType"], "coverage")
+        self.assertEqual(summary["ticketState"]["workflowStage"], "tutor_requested")
+        self.assertEqual(summary["ticketState"]["dashboardBucket"], "coverage")
+        self.assertEqual(summary["ticketState"]["queueScope"], "operations")
+        self.assertFalse(summary["ticketState"]["canShowConversation"])
+
+    def test_serialize_ticket_summary_includes_coverage_tutor_outcome_states(self):
+        base_ticket_row = {
+            "public_id": "KBC-000129",
+            "learner_name": "Ray Ops",
+            "learner_email": "ray@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "priority": "Normal",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Learning Plan Team",
+            "conversation_id": None,
+            "conversation_status": None,
+            "conversation_metadata": {},
+            "chat_duration_minutes": 0,
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "sla_attention_required": False,
+            "evidence_count": 0,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "metadata": {"technical_subcategory": "Coverage"},
+        }
+
+        accepted_summary = services.serialize_ticket_summary({
+            **base_ticket_row,
+            "status": "Closed",
+            "status_reason": "Tutor Accepted",
+        })
+        rejected_summary = services.serialize_ticket_summary({
+            **base_ticket_row,
+            "public_id": "KBC-000130",
+            "status": "Pending",
+            "status_reason": "Tutor Rejected",
+        })
+
+        self.assertEqual(accepted_summary["ticketState"]["ticketType"], "coverage")
+        self.assertEqual(accepted_summary["ticketState"]["workflowStage"], "tutor_accepted")
+        self.assertEqual(accepted_summary["ticketState"]["dashboardBucket"], "closed")
+        self.assertEqual(accepted_summary["ticketState"]["resolutionReason"], "Tutor Accepted")
+        self.assertEqual(rejected_summary["ticketState"]["ticketType"], "coverage")
+        self.assertEqual(rejected_summary["ticketState"]["workflowStage"], "tutor_rejected")
+        self.assertEqual(rejected_summary["ticketState"]["dashboardBucket"], "coverage")
+        self.assertEqual(rejected_summary["ticketState"]["queueScope"], "operations")
 
     def test_serialize_ticket_summary_marks_teams_call_requested_without_pending_notification(self):
         ticket_row = {
@@ -4409,6 +5016,37 @@ class SupportDirectoryTests(SimpleTestCase):
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(response["legacySupportAccess"])
 
+    def test_update_agent_operations_access_syncs_linked_kbc_auth_group(self):
+        agent = {
+            "id": 24,
+            "username": "learning.plan",
+            "full_name": "Learning Plan",
+            "email": "learning.plan@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 78,
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+            },
+        }
+
+        with (
+            patch.object(services, "run_query_one", return_value=agent),
+            patch.object(services, "sync_legacy_operations_access_group_membership") as sync_legacy_operations_access_group_membership,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = services.update_agent_operations_access(24, operations_access=True)
+
+        sync_legacy_operations_access_group_membership.assert_called_once_with(78, True)
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertTrue(saved_metadata["legacy_operations_access"])
+        self.assertTrue(response["legacyOperationsAccess"])
+        self.assertFalse(response["legacySupportAccess"])
+
     def test_remove_agent_turns_off_support_access(self):
         agent = {
             "id": 31,
@@ -4831,6 +5469,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
         ):
             with self.assertRaises(services.ApiError) as error_context:
                 services.update_admin_ticket("KBC-000017", {"status": "Closed", "note": ""})
@@ -4861,6 +5500,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
         ):
             with self.assertRaises(services.ApiError) as error_context:
@@ -4909,6 +5549,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event") as insert_history_event,
@@ -4964,6 +5605,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event") as insert_history_event,
@@ -5005,6 +5647,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
         ):
             with self.assertRaises(services.ApiError) as error_context:
                 services.update_admin_ticket(
@@ -5840,10 +6483,11 @@ class AdminTicketUpdateTests(SimpleTestCase):
         self.assertEqual(response, detail)
         ticket_insert_params = cursor.execute.call_args_list[0].args[1]
         self.assertEqual(ticket_insert_params[10], "High")
-        new_ticket_metadata = json.loads(ticket_insert_params[-1])
+        new_ticket_metadata = json.loads(ticket_insert_params[12])
         self.assertEqual(new_ticket_metadata["requester_role"], "employer")
         self.assertEqual(new_ticket_metadata["requester_account_id"], 71)
         self.assertEqual(new_ticket_metadata["requester_username"], "employer1")
+        self.assertEqual(ticket_insert_params[13:20], ["standard", "active", "support", "support", True, False, None])
 
     def test_request_ticket_transfer_creates_pending_transfer_request(self):
         ticket = {
@@ -5861,8 +6505,11 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "username": "ahmedhamamo",
             "full_name": "Ahmed Hamamo",
             "email": None,
+            "account_scope": "staff",
             "role": "admin",
+            "is_active": True,
             "metadata": {
+                "legacy_support_access": True,
                 "session_active": True,
                 "console_status": "Off",
             },
@@ -5932,6 +6579,41 @@ class AdminTicketUpdateTests(SimpleTestCase):
             {"note": "Transfer to Ahmed Hamamo. Reason: Needs LMS support"},
         )
 
+    def test_request_ticket_transfer_rejects_target_without_receiver_access(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "assigned_agent_id": 5,
+            "assigned_team": "Support Desk",
+            "metadata": {},
+            "conversation_id": 44,
+            "assigned_agent_username": "omar",
+            "assigned_agent_name": "Omar",
+        }
+        target_agent = {
+            "id": 9,
+            "username": "ops.agent",
+            "full_name": "Operations Agent",
+            "email": None,
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {"legacy_operations_access": True},
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", side_effect=[ticket, target_agent]),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.request_ticket_transfer(
+                    "KBC-000017",
+                    {"actorUsername": "omar", "targetAgentId": 9, "reason": "Needs LMS support"},
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 400)
+        self.assertEqual(raised_error.exception.message, "The selected agent does not receive support tickets.")
+
     def test_accept_ticket_transfer_request_reassigns_ticket(self):
         ticket = {
             "id": 17,
@@ -5960,8 +6642,11 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "username": "ahmedhamamo",
             "full_name": "Ahmed Hamamo",
             "email": None,
+            "account_scope": "staff",
             "role": "admin",
+            "is_active": True,
             "metadata": {
+                "legacy_support_access": True,
                 "password_hash": "hashed-password",
                 "session_active": True,
                 "session_instance_id": "session-123",
@@ -6213,6 +6898,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
         ):
             with self.assertRaises(services.ApiError) as error_context:
                 services.update_admin_ticket(
@@ -6252,6 +6938,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
         ):
             with self.assertRaises(services.ApiError) as error_context:
                 services.update_admin_ticket(
@@ -6307,6 +6994,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event") as insert_history_event,
             patch.object(services, "fetch_admin_ticket_detail", return_value=detail),
@@ -6366,6 +7054,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "require_actor_can_access_admin_ticket"),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
@@ -6646,6 +7335,135 @@ class AdminTicketUpdateTests(SimpleTestCase):
             {"fromAgentId": 5, "toAgentId": 9, "toAgentName": "Omar Helmy"},
         )
 
+    def test_update_admin_ticket_allows_learning_plan_assignment_to_operations_receiver(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_agent_id": None,
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "assigned_agent_username": None,
+            "assigned_agent_name": None,
+            "inquiry": "Learning plan request",
+        }
+        actor_row = {
+            "id": 1,
+            "username": "manager",
+            "full_name": "Support Manager",
+            "role": "admin",
+            "email": "manager@example.com",
+        }
+        operations_agent = {
+            "id": 12,
+            "username": "ops.agent",
+            "full_name": "Operations Agent",
+            "role": "agent",
+            "email": "ops@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_operations_access": True},
+        }
+        detail = {
+            "ticket": {
+                "id": "KBC-000017",
+                "assignedAgentId": 12,
+                "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                "status": "Pending",
+                "statusReason": services.STATUS_REASON_QUICK_TICKET,
+                "slaStatus": "Pending Review",
+            }
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", side_effect=[ticket, operations_agent]),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "resolve_next_sla_state", return_value=("Pending Review", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+            patch.object(services, "fetch_admin_ticket_detail", return_value=detail),
+        ):
+            response = services.update_admin_ticket(
+                "KBC-000017",
+                {"note": "Assign to operations", "actorUsername": "manager", "assignedAgentId": 12},
+            )
+
+        self.assertEqual(response, detail)
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[2], 12)
+        self.assertEqual(update_params[3], services.ASSIGNED_TEAM_LEARNING_PLAN)
+        insert_history_event.assert_any_call(
+            17,
+            "assignment_changed",
+            {"id": 1, "role": "admin", "label": "Support Manager"},
+            {"fromAgentId": None, "toAgentId": 12, "toAgentName": "Operations Agent"},
+        )
+
+    def test_update_admin_ticket_rejects_learning_plan_assignment_to_support_only_receiver(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_agent_id": None,
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "assigned_agent_username": None,
+            "assigned_agent_name": None,
+            "inquiry": "Learning plan request",
+        }
+        actor_row = {
+            "id": 1,
+            "username": "manager",
+            "full_name": "Support Manager",
+            "role": "admin",
+            "email": "manager@example.com",
+        }
+        support_agent = {
+            "id": 9,
+            "username": "support.agent",
+            "full_name": "Support Agent",
+            "role": "agent",
+            "email": "support@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True},
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", side_effect=[ticket, support_agent]),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.update_admin_ticket(
+                    "KBC-000017",
+                    {"note": "Assign to support", "actorUsername": "manager", "assignedAgentId": 9},
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 400)
+        self.assertEqual(raised_error.exception.message, "The selected agent does not receive Learning Plan tickets.")
+
     def test_update_admin_ticket_rejects_assignment_from_non_admin_actor(self):
         ticket = {
             "id": 17,
@@ -6726,9 +7544,54 @@ class AdminTicketUpdateTests(SimpleTestCase):
                 )
 
         self.assertEqual(raised_error.exception.status_code, 400)
-        self.assertEqual(raised_error.exception.message, "The selected agent does not receive tickets.")
+        self.assertEqual(raised_error.exception.message, "The selected agent does not receive support tickets.")
 
-    def test_update_admin_ticket_notifies_learning_plan_team_on_team_transfer(self):
+    def test_update_admin_ticket_requires_note_before_team_transfer(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_agent_id": 5,
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "sla_status": "On Track",
+            "metadata": {},
+            "is_archived": False,
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "assigned_agent_username": "omar",
+            "assigned_agent_name": "Omar Helmy",
+            "inquiry": "Help needed",
+        }
+        actor_row = {
+            "id": 1,
+            "username": "manager",
+            "full_name": "Support Manager",
+            "role": "admin",
+            "email": "manager@example.com",
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.update_admin_ticket(
+                    "KBC-000017",
+                    {
+                        "actorUsername": "manager",
+                        "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                    },
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 400)
+        self.assertEqual(raised_error.exception.message, "Add a transfer note before moving this ticket to another team.")
+
+    def test_support_agent_can_transfer_ticket_to_learning_plan_team_with_note(self):
         ticket = {
             "id": 17,
             "public_id": "KBC-000017",
@@ -6756,6 +7619,254 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "assigned_agent_name": "Omar Helmy",
         }
         actor_row = {
+            "id": 5,
+            "username": "omar",
+            "full_name": "Omar Helmy",
+            "role": "agent",
+            "email": "omar@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True, "legacy_operations_access": False},
+        }
+        detail = {
+            "ticket": {
+                "id": "KBC-000017",
+                "assignedAgentId": None,
+                "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                "status": "Pending",
+                "statusReason": services.STATUS_REASON_QUICK_TICKET,
+                "slaStatus": "On Track",
+            }
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+            patch.object(services, "fetch_admin_ticket_detail", return_value=detail),
+            patch.object(services, "notify_learning_plan_ticket_transfer") as notify_learning_plan_ticket_transfer,
+        ):
+            response = services.update_admin_ticket(
+                "KBC-000017",
+                {
+                    "actorUsername": "omar",
+                    "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                    "note": "Needs Learning Plan review.",
+                },
+            )
+
+        self.assertEqual(response, detail)
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertIsNone(update_params[2])
+        self.assertEqual(update_params[3], services.ASSIGNED_TEAM_LEARNING_PLAN)
+        insert_history_event.assert_any_call(
+            17,
+            "team_transferred",
+            {"id": 5, "role": "agent", "label": "Omar Helmy"},
+            {
+                "fromTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
+                "toTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+            },
+        )
+        notify_learning_plan_ticket_transfer.assert_called_once()
+
+    def test_operations_agent_can_return_learning_plan_ticket_to_support_with_note(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "learner_id": 44,
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Help needed",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "priority": "High",
+            "assigned_agent_id": 12,
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+            "sla_status": "On Track",
+            "metadata": {"requester_role": "coach", "requester_source": "legacy_portal"},
+            "is_archived": False,
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "learner_name": "Tina Wright",
+            "learner_email": "tina@example.com",
+            "learner_source": "legacy_portal",
+            "learner_metadata": {},
+            "assigned_agent_username": "ops.agent",
+            "assigned_agent_name": "Operations Agent",
+        }
+        actor_row = {
+            "id": 12,
+            "username": "ops.agent",
+            "full_name": "Operations Agent",
+            "role": "agent",
+            "email": "ops@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": False, "legacy_operations_access": True},
+        }
+        detail = {
+            "ticket": {
+                "id": "KBC-000017",
+                "assignedAgentId": None,
+                "assignedTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
+                "status": "Pending",
+                "statusReason": services.STATUS_REASON_QUICK_TICKET,
+                "slaStatus": "On Track",
+            }
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value=detail),
+            patch.object(services, "notify_learning_plan_ticket_transfer") as notify_learning_plan_ticket_transfer,
+        ):
+            response = services.update_admin_ticket(
+                "KBC-000017",
+                {
+                    "actorUsername": "ops.agent",
+                    "assignedTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
+                    "note": "Wrong queue; returning to support.",
+                },
+            )
+
+        self.assertEqual(response, detail)
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertIsNone(update_params[2])
+        self.assertEqual(update_params[3], services.ASSIGNED_TEAM_SUPPORT_DESK)
+        notify_learning_plan_ticket_transfer.assert_not_called()
+
+    def test_agent_team_transfer_cannot_assign_receiver(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_agent_id": 5,
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "sla_status": "On Track",
+            "metadata": {},
+            "is_archived": False,
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "assigned_agent_username": "omar",
+            "assigned_agent_name": "Omar Helmy",
+            "inquiry": "Help needed",
+        }
+        actor_row = {
+            "id": 5,
+            "username": "omar",
+            "full_name": "Omar Helmy",
+            "role": "agent",
+            "email": "omar@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True, "legacy_operations_access": False},
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.update_admin_ticket(
+                    "KBC-000017",
+                    {
+                        "actorUsername": "omar",
+                        "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                        "assignedAgentId": 5,
+                        "note": "Needs Learning Plan review.",
+                    },
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 403)
+        self.assertEqual(raised_error.exception.message, "Team transfers by agents cannot assign a receiver.")
+
+    def test_update_admin_ticket_notifies_learning_plan_team_on_team_transfer(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "learner_id": 44,
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Help needed",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "priority": "High",
+            "assigned_agent_id": 5,
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "sla_status": "On Track",
+            "metadata": {
+                "requester_role": "coach",
+                "requester_source": "legacy_portal",
+                services.PENDING_TRANSFER_REQUEST_METADATA_KEY: {
+                    "fromAgentId": 5,
+                    "fromAgentName": "Omar Helmy",
+                    "fromAgentUsername": "omar",
+                    "toAgentId": 9,
+                    "toAgentName": "Ahmed Hamamo",
+                    "toAgentUsername": "ahmed",
+                    "reason": "Please take over",
+                    "requestedAt": "2026-06-17T19:00:00Z",
+                },
+                services.LATEST_TRANSFER_DECISION_METADATA_KEY: {
+                    "status": "rejected",
+                    "fromAgentId": 5,
+                    "fromAgentName": "Omar Helmy",
+                    "fromAgentUsername": "omar",
+                    "toAgentId": 9,
+                    "toAgentName": "Ahmed Hamamo",
+                    "toAgentUsername": "ahmed",
+                    "reason": "Please take over",
+                    "requestedAt": "2026-06-17T19:00:00Z",
+                    "decidedAt": "2026-06-17T19:05:00Z",
+                    "decidedById": 9,
+                    "decidedByName": "Ahmed Hamamo",
+                    "decidedByUsername": "ahmed",
+                    "requesterAcknowledged": False,
+                },
+            },
+            "is_archived": False,
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "learner_name": "Tina Wright",
+            "learner_email": "tina@example.com",
+            "learner_source": "legacy_portal",
+            "learner_metadata": {},
+            "assigned_agent_username": "omar",
+            "assigned_agent_name": "Omar Helmy",
+        }
+        actor_row = {
             "id": 1,
             "username": "manager",
             "full_name": "Support Manager",
@@ -6766,7 +7877,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
         detail = {
             "ticket": {
                 "id": "KBC-000017",
-                "assignedAgentId": 5,
+                "assignedAgentId": None,
                 "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
                 "status": "Pending",
                 "statusReason": services.STATUS_REASON_QUICK_TICKET,
@@ -6796,11 +7907,13 @@ class AdminTicketUpdateTests(SimpleTestCase):
                 {
                     "actorUsername": "manager",
                     "assignedTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                    "note": "Please review the learning plan request.",
                 },
             )
 
         self.assertEqual(response, detail)
         update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertIsNone(update_params[2])
         self.assertEqual(update_params[3], services.ASSIGNED_TEAM_LEARNING_PLAN)
         insert_history_event.assert_any_call(
             17,
@@ -6820,8 +7933,12 @@ class AdminTicketUpdateTests(SimpleTestCase):
         self.assertEqual(webhook_payload["transfer"]["fromTeam"], services.ASSIGNED_TEAM_SUPPORT_DESK)
         self.assertEqual(webhook_payload["transfer"]["toTeam"], services.ASSIGNED_TEAM_LEARNING_PLAN)
         self.assertEqual(webhook_payload["transfer"]["transferredBy"]["name"], "Support Manager")
-        self.assertEqual(webhook_payload["transfer"]["assignedAgent"]["name"], "Omar Helmy")
+        self.assertIsNone(webhook_payload["transfer"]["assignedAgent"]["id"])
+        self.assertEqual(webhook_payload["transfer"]["assignedAgent"]["name"], "")
+        self.assertEqual(webhook_payload["transfer"]["note"], "Please review the learning plan request.")
         persisted_metadata = json.loads(update_params[5])
+        self.assertNotIn(services.PENDING_TRANSFER_REQUEST_METADATA_KEY, persisted_metadata)
+        self.assertNotIn(services.LATEST_TRANSFER_DECISION_METADATA_KEY, persisted_metadata)
         self.assertEqual(
             persisted_metadata["pending_learning_plan_transfer_notification"]["ticketId"],
             "KBC-000017",
@@ -6833,6 +7950,10 @@ class AdminTicketUpdateTests(SimpleTestCase):
         self.assertEqual(
             persisted_metadata["pending_learning_plan_transfer_notification"]["toTeam"],
             services.ASSIGNED_TEAM_LEARNING_PLAN,
+        )
+        self.assertEqual(
+            persisted_metadata["pending_learning_plan_transfer_notification"]["note"],
+            "Please review the learning plan request.",
         )
 
     def test_update_admin_ticket_does_not_notify_learning_plan_team_when_transferring_back_to_support(self):
@@ -6885,7 +8006,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
         detail = {
             "ticket": {
                 "id": "KBC-000017",
-                "assignedAgentId": 5,
+                "assignedAgentId": None,
                 "assignedTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
                 "status": "Pending",
                 "statusReason": services.STATUS_REASON_QUICK_TICKET,
@@ -6915,12 +8036,14 @@ class AdminTicketUpdateTests(SimpleTestCase):
                 {
                     "actorUsername": "manager",
                     "assignedTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
+                    "note": "Returning to support desk.",
                 },
             )
 
         self.assertEqual(response, detail)
         notify_learning_plan_ticket_transfer.assert_not_called()
         update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertIsNone(update_params[2])
         persisted_metadata = json.loads(update_params[5])
         self.assertNotIn("pending_learning_plan_transfer_notification", persisted_metadata)
 
@@ -8147,6 +9270,54 @@ class AgentQueueTests(SimpleTestCase):
         self.assertEqual(queue_submitted.call_args.kwargs["status_reason"], services.STATUS_REASON_QUICK_TICKET)
         queue_closed.assert_not_called()
 
+    def test_save_chat_history_does_not_duplicate_quick_ticket_submitted_notification(self):
+        ticket = {
+            "id": 23,
+            "public_id": "KBC-000023",
+            "conversation_id": 88,
+            "category": "Technical",
+            "technical_subcategory": "Aptem",
+            "priority": "Normal",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "sla_status": "Pending Review",
+            "metadata": {
+                services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY: "2026-05-08T10:05:00+00:00",
+            },
+            "created_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            "conversation_status": "open",
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "assigned_agent_username": None,
+        }
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "clear_prepared_support_teams_call"),
+            patch.object(
+                services,
+                "apply_ticket_chat_history_sync",
+                return_value=([], services.STATUS_REASON_QUICK_TICKET, "On Track", False),
+            ),
+            patch.object(services, "queue_quick_ticket_submitted_notification") as queue_submitted,
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_closed,
+        ):
+            services.save_chat_history(
+                "KBC-000023",
+                {
+                    "status": "Pending",
+                    "statusReason": services.STATUS_REASON_QUICK_TICKET,
+                    "messages": [],
+                },
+            )
+
+        queue_submitted.assert_not_called()
+        queue_closed.assert_not_called()
+
     def test_save_chat_history_queues_quick_ticket_closed_notification(self):
         ticket = {
             "id": 23,
@@ -8193,6 +9364,85 @@ class AgentQueueTests(SimpleTestCase):
         queue_closed.assert_called_once()
         self.assertEqual(queue_closed.call_args.kwargs["status"], "Closed")
         self.assertEqual(queue_closed.call_args.kwargs["status_reason"], services.STATUS_REASON_CLOSED_BY_AGENT)
+
+    @override_settings(
+        SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification",
+        SUPPORT_NOTIFICATION_DELIVERY_ENABLED=False,
+    )
+    def test_queue_support_notification_delivery_skips_when_disabled(self):
+        with (
+            patch.object(services.threading, "Thread") as thread_class,
+            patch.object(services, "deliver_support_notification") as deliver_support_notification,
+        ):
+            services.queue_support_notification_delivery(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload={"recipientType": "requester", "requester": {"name": "Omar", "email": "omar@example.com"}},
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        thread_class.assert_not_called()
+        deliver_support_notification.assert_not_called()
+
+    @override_settings(
+        SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification",
+        SUPPORT_NOTIFICATION_DELIVERY_ENABLED=True,
+    )
+    def test_queue_support_notification_delivery_starts_background_thread_when_enabled(self):
+        thread = MagicMock()
+
+        with patch.object(services.threading, "Thread", return_value=thread) as thread_class:
+            services.queue_support_notification_delivery(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload={"recipientType": "requester", "requester": {"name": "Omar", "email": "omar@example.com"}},
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        thread_class.assert_called_once()
+        self.assertEqual(
+            thread_class.call_args.kwargs["name"],
+            "support-notification-quick_ticket_submitted-KBC-000023",
+        )
+        self.assertTrue(thread_class.call_args.kwargs["daemon"])
+        thread.start.assert_called_once()
+
+    def test_deliver_support_notification_records_success_history(self):
+        payload = {
+            "recipientType": "requester",
+            "requester": {"name": "Omar", "email": "omar@example.com"},
+        }
+
+        with (
+            patch.object(
+                services,
+                "send_support_notification_webhook",
+                return_value={"configured": True, "delivered": True, "status": 202, "response": {"ok": True}},
+            ) as send_support_notification_webhook,
+            patch.object(services, "persist_ticket_metadata_patch") as persist_ticket_metadata_patch,
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.deliver_support_notification(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload=payload,
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        send_support_notification_webhook.assert_called_once_with(payload)
+        persist_ticket_metadata_patch.assert_called_once_with(
+            23,
+            {services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY: ANY},
+        )
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[0], 23)
+        self.assertEqual(insert_history_event.call_args.args[1], "quick_ticket_confirmation_email_sent")
+        self.assertEqual(insert_history_event.call_args.args[3]["ticketId"], "KBC-000023")
+        self.assertTrue(insert_history_event.call_args.args[3]["webhookDelivered"])
+        self.assertEqual(result["historyEventType"], "quick_ticket_confirmation_email_sent")
 
     def test_try_auto_assign_quick_ticket_prefers_available_ticket_receiving_agent_and_updates_ticket(self):
         ticket = {
@@ -8700,6 +9950,43 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         mock_connection.cursor.return_value = cursor_context
         return mock_connection, cursor
 
+    @override_settings(SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net")
+    def test_public_coverage_attachment_signed_link_resolves_file(self):
+        with TemporaryDirectory() as temp_dir:
+            storage_key = "KBC-000045/2026/06/deck.pdf"
+            attachment_path = Path(temp_dir) / storage_key
+            attachment_path.parent.mkdir(parents=True)
+            attachment_path.write_bytes(b"deck")
+            download_url = services.build_public_coverage_attachment_download_url("KBC-000045", 101)
+            parsed_url = urllib_parse.urlparse(download_url)
+            token = urllib_parse.parse_qs(parsed_url.query)["token"][0]
+
+            with (
+                patch.object(services, "get_support_attachment_root", return_value=Path(temp_dir)),
+                patch.object(
+                    services,
+                    "run_query_one",
+                    return_value={
+                        "id": 101,
+                        "file_name": "deck.pdf",
+                        "mime_type": "application/pdf",
+                        "file_size": 4,
+                        "storage_url": storage_key,
+                        "attachment_metadata": {"source": "coverage_tutor_request"},
+                        "public_id": "KBC-000045",
+                        "technical_subcategory": "Coverage",
+                        "assigned_team": "Learning Plan Team",
+                        "metadata": {},
+                    },
+                ),
+            ):
+                attachment = services.get_public_coverage_attachment_file("KBC-000045", 101, token)
+
+        self.assertEqual(attachment["fileName"], "deck.pdf")
+        self.assertEqual(attachment["mimeType"], "application/pdf")
+        self.assertEqual(attachment["fileSize"], 4)
+        self.assertTrue(download_url.startswith("https://technicalsupport.kentbusinesscollege.net/api/public/coverage-attachments/KBC-000045/101/download?token="))
+
     def test_send_coverage_tutor_request_webhook_uses_short_timeout(self):
         with (
             patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
@@ -8753,15 +10040,107 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         post_json_webhook.assert_not_called()
         post_multipart_webhook.assert_called_once()
         self.assertEqual(post_multipart_webhook.call_args.args[0], "https://n8n.example/webhook")
-        self.assertEqual(post_multipart_webhook.call_args.args[2], payload["request"]["presentationFiles"])
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["id"], "file-1")
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["deliveryMode"], "attachment")
         sent_payload = post_multipart_webhook.call_args.args[1]
         self.assertNotIn("dataUrl", sent_payload["request"]["presentationFiles"][0])
         post_multipart_webhook.assert_called_once_with(
             "https://n8n.example/webhook",
             sent_payload,
-            payload["request"]["presentationFiles"],
+            post_multipart_webhook.call_args.args[2],
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
+
+    def test_send_coverage_tutor_request_webhook_includes_session_files_in_multipart(self):
+        general_file = {
+            "id": "file-1",
+            "name": "overview.pdf",
+            "mimeType": "application/pdf",
+            "size": 128,
+            "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+        }
+        session_file = {
+            "id": "file-2",
+            "name": "session-1.pdf",
+            "mimeType": "application/pdf",
+            "size": 256,
+            "dataUrl": "data:application/pdf;base64,c2Vzc2lvbg==",
+        }
+        payload = {
+            "ticketId": "KBC-000001",
+            "request": {
+                "presentationFiles": [general_file],
+                "sessionFiles": [
+                    {
+                        "id": "session-1",
+                        "label": "Session 1",
+                        "attachments": [session_file],
+                    }
+                ],
+            },
+        }
+
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(
+                services,
+                "post_multipart_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_request_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_called_once()
+        self.assertEqual([file["id"] for file in post_multipart_webhook.call_args.args[2]], ["file-1", "file-2"])
+        self.assertEqual([file["deliveryMode"] for file in post_multipart_webhook.call_args.args[2]], ["attachment", "attachment"])
+        sent_payload = post_multipart_webhook.call_args.args[1]
+        self.assertNotIn("dataUrl", sent_payload["request"]["presentationFiles"][0])
+        self.assertNotIn("dataUrl", sent_payload["request"]["sessionFiles"][0]["attachments"][0])
+
+    @override_settings(
+        SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net",
+        COVERAGE_WEBHOOK_ATTACHMENT_MAX_FILE_BYTES=8 * 1024 * 1024,
+        COVERAGE_WEBHOOK_ATTACHMENT_MAX_TOTAL_BYTES=18 * 1024 * 1024,
+    )
+    def test_send_coverage_tutor_request_webhook_converts_large_files_to_signed_links(self):
+        payload = {
+            "ticketId": "KBC-000045",
+            "request": {
+                "presentationFiles": [
+                    {
+                        "id": "file-1",
+                        "attachmentId": 101,
+                        "name": "large-deck.pptx",
+                        "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "size": 11 * 1024 * 1024,
+                        "storageKey": "KBC-000045/2026/06/large-deck.pptx",
+                    }
+                ],
+                "sessionFiles": [],
+            },
+        }
+
+        with (
+            patch.object(services, "get_coverage_tutor_request_webhook_url", return_value="https://n8n.example/webhook"),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+            patch.object(services, "post_multipart_webhook") as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_request_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_not_called()
+        post_json_webhook.assert_called_once()
+        sent_payload = post_json_webhook.call_args.args[1]
+        sent_file = sent_payload["request"]["presentationFiles"][0]
+        self.assertEqual(sent_file["deliveryMode"], "link")
+        self.assertEqual(sent_file["deliveryReason"], "file_size_limit")
+        self.assertIn("/api/public/coverage-attachments/KBC-000045/101/download?token=", sent_file["downloadUrl"])
+        self.assertNotIn("storageKey", sent_file)
 
     def test_send_coverage_tutor_follow_up_webhook_uses_attachment_reply_url(self):
         payload = {
@@ -8797,15 +10176,73 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertTrue(response["delivered"])
         post_multipart_webhook.assert_called_once()
         self.assertEqual(post_multipart_webhook.call_args.args[0], "https://n8n.example/attachment-reply")
-        self.assertEqual(post_multipart_webhook.call_args.args[2], payload["followUp"]["presentationFiles"])
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["id"], "file-2")
+        self.assertEqual(post_multipart_webhook.call_args.args[2][0]["deliveryMode"], "attachment")
         sent_payload = post_multipart_webhook.call_args.args[1]
         self.assertNotIn("dataUrl", sent_payload["followUp"]["presentationFiles"][0])
         post_multipart_webhook.assert_called_once_with(
             "https://n8n.example/attachment-reply",
             sent_payload,
-            payload["followUp"]["presentationFiles"],
+            post_multipart_webhook.call_args.args[2],
             timeout_seconds=services.COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
+
+    @override_settings(
+        SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net",
+        COVERAGE_WEBHOOK_ATTACHMENT_MAX_FILE_BYTES=8 * 1024 * 1024,
+    )
+    def test_send_coverage_tutor_follow_up_webhook_converts_large_files_to_signed_links(self):
+        payload = {
+            "event": "coverage_tutor_follow_up",
+            "ticketId": "KBC-000045",
+            "attachments": [
+                {
+                    "id": "file-2",
+                    "attachmentId": 202,
+                    "name": "large-follow-up.pptx",
+                    "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "size": 12 * 1024 * 1024,
+                    "storageKey": "KBC-000045/2026/06/large-follow-up.pptx",
+                }
+            ],
+            "followUp": {
+                "presentationFiles": [
+                    {
+                        "id": "file-2",
+                        "attachmentId": 202,
+                        "name": "large-follow-up.pptx",
+                        "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "size": 12 * 1024 * 1024,
+                        "storageKey": "KBC-000045/2026/06/large-follow-up.pptx",
+                    }
+                ],
+            },
+        }
+
+        with (
+            patch.object(
+                services,
+                "get_coverage_tutor_attachment_reply_webhook_url",
+                return_value="https://n8n.example/attachment-reply",
+            ),
+            patch.object(
+                services,
+                "post_json_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_json_webhook,
+            patch.object(services, "post_multipart_webhook") as post_multipart_webhook,
+        ):
+            response = services.send_coverage_tutor_follow_up_webhook(payload)
+
+        self.assertTrue(response["delivered"])
+        post_multipart_webhook.assert_not_called()
+        post_json_webhook.assert_called_once()
+        sent_payload = post_json_webhook.call_args.args[1]
+        sent_file = sent_payload["followUp"]["presentationFiles"][0]
+        self.assertEqual(sent_file["deliveryMode"], "link")
+        self.assertIn("/api/public/coverage-attachments/KBC-000045/202/download?token=", sent_file["downloadUrl"])
+        self.assertEqual(sent_payload["attachments"][0]["deliveryMode"], "link")
+        self.assertNotIn("storageKey", sent_file)
 
     def test_queue_coverage_tutor_request_webhook_delivery_starts_background_thread(self):
         thread = MagicMock()
@@ -9739,8 +11176,254 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_card["requestStatus"], "requested")
         self.assertEqual(persisted_card["requestSubmittedByAgentId"], 7)
         self.assertTrue(persisted_card["responseToken"])
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "pending")
         self.assertEqual(persisted_card["coach"], "Mona Adel")
         self.assertEqual(persisted_card["coachEmail"], "mona.adel@example.com")
+
+    def test_record_coverage_tutor_request_email_delivery_status_marks_card_sent(self):
+        token = services.build_coverage_tutor_email_delivery_callback_token("KBC-000041", "card-1", "response-token-1")
+        ticket = {
+            "id": 41,
+            "public_id": "KBC-000041",
+            "metadata": {
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "pending",
+                        }
+                    ]
+                }
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.record_coverage_tutor_request_email_delivery_status(
+                {
+                    "ticketId": "KBC-000041",
+                    "cardId": "card-1",
+                    "status": "sent",
+                    "messageId": "gmail-message-1",
+                    "threadId": "gmail-thread-1",
+                    "token": token,
+                }
+            )
+
+        self.assertEqual(result["emailDeliveryStatus"], "sent")
+        persisted_metadata = json.loads(cursor.execute.call_args.args[1][0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "sent")
+        self.assertEqual(persisted_card["emailDeliveryMessageId"], "gmail-message-1")
+        self.assertEqual(persisted_card["emailDeliveryThreadId"], "gmail-thread-1")
+        self.assertEqual(persisted_card["emailDeliveryError"], "")
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_sent")
+
+    def test_record_coverage_tutor_request_email_delivery_status_marks_card_failed(self):
+        token = services.build_coverage_tutor_email_delivery_callback_token("KBC-000041", "card-1", "response-token-1")
+        ticket = {
+            "id": 41,
+            "public_id": "KBC-000041",
+            "metadata": {
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "pending",
+                        }
+                    ]
+                }
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            result = services.record_coverage_tutor_request_email_delivery_status(
+                {
+                    "ticketId": "KBC-000041",
+                    "cardId": "card-1",
+                    "status": "failed",
+                    "error": "Gmail rejected the message",
+                    "token": token,
+                }
+            )
+
+        self.assertEqual(result["emailDeliveryStatus"], "failed")
+        persisted_metadata = json.loads(cursor.execute.call_args.args[1][0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "failed")
+        self.assertEqual(persisted_card["emailDeliveryError"], "Gmail rejected the message")
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_failed")
+
+    def test_retry_coverage_tutor_request_email_sets_pending_and_requeues_webhook(self):
+        ticket = {
+            "id": 41,
+            "public_id": "KBC-000041",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "assigned_team": "Learning Plan Team",
+            "assigned_agent_id": 7,
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "failed",
+                            "emailDeliveryError": "Request timed out.",
+                            "emailDeliveryRetryCount": 2,
+                        }
+                    ]
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000041"}}),
+        ):
+            response = services.retry_coverage_tutor_request_email(
+                "KBC-000041",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-1",
+                    "origin": "https://technicalsupport.kentbusinesscollege.net",
+                },
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000041")
+        update_params = cursor.execute.call_args.args[1]
+        persisted_metadata = json.loads(update_params[0])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["requestStatus"], "requested")
+        self.assertEqual(persisted_card["emailDeliveryStatus"], "pending")
+        self.assertEqual(persisted_card["emailDeliveryError"], "")
+        self.assertEqual(persisted_card["emailDeliveryRetryCount"], 3)
+
+        queue_webhook.assert_called_once()
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        self.assertEqual(webhook_payload["event"], "coverage_tutor_requested")
+        self.assertEqual(webhook_payload["ticketId"], "KBC-000041")
+        self.assertEqual(webhook_payload["cardId"], "card-1")
+        self.assertEqual(webhook_payload["responseToken"], "response-token-1")
+        self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
+        self.assertTrue(webhook_payload["emailDeliveryCallback"]["token"])
+
+        insert_history_event.assert_called_once()
+        self.assertEqual(insert_history_event.call_args.args[1], "coverage_tutor_request_email_retry")
+        self.assertEqual(insert_history_event.call_args.args[3]["previousEmailDeliveryError"], "Request timed out.")
+
+    def test_send_coverage_tutor_follow_up_files_rejects_failed_email_delivery(self):
+        ticket = {
+            "id": 45,
+            "public_id": "KBC-000045",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "sla_status": "On Track",
+            "is_archived": False,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: APM",
+                            "requestStatus": "requested",
+                            "locked": True,
+                            "responseToken": "response-token-1",
+                            "emailDeliveryStatus": "failed",
+                            "emailDeliveryError": "Request timed out.",
+                        }
+                    ],
+                },
+            },
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_follow_up_webhook_configured"),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.send_coverage_tutor_follow_up_files(
+                    "KBC-000045",
+                    {
+                        "actorUsername": "ahmed",
+                        "cardId": "card-1",
+                        "presentationFiles": [
+                            {
+                                "id": "file-1",
+                                "name": "follow-up.pdf",
+                                "mimeType": "application/pdf",
+                                "size": 512,
+                                "dataUrl": "data:application/pdf;base64,ZmFrZQ==",
+                            }
+                        ],
+                    },
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 409)
+        self.assertEqual(
+            raised_error.exception.message,
+            "Send the tutor request e-mail successfully before sending follow-up files.",
+        )
 
     def test_submit_coverage_tutor_request_uses_compact_card_payload_files(self):
         ticket = {
@@ -9911,6 +11594,173 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_card["presentationFiles"][0]["attachmentId"], 101)
         self.assertEqual(persisted_card["presentationFiles"][0]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/101/download")
         self.assertFalse(persisted_card["presentationFiles"][0]["dataUrl"])
+
+    def test_upload_coverage_presentation_files_stores_pre_submit_metadata(self):
+        ticket = {
+            "id": 45,
+            "public_id": "KBC-000045",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "is_archived": False,
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        uploaded_file = SimpleUploadedFile(
+            "coverage-plan.pptx",
+            b"slides",
+            content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+        stored_request_file = {
+            "name": "coverage-plan.pptx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "size": 6,
+            "storageKey": "KBC-000045/2026/06/coverage-plan.pptx",
+            "metadata": {"originalName": "coverage-plan.pptx", "storage": "local_filesystem"},
+        }
+        mock_connection, cursor = self.build_mock_connection()
+        cursor.fetchone.return_value = (202,)
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_request_file]) as store_files,
+            patch.object(services, "connection", mock_connection),
+        ):
+            response = services.upload_coverage_presentation_files(
+                "KBC-000045",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-uploaded",
+                    "source": "coverage_tutor_request",
+                },
+                uploaded_files=[uploaded_file],
+            )
+
+        store_files.assert_called_once_with("KBC-000045", [uploaded_file])
+        self.assertEqual(response["attachments"][0]["attachmentId"], 202)
+        self.assertEqual(response["attachments"][0]["storageUrl"], "/api/admin/tickets/KBC-000045/attachments/202/download")
+        insert_attachment_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        insert_metadata = json.loads(insert_attachment_call.args[1][5])
+        self.assertEqual(insert_metadata["source"], "coverage_tutor_request")
+        self.assertEqual(insert_metadata["coverageCardId"], "card-uploaded")
+        self.assertEqual(insert_metadata["uploadPhase"], "pre_submit")
+        self.assertEqual(insert_metadata["uploadedByAgentId"], 7)
+
+    def test_submit_coverage_tutor_request_stores_session_fallback_files(self):
+        ticket = {
+            "id": 46,
+            "public_id": "KBC-000046",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "Pending Review",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "learner_name": "Ayman",
+            "learner_email": "ayman@example.com",
+            "metadata": {"technical_subcategory": "Coverage", "admin_documentation": {}},
+        }
+        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
+        card_payload = {
+            "id": "card-session-uploaded",
+            "type": "tutor_choice",
+            "tutor": "Ray",
+            "tutorEmail": "ray@example.com",
+            "sessionDetails": "Module: PMP",
+            "presentationFiles": [],
+            "sessionFiles": [
+                {
+                    "id": "session-1",
+                    "label": "Session 1",
+                    "date": "Monday 06 Mar 2028",
+                    "number": "1",
+                    "subject": "test",
+                    "attachments": [],
+                }
+            ],
+        }
+        uploaded_file = SimpleUploadedFile("session-plan.pdf", b"session", content_type="application/pdf")
+        stored_request_file = {
+            "name": "session-plan.pdf",
+            "mimeType": "application/pdf",
+            "size": 7,
+            "storageKey": "KBC-000046/2026/06/session-plan.pdf",
+            "metadata": {"originalName": "session-plan.pdf", "storage": "local_filesystem"},
+        }
+        mock_connection, cursor = self.build_mock_connection()
+        cursor.fetchone.return_value = (303,)
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "ensure_coverage_tutor_request_webhook_configured"),
+            patch.object(services, "store_uploaded_ticket_attachments", return_value=[stored_request_file]) as store_files,
+            patch.object(services, "queue_coverage_tutor_request_webhook_delivery") as queue_webhook,
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000046"}}),
+        ):
+            services.submit_coverage_tutor_request(
+                "KBC-000046",
+                {
+                    "actorUsername": "ahmed",
+                    "cardId": "card-session-uploaded",
+                    "card": card_payload,
+                    "documentation": {
+                        "inquiry": "Coverage request",
+                        "ticketId": "KBC-000046",
+                        "coverageCards": [card_payload],
+                    },
+                    "sessionPresentationFileMetadata": [
+                        {
+                            "sessionId": "session-1",
+                            "fileId": "local-session-file",
+                            "label": "Session 1",
+                            "date": "Monday 06 Mar 2028",
+                            "number": "1",
+                            "subject": "test",
+                        }
+                    ],
+                },
+                uploaded_session_files=[uploaded_file],
+            )
+
+        store_files.assert_called_once_with("KBC-000046", [uploaded_file])
+        insert_attachment_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "INSERT INTO ticket_attachments" in call.args[0]
+        )
+        insert_metadata = json.loads(insert_attachment_call.args[1][5])
+        self.assertEqual(insert_metadata["source"], "coverage_tutor_request")
+        self.assertEqual(insert_metadata["coverageCardId"], "card-session-uploaded")
+        self.assertEqual(insert_metadata["coverageSessionId"], "session-1")
+        self.assertEqual(insert_metadata["uploadPhase"], "submit_fallback")
+
+        webhook_payload = queue_webhook.call_args.kwargs["payload"]
+        session_files = webhook_payload["request"]["sessionFiles"]
+        self.assertEqual(len(session_files), 1)
+        self.assertEqual(session_files[0]["attachments"][0]["attachmentId"], 303)
+
+        update_call = next(
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0]
+        )
+        persisted_metadata = json.loads(update_call.args[1][5])
+        persisted_card = persisted_metadata["admin_documentation"]["coverageCards"][0]
+        self.assertEqual(persisted_card["sessionFiles"][0]["attachments"][0]["attachmentId"], 303)
+        self.assertEqual(persisted_card["sessionFiles"][0]["attachments"][0]["id"], "local-session-file")
 
     def test_submit_coverage_tutor_request_falls_back_to_database_email_lookup(self):
         ticket = {
@@ -10507,6 +12357,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000052"}}),
         ):
             response = services.process_coverage_tutor_response(
@@ -10532,6 +12383,14 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_cards[1]["type"], "tutor_reply")
         self.assertEqual(persisted_cards[1]["replyOutcome"], "accepted")
         self.assertEqual(persisted_cards[1]["sessionDetails"], "Friday 09:00 - 11:00")
+        notify_response_mail.assert_called_once()
+        self.assertEqual(notify_response_mail.call_args.args[0], 52)
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["event"], "coverage_tutor_accepted")
+        self.assertEqual(webhook_payload["ticket"]["id"], "KBC-000052")
+        self.assertEqual(webhook_payload["ticket"]["statusReason"], "Tutor Accepted")
+        self.assertEqual(webhook_payload["response"]["outcome"], "accepted")
+        self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
 
     def test_process_coverage_tutor_response_sends_refusal_mail_webhook_on_rejection(self):
         ticket = {
@@ -10587,7 +12446,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
-            patch.object(services, "notify_coverage_tutor_refusal_mail_webhook") as notify_refusal_mail,
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000053"}}),
         ):
             response = services.process_coverage_tutor_response(
@@ -10612,12 +12471,13 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_metadata["latest_coverage_tutor_response"]["outcome"], "rejected")
         self.assertEqual(persisted_cards[0]["requestStatus"], "refused")
         self.assertEqual(persisted_cards[1]["replyOutcome"], "refused")
-        notify_refusal_mail.assert_called_once()
-        self.assertEqual(notify_refusal_mail.call_args.args[0], 53)
-        webhook_payload = notify_refusal_mail.call_args.args[1]
+        notify_response_mail.assert_called_once()
+        self.assertEqual(notify_response_mail.call_args.args[0], 53)
+        webhook_payload = notify_response_mail.call_args.args[1]
         self.assertEqual(webhook_payload["event"], "coverage_tutor_refused")
         self.assertEqual(webhook_payload["ticket"]["id"], "KBC-000053")
         self.assertEqual(webhook_payload["ticket"]["statusReason"], "Tutor Rejected")
+        self.assertEqual(webhook_payload["response"]["outcome"], "rejected")
         self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
         self.assertEqual(webhook_payload["requestedBy"]["agentUsername"], "ahmed")
 
@@ -10787,6 +12647,52 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         update_params = cursor.execute.call_args.args[1]
         persisted_metadata = json.loads(update_params[0])
         self.assertNotIn("pending_coverage_ticket_notification", persisted_metadata)
+
+    def test_acknowledge_support_queue_notification_clears_pending_metadata(self):
+        ticket = {
+            "id": 67,
+            "public_id": "KBC-000067",
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "technical_subcategory": "LMS",
+            "metadata": {
+                "requester_role": "user",
+                "pending_support_queue_notification": {
+                    "ticketId": "KBC-000067",
+                    "requesterName": "Ali Test",
+                    "requesterEmail": "ali@example.com",
+                    "requesterRole": "user",
+                    "queue": services.ASSIGNED_TEAM_SUPPORT_DESK,
+                    "reason": "support_ticket_created",
+                    "createdAt": "2026-06-05T10:00:00Z",
+                },
+            },
+        }
+        actor_row = {
+            "id": 7,
+            "username": "support.agent",
+            "full_name": "Support Agent",
+            "email": "support.agent@example.com",
+            "role": "agent",
+            "metadata": {"legacy_support_access": True, "legacy_operations_access": False},
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000067"}}),
+        ):
+            response = services.acknowledge_support_queue_notification(
+                "KBC-000067",
+                {"actorUsername": "support.agent"},
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000067")
+        update_params = cursor.execute.call_args.args[1]
+        persisted_metadata = json.loads(update_params[0])
+        self.assertNotIn("pending_support_queue_notification", persisted_metadata)
 
     def test_acknowledge_learning_plan_transfer_notification_clears_pending_metadata(self):
         ticket = {
@@ -11032,6 +12938,24 @@ class BookingContextTests(SimpleTestCase):
                                 "dataUrl": "https://example.com/file.txt",
                             },
                         ],
+                        "sessionFiles": [
+                            {
+                                "id": "session-1",
+                                "label": "Session 1",
+                                "date": "Wednesday 01 Jul 2026",
+                                "number": "3",
+                                "subject": "Intro",
+                                "attachments": [
+                                    {
+                                        "id": "session-file-1",
+                                        "name": "session.pdf",
+                                        "mimeType": "application/pdf",
+                                        "size": 64,
+                                        "dataUrl": "data:application/pdf;base64,c2Vzc2lvbg==",
+                                    }
+                                ],
+                            }
+                        ],
                     },
                     {
                         "id": "card-2",
@@ -11056,6 +12980,8 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(normalized_documentation["coverageCards"][0]["createdByAgentName"], "Ahmed Hamamo")
         self.assertEqual(normalized_documentation["coverageCards"][0]["updatedByAgentName"], "Omar Helmy")
         self.assertEqual(len(normalized_documentation["coverageCards"][0]["presentationFiles"]), 1)
+        self.assertEqual(len(normalized_documentation["coverageCards"][0]["sessionFiles"]), 1)
+        self.assertEqual(normalized_documentation["coverageCards"][0]["sessionFiles"][0]["attachments"][0]["name"], "session.pdf")
         self.assertEqual(normalized_documentation["coverageCards"][1]["type"], "note")
         self.assertEqual(normalized_documentation["coverageCards"][1]["note"], "Follow up with another tutor if needed.")
 
@@ -11218,6 +13144,118 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(persisted_attachment["id"], "pending-file-1")
         self.assertEqual(persisted_attachment["attachmentId"], 77)
         self.assertEqual(persisted_attachment["storageUrl"], "/api/admin/tickets/KBC-000201/attachments/77/download")
+
+    def test_build_documentation_card_history_events_tracks_card_and_attachment_changes(self):
+        previous_documentation = {
+            "documentationCards": [
+                {
+                    "id": "doc-card-1",
+                    "inquiry": "Checked learner access.",
+                    "attachments": [
+                        {
+                            "id": "doc-file-1",
+                            "name": "old.png",
+                            "mimeType": "image/png",
+                            "size": 12,
+                            "storageUrl": "/api/admin/tickets/KBC-000201/attachments/77/download",
+                            "attachmentId": 77,
+                        }
+                    ],
+                }
+            ],
+            "coverageCards": [
+                {
+                    "id": "coverage-card-1",
+                    "type": "note",
+                    "note": "Initial note.",
+                    "presentationFiles": [],
+                }
+            ],
+        }
+        next_documentation = {
+            "documentationCards": [
+                {
+                    "id": "doc-card-1",
+                    "inquiry": "Confirmed learner access was restored.",
+                    "attachments": [
+                        {
+                            "id": "doc-file-1",
+                            "name": "old.png",
+                            "mimeType": "image/png",
+                            "size": 12,
+                            "storageUrl": "/api/admin/tickets/KBC-000201/attachments/77/download",
+                            "attachmentId": 77,
+                        },
+                        {
+                            "id": "doc-file-2",
+                            "name": "new.png",
+                            "mimeType": "image/png",
+                            "size": 18,
+                            "dataUrl": "data:image/png;base64,large-value",
+                            "storageKey": "internal/path/new.png",
+                            "storageUrl": "/api/admin/tickets/KBC-000201/attachments/78/download",
+                            "attachmentId": 78,
+                        },
+                    ],
+                },
+                {
+                    "id": "doc-card-2",
+                    "inquiry": "Created a second card.",
+                },
+            ],
+            "coverageCards": [
+                {
+                    "id": "coverage-card-1",
+                    "type": "note",
+                    "note": "Initial note.",
+                    "presentationFiles": [
+                        {
+                            "id": "coverage-file-1",
+                            "name": "deck.pdf",
+                            "mimeType": "application/pdf",
+                            "size": 128,
+                            "storageUrl": "/api/admin/tickets/KBC-000201/attachments/79/download",
+                            "attachmentId": 79,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        events = services.build_documentation_card_history_events(previous_documentation, next_documentation)
+        event_types = [event_type for event_type, _payload in events]
+
+        self.assertIn("documentation_card_created", event_types)
+        self.assertIn("documentation_card_updated", event_types)
+        self.assertIn("documentation_attachment_added", event_types)
+        self.assertIn("coverage_attachment_added", event_types)
+        attachment_payload = next(
+            payload
+            for event_type, payload in events
+            if event_type == "documentation_attachment_added"
+        )
+        self.assertEqual(attachment_payload["addedAttachmentCount"], 1)
+        self.assertEqual(attachment_payload["fileNames"], ["new.png"])
+        self.assertEqual(attachment_payload["addedAttachments"][0]["name"], "new.png")
+        self.assertEqual(attachment_payload["addedAttachments"][0]["mimeType"], "image/png")
+        self.assertNotIn("dataUrl", attachment_payload["addedAttachments"][0])
+        self.assertNotIn("storageKey", attachment_payload["addedAttachments"][0])
+        update_payload = next(
+            payload
+            for event_type, payload in events
+            if event_type == "documentation_card_updated"
+        )
+        self.assertEqual(update_payload["changedFields"], ["inquiry"])
+        self.assertEqual(update_payload["previousValues"], {"inquiry": "Checked learner access."})
+        self.assertEqual(update_payload["currentValues"], {"inquiry": "Confirmed learner access was restored."})
+        self.assertEqual(update_payload["cardDetails"]["inquiry"], "Confirmed learner access was restored.")
+        self.assertEqual(len(update_payload["cardDetails"]["attachments"]), 2)
+        create_payload = next(
+            payload
+            for event_type, payload in events
+            if event_type == "documentation_card_created"
+        )
+        self.assertEqual(create_payload["cardDetails"]["inquiry"], "Created a second card.")
 
     def test_stamp_documentation_card_actors_backfills_legacy_saved_card_editor(self):
         legacy_documentation = {

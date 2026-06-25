@@ -333,6 +333,22 @@ const dashboardPayload = {
         consoleStatus: "Off",
         selectedConsoleStatus: "Off",
       },
+      {
+        id: 41,
+        username: "test.test",
+        fullName: "Test Test",
+        email: "test.test@kentbusinesscollege.com",
+        accountScope: "staff",
+        role: "agent",
+        isActive: true,
+        sessionActive: false,
+        legacySupportAccess: false,
+        legacyOperationsAccess: false,
+        legacyAdminAccess: false,
+        entraDirectoryAdmin: false,
+        consoleStatus: "Off",
+        selectedConsoleStatus: "Off",
+      },
     ],
     agents: [
       {
@@ -351,29 +367,46 @@ const dashboardPayload = {
         consoleStatus: "Off",
         selectedConsoleStatus: "Off",
       },
+      {
+        id: 41,
+        username: "test.test",
+        fullName: "Test Test",
+        email: "test.test@kentbusinesscollege.com",
+        accountScope: "staff",
+        role: "agent",
+        isActive: true,
+        sessionActive: false,
+        legacySupportAccess: false,
+        legacyOperationsAccess: false,
+        legacyAdminAccess: false,
+        entraDirectoryAdmin: false,
+        consoleStatus: "Off",
+        selectedConsoleStatus: "Off",
+      },
     ],
   },
 };
 
 function buildDashboardAccountsPayload() {
+  const applyRuntimeSessionToSignedInAccount = (account: (typeof dashboardPayload.accounts.accounts)[number]) => {
+    if (account.id !== runtimeAdminSession.id && account.username !== runtimeAdminSession.username) {
+      return account;
+    }
+
+    return {
+      ...account,
+      role: runtimeAdminSession.role,
+      legacySupportAccess: runtimeAdminSession.legacySupportAccess,
+      legacyOperationsAccess: runtimeAdminSession.legacyOperationsAccess,
+      legacyAdminAccess: runtimeAdminSession.legacyAdminAccess,
+      entraDirectoryAdmin: runtimeAdminSession.entraDirectoryAdmin,
+    };
+  };
+
   return {
     accounts: {
-      accounts: dashboardPayload.accounts.accounts.map((account) => ({
-        ...account,
-        role: runtimeAdminSession.role,
-        legacySupportAccess: runtimeAdminSession.legacySupportAccess,
-        legacyOperationsAccess: runtimeAdminSession.legacyOperationsAccess,
-        legacyAdminAccess: runtimeAdminSession.legacyAdminAccess,
-        entraDirectoryAdmin: runtimeAdminSession.entraDirectoryAdmin,
-      })),
-      agents: dashboardPayload.accounts.agents.map((agent) => ({
-        ...agent,
-        role: runtimeAdminSession.role,
-        legacySupportAccess: runtimeAdminSession.legacySupportAccess,
-        legacyOperationsAccess: runtimeAdminSession.legacyOperationsAccess,
-        legacyAdminAccess: runtimeAdminSession.legacyAdminAccess,
-        entraDirectoryAdmin: runtimeAdminSession.entraDirectoryAdmin,
-      })),
+      accounts: dashboardPayload.accounts.accounts.map(applyRuntimeSessionToSignedInAccount),
+      agents: dashboardPayload.accounts.agents.map(applyRuntimeSessionToSignedInAccount),
     },
   };
 }
@@ -511,7 +544,7 @@ describe("AgentDashboard runtime", () => {
       "Support Dashboard",
       "Learning Plan Team",
       "Chat Console",
-      "Manage Agents",
+      "Team Management",
     ]);
     expect(screen.getByRole("tab", { name: /Admin Dashboard/i })).toHaveAttribute("data-state", "inactive");
     expect(screen.getByRole("tab", { name: /Support Dashboard/i })).toHaveAttribute("data-state", "active");
@@ -543,13 +576,75 @@ describe("AgentDashboard runtime", () => {
       "Support Dashboard",
       "Learning Plan Team",
       "Chat Console",
-      "Manage Agents",
+      "Team Management",
     ]);
     expect(screen.getByRole("tab", { name: /Admin Dashboard/i })).toHaveAttribute("data-state", "active");
     expect(screen.getByRole("tab", { name: /Support Dashboard/i })).toHaveAttribute("data-state", "inactive");
     expect(screen.getByRole("tab", { name: /Learning Plan Team/i })).toHaveAttribute("data-state", "inactive");
     expect(screen.getByRole("tab", { name: /Chat Console/i })).toHaveAttribute("data-state", "inactive");
     expect(within(adminPanel).getByRole("heading", { name: "All Tickets" })).toBeInTheDocument();
+  });
+
+  it("keeps no-access staff visible in Team Management so access can be restored", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin?view=management"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Team Management" })).toBeInTheDocument();
+    expect(screen.getByText("Test Test")).toBeInTheDocument();
+    expect(screen.getByText(/No support access/i)).toBeInTheDocument();
+  });
+
+  it("surfaces live handoffs from ticketState even before chatIsActive is set", async () => {
+    const originalFetch = global.fetch;
+    const waitingLiveTicket = {
+      ...dashboardPayload.tickets.tickets[0],
+      id: "KBC-000005",
+      learnerName: "Waiting Learner",
+      requesterName: "Waiting Learner",
+      email: "waiting.learner@kentbusinesscollege.com",
+      inquiryPreview: "Waiting for an available support agent",
+      chatId: "CHAT-000005",
+      chatIsActive: false,
+      liveChatRequested: true,
+      liveChatRequestedAt: "2026-06-14T10:05:00.000Z",
+      chatState: "open",
+      ticketState: {
+        ticketType: "live_chat",
+        workflowStage: "awaiting_agent",
+        queueScope: "support",
+        dashboardBucket: "live_chat",
+        canShowConversation: true,
+        canReceiveChat: true,
+        resolutionReason: "",
+      },
+    };
+
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/tickets")) {
+        return new Response(JSON.stringify({
+          tickets: [...dashboardPayload.tickets.tickets, waitingLiveTicket],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=console"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Waiting Learner")).toBeInTheDocument();
+    expect(screen.getByText("CHAT-000005")).toBeInTheDocument();
   });
 
   it("opens the Admin Dashboard overview from the admin view deep link", async () => {
