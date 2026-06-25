@@ -117,17 +117,53 @@ describe("SupportOptions", () => {
   });
 
   it("submits direct tickets as quick ticket chat history updates", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        ticket: {
-          status: "Pending",
-          statusReason: "Quick Ticket",
-          assignedTeam: "Support Desk",
-          slaStatus: "On Track",
-          createdAt: "2026-05-23T11:52:00+00:00",
-        },
-      }),
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+
+      if (url === "/api/tickets/KBC-000247") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            ticket: {
+              id: "KBC-000247",
+              learnerName: "omar2",
+              email: "omar2@gmail.com",
+              requesterRole: "user",
+              category: "Technical",
+              technicalSubcategory: "Others",
+              inquiry: "Need help with another system",
+              status: "Open",
+              statusReason: "",
+              assignedAgentId: null,
+              assignedTeam: "Unassigned",
+              slaStatus: "Pending Review",
+              createdAt: "2026-05-23T11:52:00+00:00",
+              chatState: "open",
+              liveChatRequested: false,
+            },
+          }),
+        });
+      }
+
+      if (url === "/api/tickets/KBC-000247/chat-history") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            ticket: {
+              status: "Pending",
+              statusReason: "Quick Ticket",
+              assignedTeam: "Support Desk",
+              slaStatus: "On Track",
+              createdAt: "2026-05-23T11:52:00+00:00",
+            },
+          }),
+        });
+      }
+
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({}),
+      });
     });
     vi.stubGlobal("fetch", fetchMock);
 

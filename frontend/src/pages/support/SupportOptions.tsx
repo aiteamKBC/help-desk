@@ -13,19 +13,16 @@ import { Button } from "@/components/ui/button";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import {
-  type Category,
-  type RequesterSource,
-  type TechnicalSubcategory,
   type Ticket,
 } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
 import {
   getSupportResumePath,
   isCoachRequesterRole,
-  quickTicketReason,
   shouldShowStatusStep,
   type SupportChatEntryAction,
 } from "@/lib/supportFlow";
+import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/supportTicketDraft";
 import { setTicketBookingProgress } from "@/lib/supportTicketProgress";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -38,28 +35,6 @@ interface SupportOptionAction {
   onClick: () => void | Promise<void>;
   disabled?: boolean;
   statusText?: string;
-}
-
-interface PublicTicketPayload {
-  id: string;
-  learnerName?: string;
-  email: string;
-  requesterRole?: Ticket["requesterRole"];
-  requesterSource?: RequesterSource;
-  category: Category;
-  technicalSubcategory: TechnicalSubcategory;
-  subject?: string;
-  inquiry: string;
-  submittedForLearner?: Ticket["submittedForLearner"];
-  notifySubmittedForLearner?: boolean;
-  status: Ticket["status"];
-  statusReason?: string;
-  assignedAgentId?: number | null;
-  assignedTeam: string;
-  slaStatus: string;
-  createdAt: string;
-  chatState?: Ticket["chatState"];
-  liveChatRequested?: boolean;
 }
 
 const SupportOptions = () => {
@@ -174,84 +149,16 @@ const SupportOptions = () => {
     };
   }, [isCoachRequester, ticket.id]);
 
-  const buildTicketStateFromPayload = (payloadTicket: PublicTicketPayload, currentTicket: Ticket): Ticket => {
-    const hasSubmittedForLearner = Object.prototype.hasOwnProperty.call(payloadTicket, "submittedForLearner");
-    const hasNotifySubmittedForLearner = Object.prototype.hasOwnProperty.call(payloadTicket, "notifySubmittedForLearner");
-
-    return {
-      ...currentTicket,
-      id: payloadTicket.id,
-      learnerName: payloadTicket.learnerName || currentTicket.learnerName,
-      email: payloadTicket.email || currentTicket.email,
-      requesterRole: payloadTicket.requesterRole || currentTicket.requesterRole,
-      requesterSource: payloadTicket.requesterSource || currentTicket.requesterSource,
-      category: payloadTicket.category || currentTicket.category,
-      technicalSubcategory: payloadTicket.technicalSubcategory || currentTicket.technicalSubcategory,
-      subject: payloadTicket.subject || currentTicket.subject,
-      inquiry: payloadTicket.inquiry || currentTicket.inquiry,
-      submittedForLearner: hasSubmittedForLearner ? payloadTicket.submittedForLearner ?? null : currentTicket.submittedForLearner,
-      notifySubmittedForLearner: hasNotifySubmittedForLearner ? Boolean(payloadTicket.notifySubmittedForLearner) : currentTicket.notifySubmittedForLearner,
-      status: payloadTicket.status || currentTicket.status,
-      statusReason: payloadTicket.statusReason || currentTicket.statusReason,
-      assignedAgentId: payloadTicket.assignedAgentId ?? currentTicket.assignedAgentId,
-      assignedTeam: payloadTicket.assignedTeam || currentTicket.assignedTeam,
-      slaStatus: payloadTicket.slaStatus || currentTicket.slaStatus,
-      createdAt: payloadTicket.createdAt || currentTicket.createdAt,
-      chatState: payloadTicket.chatState ?? currentTicket.chatState,
-      liveChatRequested: payloadTicket.liveChatRequested ?? currentTicket.liveChatRequested,
-    };
-  };
-
-  const buildTicketDraftFormData = (currentTicket: Ticket) => {
-    const formData = new FormData();
-    formData.set("email", currentTicket.email);
-    formData.set("requesterRole", currentTicket.requesterRole);
-    formData.set("category", currentTicket.category);
-    formData.set("technicalSubcategory", currentTicket.technicalSubcategory);
-    formData.set("subject", currentTicket.subject);
-    formData.set("inquiry", currentTicket.inquiry);
-    formData.set("submittedForLearnerId", currentTicket.submittedForLearner ? String(currentTicket.submittedForLearner.id) : "");
-    formData.set("notifySubmittedForLearner", String(Boolean(currentTicket.submittedForLearner && currentTicket.notifySubmittedForLearner)));
-    formData.set(
-      "submittedForNotificationEmail",
-      currentTicket.submittedForLearner
-        ? currentTicket.submittedForLearner.notificationEmail || currentTicket.submittedForLearner.email
-        : "",
-    );
-    currentTicket.evidence.forEach((file) => {
-      if (file.file) {
-        formData.append("evidenceFiles", file.file, file.name);
-      }
-    });
-    return formData;
-  };
-
   const ensureTicketCreated = async () => {
     const currentTicket = ticketRef.current;
     if (currentTicket.id) {
       try {
-        const response = await fetch(`/api/tickets/${encodeURIComponent(currentTicket.id)}`, {
-          method: "PATCH",
-          body: buildTicketDraftFormData(currentTicket),
-        });
-        const payload = (await response.json().catch(() => null)) as
-          | {
-              message?: string;
-              ticket?: PublicTicketPayload;
-            }
-          | null;
-
-        if (!response.ok || !payload?.ticket) {
-          toast.error(payload?.message || "We could not update the ticket details right now.");
-          return null;
-        }
-
-        const nextTicket = buildTicketStateFromPayload(payload.ticket, currentTicket);
+        const nextTicket = await persistTicketDraft(currentTicket);
         ticketRef.current = nextTicket;
         updateTicket(nextTicket);
         return nextTicket;
-      } catch {
-        toast.error("We could not connect to the server. Please try again.");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "We could not connect to the server. Please try again.");
         return null;
       }
     }
@@ -270,30 +177,12 @@ const SupportOptions = () => {
       setIsCreatingTicket(true);
 
       try {
-        const formData = buildTicketDraftFormData(currentTicket);
-
-        const response = await fetch("/api/tickets", {
-          method: "POST",
-          body: formData,
-        });
-        const payload = (await response.json().catch(() => null)) as
-          | {
-              message?: string;
-              ticket?: PublicTicketPayload;
-            }
-          | null;
-
-        if (!response.ok || !payload?.ticket) {
-          toast.error(payload?.message || "We could not create the ticket right now.");
-          return null;
-        }
-
-        const nextTicket = buildTicketStateFromPayload(payload.ticket, currentTicket);
+        const nextTicket = await persistTicketDraft(currentTicket);
         ticketRef.current = nextTicket;
         updateTicket(nextTicket);
         return nextTicket;
-      } catch {
-        toast.error("We could not connect to the server. Please try again.");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "We could not connect to the server. Please try again.");
         return null;
       } finally {
         pendingTicketCreationRef.current = null;
@@ -416,52 +305,14 @@ const SupportOptions = () => {
         return;
       }
 
-      const response = await fetch(`/api/tickets/${encodeURIComponent(targetTicket.id)}/chat-history`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          status: "Pending",
-          statusReason: quickTicketReason,
-          messages: targetTicket.chatHistory.map((message) => ({
-            sender: message.sender,
-            text: message.text,
-            timestamp: message.timestamp,
-          })),
-        }),
-      });
-
-      const payload = (await response.json().catch(() => null)) as
-        | {
-            message?: string;
-            ticket?: {
-              status?: "Open" | "Pending" | "Closed";
-              statusReason?: string;
-              assignedTeam?: string;
-              slaStatus?: string;
-              createdAt?: string;
-            };
-          }
-        | null;
-
-      if (!response.ok || !payload?.ticket) {
-        toast.error(payload?.message || "We could not submit the ticket right now.");
-        return;
-      }
-
+      const submittedTicket = await submitTicketDirectlyForReview(targetTicket);
       clearBookingSummary();
-      updateTicket({
-        status: payload.ticket.status || "Pending",
-        statusReason: payload.ticket.statusReason || quickTicketReason,
-        assignedTeam: payload.ticket.assignedTeam || targetTicket.assignedTeam,
-        slaStatus: payload.ticket.slaStatus || targetTicket.slaStatus,
-        createdAt: payload.ticket.createdAt || targetTicket.createdAt,
-      });
+      ticketRef.current = submittedTicket;
+      updateTicket(submittedTicket);
       toast.success("Your ticket has been submitted directly for team review.");
       navigate("/support/status");
-    } catch {
-      toast.error("We could not connect to the server. Please try again.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "We could not connect to the server. Please try again.");
     } finally {
       setIsQuickSubmitting(false);
     }

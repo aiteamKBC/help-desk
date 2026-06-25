@@ -33,6 +33,7 @@ import {
   type EvidenceFile,
   type SubmittedForLearner,
   type TechnicalSubcategory,
+  type Ticket,
 } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
 import {
@@ -43,6 +44,7 @@ import {
   parseCoverageInquiry,
   type CoverageTimeOption,
 } from "@/lib/coverageSupport";
+import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/supportTicketDraft";
 import { toast } from "sonner";
 
 const textExtensions = new Set([
@@ -367,7 +369,7 @@ const InquiryDetails = () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [canSubmitForLearner, learnerSearch, requestFor]);
+  }, [canSubmitForLearner, learnerSearch, requestFor, ticket.email]);
 
   useEffect(() => {
     if (!isCoverageFlow) {
@@ -628,8 +630,8 @@ const InquiryDetails = () => {
           : null
         : null;
 
-      clearBookingSummary();
-      updateTicket({
+      const nextTicket: Ticket = {
+        ...ticket,
         id: ticket.id || "",
         learnerName: ticket.learnerName,
         email: ticket.email,
@@ -651,10 +653,24 @@ const InquiryDetails = () => {
         chatState: ticket.id ? ticket.chatState : "open",
         liveChatRequested: ticket.id ? ticket.liveChatRequested : false,
         chatHistory: ticket.id ? ticket.chatHistory : [],
-      });
+      };
+
+      if (isCoverageFlow) {
+        const persistedTicket = await persistTicketDraft(nextTicket);
+        const submittedTicket = await submitTicketDirectlyForReview(persistedTicket);
+
+        clearBookingSummary();
+        updateTicket(submittedTicket);
+        toast.success("Your coverage ticket has been submitted to the Learning Plan team.");
+        navigate("/support/status");
+        return;
+      }
+
+      clearBookingSummary();
+      updateTicket(nextTicket);
       navigate("/support/options");
-    } catch {
-      toast.error("We could not save these inquiry details. Please try again.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "We could not save these inquiry details. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -913,18 +929,21 @@ const InquiryDetails = () => {
                       </div>
                     ) : null}
 
-                    <label className={`flex items-start gap-3 rounded-2xl border border-primary/10 bg-white px-4 py-3 text-sm ${
-                      selectedSubmittedForLearner ? "cursor-pointer" : "cursor-not-allowed opacity-70"
-                    }`}
+                    <label className="flex cursor-not-allowed items-start gap-3 rounded-2xl border border-primary/10 bg-white px-4 py-3 text-sm opacity-75"
                     >
                       <Checkbox
                         checked={notifySubmittedForLearner}
-                        disabled={!selectedSubmittedForLearner}
+                        disabled
                         onCheckedChange={(checked) => setNotifySubmittedForLearner(Boolean(checked))}
                         className="mt-1"
                       />
                       <span>
-                        <span className="block font-semibold text-foreground">Notify learner by email</span>
+                        <span className="flex flex-wrap items-center gap-2 font-semibold text-foreground">
+                          Notify learner by email
+                          <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700">
+                            Coming soon
+                          </span>
+                        </span>
                         <span className="mt-1 block text-xs leading-5 text-muted-foreground">
                           Off by default. If selected, the learner receives an email after the ticket is submitted.
                         </span>
