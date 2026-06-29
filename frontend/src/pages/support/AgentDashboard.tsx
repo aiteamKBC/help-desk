@@ -560,10 +560,21 @@ type PendingTeamTransfer = {
 interface ListResponse {
   message?: string;
   tickets?: TicketSummary[];
+  pagination?: TicketListPagination;
   accounts?: AdminAgent[];
   agents?: AdminAgent[];
   account?: AdminAgent;
   agent?: AdminAgent;
+}
+
+interface TicketListPagination {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrevious: boolean;
+  isPaginated: boolean;
 }
 
 interface TeamListResponse {
@@ -626,6 +637,7 @@ const adminSelectableConsoleStatuses = ["Available", "Off"] as const;
 const consolePollIntervalMs = 2500;
 const dashboardTicketPollIntervalMs = 5000;
 const dashboardAgentPollIntervalMs = 15000;
+const dashboardPageSizeOptions = [10, 25, 50, 100];
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
@@ -867,9 +879,12 @@ type AdminSelectableConsoleStatus = (typeof adminSelectableConsoleStatuses)[numb
 type DocumentationWorkflowStatus = (typeof documentationWorkflowStatuses)[number];
 type DocumentationIssuesAddressed = "yes" | "no" | "";
 type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreached" | "quickResolution" | "escalation" | "coverage";
+type AdminTicketDashboardFilterParam = DashboardTicketFilter | "learningPlanOther";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
+type DashboardStatusFilterParam = "Open" | "Pending" | "Closed";
+type DashboardTicketPageLoadOptions = { silent?: boolean; signal?: AbortSignal };
 type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management" | `${typeof teamDashboardViewPrefix}${string}`;
 type ManagementAccessTab = `${typeof managementTeamTabPrefix}${string}` | "admins";
 type TicketAccessKind = "support" | "operations";
@@ -1049,6 +1064,12 @@ const AgentDashboard = () => {
   const [dashboardArchiveScope, setDashboardArchiveScope] = useState<DashboardArchiveScope>("active");
   const [learningPlanTeamSection, setLearningPlanTeamSection] = useState<LearningPlanTeamSection>("coverage");
   const [dashboardSearch, setDashboardSearch] = useState("");
+  const [dashboardPage, setDashboardPage] = useState(1);
+  const [dashboardPageSize, setDashboardPageSize] = useState(25);
+  const [serverDashboardTickets, setServerDashboardTickets] = useState<TicketSummary[]>([]);
+  const [serverDashboardPagination, setServerDashboardPagination] = useState<TicketListPagination | null>(null);
+  const [isDashboardPageLoading, setIsDashboardPageLoading] = useState(false);
+  const [dashboardPageError, setDashboardPageError] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [standardDocumentationDraftsByTicketId, setStandardDocumentationDraftsByTicketId] = useState<Record<string, AdminDocumentation>>({});
@@ -1123,6 +1144,7 @@ const AgentDashboard = () => {
     (silent?: boolean, statusOverride?: AdminSelectableConsoleStatus) => Promise<boolean>
   >(async () => false);
   const refreshTicketsOnlyRef = useRef<(silent?: boolean) => Promise<void>>(async () => {});
+  const loadDashboardTicketPageRef = useRef<(options?: DashboardTicketPageLoadOptions) => Promise<void>>(async () => {});
   const refreshAgentsOnlyRef = useRef<(silent?: boolean) => Promise<void>>(async () => {});
   const refreshConsoleTicketDetailRef = useRef<(ticketId: string) => Promise<void>>(async () => {});
   const clearConsolePendingAttachmentsRef = useRef<(revokePreviewUrls?: boolean) => void>(() => {});
@@ -1798,6 +1820,20 @@ const AgentDashboard = () => {
     dashboardAssignedFilter !== "all",
     dashboardAssignedFilterLabel,
   );
+  const dashboardDisplayedTickets = serverDashboardPagination ? serverDashboardTickets : visibleDashboardTickets;
+  const dashboardDisplayedTableCountLabel = serverDashboardPagination
+    ? getServerDashboardTableCountLabel(
+        serverDashboardPagination,
+        Boolean(normalizedDashboardSearch),
+        dashboardAssignedFilter !== "all",
+        dashboardAssignedFilterLabel,
+      )
+    : dashboardTableCountLabel;
+  const isDashboardTableLoading = isLoading || (isDashboardPageLoading && !serverDashboardPagination);
+  const dashboardPaginationTotalPages = Math.max(serverDashboardPagination?.totalPages || 0, 1);
+  const dashboardPaginationRangeLabel = serverDashboardPagination
+    ? getDashboardPaginationRangeLabel(serverDashboardPagination)
+    : "";
   const dashboardEmptyMessage = normalizedDashboardSearch
     ? "No matching tickets found for this search."
     : dashboardArchiveScope === "archived"
@@ -2318,6 +2354,58 @@ const AgentDashboard = () => {
       window.clearInterval(agentsIntervalId);
     };
   }, [isDashboardLikeView]);
+
+  useEffect(() => {
+    if (!isCoverageDashboardView) {
+      return;
+    }
+
+    if (dashboardTicketFilter === "quickResolution" || dashboardTicketFilter === "escalation" || dashboardTicketFilter === "coverage") {
+      setDashboardTicketFilter("all");
+    }
+  }, [dashboardTicketFilter, isCoverageDashboardView]);
+
+  useEffect(() => {
+    setDashboardPage(1);
+  }, [
+    adminView,
+    dashboardArchiveScope,
+    dashboardAssignedFilter,
+    dashboardPageSize,
+    dashboardSearch,
+    dashboardSortOrder,
+    dashboardTicketFilter,
+    learningPlanTeamSection,
+    selectedDashboardTeamKey,
+  ]);
+
+  useEffect(() => {
+    if (!isDashboardLikeView || !hasCheckedTeamRoutingPolicies) {
+      setServerDashboardTickets([]);
+      setServerDashboardPagination(null);
+      setDashboardPageError("");
+      setIsDashboardPageLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    void loadDashboardTicketPageRef.current({ signal: controller.signal });
+
+    return () => controller.abort();
+  }, [
+    adminView,
+    dashboardArchiveScope,
+    dashboardAssignedFilter,
+    dashboardPage,
+    dashboardPageSize,
+    dashboardSearch,
+    dashboardSortOrder,
+    dashboardTicketFilter,
+    hasCheckedTeamRoutingPolicies,
+    isDashboardLikeView,
+    learningPlanTeamSection,
+    selectedDashboardTeamKey,
+  ]);
 
   useEffect(() => {
     const defaultAdminLandingView = getDefaultAdminLandingView(accessSession);
@@ -2963,6 +3051,156 @@ const AgentDashboard = () => {
     return payload?.tickets || [];
   }
 
+  function getDashboardServerTeamKey() {
+    if (isAdminDashboardView) {
+      return "";
+    }
+
+    if (isCoverageDashboardView) {
+      return getLearningPlanTeamRoutingPolicy().key;
+    }
+
+    if (isCustomTeamDashboardView) {
+      return selectedDashboardTeamPolicy?.key || selectedDashboardTeamKey;
+    }
+
+    return getSupportTeamRoutingPolicy().key;
+  }
+
+  function getDashboardServerFilterParam(): AdminTicketDashboardFilterParam | "" {
+    if (isCoverageDashboardView) {
+      return isLearningPlanCoverageSection ? "coverage" : "learningPlanOther";
+    }
+
+    return dashboardTicketFilter === "all" ? "" : dashboardTicketFilter;
+  }
+
+  function getDashboardServerStatusParam(): DashboardStatusFilterParam | "" {
+    if (!isCoverageDashboardView) {
+      return "";
+    }
+
+    if (dashboardTicketFilter === "open") {
+      return "Open";
+    }
+
+    if (dashboardTicketFilter === "pending") {
+      return "Pending";
+    }
+
+    if (dashboardTicketFilter === "closed") {
+      return "Closed";
+    }
+
+    return "";
+  }
+
+  function getDashboardServerSlaStatusParam() {
+    return isCoverageDashboardView && dashboardTicketFilter === "slaBreached" ? "Breached" : "";
+  }
+
+  function buildDashboardTicketPageSearchParams() {
+    const params = new URLSearchParams();
+    params.set("page", String(dashboardPage));
+    params.set("pageSize", String(dashboardPageSize));
+    params.set("sort", dashboardSortOrder);
+    params.set("archiveScope", dashboardArchiveScope);
+
+    const teamKey = getDashboardServerTeamKey();
+    if (teamKey) {
+      params.set("team", teamKey);
+    }
+
+    const dashboardFilterParam = getDashboardServerFilterParam();
+    if (dashboardFilterParam) {
+      params.set("dashboardFilter", dashboardFilterParam);
+    }
+
+    const statusParam = getDashboardServerStatusParam();
+    if (statusParam) {
+      params.set("status", statusParam);
+    }
+
+    const slaStatusParam = getDashboardServerSlaStatusParam();
+    if (slaStatusParam) {
+      params.set("slaStatus", slaStatusParam);
+    }
+
+    const trimmedSearch = dashboardSearch.trim();
+    if (trimmedSearch) {
+      params.set("search", trimmedSearch);
+    }
+
+    if (dashboardAssignedFilter !== "all") {
+      params.set("assigned", dashboardAssignedFilter);
+    }
+
+    return params;
+  }
+
+  async function fetchDashboardTicketPage(signal?: AbortSignal) {
+    const params = buildDashboardTicketPageSearchParams();
+    const response = await fetch(`/api/admin/tickets?${params.toString()}`, {
+      cache: "no-store",
+      signal,
+    });
+    const payload = (await response.json().catch(() => null)) as ListResponse | null;
+
+    if (!response.ok) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
+      throw new Error(payload?.message || "We could not load this ticket page right now.");
+    }
+
+    return {
+      tickets: payload?.tickets || [],
+      pagination: payload?.pagination || null,
+    };
+  }
+
+  async function loadDashboardTicketPage(options?: DashboardTicketPageLoadOptions) {
+    if (!isDashboardLikeView || !hasCheckedTeamRoutingPolicies) {
+      return;
+    }
+
+    if (!options?.silent) {
+      setIsDashboardPageLoading(true);
+      setDashboardPageError("");
+      setServerDashboardTickets([]);
+      setServerDashboardPagination(null);
+    }
+
+    try {
+      const result = await fetchDashboardTicketPage(options?.signal);
+      if (options?.signal?.aborted || !isCurrentDashboardSession()) {
+        return;
+      }
+
+      setServerDashboardTickets(result.tickets);
+      setServerDashboardPagination(result.pagination);
+      setDashboardPageError("");
+
+      if (result.pagination?.isPaginated && result.pagination.page !== dashboardPage) {
+        setDashboardPage(result.pagination.page);
+      }
+    } catch (fetchError) {
+      if (options?.signal?.aborted) {
+        return;
+      }
+
+      if (!options?.silent) {
+        setServerDashboardTickets([]);
+        setServerDashboardPagination(null);
+        setDashboardPageError(fetchError instanceof Error ? fetchError.message : "We could not load this ticket page right now.");
+      }
+    } finally {
+      if (!options?.signal?.aborted) {
+        setIsDashboardPageLoading(false);
+      }
+    }
+  }
+
   async function fetchAgentsList() {
     const response = await fetch("/api/admin/accounts");
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
@@ -3149,6 +3387,9 @@ const AgentDashboard = () => {
         fetchNotificationLog().catch(() => null),
       ]);
       setTickets(nextTickets);
+      if (isDashboardLikeView) {
+        void loadDashboardTicketPage({ silent: true });
+      }
       if (nextNotificationLog !== null) {
         setNotificationLog(nextNotificationLog);
       }
@@ -3716,6 +3957,9 @@ const AgentDashboard = () => {
     setTickets((currentTickets) => currentTickets.map((ticket) => (
       ticket.id === detail.ticket.id ? detail.ticket : ticket
     )));
+    setServerDashboardTickets((currentTickets) => currentTickets.map((ticket) => (
+      ticket.id === detail.ticket.id ? detail.ticket : ticket
+    )));
     setConsoleDetail((currentDetail) => (
       currentDetail?.ticket.id === detail.ticket.id ? detail : currentDetail
     ));
@@ -3726,6 +3970,7 @@ const AgentDashboard = () => {
 
   function removeTicketAcrossViews(ticketId: string) {
     setTickets((currentTickets) => currentTickets.filter((ticket) => ticket.id !== ticketId));
+    setServerDashboardTickets((currentTickets) => currentTickets.filter((ticket) => ticket.id !== ticketId));
 
     if (activeDetail?.ticket.id === ticketId || activeTicketId === ticketId) {
       closePanel();
@@ -3802,6 +4047,7 @@ const AgentDashboard = () => {
       }
 
       syncDetailAcrossViews(payload);
+      void loadDashboardTicketPage({ silent: true });
       if (activeDetail?.ticket.id === payload.ticket.id) {
         syncDrafts(payload);
       }
@@ -3848,6 +4094,7 @@ const AgentDashboard = () => {
       }
 
       syncDetailAcrossViews(payload);
+      void loadDashboardTicketPage({ silent: true });
       if (activeDetail?.ticket.id === payload.ticket.id) {
         syncDrafts(payload);
       }
@@ -5484,6 +5731,7 @@ const AgentDashboard = () => {
   loadDashboardRef.current = loadDashboard;
   syncAgentSessionHeartbeatRef.current = syncAgentSessionHeartbeat;
   refreshTicketsOnlyRef.current = refreshTicketsOnly;
+  loadDashboardTicketPageRef.current = loadDashboardTicketPage;
   refreshAgentsOnlyRef.current = refreshAgentsOnly;
   refreshConsoleTicketDetailRef.current = refreshConsoleTicketDetail;
   clearConsolePendingAttachmentsRef.current = clearConsolePendingAttachments;
@@ -5640,7 +5888,12 @@ const AgentDashboard = () => {
                   ) : null}
                 </div>
                 <div className="flex items-center gap-3 lg:shrink-0">
-                  <span className="text-xs text-muted-foreground">{dashboardTableCountLabel}</span>
+                  <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+                    {isDashboardPageLoading && serverDashboardPagination ? (
+                      <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                    ) : null}
+                    {dashboardDisplayedTableCountLabel}
+                  </span>
                   {hasDashboardViewOverrides ? (
                     <Button
                       size="sm"
@@ -5836,13 +6089,17 @@ const AgentDashboard = () => {
             <div className="p-5 text-sm text-destructive bg-destructive/5 border-b border-destructive/10">
               {error}
             </div>
+          ) : dashboardPageError ? (
+            <div className="border-b border-amber-200 bg-amber-50/80 p-5 text-sm text-amber-900">
+              {dashboardPageError} Showing the locally cached ticket list until the next successful refresh.
+            </div>
           ) : null}
 
-          {isLoading ? (
+          {isDashboardTableLoading ? (
             <div className="p-10 text-sm text-muted-foreground flex items-center justify-center gap-2">
               <LoaderCircle className="h-4 w-4 animate-spin" /> Loading dashboard...
             </div>
-          ) : visibleDashboardTickets.length === 0 ? (
+          ) : dashboardDisplayedTickets.length === 0 ? (
             <div className="p-10 text-sm text-muted-foreground text-center">
               {dashboardEmptyMessage}
             </div>
@@ -5878,7 +6135,7 @@ const AgentDashboard = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {visibleDashboardTickets.map((ticket) => {
+                  {dashboardDisplayedTickets.map((ticket) => {
                     const requesterColumnSummary = getDashboardRequesterColumnSummary(
                       ticket,
                       { preferCoverageInquiry: isLearningPlanCoverageSection },
@@ -6087,6 +6344,56 @@ const AgentDashboard = () => {
               </table>
             </div>
           )}
+          {serverDashboardPagination?.isPaginated ? (
+            <div className="flex flex-col gap-3 border-t bg-secondary/20 px-4 py-3 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span>
+                  Page {serverDashboardPagination.page} of {dashboardPaginationTotalPages}
+                </span>
+                <span className="hidden sm:inline">-</span>
+                <span>{dashboardPaginationRangeLabel}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Select
+                  value={String(serverDashboardPagination.pageSize)}
+                  onValueChange={(value) => {
+                    setDashboardPageSize(Number(value));
+                    setDashboardPage(1);
+                  }}
+                  disabled={isDashboardPageLoading}
+                >
+                  <SelectTrigger className="h-8 w-[118px]" aria-label="Tickets per page">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {dashboardPageSizeOptions.map((pageSize) => (
+                      <SelectItem key={pageSize} value={String(pageSize)}>
+                        {pageSize} / page
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setDashboardPage((currentPage) => Math.max(1, currentPage - 1))}
+                  disabled={!serverDashboardPagination.hasPrevious || isDashboardPageLoading}
+                >
+                  Previous
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setDashboardPage((currentPage) => currentPage + 1)}
+                  disabled={!serverDashboardPagination.hasNext || isDashboardPageLoading}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          ) : null}
       </div>
     );
   }
@@ -6921,7 +7228,7 @@ const AgentDashboard = () => {
                   </TabsContent>
                 </Tabs>
 
-                {false ? (
+                {managementAgents.length < 0 ? (
                 <div className="divide-y">
                   {isAgentsLoading ? (
                     <div className="flex items-center justify-center gap-2 p-10 text-sm text-muted-foreground">
@@ -15608,6 +15915,34 @@ function getDashboardTableCountLabel(
   return hasAssignedFilter
     ? `${visibleCount} matching ticket${visibleCount === 1 ? "" : "s"} for ${assignedFilterLabel}`
     : `${visibleCount} matching ticket${visibleCount === 1 ? "" : "s"}`;
+}
+
+function getServerDashboardTableCountLabel(
+  pagination: TicketListPagination,
+  hasSearch: boolean,
+  hasAssignedFilter: boolean,
+  assignedFilterLabel: string,
+) {
+  const totalCount = pagination.total;
+  if (hasSearch) {
+    return `${totalCount} matching ticket${totalCount === 1 ? "" : "s"}`;
+  }
+
+  if (hasAssignedFilter) {
+    return `${totalCount} ticket${totalCount === 1 ? "" : "s"} for ${assignedFilterLabel}`;
+  }
+
+  return `${totalCount} total`;
+}
+
+function getDashboardPaginationRangeLabel(pagination: TicketListPagination) {
+  if (pagination.total <= 0) {
+    return "0 tickets";
+  }
+
+  const startIndex = ((pagination.page - 1) * pagination.pageSize) + 1;
+  const endIndex = Math.min(pagination.page * pagination.pageSize, pagination.total);
+  return `${startIndex}-${endIndex} of ${pagination.total}`;
 }
 
 function getDashboardEmptyMessage(filter: DashboardTicketFilter) {

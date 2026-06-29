@@ -4627,6 +4627,106 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertEqual(result["filters"]["assigned"], "me")
         self.assertEqual(result["filters"]["team"], "operations")
 
+    def test_list_admin_tickets_supports_dashboard_filter_param(self):
+        base_ticket = {
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Needs help",
+            "status": "Pending",
+            "priority": "Normal",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "is_archived": False,
+            "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "metadata": {"requester_role": "user"},
+        }
+        quick_ticket = {
+            **base_ticket,
+            "id": 41,
+            "public_id": "KBC-000041",
+            "learner_name": "Quick Ticket",
+            "learner_email": "quick@example.com",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+        }
+        escalation_ticket = {
+            **base_ticket,
+            "id": 42,
+            "public_id": "KBC-000042",
+            "learner_name": "Escalation Ticket",
+            "learner_email": "escalation@example.com",
+            "status_reason": services.STATUS_REASON_ESCALATION,
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(services, "run_query", return_value=[quick_ticket, escalation_ticket]),
+            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+        ):
+            result = services.list_admin_tickets(query_params={"dashboardFilter": "quickResolution"})
+
+        self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000041"])
+        self.assertEqual(result["filters"]["dashboardFilter"], "quickResolution")
+
+    def test_list_admin_tickets_supports_learning_plan_other_dashboard_filter(self):
+        base_ticket = {
+            "learner_phone": "",
+            "category": "Technical",
+            "inquiry": "Needs help",
+            "status": "Pending",
+            "status_reason": "",
+            "priority": "Normal",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "is_archived": False,
+            "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "metadata": {"requester_role": "user"},
+        }
+        other_learning_plan_ticket = {
+            **base_ticket,
+            "id": 43,
+            "public_id": "KBC-000043",
+            "learner_name": "Learning Plan Transfer",
+            "learner_email": "learning-plan@example.com",
+            "technical_subcategory": "LMS",
+        }
+        coverage_ticket = {
+            **base_ticket,
+            "id": 44,
+            "public_id": "KBC-000044",
+            "learner_name": "Coverage Ticket",
+            "learner_email": "coverage@example.com",
+            "technical_subcategory": "Coverage",
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(services, "run_query", return_value=[other_learning_plan_ticket, coverage_ticket]),
+            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+        ):
+            result = services.list_admin_tickets(query_params={"dashboardFilter": "learningPlanOther"})
+
+        self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000043"])
+        self.assertEqual(result["filters"]["dashboardFilter"], "learningPlanOther")
+
     def test_list_admin_tickets_hides_open_pre_submission_support_flow_tickets(self):
         visible_ticket = {
             "id": 11,

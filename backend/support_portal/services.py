@@ -13838,6 +13838,17 @@ ADMIN_TICKET_LIST_SORTS = {
     "priorityDesc",
     "priorityAsc",
 }
+ADMIN_TICKET_LIST_DASHBOARD_FILTERS = {
+    "all",
+    "open",
+    "pending",
+    "closed",
+    "slaBreached",
+    "quickResolution",
+    "escalation",
+    "coverage",
+    "learningPlanOther",
+}
 
 
 def normalize_admin_ticket_list_params(query_params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -13862,6 +13873,9 @@ def normalize_admin_ticket_list_params(query_params: dict[str, Any] | None = Non
     status_filter = next((status for status in ALLOWED_STATUSES if status.lower() == normalized_status), "")
     normalized_sla_status = sanitize_text(params.get("slaStatus") or params.get("sla")).lower().replace("-", " ")
     sla_filter = next((status for status in ALLOWED_SLA_STATUSES if status.lower() == normalized_sla_status), "")
+    dashboard_filter = sanitize_text(params.get("dashboardFilter") or params.get("filter"))
+    if dashboard_filter not in ADMIN_TICKET_LIST_DASHBOARD_FILTERS:
+        dashboard_filter = "all"
     pagination_requested = any(key in params for key in {"page", "pageSize", "limit"})
 
     return {
@@ -13875,6 +13889,7 @@ def normalize_admin_ticket_list_params(query_params: dict[str, Any] | None = Non
         "team": sanitize_text(params.get("team") or params.get("teamKey")).lower(),
         "archiveScope": archive_scope,
         "sort": sort_order,
+        "dashboardFilter": dashboard_filter,
     }
 
 
@@ -13938,10 +13953,45 @@ def admin_ticket_matches_assigned_filter(
         return not ticket.get("assigned_agent_id")
     if assigned_filter == "me":
         actor_id = parse_int((actor or {}).get("id"))
-        return actor_id > 0 and parse_int(ticket.get("assigned_agent_id")) == actor_id
+        return actor_id > 0 and (
+            parse_int(ticket.get("assigned_agent_id")) == actor_id
+            or is_admin_ticket_linked_to_escalation_agent(ticket, actor_id)
+        )
 
     agent_id = parse_int(assigned_filter.replace("agent:", ""))
-    return agent_id > 0 and parse_int(ticket.get("assigned_agent_id")) == agent_id
+    return agent_id > 0 and (
+        parse_int(ticket.get("assigned_agent_id")) == agent_id
+        or is_admin_ticket_linked_to_escalation_agent(ticket, agent_id)
+    )
+
+
+def is_admin_ticket_linked_to_escalation_agent(ticket: dict[str, Any], agent_id: int) -> bool:
+    if agent_id <= 0:
+        return False
+
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    pending_escalation_notification = get_pending_escalation_notification(ticket_metadata)
+    if pending_escalation_notification:
+        return (
+            parse_int(pending_escalation_notification.get("fromAgentId")) == agent_id
+            or parse_int(pending_escalation_notification.get("toAgentId")) == agent_id
+        )
+
+    latest_escalation_closure = get_latest_escalation_closure(ticket_metadata)
+    if not latest_escalation_closure:
+        if sanitize_text(ticket.get("status_reason")) != STATUS_REASON_ESCALATION:
+            return False
+
+        documentation = normalize_admin_documentation(ticket_metadata.get("admin_documentation"))
+        return (
+            parse_int(ticket.get("assigned_agent_id")) == agent_id
+            or parse_assigned_agent_id(documentation.get("escalationAgentId")) == agent_id
+        )
+
+    return (
+        parse_int(latest_escalation_closure.get("fromAgentId")) == agent_id
+        or parse_int(latest_escalation_closure.get("toAgentId")) == agent_id
+    )
 
 
 def admin_ticket_matches_team_filter(ticket: dict[str, Any], team_filter: str) -> bool:
@@ -13955,6 +14005,70 @@ def admin_ticket_matches_team_filter(ticket: dict[str, Any], team_filter: str) -
     return get_ticket_receiver_scope(ticket).casefold() == team_filter.casefold()
 
 
+def get_admin_ticket_dashboard_bucket(ticket: dict[str, Any]) -> str:
+    chat_state = derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status"))
+    ticket_state = derive_ticket_state(ticket, chat_state=chat_state)
+    return sanitize_text(ticket_state.get("dashboardBucket"))
+
+
+def is_admin_dashboard_open_ticket(ticket: dict[str, Any]) -> bool:
+    chat_state = derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status"))
+    return (
+        sanitize_text(ticket.get("status")) == "Open"
+        and chat_state != "closed"
+        and (
+            not is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata"))
+            or (
+                is_active_conversation(ticket.get("conversation_metadata"))
+                and is_latest_ticket_for_conversation(ticket.get("public_id"), ticket.get("conversation_metadata"))
+            )
+        )
+    )
+
+
+def is_admin_dashboard_pending_ticket(ticket: dict[str, Any]) -> bool:
+    return sanitize_text(ticket.get("status")) == "Pending" or get_admin_ticket_dashboard_bucket(ticket) == "pending"
+
+
+def is_admin_dashboard_escalation_ticket(ticket: dict[str, Any]) -> bool:
+    return (
+        get_admin_ticket_dashboard_bucket(ticket) == "escalation"
+        or (
+            sanitize_text(ticket.get("status")) == "Pending"
+            and sanitize_text(ticket.get("status_reason")) == STATUS_REASON_ESCALATION
+        )
+    )
+
+
+def is_admin_dashboard_closed_ticket(ticket: dict[str, Any]) -> bool:
+    return sanitize_text(ticket.get("status")) == "Closed" or get_admin_ticket_dashboard_bucket(ticket) == "closed"
+
+
+def admin_ticket_matches_dashboard_filter(ticket: dict[str, Any], dashboard_filter: str) -> bool:
+    if dashboard_filter in {"", "all"}:
+        return True
+    if dashboard_filter == "open":
+        return is_admin_dashboard_open_ticket(ticket)
+    if dashboard_filter == "pending":
+        return is_admin_dashboard_pending_ticket(ticket)
+    if dashboard_filter == "closed":
+        return is_admin_dashboard_closed_ticket(ticket)
+    if dashboard_filter == "slaBreached":
+        return normalize_sla_status(ticket.get("sla_status")) == "Breached"
+    if dashboard_filter == "quickResolution":
+        return is_quick_ticket_record(ticket)
+    if dashboard_filter == "escalation":
+        return is_admin_dashboard_escalation_ticket(ticket)
+    if dashboard_filter == "coverage":
+        return is_coverage_ticket_record(ticket)
+    if dashboard_filter == "learningPlanOther":
+        return (
+            get_ticket_receiver_scope(ticket) == TICKET_RECEIVER_SCOPE_OPERATIONS
+            and not is_coverage_ticket_record(ticket)
+        )
+    return True
+
+
 def filter_admin_ticket_list(
     tickets: list[dict[str, Any]],
     params: dict[str, Any],
@@ -13965,6 +14079,13 @@ def filter_admin_ticket_list(
         filtered_tickets = [ticket for ticket in filtered_tickets if not normalize_bool(ticket.get("is_archived"))]
     elif params["archiveScope"] == "archived":
         filtered_tickets = [ticket for ticket in filtered_tickets if normalize_bool(ticket.get("is_archived"))]
+
+    if params["dashboardFilter"] and params["dashboardFilter"] != "all":
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_dashboard_filter(ticket, params["dashboardFilter"])
+        ]
 
     if params["status"]:
         filtered_tickets = [ticket for ticket in filtered_tickets if sanitize_text(ticket.get("status")) == params["status"]]
@@ -14077,6 +14198,7 @@ def build_admin_ticket_list_filter_response(params: dict[str, Any]) -> dict[str,
         "team": params["team"],
         "archiveScope": params["archiveScope"],
         "sort": params["sort"],
+        "dashboardFilter": params["dashboardFilter"],
     }
 
 
