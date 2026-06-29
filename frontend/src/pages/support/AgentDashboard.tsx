@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Archive,
@@ -137,6 +137,8 @@ interface AdminAgent {
   legacyOperationsAccess?: boolean;
   legacyAdminAccess?: boolean;
   entraDirectoryAdmin?: boolean;
+  teamAccess?: TeamAccessInfo[];
+  teamAccessKeys?: string[];
 }
 
 interface PendingTransferRequest {
@@ -557,6 +559,16 @@ interface ListResponse {
   agent?: AdminAgent;
 }
 
+interface TeamListResponse {
+  message?: string;
+  teams?: AdminTeam[];
+}
+
+interface TeamMutationResponse {
+  message?: string;
+  team?: AdminTeam;
+}
+
 interface DetailResponse extends TicketDetailResponse {
   message?: string;
 }
@@ -612,16 +624,48 @@ const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
 const supportDeskAssignedTeam = "Support Desk";
 const learningPlanAssignedTeam = "Learning Plan Team";
+const managementTeamTabPrefix = "team:";
+
+type TeamAccessInfo = {
+  key: string;
+  name?: string;
+  assignedTeam?: string;
+  label?: string;
+  canReceiveTickets?: boolean;
+};
+
+type AdminTeam = {
+  id?: number | null;
+  key?: string | null;
+  name?: string | null;
+  assignedTeam?: string | null;
+  label?: string | null;
+  description?: string | null;
+  receiverAccessMetadataKey?: string | null;
+  receiverErrorTicketLabel?: string | null;
+  isActive?: boolean;
+};
+
+type LegacyTeamReceiverAccessKey = "legacySupportAccess" | "legacyOperationsAccess";
 
 type TeamRoutingPolicy = {
   key: string;
   assignedTeam: string;
   label: string;
   description: string;
-  receiverAccessKey: "legacySupportAccess" | "legacyOperationsAccess";
+  receiverAccessKey?: LegacyTeamReceiverAccessKey;
+  receiverAccessMetadataKey?: string;
 };
 
-const teamRoutingPolicies: TeamRoutingPolicy[] = [
+type TeamAccessCarrier = Pick<
+  AdminSession,
+  "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys"
+> | Pick<
+  AdminAgent,
+  "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys"
+>;
+
+const defaultTeamRoutingPolicies: TeamRoutingPolicy[] = [
   {
     key: "support",
     assignedTeam: supportDeskAssignedTeam,
@@ -637,13 +681,154 @@ const teamRoutingPolicies: TeamRoutingPolicy[] = [
     receiverAccessKey: "legacyOperationsAccess",
   },
 ];
-const supportTeamRoutingPolicy = teamRoutingPolicies[0];
-const learningPlanTeamRoutingPolicy = teamRoutingPolicies[1];
-const dashboardTeamTransferOptions = teamRoutingPolicies.map((policy) => ({
-  value: policy.assignedTeam,
-  label: policy.label,
-  description: policy.description,
-}));
+const supportTeamRoutingPolicy = defaultTeamRoutingPolicies[0];
+const learningPlanTeamRoutingPolicy = defaultTeamRoutingPolicies[1];
+let activeTeamRoutingPolicies: TeamRoutingPolicy[] = defaultTeamRoutingPolicies;
+
+function normalizeTeamPolicyKey(value: string | null | undefined) {
+  return (value || "").trim().toLowerCase();
+}
+
+function normalizeTeamPolicyText(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function getActiveTeamRoutingPolicies() {
+  return activeTeamRoutingPolicies.length ? activeTeamRoutingPolicies : defaultTeamRoutingPolicies;
+}
+
+function setActiveTeamRoutingPolicies(policies: TeamRoutingPolicy[]) {
+  activeTeamRoutingPolicies = policies.length ? policies : defaultTeamRoutingPolicies;
+}
+
+function getDefaultTeamRoutingPolicyByKey(key: string) {
+  const normalizedKey = normalizeTeamPolicyKey(key);
+  return defaultTeamRoutingPolicies.find((policy) => policy.key === normalizedKey);
+}
+
+function getSupportTeamRoutingPolicy() {
+  return getActiveTeamRoutingPolicies().find((policy) => policy.key === supportTeamRoutingPolicy.key) || supportTeamRoutingPolicy;
+}
+
+function getLearningPlanTeamRoutingPolicy() {
+  return getActiveTeamRoutingPolicies().find((policy) => policy.key === learningPlanTeamRoutingPolicy.key) || learningPlanTeamRoutingPolicy;
+}
+
+function getLegacyReceiverAccessKey(teamKey: string): LegacyTeamReceiverAccessKey | undefined {
+  if (teamKey === supportTeamRoutingPolicy.key) {
+    return "legacySupportAccess";
+  }
+  if (teamKey === learningPlanTeamRoutingPolicy.key) {
+    return "legacyOperationsAccess";
+  }
+  return undefined;
+}
+
+function buildTeamRoutingPoliciesFromTeams(teams: AdminTeam[] | null | undefined): TeamRoutingPolicy[] {
+  if (!Array.isArray(teams) || teams.length === 0) {
+    return defaultTeamRoutingPolicies;
+  }
+
+  const policiesByKey = new Map<string, TeamRoutingPolicy>(
+    defaultTeamRoutingPolicies.map((policy) => [policy.key, policy]),
+  );
+
+  for (const team of teams) {
+    if (team?.isActive === false) {
+      continue;
+    }
+
+    const key = normalizeTeamPolicyKey(team?.key || "");
+    const assignedTeam = normalizeTeamPolicyText(team?.assignedTeam || team?.name || team?.label);
+    if (!key || !assignedTeam) {
+      continue;
+    }
+
+    const defaultPolicy = getDefaultTeamRoutingPolicyByKey(key);
+    const label = normalizeTeamPolicyText(team?.label) || assignedTeam;
+    policiesByKey.set(key, {
+      key,
+      assignedTeam,
+      label,
+      description: normalizeTeamPolicyText(team?.description)
+        || defaultPolicy?.description
+        || `Route this ticket to the ${label} queue.`,
+      receiverAccessKey: getLegacyReceiverAccessKey(key),
+      receiverAccessMetadataKey: normalizeTeamPolicyText(team?.receiverAccessMetadataKey) || undefined,
+    });
+  }
+
+  return [...policiesByKey.values()];
+}
+
+function buildTeamRoutingPolicyFromTeam(team: AdminTeam | null | undefined) {
+  const teamKey = normalizeTeamPolicyKey(team?.key || "");
+  if (!teamKey) {
+    return null;
+  }
+
+  return buildTeamRoutingPoliciesFromTeams([team]).find((policy) => policy.key === teamKey) || null;
+}
+
+function getDashboardTeamTransferOptions(policies: TeamRoutingPolicy[]) {
+  return policies.map((policy) => ({
+    value: policy.assignedTeam,
+    label: policy.label,
+    description: policy.description,
+  }));
+}
+
+function buildManagementTeamTabValue(teamKey: string): ManagementAccessTab {
+  return `${managementTeamTabPrefix}${normalizeTeamPolicyKey(teamKey)}` as ManagementAccessTab;
+}
+
+function getManagementTeamKeyFromTab(tab: ManagementAccessTab) {
+  return tab.startsWith(managementTeamTabPrefix)
+    ? normalizeTeamPolicyKey(tab.slice(managementTeamTabPrefix.length))
+    : "";
+}
+
+function getPreloadedTeamAccessKeys(
+  account: Pick<TeamAccessCarrier, "teamAccess" | "teamAccessKeys"> | null | undefined,
+) {
+  if (!account) {
+    return [];
+  }
+
+  const teamKeys = new Set<string>();
+  for (const key of account.teamAccessKeys || []) {
+    const normalizedKey = normalizeTeamPolicyKey(key);
+    if (normalizedKey) {
+      teamKeys.add(normalizedKey);
+    }
+  }
+
+  for (const teamAccess of account.teamAccess || []) {
+    const normalizedKey = normalizeTeamPolicyKey(teamAccess.key);
+    if (normalizedKey && teamAccess.canReceiveTickets !== false) {
+      teamKeys.add(normalizedKey);
+    }
+  }
+
+  return [...teamKeys];
+}
+
+function hasPreloadedTeamAccess(
+  account: Pick<TeamAccessCarrier, "teamAccess" | "teamAccessKeys"> | null | undefined,
+  teamKey: string,
+) {
+  const normalizedTeamKey = normalizeTeamPolicyKey(teamKey);
+  if (!account || !normalizedTeamKey) {
+    return false;
+  }
+
+  return getPreloadedTeamAccessKeys(account).includes(normalizedTeamKey);
+}
+
+function hasAnyPreloadedTeamAccess(account?: Pick<TeamAccessCarrier, "teamAccess" | "teamAccessKeys"> | null) {
+  return getPreloadedTeamAccessKeys(account).length > 0;
+}
+
 const documentationStatusReasons = {
   Closed: ["Closed due to inactivity", "Closed via Chatbot", "Closed by Requester", "Closed via Agent"],
   Pending: [defaultPendingDocumentationStatusReason, "Awaiting support meeting", "Escalation", "Quick Ticket"],
@@ -660,7 +845,7 @@ type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
 type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management";
-type ManagementAccessTab = "support" | "operations" | "admins";
+type ManagementAccessTab = `${typeof managementTeamTabPrefix}${string}` | "admins";
 type TicketAccessKind = "support" | "operations";
 type LearningPlanTeamSection = "coverage" | "others";
 type TicketDetailTab = "conversation" | "documentation" | "activity" | "details";
@@ -698,7 +883,7 @@ function hasFullAdminDashboardAccess(
 }
 
 function hasLegacySupportDashboardAccess(
-  session?: Pick<AdminSession, "role" | "legacySupportAccess" | "legacyOperationsAccess"> | null,
+  session?: (Pick<AdminSession, "role" | "legacySupportAccess" | "legacyOperationsAccess"> & Partial<Pick<AdminSession, "teamAccess" | "teamAccessKeys">>) | null,
 ) {
   if (!session) {
     return false;
@@ -706,6 +891,10 @@ function hasLegacySupportDashboardAccess(
 
   if (typeof session.legacySupportAccess === "boolean") {
     return session.legacySupportAccess;
+  }
+
+  if (hasAnyPreloadedTeamAccess(session)) {
+    return hasPreloadedTeamAccess(session, supportTeamRoutingPolicy.key);
   }
 
   // Older sessions did not carry the access flags; keep agent sessions on the
@@ -720,34 +909,58 @@ function hasLegacyOperationsDashboardAccess(
 }
 
 function hasTeamRoutingDashboardAccess(
-  session: Pick<AdminSession, "role" | "legacySupportAccess" | "legacyOperationsAccess"> | AdminAgent | null | undefined,
+  session: TeamAccessCarrier | null | undefined,
   policy: TeamRoutingPolicy,
 ) {
-  if (policy.receiverAccessKey === "legacySupportAccess") {
-    return hasLegacySupportDashboardAccess(session);
+  if (!session) {
+    return false;
   }
 
-  if (policy.receiverAccessKey === "legacyOperationsAccess") {
-    return hasLegacyOperationsDashboardAccess(session);
+  if (policy.receiverAccessKey === "legacySupportAccess" && hasLegacySupportDashboardAccess(session)) {
+    return true;
   }
 
-  return false;
+  if (policy.receiverAccessKey === "legacyOperationsAccess" && hasLegacyOperationsDashboardAccess(session)) {
+    return true;
+  }
+
+  return hasPreloadedTeamAccess(session, policy.key);
+}
+
+function hasAnyTeamRoutingDashboardAccess(session?: TeamAccessCarrier | null) {
+  return getActiveTeamRoutingPolicies().some((policy) => hasTeamRoutingDashboardAccess(session, policy))
+    || hasAnyPreloadedTeamAccess(session);
+}
+
+function hasLearningPlanTeamDashboardAccess(session?: TeamAccessCarrier | null) {
+  return hasTeamRoutingDashboardAccess(session, getLearningPlanTeamRoutingPolicy());
+}
+
+function hasNonLearningPlanTeamDashboardAccess(session?: TeamAccessCarrier | null) {
+  const learningPlanPolicy = getLearningPlanTeamRoutingPolicy();
+  if (getActiveTeamRoutingPolicies().some((policy) => (
+    policy.key !== learningPlanPolicy.key
+    && hasTeamRoutingDashboardAccess(session, policy)
+  ))) {
+    return true;
+  }
+
+  return getPreloadedTeamAccessKeys(session).some((teamKey) => teamKey !== learningPlanPolicy.key);
 }
 
 function hasAnyAdminDashboardAccess(session?: AdminSession | null) {
   return Boolean(
     hasFullAdminDashboardAccess(session)
-    || hasLegacySupportDashboardAccess(session)
-    || hasLegacyOperationsDashboardAccess(session),
+    || hasAnyTeamRoutingDashboardAccess(session),
   );
 }
 
 function getDefaultAdminLandingView(session?: AdminSession | null): AdminView {
-  if (hasLegacySupportDashboardAccess(session)) {
+  if (hasNonLearningPlanTeamDashboardAccess(session)) {
     return "dashboard";
   }
 
-  if (hasLegacyOperationsDashboardAccess(session)) {
+  if (hasLearningPlanTeamDashboardAccess(session)) {
     return "coverage";
   }
 
@@ -847,9 +1060,19 @@ const AgentDashboard = () => {
   const [deleteConfirmationTicketId, setDeleteConfirmationTicketId] = useState("");
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
-  const [managementAccessTab, setManagementAccessTab] = useState<ManagementAccessTab>("support");
+  const [newTeamName, setNewTeamName] = useState("");
+  const [newTeamDescription, setNewTeamDescription] = useState("");
+  const [isCreatingTeam, setIsCreatingTeam] = useState(false);
+  const [teamRoutingPolicyState, setTeamRoutingPolicyState] = useState<TeamRoutingPolicy[]>(defaultTeamRoutingPolicies);
+  const [managementAccessTab, setManagementAccessTab] = useState<ManagementAccessTab>(buildManagementTeamTabValue(supportTeamRoutingPolicy.key));
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
+  const teamRoutingPolicies = teamRoutingPolicyState.length ? teamRoutingPolicyState : defaultTeamRoutingPolicies;
+  const dashboardTeamTransferOptions = getDashboardTeamTransferOptions(teamRoutingPolicies);
+  const managementTeamTabs = teamRoutingPolicies.map((policy) => ({
+    value: buildManagementTeamTabValue(policy.key),
+    policy,
+  }));
   const chatPreviewAttachmentUrl = chatPreviewAttachment ? getChatAttachmentOpenUrl(chatPreviewAttachment) : "";
   const chatPreviewAttachmentKind = getChatAttachmentPreviewKind(chatPreviewAttachment);
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
@@ -874,13 +1097,14 @@ const AgentDashboard = () => {
   const accessSession = signedInAgent || session;
   const normalizedSessionRole = getNormalizedAdminRole(accessSession);
   const hasFullAdminAccess = hasFullAdminDashboardAccess(accessSession);
-  const hasSupportDashboardAccess = hasLegacySupportDashboardAccess(accessSession);
-  const hasOperationsDashboardAccess = hasLegacyOperationsDashboardAccess(accessSession);
+  const hasAnyTeamDashboardAccess = hasAnyTeamRoutingDashboardAccess(accessSession);
+  const hasLearningPlanDashboardAccess = hasLearningPlanTeamDashboardAccess(accessSession);
+  const hasNonLearningPlanDashboardAccess = hasNonLearningPlanTeamDashboardAccess(accessSession);
   const isSuperadminSession = normalizedSessionRole === "superadmin";
-  const canViewSupportDashboard = hasFullAdminAccess || hasSupportDashboardAccess;
+  const canViewSupportDashboard = hasFullAdminAccess || hasNonLearningPlanDashboardAccess;
   const canViewAdminDashboard = hasFullAdminAccess;
-  const canViewLearningPlanTeam = hasFullAdminAccess || hasOperationsDashboardAccess;
-  const canUseTicketReceiving = hasFullAdminAccess || hasSupportDashboardAccess;
+  const canViewLearningPlanTeam = hasFullAdminAccess || hasLearningPlanDashboardAccess;
+  const canUseTicketReceiving = hasFullAdminAccess || hasAnyTeamDashboardAccess;
   const canManageUsers = userManagementRoles.has(normalizedSessionRole) && hasFullAdminAccess;
   const canAssignTickets = ticketAssignmentRoles.has(normalizedSessionRole) && hasFullAdminAccess;
   const isConsoleView = adminView === "console";
@@ -956,19 +1180,11 @@ const AgentDashboard = () => {
   const resolvedSessionAgentId = signedInAgent?.id ?? session?.id ?? null;
   const dashboardSessionAgentId = resolvedSessionAgentId;
   const accessibleTickets = tickets.filter((ticket) => {
-    if (hasFullAdminAccess || (hasSupportDashboardAccess && hasOperationsDashboardAccess)) {
+    if (hasFullAdminAccess) {
       return true;
     }
 
-    const isLearningPlanTicketRecord = isLearningPlanTicket(ticket);
-    if (hasOperationsDashboardAccess) {
-      return isLearningPlanTicketRecord;
-    }
-    if (hasSupportDashboardAccess) {
-      return !isLearningPlanTicketRecord;
-    }
-
-    return false;
+    return hasTeamRoutingDashboardAccess(accessSession, getTicketRoutingPolicy(ticket));
   });
   const scopedConsoleTickets = accessibleTickets.filter((ticket) => {
     if (isArchivedTicket(ticket)) {
@@ -1114,6 +1330,23 @@ const AgentDashboard = () => {
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    setActiveTeamRoutingPolicies(teamRoutingPolicies);
+  }, [teamRoutingPolicies]);
+
+  useEffect(() => {
+    if (managementAccessTab === "admins") {
+      return;
+    }
+
+    const activeTeamKey = getManagementTeamKeyFromTab(managementAccessTab);
+    if (teamRoutingPolicies.some((policy) => policy.key === activeTeamKey)) {
+      return;
+    }
+
+    setManagementAccessTab(buildManagementTeamTabValue(teamRoutingPolicies[0]?.key || supportTeamRoutingPolicy.key));
+  }, [managementAccessTab, teamRoutingPolicies]);
 
   useEffect(() => {
     if (typeof document === "undefined" || isStackedAdminLayout) {
@@ -2438,6 +2671,82 @@ const AgentDashboard = () => {
     },
   ];
 
+  function applyTeamRoutingPolicies(nextPolicies: TeamRoutingPolicy[]) {
+    const safePolicies = nextPolicies.length ? nextPolicies : defaultTeamRoutingPolicies;
+    setActiveTeamRoutingPolicies(safePolicies);
+    setTeamRoutingPolicyState(safePolicies);
+  }
+
+  async function fetchTeamRoutingPoliciesList() {
+    const response = await fetch("/api/admin/teams", { cache: "no-store" });
+    const payload = (await response.json().catch(() => null)) as TeamListResponse | null;
+
+    if (!response.ok) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
+      throw new Error(payload?.message || "We could not load support teams right now.");
+    }
+
+    return buildTeamRoutingPoliciesFromTeams(payload?.teams);
+  }
+
+  async function createTeam(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const teamName = newTeamName.trim();
+    const teamDescription = newTeamDescription.trim();
+    if (!teamName) {
+      toast.error("Team name is required.");
+      return;
+    }
+
+    setIsCreatingTeam(true);
+    try {
+      const response = await fetch("/api/admin/teams", {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({
+          name: teamName,
+          description: teamDescription,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as TeamMutationResponse | null;
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "Could not create this team.");
+        return;
+      }
+
+      const createdPolicy = buildTeamRoutingPolicyFromTeam(payload?.team);
+      let nextPolicies = teamRoutingPolicies;
+      if (createdPolicy) {
+        const policiesByKey = new Map(teamRoutingPolicies.map((policy) => [policy.key, policy]));
+        policiesByKey.set(createdPolicy.key, createdPolicy);
+        nextPolicies = [...policiesByKey.values()];
+      }
+
+      try {
+        nextPolicies = await fetchTeamRoutingPoliciesList();
+      } catch {
+        // The team was created; keep the local optimistic policy until the next refresh.
+      }
+
+      applyTeamRoutingPolicies(nextPolicies);
+      if (createdPolicy) {
+        setManagementAccessTab(buildManagementTeamTabValue(createdPolicy.key));
+      }
+      setNewTeamName("");
+      setNewTeamDescription("");
+      toast.success(`${createdPolicy?.label || teamName} team created.`);
+    } catch {
+      toast.error("Could not create this team.");
+    } finally {
+      setIsCreatingTeam(false);
+    }
+  }
+
   async function fetchTicketsList() {
     const response = await fetch("/api/admin/tickets", { cache: "no-store" });
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
@@ -2524,6 +2833,8 @@ const AgentDashboard = () => {
         sessionActive: signedInAgent.sessionActive,
         consoleStatus: normalizeAdminConsoleStatus(signedInAgent.consoleStatus),
         selectedConsoleStatus: nextStatus,
+        teamAccess: signedInAgent.teamAccess,
+        teamAccessKeys: signedInAgent.teamAccessKeys,
       });
     }
   }
@@ -2545,6 +2856,9 @@ const AgentDashboard = () => {
       const agentsPromise = fetchAgentsList()
         .then((nextAgents) => ({ agents: nextAgents, error: null as unknown }))
         .catch((fetchError) => ({ agents: null, error: fetchError }));
+      const teamsPromise = fetchTeamRoutingPoliciesList()
+        .then((policies) => ({ policies, error: null as unknown }))
+        .catch((fetchError) => ({ policies: null, error: fetchError }));
       const migrationStatusPromise = fetch("/api/migration-status")
         .then(async (response) => ((await response.json().catch(() => null)) as MigrationStatusResponse | null))
         .catch(() => null);
@@ -2576,6 +2890,14 @@ const AgentDashboard = () => {
             setIsAgentsLoading(false);
           }
         });
+
+      void teamsPromise.then((teamsResult) => {
+        if (!isCurrentDashboardSession(requestSession) || !teamsResult.policies) {
+          return;
+        }
+
+        applyTeamRoutingPolicies(teamsResult.policies);
+      });
 
       void migrationStatusPromise.then((migrationStatusPayload) => {
         if (!isCurrentDashboardSession(requestSession)) {
@@ -2741,6 +3063,41 @@ const AgentDashboard = () => {
     }
   }
 
+  function applyUpdatedAgentState(updatedAgent: AdminAgent) {
+    setAgents((prev) => prev.map((agent) => (agent.id === updatedAgent.id ? { ...agent, ...updatedAgent } : agent)));
+
+    const currentSession = sessionRef.current;
+    const isUpdatedSignedInAgent = (
+      (currentSession?.id && updatedAgent.id === currentSession.id)
+      || (currentSession?.username && updatedAgent.username === currentSession.username)
+    );
+    if (!isUpdatedSignedInAgent || !currentSession) {
+      return;
+    }
+
+    const nextSession = {
+      ...currentSession,
+      role: updatedAgent.role || currentSession.role,
+      fullName: updatedAgent.fullName || currentSession.fullName,
+      email: updatedAgent.email ?? currentSession.email,
+      legacySupportAccess: updatedAgent.legacySupportAccess,
+      legacyOperationsAccess: updatedAgent.legacyOperationsAccess,
+      legacyAdminAccess: updatedAgent.legacyAdminAccess,
+      entraDirectoryAdmin: updatedAgent.entraDirectoryAdmin,
+      teamAccess: updatedAgent.teamAccess,
+      teamAccessKeys: updatedAgent.teamAccessKeys,
+    };
+    persistAdminSessionState(nextSession);
+
+    const nextLandingView = getDefaultAdminLandingView(nextSession);
+    if ((adminView === "dashboard" || adminView === "console") && !hasNonLearningPlanTeamDashboardAccess(nextSession)) {
+      setAdminView(nextLandingView);
+    }
+    if (adminView === "coverage" && !hasLearningPlanTeamDashboardAccess(nextSession)) {
+      setAdminView(nextLandingView);
+    }
+  }
+
   async function toggleTicketAccess(agent: AdminAgent, accessKind: TicketAccessKind, nextValue: boolean) {
     const payloadKey = accessKind === "support" ? "supportAccess" : "operationsAccess";
     const accessLabel = accessKind === "support" ? "Support" : "Learning Plan";
@@ -2758,31 +3115,7 @@ const AgentDashboard = () => {
       }
       const updatedAgent = payload?.agent;
       if (updatedAgent) {
-        setAgents((prev) => prev.map((a) => (a.id === updatedAgent.id ? { ...a, ...updatedAgent } : a)));
-        const isUpdatedSignedInAgent = (
-          (session?.id && updatedAgent.id === session.id)
-          || (session?.username && updatedAgent.username === session.username)
-        );
-        if (isUpdatedSignedInAgent && session) {
-          const nextSession = {
-            ...session,
-            role: updatedAgent.role || session.role,
-            fullName: updatedAgent.fullName || session.fullName,
-            email: updatedAgent.email ?? session.email,
-            legacySupportAccess: updatedAgent.legacySupportAccess,
-            legacyOperationsAccess: updatedAgent.legacyOperationsAccess,
-            legacyAdminAccess: updatedAgent.legacyAdminAccess,
-            entraDirectoryAdmin: updatedAgent.entraDirectoryAdmin,
-          };
-          persistAdminSessionState(nextSession);
-          const nextLandingView = getDefaultAdminLandingView(nextSession);
-          if (adminView === "dashboard" && !hasLegacySupportDashboardAccess(nextSession)) {
-            setAdminView(nextLandingView);
-          }
-          if (adminView === "coverage" && !hasLegacyOperationsDashboardAccess(nextSession)) {
-            setAdminView(nextLandingView);
-          }
-        }
+        applyUpdatedAgentState(updatedAgent);
       }
       void refreshAgentsOnly(true);
       toast.success(`${accessLabel} access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
@@ -2803,6 +3136,49 @@ const AgentDashboard = () => {
 
   async function toggleOperationsAccess(agent: AdminAgent, nextValue: boolean) {
     await toggleTicketAccess(agent, "operations", nextValue);
+  }
+
+  async function toggleTeamAccess(agent: AdminAgent, policy: TeamRoutingPolicy, nextValue: boolean) {
+    if (policy.key === supportTeamRoutingPolicy.key) {
+      await toggleSupportAccess(agent, nextValue);
+      return;
+    }
+
+    if (policy.key === learningPlanTeamRoutingPolicy.key) {
+      await toggleOperationsAccess(agent, nextValue);
+      return;
+    }
+
+    setTogglingAccessIds((prev) => new Set(prev).add(agent.id));
+    try {
+      const response = await fetch(`/api/admin/accounts/${agent.id}/team-access`, {
+        method: "PATCH",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({
+          teamKey: policy.key,
+          receiveTickets: nextValue,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
+      if (!response.ok) {
+        toast.error(payload?.message || `Could not update ${policy.label.toLowerCase()} access.`);
+        return;
+      }
+
+      if (payload?.agent) {
+        applyUpdatedAgentState(payload.agent);
+      }
+      void refreshAgentsOnly(true);
+      toast.success(`${policy.label} access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
+    } catch {
+      toast.error(`Could not update ${policy.label.toLowerCase()} access.`);
+    } finally {
+      setTogglingAccessIds((prev) => {
+        const next = new Set(prev);
+        next.delete(agent.id);
+        return next;
+      });
+    }
   }
 
   async function fetchTicketDetail(ticketId: string) {
@@ -5418,6 +5794,7 @@ const AgentDashboard = () => {
                               <TeamTransferMenu
                                 ticketId={ticket.id}
                                 assignedTeam={ticket.assignedTeam}
+                                teamOptions={dashboardTeamTransferOptions}
                                 disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
                                 isLoading={teamTransferTicketId === ticket.id}
                                 onTransfer={(nextAssignedTeam) => void handleTeamTransfer(ticket, nextAssignedTeam)}
@@ -5493,14 +5870,18 @@ const AgentDashboard = () => {
       (agent.email || "").toLowerCase().includes(normalizedManagementSearch)
     );
   });
-  const supportAccessCount = managementAgents.filter((agent) => agent.legacySupportAccess === true).length;
-  const operationsAccessCount = managementAgents.filter((agent) => agent.legacyOperationsAccess === true).length;
   const adminAccessCount = managementAgents.filter((agent) => (
     agent.legacyAdminAccess === true ||
     agent.entraDirectoryAdmin === true ||
     getNormalizedAdminRole(agent) === "admin" ||
     getNormalizedAdminRole(agent) === "superadmin"
   )).length;
+  const managementTeamAccessCounts = new Map(
+    teamRoutingPolicies.map((policy) => [
+      policy.key,
+      managementAgents.filter((agent) => canReceiveTeamTickets(agent, policy)).length,
+    ]),
+  );
 
   function getAdminAccessLabel(agent: AdminAgent) {
     const normalizedRole = getNormalizedAdminRole(agent);
@@ -5510,7 +5891,38 @@ const AgentDashboard = () => {
     return "No admin access";
   }
 
+  function getManagementTeamTabLabel(policy: TeamRoutingPolicy) {
+    if (policy.key === supportTeamRoutingPolicy.key) {
+      return "Support Agents";
+    }
+
+    return policy.label;
+  }
+
+  function getManagementTeamIcon(policy: TeamRoutingPolicy) {
+    if (policy.key === supportTeamRoutingPolicy.key) {
+      return Headphones;
+    }
+    if (policy.key === learningPlanTeamRoutingPolicy.key) {
+      return FileText;
+    }
+    return Users;
+  }
+
+  function getManagementTeamIconClassName(policy: TeamRoutingPolicy) {
+    if (policy.key === supportTeamRoutingPolicy.key) {
+      return "bg-primary/10 text-primary";
+    }
+    if (policy.key === learningPlanTeamRoutingPolicy.key) {
+      return "bg-amber-100 text-amber-700";
+    }
+    return "bg-sky-100 text-sky-700";
+  }
+
   function renderManagementAccessRows(tab: ManagementAccessTab): ReactNode {
+    const selectedTeamPolicy = tab === "admins"
+      ? null
+      : teamRoutingPolicies.find((policy) => policy.key === getManagementTeamKeyFromTab(tab)) || null;
     const visibleAgents = tab === "admins"
       ? filteredManagementAgents.filter((agent) => (
           agent.legacyAdminAccess === true ||
@@ -5532,7 +5944,7 @@ const AgentDashboard = () => {
     if (visibleAgents.length === 0) {
       const emptyMessage = tab === "admins"
         ? "No matching admin accounts found. Admin access is managed separately from ticket access."
-        : "No matching staff accounts found. Add or sync the user in Communication Centre first.";
+        : `No matching staff accounts found. Add or sync users before enabling ${selectedTeamPolicy?.label || "team"} access.`;
       return (
         <div className="p-10 text-center text-sm text-muted-foreground">
           {emptyMessage}
@@ -5542,25 +5954,23 @@ const AgentDashboard = () => {
 
     return visibleAgents.map((agent) => {
       const isToggling = togglingAccessIds.has(agent.id);
-      const hasSupportAccess = agent.legacySupportAccess === true;
-      const hasOperationsAccess = agent.legacyOperationsAccess === true;
       const isCurrentUser = session?.id === agent.id;
-      const isSupportTab = tab === "support";
-      const isOperationsTab = tab === "operations";
-      const hasTabAccess = isSupportTab ? hasSupportAccess : isOperationsTab ? hasOperationsAccess : false;
-      const statusLabel = isSupportTab
-        ? hasSupportAccess ? "Receives support tickets" : "No support access"
-        : isOperationsTab
-          ? hasOperationsAccess ? "Learning Plan access" : "No Learning Plan access"
-          : getAdminAccessLabel(agent);
-      const Icon = isSupportTab ? Headphones : isOperationsTab ? FileText : Settings2;
+      const hasTabAccess = selectedTeamPolicy ? canReceiveTeamTickets(agent, selectedTeamPolicy) : false;
+      const statusLabel = selectedTeamPolicy?.key === supportTeamRoutingPolicy.key
+        ? hasTabAccess ? "Receives support tickets" : "No support access"
+        : selectedTeamPolicy?.key === learningPlanTeamRoutingPolicy.key
+          ? hasTabAccess ? "Learning Plan access" : "No Learning Plan access"
+          : selectedTeamPolicy
+            ? hasTabAccess ? `Receives ${selectedTeamPolicy.label} tickets` : `No ${selectedTeamPolicy.label} access`
+            : getAdminAccessLabel(agent);
+      const Icon = selectedTeamPolicy ? getManagementTeamIcon(selectedTeamPolicy) : Settings2;
 
       return (
         <div key={`${tab}-${agent.id}`} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
           <div className="flex min-w-0 items-center gap-3">
             <div className={cn(
               "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl",
-              isSupportTab ? "bg-primary/10 text-primary" : isOperationsTab ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600",
+              selectedTeamPolicy ? getManagementTeamIconClassName(selectedTeamPolicy) : "bg-slate-100 text-slate-600",
             )}>
               <Icon className="h-4 w-4" />
             </div>
@@ -5581,19 +5991,12 @@ const AgentDashboard = () => {
             )}>
               {statusLabel}
             </span>
-            {isSupportTab ? (
+            {selectedTeamPolicy ? (
               <Switch
-                checked={hasSupportAccess}
+                checked={hasTabAccess}
                 disabled={isToggling}
-                onCheckedChange={(checked) => void toggleSupportAccess(agent, checked)}
-                aria-label={`Toggle support access for ${agent.fullName || agent.username}`}
-              />
-            ) : isOperationsTab ? (
-              <Switch
-                checked={hasOperationsAccess}
-                disabled={isToggling}
-                onCheckedChange={(checked) => void toggleOperationsAccess(agent, checked)}
-                aria-label={`Toggle Learning Plan access for ${agent.fullName || agent.username}`}
+                onCheckedChange={(checked) => void toggleTeamAccess(agent, selectedTeamPolicy, checked)}
+                aria-label={`Toggle ${selectedTeamPolicy.label} access for ${agent.fullName || agent.username}`}
               />
             ) : (
               <span className="rounded-full border bg-muted/40 px-3 py-1 text-xs font-medium text-muted-foreground">
@@ -6114,31 +6517,64 @@ const AgentDashboard = () => {
                       />
                     </div>
                   </div>
+                  <form
+                    onSubmit={createTeam}
+                    className="mt-4 grid gap-2 rounded-2xl border bg-secondary/25 p-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_auto]"
+                  >
+                    <Input
+                      value={newTeamName}
+                      onChange={(event) => setNewTeamName(event.target.value)}
+                      placeholder="New team name"
+                      aria-label="New team name"
+                      disabled={isCreatingTeam}
+                    />
+                    <Input
+                      value={newTeamDescription}
+                      onChange={(event) => setNewTeamDescription(event.target.value)}
+                      placeholder="Optional transfer menu description"
+                      aria-label="New team description"
+                      disabled={isCreatingTeam}
+                    />
+                    <Button
+                      type="submit"
+                      className="whitespace-nowrap"
+                      disabled={isCreatingTeam || !newTeamName.trim()}
+                    >
+                      {isCreatingTeam ? (
+                        <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Users className="mr-2 h-4 w-4" />
+                      )}
+                      Add Team
+                    </Button>
+                  </form>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    New teams appear as ticket transfer targets after creation. Use the tab below to enable receivers.
+                  </p>
                 </div>
 
                 <Tabs value={managementAccessTab} onValueChange={(value) => setManagementAccessTab(value as ManagementAccessTab)}>
                   <div className="border-b px-4 py-3 sm:px-5">
-                    <TabsList className="grid h-auto w-full grid-cols-1 gap-2 rounded-2xl bg-muted/40 p-1 sm:grid-cols-3">
-                      <TabsTrigger value="support" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
-                        <span>Support Agents</span>
-                        <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{supportAccessCount}</span>
-                      </TabsTrigger>
-                      <TabsTrigger value="operations" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
-                        <span>Learning Plan Team</span>
-                        <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{operationsAccessCount}</span>
-                      </TabsTrigger>
+                    <TabsList className="flex h-auto w-full flex-wrap gap-2 rounded-2xl bg-muted/40 p-1">
+                      {managementTeamTabs.map(({ value, policy }) => (
+                        <TabsTrigger key={value} value={value} className="min-w-[180px] flex-1 justify-between gap-2 rounded-xl px-3 py-2 text-sm">
+                          <span className="truncate">{getManagementTeamTabLabel(policy)}</span>
+                          <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">
+                            {managementTeamAccessCounts.get(policy.key) || 0}
+                          </span>
+                        </TabsTrigger>
+                      ))}
                       <TabsTrigger value="admins" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
                         <span>Admins</span>
                         <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{adminAccessCount}</span>
                       </TabsTrigger>
                     </TabsList>
                   </div>
-                  <TabsContent value="support" className="m-0">
-                    <div className="divide-y">{renderManagementAccessRows("support")}</div>
-                  </TabsContent>
-                  <TabsContent value="operations" className="m-0">
-                    <div className="divide-y">{renderManagementAccessRows("operations")}</div>
-                  </TabsContent>
+                  {managementTeamTabs.map(({ value }) => (
+                    <TabsContent key={value} value={value} className="m-0">
+                      <div className="divide-y">{renderManagementAccessRows(value)}</div>
+                    </TabsContent>
+                  ))}
                   <TabsContent value="admins" className="m-0">
                     <div className="divide-y">{renderManagementAccessRows("admins")}</div>
                   </TabsContent>
@@ -6985,6 +7421,7 @@ const AgentDashboard = () => {
                   <TeamTransferMenu
                     ticketId={activeDetail.ticket.id}
                     assignedTeam={activeDetail.ticket.assignedTeam}
+                    teamOptions={dashboardTeamTransferOptions}
                     disabled={isSaving || archiveActionTicketId === activeDetail.ticket.id || deleteActionTicketId === activeDetail.ticket.id}
                     isLoading={teamTransferTicketId === activeDetail.ticket.id}
                     onTransfer={(nextAssignedTeam) => void handleTeamTransfer(activeDetail.ticket, nextAssignedTeam)}
@@ -12999,6 +13436,7 @@ const ConsoleField = ({
 const TeamTransferMenu = ({
   ticketId,
   assignedTeam,
+  teamOptions,
   disabled,
   isLoading,
   onTransfer,
@@ -13007,6 +13445,11 @@ const TeamTransferMenu = ({
 }: {
   ticketId: string;
   assignedTeam: string;
+  teamOptions: Array<{
+    value: string;
+    label: string;
+    description: string;
+  }>;
   disabled?: boolean;
   isLoading?: boolean;
   onTransfer: (nextAssignedTeam: string) => void;
@@ -13017,7 +13460,7 @@ const TeamTransferMenu = ({
   const isAssignedToLearningPlan = isLearningPlanAssignedTeam(assignedTeam);
   const actionLabel = isAssignedToLearningPlan ? "Return" : "Transfer";
   const ActionIcon = isAssignedToLearningPlan ? Undo2 : ArrowRightLeft;
-  const availableTeamOptions = dashboardTeamTransferOptions.filter(
+  const availableTeamOptions = teamOptions.filter(
     (teamOption) => normalizeAssignedTeamName(teamOption.value) !== normalizedAssignedTeam,
   );
 
@@ -13187,23 +13630,23 @@ function normalizeAssignedTeamName(value: string | null | undefined) {
 
 function getTeamRoutingPolicyByAssignedTeam(teamName: string | null | undefined) {
   const normalizedTeamName = normalizeAssignedTeamName(teamName);
-  return teamRoutingPolicies.find((policy) => (
+  return getActiveTeamRoutingPolicies().find((policy) => (
     normalizeAssignedTeamName(policy.assignedTeam) === normalizedTeamName
-  )) || supportTeamRoutingPolicy;
+  )) || getSupportTeamRoutingPolicy();
 }
 
 function getTicketRoutingPolicy(
   ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
 ) {
   if (isCoverageTicket(ticket)) {
-    return learningPlanTeamRoutingPolicy;
+    return getLearningPlanTeamRoutingPolicy();
   }
 
   return getTeamRoutingPolicyByAssignedTeam(ticket?.assignedTeam);
 }
 
 function isLearningPlanAssignedTeam(teamName: string | null | undefined) {
-  return getTeamRoutingPolicyByAssignedTeam(teamName).key === learningPlanTeamRoutingPolicy.key;
+  return getTeamRoutingPolicyByAssignedTeam(teamName).key === getLearningPlanTeamRoutingPolicy().key;
 }
 
 function isLearningPlanOtherTicket(
@@ -13215,7 +13658,7 @@ function isLearningPlanOtherTicket(
 function isLearningPlanTicket(
   ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
 ) {
-  return getTicketRoutingPolicy(ticket).key === learningPlanTeamRoutingPolicy.key;
+  return getTicketRoutingPolicy(ticket).key === getLearningPlanTeamRoutingPolicy().key;
 }
 
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
@@ -14616,37 +15059,45 @@ function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">)
   return normalizedScope === "staff";
 }
 
-function hasCurrentCommunicationCentreAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess">) {
+function hasCurrentCommunicationCentreAccess(
+  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess" | "teamAccess" | "teamAccessKeys">,
+) {
   return Boolean(
-    teamRoutingPolicies.some((policy) => agent[policy.receiverAccessKey] === true)
+    getActiveTeamRoutingPolicies().some((policy) => canReceiveTeamTickets(agent, policy))
+    || hasAnyPreloadedTeamAccess(agent)
     || agent.legacyAdminAccess,
   );
 }
 
 function canReceiveTeamTickets(
-  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">,
+  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">,
   policy: TeamRoutingPolicy,
 ) {
-  return agent[policy.receiverAccessKey] === true;
+  if (policy.receiverAccessKey && agent[policy.receiverAccessKey] === true) {
+    return true;
+  }
+
+  return hasPreloadedTeamAccess(agent, policy.key);
 }
 
-function canReceiveSupportTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">) {
-  return canReceiveTeamTickets(agent, supportTeamRoutingPolicy);
+function canReceiveSupportTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+  return canReceiveTeamTickets(agent, getSupportTeamRoutingPolicy());
 }
 
-function canReceiveLearningPlanTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">) {
-  return canReceiveTeamTickets(agent, learningPlanTeamRoutingPolicy);
+function canReceiveLearningPlanTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+  return canReceiveTeamTickets(agent, getLearningPlanTeamRoutingPolicy());
 }
 
 function canReceiveTicketAssignment(
-  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">,
+  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">,
   ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
 ) {
   return canReceiveTeamTickets(agent, getTicketRoutingPolicy(ticket));
 }
 
-function hasTicketAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess">) {
-  return canReceiveSupportTickets(agent);
+function hasTicketAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+  return getActiveTeamRoutingPolicies().some((policy) => canReceiveTeamTickets(agent, policy))
+    || hasAnyPreloadedTeamAccess(agent);
 }
 
 function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicketFilter) {

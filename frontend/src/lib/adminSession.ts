@@ -12,6 +12,14 @@ export interface AdminSession {
   legacyOperationsAccess?: boolean;
   legacyAdminAccess?: boolean;
   entraDirectoryAdmin?: boolean;
+  teamAccess?: Array<{
+    key: string;
+    name?: string;
+    assignedTeam?: string;
+    label?: string;
+    canReceiveTickets?: boolean;
+  }>;
+  teamAccessKeys?: string[];
 }
 
 interface AdminSessionResponse {
