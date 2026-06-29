@@ -13828,8 +13828,265 @@ def trigger_ticket_background_sync() -> None:
     threading.Thread(target=_sync_tickets_background, daemon=True).start()
 
 
-def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
+ADMIN_TICKET_LIST_DEFAULT_PAGE_SIZE = 50
+ADMIN_TICKET_LIST_MAX_PAGE_SIZE = 200
+ADMIN_TICKET_LIST_SORTS = {
+    "newest",
+    "oldest",
+    "updatedNewest",
+    "updatedOldest",
+    "priorityDesc",
+    "priorityAsc",
+}
+
+
+def normalize_admin_ticket_list_params(query_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = query_params or {}
+    page = max(parse_int(params.get("page"), 1), 1)
+    page_size_value = params.get("pageSize", params.get("limit"))
+    page_size = parse_int(page_size_value, ADMIN_TICKET_LIST_DEFAULT_PAGE_SIZE)
+    page_size = min(max(page_size, 1), ADMIN_TICKET_LIST_MAX_PAGE_SIZE)
+    sort_order = sanitize_text(params.get("sort") or params.get("sortOrder") or "priorityDesc")
+    if sort_order not in ADMIN_TICKET_LIST_SORTS:
+        sort_order = "priorityDesc"
+
+    archive_scope = sanitize_text(params.get("archiveScope") or params.get("archived") or "").lower()
+    if archive_scope in {"true", "1", "yes"}:
+        archive_scope = "archived"
+    elif archive_scope in {"false", "0", "no"}:
+        archive_scope = "active"
+    elif archive_scope not in {"active", "archived", "all"}:
+        archive_scope = ""
+
+    normalized_status = sanitize_text(params.get("status")).lower()
+    status_filter = next((status for status in ALLOWED_STATUSES if status.lower() == normalized_status), "")
+    normalized_sla_status = sanitize_text(params.get("slaStatus") or params.get("sla")).lower().replace("-", " ")
+    sla_filter = next((status for status in ALLOWED_SLA_STATUSES if status.lower() == normalized_sla_status), "")
+    pagination_requested = any(key in params for key in {"page", "pageSize", "limit"})
+
+    return {
+        "page": page,
+        "pageSize": page_size,
+        "paginationRequested": pagination_requested,
+        "search": sanitize_text(params.get("search") or params.get("q")),
+        "status": status_filter,
+        "slaStatus": sla_filter,
+        "assigned": sanitize_text(params.get("assigned") or params.get("assignedTo")).lower(),
+        "team": sanitize_text(params.get("team") or params.get("teamKey")).lower(),
+        "archiveScope": archive_scope,
+        "sort": sort_order,
+    }
+
+
+def get_admin_ticket_search_fields(ticket: dict[str, Any]) -> list[str]:
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
+    return [
+        ticket.get("public_id"),
+        build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), conversation_metadata),
+        ticket.get("learner_name"),
+        ticket.get("learner_email"),
+        ticket.get("learner_phone"),
+        ticket.get("submitted_for_external_learner_id"),
+        ticket.get("submitted_for_learner_name"),
+        ticket.get("submitted_for_learner_email"),
+        ticket.get("category"),
+        ticket.get("technical_subcategory"),
+        ticket.get("subject"),
+        ticket.get("inquiry"),
+        ticket.get("status"),
+        ticket.get("status_reason"),
+        ticket.get("priority"),
+        ticket.get("assigned_team"),
+        ticket.get("assigned_agent_name"),
+        ticket.get("assigned_agent_username"),
+        get_ticket_requester_role(ticket_metadata),
+        get_ticket_requester_source(
+            ticket_metadata,
+            learner_source=ticket.get("learner_source"),
+            learner_metadata=ticket.get("learner_metadata"),
+        ),
+    ]
+
+
+def admin_ticket_matches_search(ticket: dict[str, Any], search: str) -> bool:
+    normalized_search = search.casefold()
+    if not normalized_search:
+        return True
+
+    compact_search = re.sub(r"[\s_-]+", "", normalized_search)
+    for value in get_admin_ticket_search_fields(ticket):
+        normalized_value = sanitize_text(value).casefold()
+        if not normalized_value:
+            continue
+        if normalized_search in normalized_value:
+            return True
+        if compact_search and compact_search in re.sub(r"[\s_-]+", "", normalized_value):
+            return True
+
+    return False
+
+
+def admin_ticket_matches_assigned_filter(
+    ticket: dict[str, Any],
+    assigned_filter: str,
+    actor: dict[str, Any] | None,
+) -> bool:
+    if not assigned_filter or assigned_filter == "all":
+        return True
+    if assigned_filter == "unassigned":
+        return not ticket.get("assigned_agent_id")
+    if assigned_filter == "me":
+        actor_id = parse_int((actor or {}).get("id"))
+        return actor_id > 0 and parse_int(ticket.get("assigned_agent_id")) == actor_id
+
+    agent_id = parse_int(assigned_filter.replace("agent:", ""))
+    return agent_id > 0 and parse_int(ticket.get("assigned_agent_id")) == agent_id
+
+
+def admin_ticket_matches_team_filter(ticket: dict[str, Any], team_filter: str) -> bool:
+    if not team_filter or team_filter == "all":
+        return True
+
+    assigned_team = sanitize_text(ticket.get("assigned_team")).casefold()
+    if assigned_team == team_filter.casefold():
+        return True
+
+    return get_ticket_receiver_scope(ticket).casefold() == team_filter.casefold()
+
+
+def filter_admin_ticket_list(
+    tickets: list[dict[str, Any]],
+    params: dict[str, Any],
+    actor: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    filtered_tickets = tickets
+    if params["archiveScope"] == "active":
+        filtered_tickets = [ticket for ticket in filtered_tickets if not normalize_bool(ticket.get("is_archived"))]
+    elif params["archiveScope"] == "archived":
+        filtered_tickets = [ticket for ticket in filtered_tickets if normalize_bool(ticket.get("is_archived"))]
+
+    if params["status"]:
+        filtered_tickets = [ticket for ticket in filtered_tickets if sanitize_text(ticket.get("status")) == params["status"]]
+
+    if params["slaStatus"]:
+        filtered_tickets = [ticket for ticket in filtered_tickets if normalize_sla_status(ticket.get("sla_status")) == params["slaStatus"]]
+
+    if params["assigned"]:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_assigned_filter(ticket, params["assigned"], actor)
+        ]
+
+    if params["team"]:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_team_filter(ticket, params["team"])
+        ]
+
+    if params["search"]:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_search(ticket, params["search"])
+        ]
+
+    return filtered_tickets
+
+
+def get_admin_ticket_sort_datetime(ticket: dict[str, Any], field: str) -> datetime:
+    return coerce_datetime(ticket.get(field)) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def get_ticket_priority_ascending_rank(priority: Any) -> int:
+    normalized_priority = normalize_ticket_priority(priority)
+    if normalized_priority == "Low":
+        return 0
+    if normalized_priority == "Normal":
+        return 1
+    if normalized_priority == "High":
+        return 2
+    if normalized_priority == "Urgent":
+        return 3
+    return 4
+
+
+def sort_admin_ticket_list(tickets: list[dict[str, Any]], sort_order: str) -> list[dict[str, Any]]:
+    if sort_order == "newest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "created_at"), parse_int(ticket.get("id"))), reverse=True)
+    if sort_order == "oldest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "created_at"), parse_int(ticket.get("id"))))
+    if sort_order == "updatedNewest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "updated_at"), parse_int(ticket.get("id"))), reverse=True)
+    if sort_order == "updatedOldest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "updated_at"), parse_int(ticket.get("id"))))
+    if sort_order == "priorityAsc":
+        return sorted(
+            tickets,
+            key=lambda ticket: (
+                0 if is_priority_sorted_ticket_status(ticket.get("status")) else 1,
+                get_ticket_priority_ascending_rank(ticket.get("priority")) if is_priority_sorted_ticket_status(ticket.get("status")) else 4,
+                get_admin_ticket_sort_datetime(ticket, "created_at"),
+                parse_int(ticket.get("id")),
+            ),
+        )
+
+    return sort_tickets_by_priority_and_recency(tickets)
+
+
+def paginate_admin_ticket_list(tickets: list[dict[str, Any]], params: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    total = len(tickets)
+    if not params["paginationRequested"]:
+        return tickets, {
+            "page": 1,
+            "pageSize": total,
+            "total": total,
+            "totalPages": 1 if total else 0,
+            "hasNext": False,
+            "hasPrevious": False,
+            "isPaginated": False,
+        }
+
+    page = params["page"]
+    page_size = params["pageSize"]
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    if total_pages:
+        page = min(page, total_pages)
+    start_index = (page - 1) * page_size
+    end_index = start_index + page_size
+
+    return tickets[start_index:end_index], {
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": total_pages,
+        "hasNext": bool(total_pages and page < total_pages),
+        "hasPrevious": page > 1,
+        "isPaginated": True,
+    }
+
+
+def build_admin_ticket_list_filter_response(params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "search": params["search"],
+        "status": params["status"],
+        "slaStatus": params["slaStatus"],
+        "assigned": params["assigned"],
+        "team": params["team"],
+        "archiveScope": params["archiveScope"],
+        "sort": params["sort"],
+    }
+
+
+def list_admin_tickets(
+    actor: dict[str, Any] | None = None,
+    *,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     trigger_ticket_background_sync()
+    list_params = normalize_admin_ticket_list_params(query_params)
 
     tickets = run_query(
         """
@@ -13904,8 +14161,14 @@ def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
     tickets = [ticket for ticket in tickets if not is_admin_hidden_support_flow_ticket_record(ticket)]
     tickets = filter_admin_tickets_for_actor(tickets, actor)
     tickets = [apply_ticket_sla_policy(ticket) for ticket in tickets]
-    tickets = sort_tickets_by_priority_and_recency(tickets)
-    return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
+    tickets = filter_admin_ticket_list(tickets, list_params, actor)
+    tickets = sort_admin_ticket_list(tickets, list_params["sort"])
+    paged_tickets, pagination = paginate_admin_ticket_list(tickets, list_params)
+    return {
+        "tickets": [serialize_ticket_summary(ticket) for ticket in paged_tickets],
+        "pagination": pagination,
+        "filters": build_admin_ticket_list_filter_response(list_params),
+    }
 
 
 def do_transfer_request_payloads_match(left: Any, right: Any) -> bool:

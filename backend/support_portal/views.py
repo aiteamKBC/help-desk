@@ -758,6 +758,9 @@ def admin_account_team_access(request, account_id: int):
 def admin_tickets(request):
     try:
         actor, _session_payload = require_request_admin_session(request)
+        query_params = parse_query_params(request)
+        if query_params:
+            return JsonResponse(list_admin_tickets(actor, query_params=query_params))
         return JsonResponse(list_admin_tickets(actor))
     except Exception as error:
         return handle_api_error(error)

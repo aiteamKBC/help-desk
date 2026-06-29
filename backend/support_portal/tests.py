@@ -1406,6 +1406,41 @@ class AdminSessionViewTests(SimpleTestCase):
             }
         )
 
+    def test_admin_tickets_passes_query_params_to_list_service(self):
+        request = self.factory.get("/api/admin/tickets?page=2&pageSize=25&search=coach")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "agent",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        actor = {
+            "id": 7,
+            "username": "admin1",
+            "full_name": "Admin One",
+            "email": None,
+            "role": "agent",
+        }
+        with (
+            patch.object(views, "require_agent_session_actor", return_value=actor),
+            patch.object(views, "list_admin_tickets", return_value={"tickets": []}) as list_admin_tickets,
+        ):
+            response = views.admin_tickets(request)
+
+        self.assertEqual(response.status_code, 200)
+        list_admin_tickets.assert_called_once_with(
+            actor,
+            query_params={"page": "2", "pageSize": "25", "search": "coach"},
+        )
+
     def test_admin_accounts_get_allows_agent_session(self):
         request = self.factory.get("/api/admin/accounts")
         self.attach_session(
@@ -4422,6 +4457,175 @@ class SlaPolicyTests(SimpleTestCase):
 
         self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000010", "KBC-000011", "KBC-000012"])
         self.assertEqual(result["tickets"][0]["priority"], "High")
+
+    def test_list_admin_tickets_supports_query_filters_and_pagination(self):
+        base_ticket = {
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Needs help",
+            "status_reason": "",
+            "priority": "Normal",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "is_archived": False,
+            "metadata": {"requester_role": "user"},
+        }
+        older_matching_ticket = {
+            **base_ticket,
+            "id": 21,
+            "public_id": "KBC-000021",
+            "learner_name": "Alice Learner",
+            "learner_email": "alice@example.com",
+            "status": "Open",
+            "created_at": datetime(2026, 5, 11, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 11, 9, 0, tzinfo=timezone.utc),
+        }
+        newer_matching_ticket = {
+            **base_ticket,
+            "id": 22,
+            "public_id": "KBC-000022",
+            "learner_name": "Alice Coach",
+            "learner_email": "alice.coach@example.com",
+            "status": "Open",
+            "created_at": datetime(2026, 5, 12, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 12, 9, 0, tzinfo=timezone.utc),
+        }
+        hidden_status_ticket = {
+            **base_ticket,
+            "id": 23,
+            "public_id": "KBC-000023",
+            "learner_name": "Alice Pending",
+            "learner_email": "alice.pending@example.com",
+            "status": "Pending",
+            "created_at": datetime(2026, 5, 13, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 13, 9, 0, tzinfo=timezone.utc),
+        }
+        hidden_archive_ticket = {
+            **base_ticket,
+            "id": 24,
+            "public_id": "KBC-000024",
+            "learner_name": "Alice Archived",
+            "learner_email": "alice.archived@example.com",
+            "status": "Open",
+            "is_archived": True,
+            "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(
+                services,
+                "run_query",
+                return_value=[hidden_archive_ticket, newer_matching_ticket, hidden_status_ticket, older_matching_ticket],
+            ),
+            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+        ):
+            result = services.list_admin_tickets(
+                query_params={
+                    "search": "alice",
+                    "status": "open",
+                    "archiveScope": "active",
+                    "sort": "oldest",
+                    "page": "2",
+                    "pageSize": "1",
+                }
+            )
+
+        self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000022"])
+        self.assertEqual(
+            result["pagination"],
+            {
+                "page": 2,
+                "pageSize": 1,
+                "total": 2,
+                "totalPages": 2,
+                "hasNext": False,
+                "hasPrevious": True,
+                "isPaginated": True,
+            },
+        )
+        self.assertEqual(result["filters"]["search"], "alice")
+        self.assertEqual(result["filters"]["status"], "Open")
+        self.assertEqual(result["filters"]["archiveScope"], "active")
+
+    def test_list_admin_tickets_filters_by_actor_assignment_and_team(self):
+        base_ticket = {
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "Needs help",
+            "status": "Open",
+            "status_reason": "",
+            "priority": "Normal",
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "Pending Review",
+            "evidence_count": 0,
+            "is_archived": False,
+            "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "metadata": {"requester_role": "user"},
+        }
+        support_ticket = {
+            **base_ticket,
+            "id": 31,
+            "public_id": "KBC-000031",
+            "learner_name": "Support Ticket",
+            "learner_email": "support@example.com",
+            "assigned_agent_id": 5,
+            "assigned_agent_name": "Support Agent",
+            "assigned_agent_username": "support.agent",
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+        }
+        operations_ticket = {
+            **base_ticket,
+            "id": 32,
+            "public_id": "KBC-000032",
+            "learner_name": "Operations Ticket",
+            "learner_email": "operations@example.com",
+            "technical_subcategory": "Coverage",
+            "assigned_agent_id": 5,
+            "assigned_agent_name": "Operations Agent",
+            "assigned_agent_username": "operations.agent",
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+        }
+        other_agent_operations_ticket = {
+            **operations_ticket,
+            "id": 33,
+            "public_id": "KBC-000033",
+            "assigned_agent_id": 6,
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(
+                services,
+                "run_query",
+                return_value=[support_ticket, operations_ticket, other_agent_operations_ticket],
+            ),
+            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+        ):
+            result = services.list_admin_tickets(
+                {"id": 5, "role": "admin", "metadata": {"legacy_admin_access": True}},
+                query_params={"assigned": "me", "team": "operations", "sort": "newest"},
+            )
+
+        self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000032"])
+        self.assertFalse(result["pagination"]["isPaginated"])
+        self.assertEqual(result["filters"]["assigned"], "me")
+        self.assertEqual(result["filters"]["team"], "operations")
 
     def test_list_admin_tickets_hides_open_pre_submission_support_flow_tickets(self):
         visible_ticket = {
