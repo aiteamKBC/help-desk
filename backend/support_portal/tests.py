@@ -3866,6 +3866,52 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertFalse(inactive_summary["chatIsActive"])
         self.assertFalse(inactive_summary["liveChatRequested"])
 
+    def test_serialize_ticket_summary_includes_sla_policy_context(self):
+        started_at = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+        due_at = datetime(2026, 6, 28, 9, 0, tzinfo=timezone.utc)
+        breached_at = datetime(2026, 6, 29, 10, 15, tzinfo=timezone.utc)
+        ticket_row = {
+            "public_id": "KBC-000124",
+            "learner_name": "SLA Learner",
+            "learner_email": "sla@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "LMS",
+            "inquiry": "SLA context",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+            "conversation_id": None,
+            "conversation_status": "",
+            "conversation_metadata": {},
+            "last_message_at": None,
+            "sla_status": "Breached",
+            "sla_attention_required": True,
+            "evidence_count": 0,
+            "created_at": started_at,
+            "updated_at": breached_at,
+            "metadata": {
+                services.SLA_POLICY_KEY_METADATA_KEY: services.SLA_POLICY_PENDING_AGE,
+                services.SLA_STARTED_AT_METADATA_KEY: services.serialize_datetime_value(started_at),
+                services.SLA_DUE_AT_METADATA_KEY: services.serialize_datetime_value(due_at),
+                services.SLA_BREACHED_AT_METADATA_KEY: services.serialize_datetime_value(breached_at),
+                "sla_attention_reason": services.SLA_ATTENTION_REASON_PENDING_OVERDUE,
+            },
+        }
+
+        summary = services.serialize_ticket_summary(ticket_row)
+
+        self.assertEqual(summary["slaStatus"], "Breached")
+        self.assertTrue(summary["slaAttentionRequired"])
+        self.assertEqual(summary["slaAttentionReason"], services.SLA_ATTENTION_REASON_PENDING_OVERDUE)
+        self.assertEqual(summary["slaPolicyKey"], services.SLA_POLICY_PENDING_AGE)
+        self.assertEqual(summary["slaStartedAt"], services.serialize_datetime_value(started_at))
+        self.assertEqual(summary["slaDueAt"], services.serialize_datetime_value(due_at))
+        self.assertEqual(summary["slaBreachedAt"], services.serialize_datetime_value(breached_at))
+
     def test_serialize_ticket_summary_includes_standard_chatbot_ticket_state(self):
         ticket_row = {
             "public_id": "KBC-000122",

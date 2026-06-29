@@ -328,6 +328,13 @@ interface TicketSummary {
   documentation?: AdminDocumentation | null;
   slaStatus: "Pending Review" | "On Track" | "Breached";
   slaAttentionRequired?: boolean;
+  slaAttentionReason?: string | null;
+  slaPolicyKey?: string | null;
+  slaStartedAt?: string | null;
+  slaDueAt?: string | null;
+  slaBreachedAt?: string | null;
+  slaResolvedAt?: string | null;
+  slaOutcomeStatus?: string | null;
   evidenceCount: number;
   isArchived?: boolean;
   archivedAt?: string | null;
@@ -5882,6 +5889,7 @@ const AgentDashboard = () => {
                     const coverageSessionDateLabel = isLearningPlanCoverageSection
                       ? getCoverageTicketNextSessionDateInfo(ticket, coveragePriorityReferenceDate)?.label || ""
                       : "";
+                    const slaContextLabel = getTicketSlaContextLabel(ticket);
 
                     return (
                       <tr
@@ -5996,9 +6004,19 @@ const AgentDashboard = () => {
                           )}
                         </td>
                         <td className={dashboardCellClassName}>
-                          <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
-                            {ticket.slaStatus}
-                          </span>
+                          <div className="min-w-0">
+                            <span className={cn("text-xs font-medium", slaStatusClassName(ticket.slaStatus))}>
+                              {ticket.slaStatus}
+                            </span>
+                            {slaContextLabel ? (
+                              <div
+                                className="mt-1 max-w-[7rem] truncate text-[11px] text-muted-foreground"
+                                title={slaContextLabel}
+                              >
+                                {slaContextLabel}
+                              </div>
+                            ) : null}
+                          </div>
                         </td>
                         <td className={dashboardCellClassName} onClick={(event) => event.stopPropagation()}>
                           <div className={cn("flex items-center justify-end gap-2", useCompactDashboardTable && "flex-col items-stretch")}>
@@ -7689,6 +7707,16 @@ const AgentDashboard = () => {
                       <InfoCard label="Created" value={formatDateTime(activeDetail.ticket.createdAt)} />
                       <InfoCard label="Updated" value={formatDateTime(activeDetail.ticket.updatedAt)} />
                       <InfoCard label="Priority" value={activeDetail.ticket.priority} />
+                      <InfoCard label="SLA Summary" value={getTicketSlaDetailSummary(activeDetail.ticket)} />
+                      {activeDetail.ticket.slaDueAt ? (
+                        <InfoCard label="SLA Due" value={formatDateTime(activeDetail.ticket.slaDueAt)} />
+                      ) : null}
+                      {activeDetail.ticket.slaBreachedAt ? (
+                        <InfoCard label="SLA Breached" value={formatDateTime(activeDetail.ticket.slaBreachedAt)} />
+                      ) : null}
+                      {activeDetail.ticket.slaResolvedAt ? (
+                        <InfoCard label="SLA Resolved" value={formatDateTime(activeDetail.ticket.slaResolvedAt)} />
+                      ) : null}
                       <InfoCard label="Evidence Count" value={String(activeDetail.ticket.evidenceCount)} />
                       {activeTicketIsArchived ? (
                         <InfoCard
@@ -17320,6 +17348,92 @@ function presenceDotClassName(status: AdminConsoleStatus) {
   if (status === "Busy") return "bg-amber-500";
   if (status === "Off") return "bg-slate-400";
   return "bg-emerald-500";
+}
+
+const slaPolicyLabels: Record<string, string> = {
+  archived: "Archived",
+  awaiting_support_meeting: "Awaiting support meeting",
+  closed: "Closed",
+  coverage_session_deadline: "Coverage session deadline",
+  open_review: "Open review",
+  pending_age: "Pending age limit",
+};
+
+const slaAttentionReasonLabels: Record<string, string> = {
+  coverage_session_deadline: "Coverage session deadline",
+  meeting_over_3_days: "Meeting overdue",
+  pending_over_3_days: "Pending over 3 days",
+};
+
+function humanizeSlaToken(value: string | null | undefined) {
+  return (value || "")
+    .trim()
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatTicketSlaPolicyLabel(value: string | null | undefined) {
+  const normalizedValue = (value || "").trim().toLowerCase();
+  if (!normalizedValue) return "";
+  return slaPolicyLabels[normalizedValue] || humanizeSlaToken(normalizedValue);
+}
+
+function formatTicketSlaAttentionReason(value: string | null | undefined) {
+  const normalizedValue = (value || "").trim().toLowerCase();
+  if (!normalizedValue) return "";
+  return slaAttentionReasonLabels[normalizedValue] || humanizeSlaToken(normalizedValue);
+}
+
+function formatSlaDateShort(value: string | null | undefined) {
+  if (!value || Number.isNaN(Date.parse(value))) {
+    return "";
+  }
+
+  return formatDateShort(value);
+}
+
+function getTicketSlaContextLabel(ticket: Pick<
+  TicketSummary,
+  "slaStatus" | "slaAttentionReason" | "slaPolicyKey" | "slaDueAt" | "slaBreachedAt" | "slaResolvedAt"
+>) {
+  const dueAtLabel = formatSlaDateShort(ticket.slaDueAt);
+  const breachedAtLabel = formatSlaDateShort(ticket.slaBreachedAt);
+  const resolvedAtLabel = formatSlaDateShort(ticket.slaResolvedAt);
+  const attentionReasonLabel = formatTicketSlaAttentionReason(ticket.slaAttentionReason);
+  const policyLabel = formatTicketSlaPolicyLabel(ticket.slaPolicyKey);
+
+  if (ticket.slaStatus === "Breached") {
+    if (breachedAtLabel) return `Breached ${breachedAtLabel}`;
+    if (dueAtLabel) return `Due ${dueAtLabel}`;
+    return attentionReasonLabel || "Attention required";
+  }
+
+  if (resolvedAtLabel) {
+    return `Resolved ${resolvedAtLabel}`;
+  }
+
+  if (dueAtLabel) {
+    return `Due ${dueAtLabel}`;
+  }
+
+  return policyLabel;
+}
+
+function getTicketSlaDetailSummary(ticket: Pick<
+  TicketSummary,
+  "slaStatus" | "slaAttentionReason" | "slaPolicyKey" | "slaDueAt" | "slaBreachedAt" | "slaResolvedAt" | "slaOutcomeStatus"
+>) {
+  const parts = [
+    ticket.slaStatus,
+    formatTicketSlaPolicyLabel(ticket.slaPolicyKey),
+    getTicketSlaContextLabel(ticket),
+    formatTicketSlaAttentionReason(ticket.slaAttentionReason),
+    ticket.slaOutcomeStatus ? `Outcome ${ticket.slaOutcomeStatus}` : "",
+  ].filter(Boolean);
+
+  return [...new Set(parts)].join(" - ") || ticket.slaStatus;
 }
 
 function slaStatusClassName(value: TicketSummary["slaStatus"]) {

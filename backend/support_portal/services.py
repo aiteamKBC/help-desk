@@ -9031,6 +9031,10 @@ def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -
     return normalize_ticket_state_payload(persisted_state, fallback)
 
 
+def serialize_ticket_sla_timestamp(metadata: dict[str, Any], key: str) -> str | None:
+    return serialize_datetime_value(coerce_datetime(metadata.get(key)))
+
+
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
@@ -9126,6 +9130,13 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "documentation": documentation,
         "slaStatus": row["sla_status"],
         "slaAttentionRequired": bool(row.get("sla_attention_required")),
+        "slaAttentionReason": sanitize_text(ticket_metadata.get("sla_attention_reason")) or None,
+        "slaPolicyKey": sanitize_text(ticket_metadata.get(SLA_POLICY_KEY_METADATA_KEY)) or None,
+        "slaStartedAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_STARTED_AT_METADATA_KEY),
+        "slaDueAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_DUE_AT_METADATA_KEY),
+        "slaBreachedAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_BREACHED_AT_METADATA_KEY),
+        "slaResolvedAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_RESOLVED_AT_METADATA_KEY),
+        "slaOutcomeStatus": sanitize_text(ticket_metadata.get(SLA_OUTCOME_STATUS_METADATA_KEY)) or None,
         "evidenceCount": int(row.get("evidence_count") or 0),
         "isArchived": normalize_bool(row.get("is_archived")),
         "archivedAt": row.get("archived_at"),
