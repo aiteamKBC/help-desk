@@ -38,6 +38,7 @@ from .services import (
     cancel_support_session_request,
     close_agent_session,
     create_follow_up_ticket,
+    create_support_team,
     create_support_session_request,
     create_ticket,
     delete_admin_ticket_permanently,
@@ -62,6 +63,7 @@ from .services import (
     add_entra_agent,
     list_admin_tickets,
     list_agents,
+    list_support_teams,
     remove_agent,
     require_agent_session_actor,
     search_entra_agents,
@@ -79,6 +81,7 @@ from .services import (
     upload_coverage_presentation_files,
     update_admin_ticket,
     update_admin_ticket_archive_state,
+    update_agent_team_access,
     update_agent_operations_access,
     update_agent_support_access,
     update_ticket,
@@ -674,6 +677,19 @@ def admin_accounts(request):
         return handle_api_error(error)
 
 
+@require_http_methods(["GET", "POST"])
+def admin_teams(request):
+    try:
+        if request.method == "POST":
+            require_request_admin_session(request, allowed_roles=ADMIN_ACCESS_ROLES)
+            return JsonResponse(create_support_team(parse_json_body(request)), status=201)
+
+        require_request_admin_session(request)
+        return JsonResponse(list_support_teams())
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @require_GET
 def admin_agents_search(request):
     try:
@@ -703,6 +719,19 @@ def admin_account_detail(request, account_id: int):
             agent = update_agent_support_access(account_id, support_access=bool(payload["supportAccess"]))
         else:
             agent = update_agent_operations_access(account_id, operations_access=bool(payload["operationsAccess"]))
+        return JsonResponse({"agent": agent})
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["PATCH"])
+def admin_account_team_access(request, account_id: int):
+    try:
+        require_request_admin_session(request, allowed_roles=ADMIN_ACCESS_ROLES)
+        payload = parse_json_body(request)
+        team_key = payload.get("teamKey") or payload.get("key")
+        receive_tickets = bool(payload.get("receiveTickets", payload.get("teamAccess", False)))
+        agent = update_agent_team_access(account_id, team_key=team_key, receive_tickets=receive_tickets)
         return JsonResponse({"agent": agent})
     except Exception as error:
         return handle_api_error(error)

@@ -3660,6 +3660,47 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertTrue(services.account_can_receive_ticket_assignment(operations_agent, learning_plan_ticket))
         self.assertTrue(services.account_can_receive_ticket_assignment(operations_agent, coverage_ticket_with_legacy_team))
 
+    def test_dynamic_team_routing_policy_uses_team_access(self):
+        curriculum_team = {
+            "id": 3,
+            "key": "curriculum",
+            "name": "Curriculum Team",
+            "description": "",
+            "receiver_access_metadata_key": "team_access:curriculum",
+            "receiver_error_ticket_label": "Curriculum",
+            "is_active": True,
+            "metadata": {},
+        }
+        curriculum_ticket = {"assigned_team": "Curriculum Team"}
+        curriculum_agent = {
+            "id": 91,
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {},
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "canReceiveTickets": True,
+                }
+            ],
+        }
+        support_agent = {
+            "id": 92,
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True},
+        }
+
+        with patch.object(services, "fetch_optional_dynamic_team_row_by_assigned_team", return_value=curriculum_team):
+            self.assertEqual(services.normalize_assigned_team("Curriculum Team"), "Curriculum Team")
+            self.assertEqual(services.get_ticket_receiver_scope(curriculum_ticket), "curriculum")
+            self.assertTrue(services.account_can_receive_ticket_assignment(curriculum_agent, curriculum_ticket))
+            self.assertFalse(services.account_can_receive_ticket_assignment(support_agent, curriculum_ticket))
+
     def test_serialize_ticket_summary_marks_chat_active_only_when_conversation_is_active(self):
         ticket_row = {
             "public_id": "KBC-000123",

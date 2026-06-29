@@ -59,6 +59,7 @@ ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
 EMPLOYER_TICKET_PRIORITY = "High"
 COACH_TICKET_PRIORITY = "High"
+SUPPORT_TEAM_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 ASSIGNED_TEAM_UNASSIGNED = "Unassigned"
 ASSIGNED_TEAM_SUPPORT_DESK = "Support Desk"
 ASSIGNED_TEAM_LEARNING_PLAN = "Learning Plan Team"
@@ -82,6 +83,7 @@ TEAM_ROUTING_POLICIES = {
         "receiver_error_ticket_label": "Learning Plan",
     },
 }
+LEGACY_TEAM_ROUTING_POLICY_KEYS = {policy["key"] for policy in TEAM_ROUTING_POLICIES.values()}
 ALLOWED_ASSIGNED_TEAMS = {ASSIGNED_TEAM_UNASSIGNED, *TEAM_ROUTING_POLICIES.keys()}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
@@ -7965,11 +7967,475 @@ def is_coverage_ticket_record(ticket: dict[str, Any] | None) -> bool:
     return sanitize_text(metadata.get("technical_subcategory")).lower() == "coverage"
 
 
-def get_team_routing_policy_by_assigned_team(assigned_team: Any) -> dict[str, str]:
+def build_support_team_key(value: Any) -> str:
+    normalized_value = sanitize_text(value).lower()
+    normalized_value = re.sub(r"[^a-z0-9]+", "_", normalized_value).strip("_")
+    if not normalized_value:
+        return ""
+    if not normalized_value[0].isalpha():
+        normalized_value = f"team_{normalized_value}"
+    return normalized_value[:64]
+
+
+def normalize_support_team_key(value: Any) -> str:
+    normalized_value = sanitize_text(value).lower()
+    if not normalized_value:
+        raise ApiError(400, "Team key is required.")
+    if normalized_value == "unassigned":
+        raise ApiError(400, "Team key is reserved.")
+    if not SUPPORT_TEAM_KEY_PATTERN.match(normalized_value):
+        raise ApiError(400, "Team key must start with a letter and use letters, numbers, hyphens or underscores.")
+    return normalized_value
+
+
+def build_team_routing_policy_from_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+
+    team_key = sanitize_text(row.get("key")).lower()
+    team_name = sanitize_text(row.get("name"))
+    if not team_key or not team_name:
+        return None
+
+    return {
+        "id": int(row["id"]) if row.get("id") else None,
+        "key": team_key,
+        "assigned_team": team_name,
+        "receiver_access_metadata_key": (
+            sanitize_text(row.get("receiver_access_metadata_key"))
+            or f"team_access:{team_key}"
+        ),
+        "receiver_error_ticket_label": sanitize_text(row.get("receiver_error_ticket_label")) or team_name,
+    }
+
+
+def serialize_support_team(row: dict[str, Any]) -> dict[str, Any]:
+    policy = build_team_routing_policy_from_row(row) or {}
+    return {
+        "id": int(row["id"]) if row.get("id") else None,
+        "key": policy.get("key") or sanitize_text(row.get("key")).lower(),
+        "name": policy.get("assigned_team") or sanitize_text(row.get("name")),
+        "assignedTeam": policy.get("assigned_team") or sanitize_text(row.get("name")),
+        "label": policy.get("assigned_team") or sanitize_text(row.get("name")),
+        "description": sanitize_text(row.get("description")),
+        "receiverAccessMetadataKey": policy.get("receiver_access_metadata_key") or "",
+        "receiverErrorTicketLabel": policy.get("receiver_error_ticket_label") or "",
+        "isActive": normalize_bool(row.get("is_active")) if "is_active" in row else True,
+        "metadata": normalize_json_object(row.get("metadata")),
+    }
+
+
+def get_default_support_team_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": None,
+            "key": policy["key"],
+            "name": policy["assigned_team"],
+            "description": "",
+            "receiver_access_metadata_key": policy["receiver_access_metadata_key"],
+            "receiver_error_ticket_label": policy["receiver_error_ticket_label"],
+            "is_active": True,
+            "metadata": {"fallback": True, "legacyTeam": True},
+        }
+        for policy in TEAM_ROUTING_POLICIES.values()
+    ]
+
+
+def fetch_optional_dynamic_team_row_by_assigned_team(assigned_team: Any) -> dict[str, Any] | None:
+    normalized_assigned_team = sanitize_text(assigned_team)
+    if not normalized_assigned_team:
+        return None
+
+    normalized_lookup = normalized_assigned_team.casefold()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, key, name, description, receiver_access_metadata_key,
+                       receiver_error_ticket_label, is_active, metadata
+                FROM support_teams
+                WHERE is_active = TRUE
+                  AND (
+                    LOWER(TRIM(name)) = %s
+                    OR LOWER(TRIM(key)) = %s
+                  )
+                LIMIT 1
+                """,
+                [normalized_lookup, normalized_lookup],
+            )
+            columns = cursor.description
+            row = cursor.fetchone()
+            if not row or not isinstance(columns, (list, tuple)):
+                return None
+            return dict(zip([column[0] for column in columns], row))
+    except Exception:
+        return None
+
+
+def fetch_optional_account_team_access(account_id: Any, team_key: Any) -> bool:
+    normalized_account_id = parse_int(account_id)
+    normalized_team_key = sanitize_text(team_key).lower()
+    if normalized_account_id <= 0 or not normalized_team_key:
+        return False
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM support_account_team_access ata
+                JOIN support_teams st
+                  ON st.id = ata.team_id
+                WHERE ata.account_id = %s
+                  AND st.key = %s
+                  AND st.is_active = TRUE
+                  AND ata.can_receive_tickets = TRUE
+                LIMIT 1
+                """,
+                [normalized_account_id, normalized_team_key],
+            )
+            row = cursor.fetchone()
+            return isinstance(row, (list, tuple, dict))
+    except Exception:
+        return False
+
+
+def normalize_preloaded_team_access_keys(value: Any) -> set[str]:
+    team_keys: set[str] = set()
+    if isinstance(value, dict):
+        for key, enabled in value.items():
+            normalized_key = sanitize_text(key).lower()
+            if normalized_key and normalize_bool(enabled):
+                team_keys.add(normalized_key)
+        return team_keys
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, str):
+                normalized_key = sanitize_text(item).lower()
+                if normalized_key:
+                    team_keys.add(normalized_key)
+                continue
+            if isinstance(item, dict):
+                normalized_key = sanitize_text(item.get("key")).lower()
+                receives_tickets = item.get("canReceiveTickets", item.get("can_receive_tickets", True))
+                if normalized_key and normalize_bool(receives_tickets):
+                    team_keys.add(normalized_key)
+        return team_keys
+
+    return team_keys
+
+
+def get_preloaded_account_team_access_keys(account: dict[str, Any] | None) -> set[str]:
+    if not isinstance(account, dict):
+        return set()
+
+    team_keys = normalize_preloaded_team_access_keys(account.get("team_access"))
+    team_keys.update(normalize_preloaded_team_access_keys(account.get("teamAccess")))
+    team_keys.update(normalize_preloaded_team_access_keys(account.get("team_access_keys")))
+    team_keys.update(normalize_preloaded_team_access_keys(account.get("teamAccessKeys")))
+    metadata = normalize_json_object(account.get("metadata"))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("team_access")))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("teamAccess")))
+    return team_keys
+
+
+def account_has_preloaded_team_access(account: dict[str, Any] | None, team_key: str) -> bool:
+    return sanitize_text(team_key).lower() in get_preloaded_account_team_access_keys(account)
+
+
+def serialize_agent_team_access_from_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": sanitize_text(policy.get("key")).lower(),
+        "name": sanitize_text(policy.get("assigned_team")),
+        "assignedTeam": sanitize_text(policy.get("assigned_team")),
+        "label": sanitize_text(policy.get("assigned_team")),
+        "canReceiveTickets": True,
+    }
+
+
+def build_serialized_agent_team_access(row: dict[str, Any], metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    team_access_by_key: dict[str, dict[str, Any]] = {}
+
+    for item in row.get("team_access") or row.get("teamAccess") or []:
+        if not isinstance(item, dict):
+            continue
+        normalized_key = sanitize_text(item.get("key")).lower()
+        receives_tickets = item.get("canReceiveTickets", item.get("can_receive_tickets", True))
+        if not normalized_key or not normalize_bool(receives_tickets):
+            continue
+        team_access_by_key[normalized_key] = {
+            "key": normalized_key,
+            "name": sanitize_text(item.get("name") or item.get("assignedTeam") or item.get("assigned_team")),
+            "assignedTeam": sanitize_text(item.get("assignedTeam") or item.get("assigned_team") or item.get("name")),
+            "label": sanitize_text(item.get("label") or item.get("name") or item.get("assignedTeam")),
+            "canReceiveTickets": True,
+        }
+
+    for policy in TEAM_ROUTING_POLICIES.values():
+        if normalize_bool(metadata.get(policy["receiver_access_metadata_key"])):
+            team_access_by_key[policy["key"]] = serialize_agent_team_access_from_policy(policy)
+
+    for team_key in get_preloaded_account_team_access_keys(row):
+        if team_key not in team_access_by_key:
+            policy = next((item for item in TEAM_ROUTING_POLICIES.values() if item["key"] == team_key), None)
+            team_access_by_key[team_key] = (
+                serialize_agent_team_access_from_policy(policy)
+                if policy
+                else {
+                    "key": team_key,
+                    "name": team_key,
+                    "assignedTeam": team_key,
+                    "label": team_key,
+                    "canReceiveTickets": True,
+                }
+            )
+
+    return sorted(team_access_by_key.values(), key=lambda item: item["label"].casefold())
+
+
+def attach_account_team_access(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    account_ids = [int(account["id"]) for account in accounts if parse_int(account.get("id")) > 0]
+    if not account_ids:
+        return accounts
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  ata.account_id,
+                  ata.can_receive_tickets,
+                  st.id AS team_id,
+                  st.key,
+                  st.name,
+                  st.description,
+                  st.receiver_access_metadata_key,
+                  st.receiver_error_ticket_label,
+                  st.is_active,
+                  st.metadata
+                FROM support_account_team_access ata
+                JOIN support_teams st
+                  ON st.id = ata.team_id
+                WHERE ata.account_id = ANY(%s::bigint[])
+                  AND st.is_active = TRUE
+                  AND ata.can_receive_tickets = TRUE
+                ORDER BY st.name ASC
+                """,
+                [account_ids],
+            )
+            columns = cursor.description
+            fetched_rows = cursor.fetchall()
+            if not isinstance(columns, (list, tuple)) or not isinstance(fetched_rows, list):
+                return accounts
+            rows = [dict(zip([column[0] for column in columns], row)) for row in fetched_rows]
+    except Exception:
+        return accounts
+
+    access_by_account_id: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        account_id = parse_int(row.get("account_id"))
+        if account_id <= 0:
+            continue
+        access_by_account_id.setdefault(account_id, []).append(
+            {
+                **serialize_support_team(row),
+                "canReceiveTickets": normalize_bool(row.get("can_receive_tickets")),
+            }
+        )
+
+    return [
+        {
+            **account,
+            "team_access": access_by_account_id.get(int(account["id"]), []),
+        }
+        for account in accounts
+    ]
+
+
+def list_support_teams(*, include_inactive: bool = False) -> dict[str, Any]:
+    where_clause = "" if include_inactive else "WHERE is_active = TRUE"
+    try:
+        rows = run_query(
+            f"""
+            SELECT id, key, name, description, receiver_access_metadata_key,
+                   receiver_error_ticket_label, is_active, metadata
+            FROM support_teams
+            {where_clause}
+            ORDER BY name ASC
+            """
+        )
+    except Exception:
+        rows = get_default_support_team_rows()
+
+    return {"teams": [serialize_support_team(row) for row in rows]}
+
+
+def fetch_support_team_by_key(team_key: Any, *, active_only: bool = True) -> dict[str, Any] | None:
+    normalized_team_key = normalize_support_team_key(team_key)
+    active_filter = "AND is_active = TRUE" if active_only else ""
+    return run_query_one(
+        f"""
+        SELECT id, key, name, description, receiver_access_metadata_key,
+               receiver_error_ticket_label, is_active, metadata
+        FROM support_teams
+        WHERE key = %s
+          {active_filter}
+        LIMIT 1
+        """,
+        [normalized_team_key],
+    )
+
+
+def create_support_team(payload: dict[str, Any]) -> dict[str, Any]:
+    name = sanitize_text(payload.get("name") or payload.get("label") or payload.get("assignedTeam"))
+    if not name:
+        raise ApiError(400, "Team name is required.")
+
+    requested_key = sanitize_text(payload.get("key"))
+    team_key = normalize_support_team_key(requested_key or build_support_team_key(name))
+    description = sanitize_text(payload.get("description"))
+    receiver_error_ticket_label = sanitize_text(payload.get("receiverErrorTicketLabel")) or name
+    metadata = normalize_json_object(payload.get("metadata"))
+
+    row = run_query_one(
+        """
+        INSERT INTO support_teams (
+          key,
+          name,
+          description,
+          receiver_access_metadata_key,
+          receiver_error_ticket_label,
+          metadata
+        )
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        RETURNING id, key, name, description, receiver_access_metadata_key,
+                  receiver_error_ticket_label, is_active, metadata
+        """,
+        [
+            team_key,
+            name,
+            description,
+            f"team_access:{team_key}",
+            receiver_error_ticket_label,
+            json.dumps(metadata),
+        ],
+    )
+    if not row:
+        raise ApiError(500, "We could not create this team right now.")
+
+    return {"team": serialize_support_team(row)}
+
+
+def persist_account_team_access(
+    account_id: int,
+    team_key: Any,
+    enabled: bool,
+    *,
+    source: str = "team_management",
+    strict: bool = False,
+) -> None:
+    normalized_team_key = normalize_support_team_key(team_key)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO support_account_team_access (
+                  account_id,
+                  team_id,
+                  can_receive_tickets,
+                  metadata
+                )
+                SELECT %s, st.id, %s, %s::jsonb
+                FROM support_teams st
+                WHERE st.key = %s
+                  AND st.is_active = TRUE
+                ON CONFLICT (account_id, team_id) DO UPDATE
+                SET can_receive_tickets = EXCLUDED.can_receive_tickets,
+                    metadata = support_account_team_access.metadata || EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    account_id,
+                    bool(enabled),
+                    json.dumps({"source": source}),
+                    normalized_team_key,
+                ],
+            )
+            if strict and cursor.rowcount == 0:
+                raise ApiError(404, "Team not found.")
+    except ApiError:
+        raise
+    except Exception as exc:
+        if strict:
+            raise ApiError(500, "We could not update this team access right now.") from exc
+        logger.warning("Could not sync support account team access.", exc_info=(type(exc), exc, exc.__traceback__))
+
+
+def update_agent_team_access(agent_id: int, *, team_key: Any, receive_tickets: bool) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    agent = run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE id = %s AND account_scope = %s
+        LIMIT 1
+        """,
+        [agent_id, ACCOUNT_SCOPE_STAFF],
+    )
+    if not agent:
+        raise ApiError(404, "Agent not found.")
+    if not fetch_support_team_by_key(normalized_team_key):
+        raise ApiError(404, "Team not found.")
+
+    persist_account_team_access(
+        agent_id,
+        normalized_team_key,
+        receive_tickets,
+        strict=True,
+    )
+    return serialize_agent(
+        attach_account_team_access([agent])[0],
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
+
+
+def sync_legacy_team_access_memberships(
+    account_id: int,
+    *,
+    support_access: bool | None = None,
+    operations_access: bool | None = None,
+) -> None:
+    if support_access is not None:
+        persist_account_team_access(
+            account_id,
+            TICKET_RECEIVER_SCOPE_SUPPORT,
+            support_access,
+            source="legacy_support_access",
+        )
+    if operations_access is not None:
+        persist_account_team_access(
+            account_id,
+            TICKET_RECEIVER_SCOPE_OPERATIONS,
+            operations_access,
+            source="legacy_operations_access",
+        )
+
+
+def get_team_routing_policy_by_assigned_team(assigned_team: Any) -> dict[str, Any]:
     normalized_assigned_team = sanitize_text(assigned_team).casefold()
+    if not normalized_assigned_team or normalized_assigned_team == ASSIGNED_TEAM_UNASSIGNED.casefold():
+        return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]
+
     for team_name, policy in TEAM_ROUTING_POLICIES.items():
         if normalized_assigned_team == team_name.casefold():
             return policy
+
+    dynamic_policy = build_team_routing_policy_from_row(
+        fetch_optional_dynamic_team_row_by_assigned_team(assigned_team)
+    )
+    if dynamic_policy:
+        return dynamic_policy
 
     return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]
 
@@ -8030,10 +8496,19 @@ def actor_has_team_routing_access(actor: dict[str, Any] | None, policy: dict[str
 
     role = sanitize_text(actor.get("role")).lower()
     legacy_default = policy["key"] == TICKET_RECEIVER_SCOPE_SUPPORT and role == ROLE_AGENT
-    return actor_has_metadata_flag(
+    if actor_has_metadata_flag(
         actor,
         policy["receiver_access_metadata_key"],
         default=legacy_default,
+    ):
+        return True
+
+    if account_has_preloaded_team_access(actor, policy["key"]):
+        return True
+
+    return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
+        actor.get("id"),
+        policy["key"],
     )
 
 
@@ -8107,6 +8582,7 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         or sanitize_text(metadata.get("legacy_auth_email"))
         or None
     )
+    team_access = build_serialized_agent_team_access(row, metadata)
     return {
         "id": agent_id,
         "username": row["username"],
@@ -8120,6 +8596,8 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         "legacyOperationsAccess": normalize_bool(metadata.get("legacy_operations_access")),
         "legacyAdminAccess": normalize_bool(metadata.get("legacy_admin_access")),
         "entraDirectoryAdmin": normalize_bool(metadata.get("entra_directory_admin_access")),
+        "teamAccess": team_access,
+        "teamAccessKeys": [item["key"] for item in team_access],
         "consoleStatus": resolve_agent_console_status(
             metadata,
             session_active=session_active,
@@ -8149,7 +8627,16 @@ def account_has_team_receiver_access(account: dict[str, Any] | None, policy: dic
         return False
 
     metadata = normalize_json_object(account.get("metadata"))
-    return normalize_bool(metadata.get(policy["receiver_access_metadata_key"]))
+    if normalize_bool(metadata.get(policy["receiver_access_metadata_key"])):
+        return True
+
+    if account_has_preloaded_team_access(account, policy["key"]):
+        return True
+
+    return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
+        account.get("id"),
+        policy["key"],
+    )
 
 
 def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
@@ -8299,6 +8786,8 @@ def derive_legacy_ticket_state(row: dict[str, Any], *, chat_state: str | None = 
         dashboard_bucket = "live_chat"
     elif normalized_status == "Pending":
         dashboard_bucket = "pending"
+    elif ticket_routing_policy["key"] not in {TICKET_RECEIVER_SCOPE_SUPPORT, TICKET_RECEIVER_SCOPE_OPERATIONS}:
+        dashboard_bucket = ticket_routing_policy["key"]
     else:
         dashboard_bucket = "support"
 
@@ -8939,6 +9428,12 @@ def normalize_assigned_team(value: Any) -> str:
     for allowed_value in ALLOWED_ASSIGNED_TEAMS:
         if allowed_value.casefold() == normalized_lookup:
             return allowed_value
+
+    dynamic_policy = build_team_routing_policy_from_row(
+        fetch_optional_dynamic_team_row_by_assigned_team(normalized_value)
+    )
+    if dynamic_policy:
+        return dynamic_policy["assigned_team"]
 
     raise ApiError(400, "Invalid assigned team.")
 
@@ -11360,7 +11855,10 @@ def update_agent_ticket_access(
     persist_agent_metadata(agent_id, metadata)
 
     agent["metadata"] = metadata
-    return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
+    return serialize_agent(
+        attach_account_team_access([agent])[0],
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
 
 
 def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
@@ -12064,7 +12562,10 @@ def register_agent_session(username: str, instance_id: str, console_status: str 
     persist_agent_metadata(int(agent["id"]), metadata)
     agent["metadata"] = metadata
     assign_waiting_live_chat_tickets(now)
-    return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
+    return serialize_agent(
+        attach_account_team_access([agent])[0],
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
 
 
 def heartbeat_agent_session(payload: dict[str, Any]) -> dict[str, Any]:
@@ -12810,6 +13311,7 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         refresh_staff_account_legacy_access(account, legacy_lookup)
         for account in accounts
     ]
+    refreshed_accounts = attach_account_team_access(refreshed_accounts)
     serialized_accounts = [
         serialize_agent(account, open_assigned_chat_agent_ids=open_assigned_chat_agent_ids)
         for account in refreshed_accounts

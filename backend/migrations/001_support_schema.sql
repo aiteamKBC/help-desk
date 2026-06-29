@@ -111,6 +111,121 @@ ALTER TABLE support_accounts
 ADD CONSTRAINT support_accounts_account_scope_check
 CHECK (account_scope IN ('staff', 'requester'));
 
+CREATE TABLE IF NOT EXISTS support_teams (
+  id BIGSERIAL PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  receiver_access_metadata_key TEXT NOT NULL DEFAULT '',
+  receiver_error_ticket_label TEXT NOT NULL DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS receiver_access_metadata_key TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS receiver_error_ticket_label TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS support_account_team_access (
+  id BIGSERIAL PRIMARY KEY,
+  account_id BIGINT NOT NULL REFERENCES support_accounts(id) ON DELETE CASCADE,
+  team_id BIGINT NOT NULL REFERENCES support_teams(id) ON DELETE CASCADE,
+  can_receive_tickets BOOLEAN NOT NULL DEFAULT TRUE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT support_account_team_access_account_team_key UNIQUE (account_id, team_id)
+);
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS can_receive_tickets BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+INSERT INTO support_teams (
+  key,
+  name,
+  description,
+  receiver_access_metadata_key,
+  receiver_error_ticket_label,
+  metadata
+)
+VALUES
+  (
+    'support',
+    'Support Desk',
+    'Default support desk queue for technical support tickets.',
+    'legacy_support_access',
+    'support',
+    '{"seeded": true, "legacyTeam": true}'::jsonb
+  ),
+  (
+    'operations',
+    'Learning Plan Team',
+    'Operations queue for Learning Plan and Coverage tickets.',
+    'legacy_operations_access',
+    'Learning Plan',
+    '{"seeded": true, "legacyTeam": true}'::jsonb
+  )
+ON CONFLICT (key) DO UPDATE
+SET name = EXCLUDED.name,
+    description = EXCLUDED.description,
+    receiver_access_metadata_key = EXCLUDED.receiver_access_metadata_key,
+    receiver_error_ticket_label = EXCLUDED.receiver_error_ticket_label,
+    is_active = TRUE,
+    metadata = COALESCE(support_teams.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+    updated_at = NOW();
+
+INSERT INTO support_account_team_access (account_id, team_id, can_receive_tickets, metadata)
+SELECT sa.id, st.id, TRUE, '{"source": "legacy_support_access"}'::jsonb
+FROM support_accounts sa
+JOIN support_teams st
+  ON st.key = 'support'
+WHERE sa.account_scope = 'staff'
+  AND LOWER(COALESCE(sa.metadata->>'legacy_support_access', 'false')) = 'true'
+ON CONFLICT (account_id, team_id) DO UPDATE
+SET can_receive_tickets = TRUE,
+    metadata = support_account_team_access.metadata || EXCLUDED.metadata,
+    updated_at = NOW();
+
+INSERT INTO support_account_team_access (account_id, team_id, can_receive_tickets, metadata)
+SELECT sa.id, st.id, TRUE, '{"source": "legacy_operations_access"}'::jsonb
+FROM support_accounts sa
+JOIN support_teams st
+  ON st.key = 'operations'
+WHERE sa.account_scope = 'staff'
+  AND LOWER(COALESCE(sa.metadata->>'legacy_operations_access', 'false')) = 'true'
+ON CONFLICT (account_id, team_id) DO UPDATE
+SET can_receive_tickets = TRUE,
+    metadata = support_account_team_access.metadata || EXCLUDED.metadata,
+    updated_at = NOW();
+
 ALTER TABLE learners
 ADD COLUMN IF NOT EXISTS support_account_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
 
