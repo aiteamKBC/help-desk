@@ -577,6 +577,28 @@ interface TicketListPagination {
   isPaginated: boolean;
 }
 
+interface DashboardTicketSectionMetrics {
+  coverage: number;
+  learningPlanOther: number;
+}
+
+interface DashboardTicketMetrics {
+  total: number;
+  open: number;
+  pending: number;
+  escalation: number;
+  closed: number;
+  slaBreached: number;
+  coverage: number;
+  quickResolution: number;
+  sections: DashboardTicketSectionMetrics;
+}
+
+interface DashboardMetricsResponse {
+  message?: string;
+  metrics?: DashboardTicketMetrics;
+}
+
 interface TeamListResponse {
   message?: string;
   teams?: AdminTeam[];
@@ -885,6 +907,7 @@ type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
 type DashboardStatusFilterParam = "Open" | "Pending" | "Closed";
 type DashboardTicketPageLoadOptions = { silent?: boolean; signal?: AbortSignal };
+type DashboardMetricsLoadOptions = { silent?: boolean; signal?: AbortSignal };
 type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management" | `${typeof teamDashboardViewPrefix}${string}`;
 type ManagementAccessTab = `${typeof managementTeamTabPrefix}${string}` | "admins";
 type TicketAccessKind = "support" | "operations";
@@ -1070,6 +1093,9 @@ const AgentDashboard = () => {
   const [serverDashboardPagination, setServerDashboardPagination] = useState<TicketListPagination | null>(null);
   const [isDashboardPageLoading, setIsDashboardPageLoading] = useState(false);
   const [dashboardPageError, setDashboardPageError] = useState("");
+  const [serverDashboardMetrics, setServerDashboardMetrics] = useState<DashboardTicketMetrics | null>(null);
+  const [isDashboardMetricsLoading, setIsDashboardMetricsLoading] = useState(false);
+  const [dashboardMetricsError, setDashboardMetricsError] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [standardDocumentationDraftsByTicketId, setStandardDocumentationDraftsByTicketId] = useState<Record<string, AdminDocumentation>>({});
@@ -1145,6 +1171,7 @@ const AgentDashboard = () => {
   >(async () => false);
   const refreshTicketsOnlyRef = useRef<(silent?: boolean) => Promise<void>>(async () => {});
   const loadDashboardTicketPageRef = useRef<(options?: DashboardTicketPageLoadOptions) => Promise<void>>(async () => {});
+  const loadDashboardMetricsRef = useRef<(options?: DashboardMetricsLoadOptions) => Promise<void>>(async () => {});
   const refreshAgentsOnlyRef = useRef<(silent?: boolean) => Promise<void>>(async () => {});
   const refreshConsoleTicketDetailRef = useRef<(ticketId: string) => Promise<void>>(async () => {});
   const clearConsolePendingAttachmentsRef = useRef<(revokePreviewUrls?: boolean) => void>(() => {});
@@ -2408,6 +2435,28 @@ const AgentDashboard = () => {
   ]);
 
   useEffect(() => {
+    if (!isDashboardLikeView || !hasCheckedTeamRoutingPolicies) {
+      setServerDashboardMetrics(null);
+      setDashboardMetricsError("");
+      setIsDashboardMetricsLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    void loadDashboardMetricsRef.current({ signal: controller.signal });
+
+    return () => controller.abort();
+  }, [
+    adminView,
+    dashboardArchiveScope,
+    dashboardAssignedFilter,
+    hasCheckedTeamRoutingPolicies,
+    isDashboardLikeView,
+    learningPlanTeamSection,
+    selectedDashboardTeamKey,
+  ]);
+
+  useEffect(() => {
     const defaultAdminLandingView = getDefaultAdminLandingView(accessSession);
     let nextView = adminView;
 
@@ -2825,45 +2874,60 @@ const AgentDashboard = () => {
     consoleDurationStartedAt,
   ]);
 
+  const localDashboardMetrics: DashboardTicketMetrics = {
+    total: dashboardAssignmentScopedTickets.length,
+    open: dashboardAssignmentScopedTickets.filter(isDashboardOpenTicket).length,
+    pending: dashboardAssignmentScopedTickets.filter(isDashboardPendingTicket).length,
+    escalation: dashboardAssignmentScopedTickets.filter(isDashboardEscalationTicket).length,
+    closed: dashboardAssignmentScopedTickets.filter(isDashboardClosedTicket).length,
+    slaBreached: dashboardAssignmentScopedTickets.filter((ticket) => ticket.slaStatus === "Breached").length,
+    coverage: dashboardAssignmentScopedTickets.filter((ticket) => isCoverageTicket(ticket)).length,
+    quickResolution: quickResolutionTickets.length,
+    sections: {
+      coverage: learningPlanCoverageAssignmentScopedTickets.length,
+      learningPlanOther: learningPlanOtherAssignmentScopedTickets.length,
+    },
+  };
+  const dashboardMetrics = serverDashboardMetrics || localDashboardMetrics;
   const kpis = [
     {
       label: "Open Tickets",
-      value: dashboardAssignmentScopedTickets.filter(isDashboardOpenTicket).length,
+      value: dashboardMetrics.open,
       icon: TicketIcon,
       color: "text-info bg-info/10",
       filter: "open" as const,
     },
     {
       label: "Pending Tickets",
-      value: dashboardAssignmentScopedTickets.filter(isDashboardPendingTicket).length,
+      value: dashboardMetrics.pending,
       icon: Clock,
       color: "text-warning bg-warning/10",
       filter: "pending" as const,
     },
     {
       label: "Escalation Tickets",
-      value: dashboardAssignmentScopedTickets.filter(isDashboardEscalationTicket).length,
+      value: dashboardMetrics.escalation,
       icon: AlertOctagon,
       color: "text-amber-700 bg-amber-100",
       filter: "escalation" as const,
     },
     {
       label: "Closed Tickets",
-      value: dashboardAssignmentScopedTickets.filter(isDashboardClosedTicket).length,
+      value: dashboardMetrics.closed,
       icon: CheckCircle2,
       color: "text-success bg-success/10",
       filter: "closed" as const,
     },
     {
       label: "SLA Breaches",
-      value: dashboardAssignmentScopedTickets.filter((ticket) => ticket.slaStatus === "Breached").length,
+      value: dashboardMetrics.slaBreached,
       icon: AlertOctagon,
       color: "bg-rose-100 text-rose-700",
       filter: "slaBreached" as const,
     },
     {
       label: "Coverage Tickets",
-      value: dashboardAssignmentScopedTickets.filter((ticket) => isCoverageTicket(ticket)).length,
+      value: dashboardMetrics.coverage,
       icon: FileText,
       color: "bg-primary/10 text-primary",
       filter: "coverage" as const,
@@ -3201,6 +3265,85 @@ const AgentDashboard = () => {
     }
   }
 
+  function getDashboardMetricsFilterParam(): AdminTicketDashboardFilterParam | "" {
+    if (!isCoverageDashboardView) {
+      return "";
+    }
+
+    return isLearningPlanCoverageSection ? "coverage" : "learningPlanOther";
+  }
+
+  function buildDashboardMetricsSearchParams() {
+    const params = new URLSearchParams();
+    params.set("archiveScope", dashboardArchiveScope);
+
+    const teamKey = getDashboardServerTeamKey();
+    if (teamKey) {
+      params.set("team", teamKey);
+    }
+
+    const dashboardFilterParam = getDashboardMetricsFilterParam();
+    if (dashboardFilterParam) {
+      params.set("dashboardFilter", dashboardFilterParam);
+    }
+
+    if (dashboardAssignedFilter !== "all") {
+      params.set("assigned", dashboardAssignedFilter);
+    }
+
+    return params;
+  }
+
+  async function fetchDashboardMetrics(signal?: AbortSignal) {
+    const params = buildDashboardMetricsSearchParams();
+    const response = await fetch(`/api/admin/tickets/metrics?${params.toString()}`, {
+      cache: "no-store",
+      signal,
+    });
+    const payload = (await response.json().catch(() => null)) as DashboardMetricsResponse | null;
+
+    if (!response.ok) {
+      if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+        throw new Error("Admin session is required.");
+      }
+      throw new Error(payload?.message || "We could not load ticket metrics right now.");
+    }
+
+    return payload?.metrics || null;
+  }
+
+  async function loadDashboardMetrics(options?: DashboardMetricsLoadOptions) {
+    if (!isDashboardLikeView || !hasCheckedTeamRoutingPolicies) {
+      return;
+    }
+
+    if (!options?.silent) {
+      setIsDashboardMetricsLoading(true);
+      setDashboardMetricsError("");
+    }
+
+    try {
+      const nextMetrics = await fetchDashboardMetrics(options?.signal);
+      if (options?.signal?.aborted || !isCurrentDashboardSession()) {
+        return;
+      }
+
+      setServerDashboardMetrics(nextMetrics);
+      setDashboardMetricsError("");
+    } catch (fetchError) {
+      if (options?.signal?.aborted) {
+        return;
+      }
+
+      setServerDashboardMetrics(null);
+      setDashboardMetricsError(fetchError instanceof Error ? fetchError.message : "We could not load ticket metrics right now.");
+    } finally {
+      if (!options?.signal?.aborted) {
+        setIsDashboardMetricsLoading(false);
+      }
+    }
+  }
+
   async function fetchAgentsList() {
     const response = await fetch("/api/admin/accounts");
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
@@ -3389,6 +3532,7 @@ const AgentDashboard = () => {
       setTickets(nextTickets);
       if (isDashboardLikeView) {
         void loadDashboardTicketPage({ silent: true });
+        void loadDashboardMetrics({ silent: true });
       }
       if (nextNotificationLog !== null) {
         setNotificationLog(nextNotificationLog);
@@ -4048,6 +4192,7 @@ const AgentDashboard = () => {
 
       syncDetailAcrossViews(payload);
       void loadDashboardTicketPage({ silent: true });
+      void loadDashboardMetrics({ silent: true });
       if (activeDetail?.ticket.id === payload.ticket.id) {
         syncDrafts(payload);
       }
@@ -4095,6 +4240,7 @@ const AgentDashboard = () => {
 
       syncDetailAcrossViews(payload);
       void loadDashboardTicketPage({ silent: true });
+      void loadDashboardMetrics({ silent: true });
       if (activeDetail?.ticket.id === payload.ticket.id) {
         syncDrafts(payload);
       }
@@ -5732,6 +5878,7 @@ const AgentDashboard = () => {
   syncAgentSessionHeartbeatRef.current = syncAgentSessionHeartbeat;
   refreshTicketsOnlyRef.current = refreshTicketsOnly;
   loadDashboardTicketPageRef.current = loadDashboardTicketPage;
+  loadDashboardMetricsRef.current = loadDashboardMetrics;
   refreshAgentsOnlyRef.current = refreshAgentsOnly;
   refreshConsoleTicketDetailRef.current = refreshConsoleTicketDetail;
   clearConsolePendingAttachmentsRef.current = clearConsolePendingAttachments;
@@ -5756,13 +5903,13 @@ const AgentDashboard = () => {
                   value: "coverage" as LearningPlanTeamSection,
                   label: "Coverage",
                   description: "Standard coverage tickets.",
-                  count: learningPlanCoverageAssignmentScopedTickets.length,
+                  count: dashboardMetrics.sections.coverage,
                 },
                 {
                   value: "others" as LearningPlanTeamSection,
                   label: "Others",
                   description: "Tickets transferred to Learning Plan Team.",
-                  count: learningPlanOtherAssignmentScopedTickets.length,
+                  count: dashboardMetrics.sections.learningPlanOther,
                 },
               ]).map((section) => (
                 <button
@@ -5815,7 +5962,10 @@ const AgentDashboard = () => {
               <div className={cn("h-9 w-9 rounded-lg flex items-center justify-center mb-3", kpi.color)}>
                 <kpi.icon className="h-5 w-5" />
               </div>
-              <div className="text-2xl font-bold">{kpi.value}</div>
+              <div className="flex items-center gap-2 text-2xl font-bold">
+                {kpi.value}
+                {isDashboardMetricsLoading ? <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" /> : null}
+              </div>
               <div className="text-xs text-muted-foreground">{kpi.label}</div>
               <div className="mt-2 text-[11px] font-medium text-primary">
                 {dashboardTicketFilter === kpi.filter ? `Showing ${kpi.label.toLowerCase()}` : `Click to view ${kpi.label.toLowerCase()}`}
@@ -5838,7 +5988,10 @@ const AgentDashboard = () => {
               <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
                 <FileText className="h-5 w-5" />
               </div>
-              <div className="text-2xl font-bold">{quickResolutionTickets.length}</div>
+              <div className="flex items-center gap-2 text-2xl font-bold">
+                {dashboardMetrics.quickResolution}
+                {isDashboardMetricsLoading ? <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" /> : null}
+              </div>
               <div className="text-xs text-muted-foreground">Quick Tickets</div>
               <div className="mt-2 text-[11px] font-medium text-primary">
                 {dashboardTicketFilter === "quickResolution" ? "Showing only quick tickets" : "Click to view quick tickets"}
@@ -5846,6 +5999,11 @@ const AgentDashboard = () => {
             </button>
           ) : null}
         </div>
+        {dashboardMetricsError ? (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-xs text-amber-900">
+            {dashboardMetricsError} Showing locally cached dashboard counts until the next successful refresh.
+          </div>
+        ) : null}
 
         <div
           className={cn(

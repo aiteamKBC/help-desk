@@ -1441,6 +1441,41 @@ class AdminSessionViewTests(SimpleTestCase):
             query_params={"page": "2", "pageSize": "25", "search": "coach"},
         )
 
+    def test_admin_ticket_metrics_passes_query_params_to_service(self):
+        request = self.factory.get("/api/admin/tickets/metrics?team=operations&dashboardFilter=coverage")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "agent",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        actor = {
+            "id": 7,
+            "username": "admin1",
+            "full_name": "Admin One",
+            "email": None,
+            "role": "agent",
+        }
+        with (
+            patch.object(views, "require_agent_session_actor", return_value=actor),
+            patch.object(views, "get_admin_ticket_metrics", return_value={"metrics": {"total": 0}}) as get_admin_ticket_metrics,
+        ):
+            response = views.admin_ticket_metrics(request)
+
+        self.assertEqual(response.status_code, 200)
+        get_admin_ticket_metrics.assert_called_once_with(
+            actor,
+            query_params={"team": "operations", "dashboardFilter": "coverage"},
+        )
+
     def test_admin_accounts_get_allows_agent_session(self):
         request = self.factory.get("/api/admin/accounts")
         self.attach_session(
@@ -4726,6 +4761,84 @@ class SlaPolicyTests(SimpleTestCase):
 
         self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000043"])
         self.assertEqual(result["filters"]["dashboardFilter"], "learningPlanOther")
+
+    def test_admin_ticket_metrics_supports_dashboard_scope_counts(self):
+        base_ticket = {
+            "learner_phone": "",
+            "category": "Technical",
+            "inquiry": "Needs help",
+            "status_reason": "",
+            "priority": "Normal",
+            "assigned_agent_id": 5,
+            "assigned_agent_name": "Operations Agent",
+            "assigned_agent_username": "operations.agent",
+            "conversation_id": 13,
+            "conversation_status": "open",
+            "conversation_metadata": {"is_active_conversation": True},
+            "last_message_at": None,
+            "sla_status": "On Track",
+            "evidence_count": 0,
+            "is_archived": False,
+            "created_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
+            "metadata": {"requester_role": "user"},
+        }
+        coverage_ticket = {
+            **base_ticket,
+            "id": 45,
+            "public_id": "KBC-000045",
+            "learner_name": "Coverage Ticket",
+            "learner_email": "coverage@example.com",
+            "technical_subcategory": "Coverage",
+            "status": "Pending",
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+        }
+        other_learning_plan_ticket = {
+            **base_ticket,
+            "id": 46,
+            "public_id": "KBC-000046",
+            "learner_name": "Learning Plan Transfer",
+            "learner_email": "learning-plan@example.com",
+            "technical_subcategory": "LMS",
+            "status": "Open",
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+        }
+        support_ticket = {
+            **base_ticket,
+            "id": 47,
+            "public_id": "KBC-000047",
+            "learner_name": "Support Ticket",
+            "learner_email": "support@example.com",
+            "technical_subcategory": "LMS",
+            "status": "Open",
+            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(services, "run_query", return_value=[coverage_ticket, other_learning_plan_ticket, support_ticket]),
+            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+        ):
+            result = services.get_admin_ticket_metrics(
+                {"id": 5, "role": "admin", "metadata": {"legacy_admin_access": True}},
+                query_params={
+                    "assigned": "me",
+                    "team": "operations",
+                    "dashboardFilter": "coverage",
+                    "status": "closed",
+                    "search": "ignored",
+                },
+            )
+
+        self.assertEqual(result["metrics"]["total"], 1)
+        self.assertEqual(result["metrics"]["pending"], 1)
+        self.assertEqual(result["metrics"]["coverage"], 1)
+        self.assertEqual(result["metrics"]["sections"], {"coverage": 1, "learningPlanOther": 1})
+        self.assertEqual(result["filters"]["assigned"], "me")
+        self.assertEqual(result["filters"]["team"], "operations")
+        self.assertEqual(result["filters"]["dashboardFilter"], "coverage")
+        self.assertEqual(result["filters"]["status"], "")
+        self.assertEqual(result["filters"]["search"], "")
 
     def test_list_admin_tickets_hides_open_pre_submission_support_flow_tickets(self):
         visible_ticket = {

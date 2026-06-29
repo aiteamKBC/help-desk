@@ -14056,7 +14056,7 @@ def admin_ticket_matches_dashboard_filter(ticket: dict[str, Any], dashboard_filt
     if dashboard_filter == "slaBreached":
         return normalize_sla_status(ticket.get("sla_status")) == "Breached"
     if dashboard_filter == "quickResolution":
-        return is_quick_ticket_record(ticket)
+        return is_quick_ticket_record(ticket) and not is_coverage_ticket_record(ticket)
     if dashboard_filter == "escalation":
         return is_admin_dashboard_escalation_ticket(ticket)
     if dashboard_filter == "coverage":
@@ -14202,15 +14202,8 @@ def build_admin_ticket_list_filter_response(params: dict[str, Any]) -> dict[str,
     }
 
 
-def list_admin_tickets(
-    actor: dict[str, Any] | None = None,
-    *,
-    query_params: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    trigger_ticket_background_sync()
-    list_params = normalize_admin_ticket_list_params(query_params)
-
-    tickets = run_query(
+def fetch_admin_ticket_rows() -> list[dict[str, Any]]:
+    return run_query(
         """
         SELECT
           t.id,
@@ -14280,9 +14273,79 @@ def list_admin_tickets(
         """
     )
 
+
+def get_admin_ticket_rows_for_actor(actor: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    tickets = fetch_admin_ticket_rows()
     tickets = [ticket for ticket in tickets if not is_admin_hidden_support_flow_ticket_record(ticket)]
     tickets = filter_admin_tickets_for_actor(tickets, actor)
-    tickets = [apply_ticket_sla_policy(ticket) for ticket in tickets]
+    return [apply_ticket_sla_policy(ticket) for ticket in tickets]
+
+
+def get_admin_ticket_metrics_params(query_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = normalize_admin_ticket_list_params(query_params)
+    return {
+        **params,
+        "search": "",
+        "status": "",
+        "slaStatus": "",
+        "paginationRequested": False,
+    }
+
+
+def build_admin_ticket_metric_counts(tickets: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "total": len(tickets),
+        "open": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "open")),
+        "pending": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "pending")),
+        "escalation": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "escalation")),
+        "closed": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "closed")),
+        "slaBreached": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "slaBreached")),
+        "coverage": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "coverage")),
+        "quickResolution": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "quickResolution")),
+    }
+
+
+def build_admin_ticket_section_metric_counts(tickets: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "coverage": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "coverage")),
+        "learningPlanOther": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "learningPlanOther")),
+    }
+
+
+def get_admin_ticket_metrics(
+    actor: dict[str, Any] | None = None,
+    *,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    trigger_ticket_background_sync()
+    metrics_params = get_admin_ticket_metrics_params(query_params)
+    section_params = {
+        **metrics_params,
+        "dashboardFilter": "all",
+    }
+
+    tickets = get_admin_ticket_rows_for_actor(actor)
+    section_scope_tickets = filter_admin_ticket_list(tickets, section_params, actor)
+    metric_scope_tickets = filter_admin_ticket_list(tickets, metrics_params, actor)
+
+    return {
+        "metrics": {
+            **build_admin_ticket_metric_counts(metric_scope_tickets),
+            "sections": build_admin_ticket_section_metric_counts(section_scope_tickets),
+        },
+        "filters": build_admin_ticket_list_filter_response(metrics_params),
+    }
+
+
+def list_admin_tickets(
+    actor: dict[str, Any] | None = None,
+    *,
+    query_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    trigger_ticket_background_sync()
+    list_params = normalize_admin_ticket_list_params(query_params)
+
+    tickets = get_admin_ticket_rows_for_actor(actor)
     tickets = filter_admin_ticket_list(tickets, list_params, actor)
     tickets = sort_admin_ticket_list(tickets, list_params["sort"])
     paged_tickets, pagination = paginate_admin_ticket_list(tickets, list_params)

@@ -64,6 +64,7 @@ from .services import (
     get_verify_email_response,
     add_entra_agent,
     list_admin_tickets,
+    get_admin_ticket_metrics,
     list_agents,
     list_support_teams,
     remove_agent,
@@ -762,6 +763,15 @@ def admin_tickets(request):
         if query_params:
             return JsonResponse(list_admin_tickets(actor, query_params=query_params))
         return JsonResponse(list_admin_tickets(actor))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def admin_ticket_metrics(request):
+    try:
+        actor, _session_payload = require_request_admin_session(request)
+        return JsonResponse(get_admin_ticket_metrics(actor, query_params=parse_query_params(request)))
     except Exception as error:
         return handle_api_error(error)
 

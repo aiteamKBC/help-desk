@@ -387,6 +387,45 @@ const dashboardPayload = {
   },
 };
 
+type RuntimeDashboardTicket = (typeof dashboardPayload.tickets.tickets)[number] & {
+  ticketState?: {
+    dashboardBucket?: string;
+    ticketType?: string;
+  };
+};
+
+function isRuntimeCoverageTicket(ticket: RuntimeDashboardTicket) {
+  return ticket.ticketState?.ticketType === "coverage" || ticket.technicalSubcategory === "Coverage";
+}
+
+function isRuntimeQuickTicket(ticket: RuntimeDashboardTicket) {
+  return (
+    ticket.ticketState?.ticketType === "quick"
+    || ticket.statusReason === "Quick Ticket"
+    || ticket.statusReason === "Quick Resolution"
+  ) && !isRuntimeCoverageTicket(ticket);
+}
+
+function buildDashboardMetricsPayload(tickets: RuntimeDashboardTicket[] = dashboardPayload.tickets.tickets) {
+  const activeTickets = tickets.filter((ticket) => !ticket.isArchived);
+  return {
+    metrics: {
+      total: activeTickets.length,
+      open: activeTickets.filter((ticket) => ticket.status === "Open" && ticket.chatState !== "closed").length,
+      pending: activeTickets.filter((ticket) => ticket.status === "Pending" || ticket.ticketState?.dashboardBucket === "pending").length,
+      escalation: activeTickets.filter((ticket) => ticket.status === "Pending" && ticket.statusReason === "Escalation").length,
+      closed: activeTickets.filter((ticket) => ticket.status === "Closed" || ticket.ticketState?.dashboardBucket === "closed").length,
+      slaBreached: activeTickets.filter((ticket) => ticket.slaStatus === "Breached").length,
+      coverage: activeTickets.filter(isRuntimeCoverageTicket).length,
+      quickResolution: activeTickets.filter(isRuntimeQuickTicket).length,
+      sections: {
+        coverage: activeTickets.filter(isRuntimeCoverageTicket).length,
+        learningPlanOther: activeTickets.filter((ticket) => ticket.assignedTeam === "Learning Plan Team" && !isRuntimeCoverageTicket(ticket)).length,
+      },
+    },
+  };
+}
+
 function buildDashboardAccountsPayload() {
   const applyRuntimeSessionToSignedInAccount = (account: (typeof dashboardPayload.accounts.accounts)[number]) => {
     if (account.id !== runtimeAdminSession.id && account.username !== runtimeAdminSession.username) {
@@ -478,6 +517,13 @@ describe("AgentDashboard runtime", () => {
 
       if (url.includes("/api/admin/session")) {
         return new Response(JSON.stringify({ admin: runtimeAdminSession }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload()), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
@@ -682,6 +728,13 @@ describe("AgentDashboard runtime", () => {
         });
       }
 
+      if (url.includes("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload([...dashboardPayload.tickets.tickets, curriculumTicket])), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
       if (url.includes("/api/admin/tickets")) {
         return new Response(JSON.stringify({
           tickets: [...dashboardPayload.tickets.tickets, curriculumTicket],
@@ -817,6 +870,13 @@ describe("AgentDashboard runtime", () => {
 
     global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload([...dashboardPayload.tickets.tickets, waitingLiveTicket])), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
 
       if (url.includes("/api/admin/tickets")) {
         return new Response(JSON.stringify({

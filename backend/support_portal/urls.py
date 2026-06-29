@@ -27,6 +27,7 @@ urlpatterns = [
     path("admin/accounts/<int:account_id>/team-access", views.admin_account_team_access, name="admin-account-team-access"),
     path("admin/accounts/<int:account_id>", views.admin_account_detail, name="admin-account-detail"),
     path("admin/tickets", views.admin_tickets, name="admin-tickets"),
+    path("admin/tickets/metrics", views.admin_ticket_metrics, name="admin-ticket-metrics"),
     path("admin/notifications", views.admin_notifications, name="admin-notifications"),
     path("admin/tickets/<str:public_id>/archive", views.admin_ticket_archive, name="admin-ticket-archive"),
     path("admin/tickets/<str:public_id>/delete-permanently", views.admin_ticket_permanent_delete, name="admin-ticket-permanent-delete"),
