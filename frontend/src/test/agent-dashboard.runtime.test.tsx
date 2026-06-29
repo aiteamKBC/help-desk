@@ -644,6 +644,76 @@ describe("AgentDashboard runtime", () => {
     expect(await screen.findByRole("menuitem", { name: /Curriculum Team/i })).toBeInTheDocument();
   });
 
+  it("shows dynamic teams as isolated dashboard tabs", async () => {
+    const originalFetch = global.fetch;
+    const curriculumTicket = {
+      ...dashboardPayload.tickets.tickets[0],
+      id: "KBC-000006",
+      learnerName: "Curriculum Learner",
+      requesterName: "Curriculum Learner",
+      email: "curriculum.learner@kentbusinesscollege.com",
+      inquiryPreview: "Curriculum team request",
+      assignedTeam: "Curriculum Team",
+      chatId: "CHAT-000006",
+      createdAt: "2026-06-14T13:00:00.000Z",
+      updatedAt: "2026-06-14T13:00:00.000Z",
+    };
+
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/teams")) {
+        return new Response(JSON.stringify({
+          teams: [
+            {
+              id: 7,
+              key: "curriculum",
+              name: "Curriculum Team",
+              assignedTeam: "Curriculum Team",
+              label: "Curriculum Team",
+              description: "Route this ticket to the curriculum queue.",
+              receiverAccessMetadataKey: "team_access:curriculum",
+              isActive: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/api/admin/tickets")) {
+        return new Response(JSON.stringify({
+          tickets: [...dashboardPayload.tickets.tickets, curriculumTicket],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    const curriculumTab = await screen.findByRole("tab", { name: /^Curriculum Team$/i });
+    fireEvent.mouseDown(curriculumTab, {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.mouseUp(curriculumTab);
+    fireEvent.click(curriculumTab);
+
+    expect(await screen.findByRole("heading", { name: "Curriculum Team Tickets" })).toBeInTheDocument();
+    const curriculumPanel = screen.getByRole("tabpanel", { name: /^Curriculum Team$/i });
+    expect(within(curriculumPanel).getByText("KBC-000006")).toBeInTheDocument();
+    expect(within(curriculumPanel).queryByText("KBC-000001")).not.toBeInTheDocument();
+  });
+
   it("toggles dynamic team receiver access through the team-access endpoint", async () => {
     const originalFetch = global.fetch;
     const teamAccessRequests: Array<Record<string, unknown>> = [];
@@ -702,8 +772,8 @@ describe("AgentDashboard runtime", () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByRole("tab", { name: /Curriculum Team/i })).toBeInTheDocument();
-    const curriculumTab = screen.getByRole("tab", { name: /Curriculum Team/i });
+    expect(await screen.findByRole("tab", { name: /Curriculum Team0/i })).toBeInTheDocument();
+    const curriculumTab = screen.getByRole("tab", { name: /Curriculum Team0/i });
     fireEvent.mouseDown(curriculumTab, {
       button: 0,
       ctrlKey: false,

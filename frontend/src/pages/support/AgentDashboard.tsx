@@ -625,6 +625,7 @@ const emptyTicketSummaryList: TicketSummary[] = [];
 const supportDeskAssignedTeam = "Support Desk";
 const learningPlanAssignedTeam = "Learning Plan Team";
 const managementTeamTabPrefix = "team:";
+const teamDashboardViewPrefix = "team:";
 
 type TeamAccessInfo = {
   key: string;
@@ -792,6 +793,20 @@ function getManagementTeamKeyFromTab(tab: ManagementAccessTab) {
     : "";
 }
 
+function buildTeamDashboardView(teamKey: string): AdminView {
+  return `${teamDashboardViewPrefix}${normalizeTeamPolicyKey(teamKey)}` as AdminView;
+}
+
+function isTeamDashboardView(view: AdminView) {
+  return view.startsWith(teamDashboardViewPrefix);
+}
+
+function getTeamKeyFromDashboardView(view: AdminView) {
+  return isTeamDashboardView(view)
+    ? normalizeTeamPolicyKey(view.slice(teamDashboardViewPrefix.length))
+    : "";
+}
+
 function getPreloadedTeamAccessKeys(
   account: Pick<TeamAccessCarrier, "teamAccess" | "teamAccessKeys"> | null | undefined,
 ) {
@@ -848,7 +863,7 @@ type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreache
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
 type DashboardArchiveScope = "active" | "archived";
-type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management";
+type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management" | `${typeof teamDashboardViewPrefix}${string}`;
 type ManagementAccessTab = `${typeof managementTeamTabPrefix}${string}` | "admins";
 type TicketAccessKind = "support" | "operations";
 type LearningPlanTeamSection = "coverage" | "others";
@@ -940,16 +955,15 @@ function hasLearningPlanTeamDashboardAccess(session?: TeamAccessCarrier | null) 
   return hasTeamRoutingDashboardAccess(session, getLearningPlanTeamRoutingPolicy());
 }
 
-function hasNonLearningPlanTeamDashboardAccess(session?: TeamAccessCarrier | null) {
-  const learningPlanPolicy = getLearningPlanTeamRoutingPolicy();
-  if (getActiveTeamRoutingPolicies().some((policy) => (
-    policy.key !== learningPlanPolicy.key
-    && hasTeamRoutingDashboardAccess(session, policy)
-  ))) {
-    return true;
-  }
+function hasSupportTeamDashboardAccess(session?: TeamAccessCarrier | null) {
+  return hasTeamRoutingDashboardAccess(session, getSupportTeamRoutingPolicy());
+}
 
-  return getPreloadedTeamAccessKeys(session).some((teamKey) => teamKey !== learningPlanPolicy.key);
+function getFirstCustomTeamDashboardPolicy(session?: TeamAccessCarrier | null) {
+  return getActiveTeamRoutingPolicies().find((policy) => (
+    !isBuiltInTeamPolicy(policy)
+    && hasTeamRoutingDashboardAccess(session, policy)
+  )) || null;
 }
 
 function hasAnyAdminDashboardAccess(session?: AdminSession | null) {
@@ -960,12 +974,17 @@ function hasAnyAdminDashboardAccess(session?: AdminSession | null) {
 }
 
 function getDefaultAdminLandingView(session?: AdminSession | null): AdminView {
-  if (hasNonLearningPlanTeamDashboardAccess(session)) {
+  if (hasSupportTeamDashboardAccess(session)) {
     return "dashboard";
   }
 
   if (hasLearningPlanTeamDashboardAccess(session)) {
     return "coverage";
+  }
+
+  const customTeamPolicy = getFirstCustomTeamDashboardPolicy(session);
+  if (customTeamPolicy) {
+    return buildTeamDashboardView(customTeamPolicy.key);
   }
 
   if (hasFullAdminDashboardAccess(session)) {
@@ -1073,6 +1092,7 @@ const AgentDashboard = () => {
   const [savingTeamKey, setSavingTeamKey] = useState("");
   const [disablingTeamKey, setDisablingTeamKey] = useState("");
   const [teamRoutingPolicyState, setTeamRoutingPolicyState] = useState<TeamRoutingPolicy[]>(defaultTeamRoutingPolicies);
+  const [hasCheckedTeamRoutingPolicies, setHasCheckedTeamRoutingPolicies] = useState(false);
   const [managementAccessTab, setManagementAccessTab] = useState<ManagementAccessTab>(buildManagementTeamTabValue(supportTeamRoutingPolicy.key));
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
@@ -1109,21 +1129,32 @@ const AgentDashboard = () => {
   const normalizedSessionRole = getNormalizedAdminRole(accessSession);
   const hasFullAdminAccess = hasFullAdminDashboardAccess(accessSession);
   const hasAnyTeamDashboardAccess = hasAnyTeamRoutingDashboardAccess(accessSession);
+  const hasSupportDashboardAccess = hasSupportTeamDashboardAccess(accessSession);
   const hasLearningPlanDashboardAccess = hasLearningPlanTeamDashboardAccess(accessSession);
-  const hasNonLearningPlanDashboardAccess = hasNonLearningPlanTeamDashboardAccess(accessSession);
   const isSuperadminSession = normalizedSessionRole === "superadmin";
-  const canViewSupportDashboard = hasFullAdminAccess || hasNonLearningPlanDashboardAccess;
+  const canViewSupportDashboard = hasFullAdminAccess || hasSupportDashboardAccess;
   const canViewAdminDashboard = hasFullAdminAccess;
   const canViewLearningPlanTeam = hasFullAdminAccess || hasLearningPlanDashboardAccess;
   const canUseTicketReceiving = hasFullAdminAccess || hasAnyTeamDashboardAccess;
+  const canViewConsole = canUseTicketReceiving;
   const canManageUsers = userManagementRoles.has(normalizedSessionRole) && hasFullAdminAccess;
   const canAssignTickets = ticketAssignmentRoles.has(normalizedSessionRole) && hasFullAdminAccess;
   const isConsoleView = adminView === "console";
   const isAdminDashboardView = adminView === "adminDashboard";
   const isCoverageDashboardView = adminView === "coverage";
+  const selectedDashboardTeamKey = getTeamKeyFromDashboardView(adminView);
+  const selectedDashboardTeamPolicy = teamRoutingPolicies.find((policy) => policy.key === selectedDashboardTeamKey) || null;
+  const isCustomTeamDashboardView = Boolean(selectedDashboardTeamPolicy && !isBuiltInTeamPolicy(selectedDashboardTeamPolicy));
+  const customDashboardTeamTabs = teamRoutingPolicies
+    .filter((policy) => !isBuiltInTeamPolicy(policy))
+    .filter((policy) => hasFullAdminAccess || hasTeamRoutingDashboardAccess(accessSession, policy))
+    .map((policy) => ({
+      value: buildTeamDashboardView(policy.key),
+      policy,
+    }));
   const isLearningPlanCoverageSection = isCoverageDashboardView && learningPlanTeamSection === "coverage";
   const defaultDashboardSortOrder = getDefaultDashboardSortOrder(isLearningPlanCoverageSection);
-  const isDashboardLikeView = adminView === "dashboard" || adminView === "adminDashboard" || adminView === "coverage";
+  const isDashboardLikeView = adminView === "dashboard" || adminView === "adminDashboard" || adminView === "coverage" || isCustomTeamDashboardView;
   const useCompactAdminSidebar = !isStackedAdminLayout && isAdminSidebarCollapsed;
   const trimmedNotes = notes.trim();
   const dashboardSessionAgentName = session?.fullName || session?.username || "Me";
@@ -1139,6 +1170,8 @@ const AgentDashboard = () => {
     ? isLearningPlanCoverageSection
       ? "Search by tutor, module, requester, chat ID, or ticket ID"
       : "Search by requester, chat ID, or ticket ID"
+    : isCustomTeamDashboardView
+      ? `Search ${selectedDashboardTeamPolicy?.label || "team"} tickets by requester, chat ID, or ticket ID`
     : "Search by requester name, chat ID, or ticket ID";
   const isActiveCoverageTicket = isCoverageTicket(activeDetail?.ticket);
   const activeTicketIsArchived = Boolean(activeDetail?.ticket.isArchived);
@@ -1494,9 +1527,10 @@ const AgentDashboard = () => {
       ? "dashboard"
       : canViewLearningPlanTeam
         ? "coverage"
-        : canViewAdminDashboard
-          ? "adminDashboard"
-          : "dashboard";
+        : customDashboardTeamTabs[0]?.value
+          || (canViewAdminDashboard
+            ? "adminDashboard"
+            : "dashboard");
     setAdminView(nextView);
     setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
     setIsTransferNotificationsOpen(true);
@@ -1552,7 +1586,9 @@ const AgentDashboard = () => {
         ? (isLearningPlanCoverageSection ? "All Coverage Tickets" : "All Other Learning Plan Tickets")
         : isAdminDashboardView
           ? "All Tickets"
-          : "All Support Tickets",
+          : isCustomTeamDashboardView
+            ? `All ${selectedDashboardTeamPolicy?.label || "Team"} Tickets`
+            : "All Support Tickets",
     },
     ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "unassigned" as DashboardAssignedFilter, label: "Unassigned" },
@@ -1572,20 +1608,34 @@ const AgentDashboard = () => {
   ));
   const learningPlanCoverageBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isCoverageTicket(ticket));
   const learningPlanOtherBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isLearningPlanOtherTicket(ticket));
-  const supportDashboardBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => !isLearningPlanTicket(ticket));
+  const supportDashboardBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => (
+    getTicketRoutingPolicy(ticket).key === getSupportTeamRoutingPolicy().key
+  ));
+  const customTeamDashboardBaseTickets = selectedDashboardTeamPolicy
+    ? dashboardArchiveScopedTickets.filter((ticket) => getTicketRoutingPolicy(ticket).key === selectedDashboardTeamPolicy.key)
+    : emptyTicketSummaryList;
   const activeLearningPlanCoverageTickets = activeAccessibleTickets.filter((ticket) => isCoverageTicket(ticket));
   const activeLearningPlanOtherTickets = activeAccessibleTickets.filter((ticket) => isLearningPlanOtherTicket(ticket));
   const activeLearningPlanTicketCount = activeLearningPlanCoverageTickets.length + activeLearningPlanOtherTickets.length;
-  const activeSupportDashboardTickets = activeAccessibleTickets.filter((ticket) => !isLearningPlanTicket(ticket));
+  const activeSupportDashboardTickets = activeAccessibleTickets.filter((ticket) => (
+    getTicketRoutingPolicy(ticket).key === getSupportTeamRoutingPolicy().key
+  ));
+  const activeCustomTeamDashboardTickets = selectedDashboardTeamPolicy
+    ? activeAccessibleTickets.filter((ticket) => getTicketRoutingPolicy(ticket).key === selectedDashboardTeamPolicy.key)
+    : emptyTicketSummaryList;
   const overviewTicketCount = isCoverageDashboardView
     ? activeLearningPlanTicketCount
     : isAdminDashboardView || adminView === "management"
       ? activeAccessibleTickets.length
+      : isCustomTeamDashboardView
+        ? activeCustomTeamDashboardTickets.length
       : activeSupportDashboardTickets.length;
   const overviewTicketCountLabel = isCoverageDashboardView
     ? "Learning Plan Tickets"
     : isAdminDashboardView || adminView === "management"
       ? "All Tickets"
+      : isCustomTeamDashboardView
+        ? `${selectedDashboardTeamPolicy?.label || "Team"} Tickets`
       : "Support Tickets";
   const overviewTicketBreakdownItems = isCoverageDashboardView
     ? [
@@ -1597,6 +1647,8 @@ const AgentDashboard = () => {
     ? (isLearningPlanCoverageSection ? learningPlanCoverageBaseTickets : learningPlanOtherBaseTickets)
     : isAdminDashboardView
       ? dashboardArchiveScopedTickets
+      : isCustomTeamDashboardView
+        ? customTeamDashboardBaseTickets
       : supportDashboardBaseTickets;
   const learningPlanCoverageAssignmentScopedTickets = filterDashboardTicketsByAssignee(
     learningPlanCoverageBaseTickets,
@@ -1688,6 +1740,8 @@ const AgentDashboard = () => {
     ? (isLearningPlanCoverageSection ? "Coverage Tickets" : "Other Learning Plan Tickets")
     : isAdminDashboardView
       ? "All Tickets"
+      : isCustomTeamDashboardView
+        ? `${selectedDashboardTeamPolicy?.label || "Team"} Tickets`
       : "Support Tickets";
   const dashboardActiveTableTitle = dashboardTicketFilter === "all"
     ? dashboardDefaultTableTitle
@@ -1699,6 +1753,8 @@ const AgentDashboard = () => {
           ? (isLearningPlanCoverageSection ? "Archived Coverage Tickets" : "Archived Other Learning Plan Tickets")
           : isAdminDashboardView
             ? "Archived Tickets"
+            : isCustomTeamDashboardView
+              ? `Archived ${selectedDashboardTeamPolicy?.label || "Team"} Tickets`
             : "Archived Support Tickets"
       )
       : `Archived ${dashboardActiveTableTitle}`
@@ -1743,12 +1799,16 @@ const AgentDashboard = () => {
           ? (isLearningPlanCoverageSection ? "No archived coverage tickets found." : "No archived other learning plan tickets found.")
           : isAdminDashboardView
             ? "No archived tickets found."
+            : isCustomTeamDashboardView
+              ? `No archived ${selectedDashboardTeamPolicy?.label || "team"} tickets found.`
             : "No archived support tickets found."
       )
     : dashboardAssignedFilter !== "all"
       ? getDashboardAssignedFilterEmptyMessage(dashboardTicketFilter, dashboardAssignedFilterEmptyTarget)
       : isCoverageDashboardView && dashboardTicketFilter === "all"
         ? (isLearningPlanCoverageSection ? "No coverage tickets have been created yet." : "No transferred learning plan tickets have been created yet.")
+        : isCustomTeamDashboardView && dashboardTicketFilter === "all"
+          ? `No ${selectedDashboardTeamPolicy?.label || "team"} tickets are currently available.`
         : dashboardTicketFilter === "all" && !isAdminDashboardView
           ? "No support tickets are currently available."
           : getDashboardEmptyMessage(dashboardTicketFilter);
@@ -2256,7 +2316,11 @@ const AgentDashboard = () => {
     const defaultAdminLandingView = getDefaultAdminLandingView(accessSession);
     let nextView = adminView;
 
-    if ((nextView === "dashboard" || nextView === "console") && !canViewSupportDashboard) {
+    if (nextView === "dashboard" && !canViewSupportDashboard) {
+      nextView = defaultAdminLandingView;
+    }
+
+    if (nextView === "console" && !canViewConsole) {
       nextView = defaultAdminLandingView;
     }
 
@@ -2272,11 +2336,21 @@ const AgentDashboard = () => {
       nextView = defaultAdminLandingView;
     }
 
+    if (isTeamDashboardView(nextView)) {
+      const selectedPolicy = teamRoutingPolicies.find((policy) => policy.key === getTeamKeyFromDashboardView(nextView)) || null;
+      if (!selectedPolicy && !hasCheckedTeamRoutingPolicies) {
+        return;
+      }
+      if (!selectedPolicy || isBuiltInTeamPolicy(selectedPolicy) || (!hasFullAdminAccess && !hasTeamRoutingDashboardAccess(accessSession, selectedPolicy))) {
+        nextView = defaultAdminLandingView;
+      }
+    }
+
     if (nextView !== adminView) {
       setAdminView(nextView);
       setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
     }
-  }, [accessSession, adminView, canManageUsers, canViewAdminDashboard, canViewLearningPlanTeam, canViewSupportDashboard, learningPlanTeamSection]);
+  }, [accessSession, adminView, canManageUsers, canViewAdminDashboard, canViewConsole, canViewLearningPlanTeam, canViewSupportDashboard, hasCheckedTeamRoutingPolicies, hasFullAdminAccess, learningPlanTeamSection, teamRoutingPolicies]);
 
   useEffect(() => {
     const nextNotificationKeys = new Set<string>();
@@ -2705,6 +2779,7 @@ const AgentDashboard = () => {
     const safePolicies = nextPolicies.length ? nextPolicies : defaultTeamRoutingPolicies;
     setActiveTeamRoutingPolicies(safePolicies);
     setTeamRoutingPolicyState(safePolicies);
+    setHasCheckedTeamRoutingPolicies(true);
   }
 
   async function fetchTeamRoutingPoliciesList() {
@@ -3012,11 +3087,14 @@ const AgentDashboard = () => {
         });
 
       void teamsPromise.then((teamsResult) => {
-        if (!isCurrentDashboardSession(requestSession) || !teamsResult.policies) {
+        if (!isCurrentDashboardSession(requestSession)) {
           return;
         }
 
-        applyTeamRoutingPolicies(teamsResult.policies);
+        if (teamsResult.policies) {
+          applyTeamRoutingPolicies(teamsResult.policies);
+        }
+        setHasCheckedTeamRoutingPolicies(true);
       });
 
       void migrationStatusPromise.then((migrationStatusPayload) => {
@@ -3210,11 +3288,21 @@ const AgentDashboard = () => {
     persistAdminSessionState(nextSession);
 
     const nextLandingView = getDefaultAdminLandingView(nextSession);
-    if ((adminView === "dashboard" || adminView === "console") && !hasNonLearningPlanTeamDashboardAccess(nextSession)) {
+    if (adminView === "dashboard" && !hasSupportTeamDashboardAccess(nextSession)) {
+      setAdminView(nextLandingView);
+    }
+    if (adminView === "console" && !hasAnyTeamRoutingDashboardAccess(nextSession)) {
       setAdminView(nextLandingView);
     }
     if (adminView === "coverage" && !hasLearningPlanTeamDashboardAccess(nextSession)) {
       setAdminView(nextLandingView);
+    }
+    if (isTeamDashboardView(adminView)) {
+      const currentTeamKey = getTeamKeyFromDashboardView(adminView);
+      const currentPolicy = teamRoutingPolicies.find((policy) => policy.key === currentTeamKey) || null;
+      if (!currentPolicy || !hasTeamRoutingDashboardAccess(nextSession, currentPolicy)) {
+        setAdminView(nextLandingView);
+      }
     }
   }
 
@@ -5534,6 +5622,10 @@ const AgentDashboard = () => {
                         ? "Standard coverage tickets are grouped here."
                         : "Tickets manually transferred to Learning Plan Team appear here."}
                     </p>
+                  ) : isCustomTeamDashboardView ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Tickets routed to {selectedDashboardTeamPolicy?.label || "this team"} appear here for eligible receivers.
+                    </p>
                   ) : dashboardTicketFilter === "quickResolution" ? (
                     <p className="mt-1 text-xs text-muted-foreground">
                       These tickets skip the chat console and stay available from the dashboard only.
@@ -6227,7 +6319,10 @@ const AgentDashboard = () => {
         value={adminView}
         onValueChange={(value) => {
           const nextView = value as AdminView;
-          if ((nextView === "dashboard" || nextView === "console") && !canViewSupportDashboard) {
+          if (nextView === "dashboard" && !canViewSupportDashboard) {
+            return;
+          }
+          if (nextView === "console" && !canViewConsole) {
             return;
           }
           if (nextView === "adminDashboard" && !canViewAdminDashboard) {
@@ -6239,11 +6334,17 @@ const AgentDashboard = () => {
           if (nextView === "management" && !canManageUsers) {
             return;
           }
+          if (isTeamDashboardView(nextView)) {
+            const selectedPolicy = teamRoutingPolicies.find((policy) => policy.key === getTeamKeyFromDashboardView(nextView)) || null;
+            if (!selectedPolicy || isBuiltInTeamPolicy(selectedPolicy) || (!hasFullAdminAccess && !hasTeamRoutingDashboardAccess(accessSession, selectedPolicy))) {
+              return;
+            }
+          }
           if (nextView !== adminView) {
             closePanel();
           }
           setAdminView(nextView);
-          if (nextView === "dashboard" && dashboardTicketFilter === "coverage") {
+          if (nextView !== "coverage" && dashboardTicketFilter === "coverage") {
             setDashboardTicketFilter("all");
           }
           setDashboardSortOrder(getDefaultDashboardSortOrder(nextView === "coverage" && learningPlanTeamSection === "coverage"));
@@ -6554,7 +6655,20 @@ const AgentDashboard = () => {
                     {!useCompactAdminSidebar ? <span>Learning Plan Team</span> : null}
                   </TabsTrigger>
                 ) : null}
-                {canViewSupportDashboard ? (
+                {customDashboardTeamTabs.map(({ value, policy }) => (
+                  <TabsTrigger
+                    key={value}
+                    value={value}
+                    className={cn(
+                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
+                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                    )}
+                  >
+                    <Users className="h-4 w-4 shrink-0" />
+                    {!useCompactAdminSidebar ? <span className="truncate">{policy.label}</span> : null}
+                  </TabsTrigger>
+                ))}
+                {canViewConsole ? (
                   <TabsTrigger
                     value="console"
                     className={cn(
@@ -6697,6 +6811,11 @@ const AgentDashboard = () => {
             </TabsContent>
           ) : null}
 
+          {customDashboardTeamTabs.map(({ value }) => (
+            <TabsContent key={value} value={value} className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+              {renderDashboardWorkspace()}
+            </TabsContent>
+          ))}
 
           {canManageUsers ? (
             <TabsContent value="management" className="mt-0 min-h-0 w-full flex-1 overflow-y-auto pr-1">
@@ -6866,7 +6985,7 @@ const AgentDashboard = () => {
             </TabsContent>
           ) : null}
 
-          {canViewSupportDashboard ? (
+          {canViewConsole ? (
             <TabsContent value="console" className="mt-0 min-h-0 flex-1">
             <div className="h-full min-h-0 overflow-hidden rounded-3xl border bg-card p-3 shadow-card md:p-4">
               <div className="flex h-full flex-col">
@@ -15062,7 +15181,11 @@ function parseAdminDeepLink(search: string) {
   const shouldOpenManagement = requestedView === "management";
   const shouldOpenAdminDashboard = requestedView === "adminDashboard" || requestedView === "admin";
   const shouldOpenCoverage = requestedView === "coverage";
+  const shouldOpenTeamDashboard = typeof requestedView === "string" && requestedView.startsWith(teamDashboardViewPrefix);
   const shouldOpenConsole = requestedView === "console" || Boolean(requestedTicketId);
+  const requestedTeamView = shouldOpenTeamDashboard
+    ? buildTeamDashboardView(requestedView.slice(teamDashboardViewPrefix.length))
+    : null;
 
   return {
     view: shouldOpenManagement
@@ -15073,6 +15196,8 @@ function parseAdminDeepLink(search: string) {
           ? "adminDashboard" as const
           : shouldOpenCoverage
             ? "coverage" as const
+            : requestedTeamView
+              ? requestedTeamView
             : "dashboard" as const,
     ticketId: requestedTicketId,
     scope: requestedScope === "all" ? "all" as const : "my" as const,
