@@ -5262,6 +5262,89 @@ class AdminLoginTests(SimpleTestCase):
         fetch_legacy_support_user_by_username.assert_not_called()
         register_agent_session.assert_called_once_with("operations1", "instance-ops", "Off")
 
+    def test_admin_login_accepts_staff_password_for_custom_team_access_account(self):
+        curriculum_agent = {
+            "id": 31,
+            "username": "curriculum1",
+            "full_name": "Curriculum Agent",
+            "email": "curriculum.agent@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "canReceiveTickets": True,
+                },
+            ],
+            "metadata": {
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+                "password_hash": make_password("curriculum-pass"),
+            },
+        }
+        registered_session = {
+            "id": 31,
+            "username": "curriculum1",
+            "fullName": "Curriculum Agent",
+            "email": "curriculum.agent@kentbusinesscollege.com",
+            "role": "agent",
+            "sessionActive": True,
+            "consoleStatus": "Off",
+        }
+
+        with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=curriculum_agent),
+            patch.object(services, "run_query_one") as run_query_one,
+            patch.object(services, "fetch_legacy_support_user_by_username") as fetch_legacy_support_user_by_username,
+            patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
+        ):
+            response = services.get_admin_login_response(
+                {"username": "Curriculum1", "password": "curriculum-pass", "instanceId": "instance-curriculum"}
+            )
+
+        self.assertEqual(response["admin"], registered_session)
+        self.assertEqual(response["message"], "Login successful.")
+        run_query_one.assert_not_called()
+        fetch_legacy_support_user_by_username.assert_not_called()
+        register_agent_session.assert_called_once_with("curriculum1", "instance-curriculum", "Off")
+
+    def test_admin_login_rejects_staff_password_account_without_team_or_admin_access(self):
+        no_access_agent = {
+            "id": 32,
+            "username": "noaccess1",
+            "full_name": "No Access",
+            "email": "noaccess@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+                "password_hash": make_password("no-access-pass"),
+            },
+        }
+
+        with (
+            patch.object(services, "fetch_agent_account_by_username", return_value=no_access_agent),
+            patch.object(services, "fetch_optional_any_account_team_access", return_value=False),
+            patch.object(services, "fetch_legacy_support_user_by_username") as fetch_legacy_support_user_by_username,
+            patch.object(services, "register_agent_session") as register_agent_session,
+        ):
+            with self.assertRaises(services.ApiError) as error_context:
+                services.get_admin_login_response(
+                    {"username": "noaccess1", "password": "no-access-pass", "instanceId": "instance-noaccess"}
+                )
+
+        self.assertEqual(error_context.exception.status_code, 403)
+        self.assertEqual(error_context.exception.message, "This account must have team, support, operations, or admin access.")
+        fetch_legacy_support_user_by_username.assert_not_called()
+        register_agent_session.assert_not_called()
+
     def test_admin_login_rejects_kbc_auth_user_without_support_or_admin_access_after_password_check(self):
         legacy_user = {
             "id": 6,
@@ -5291,7 +5374,7 @@ class AdminLoginTests(SimpleTestCase):
                 )
 
         self.assertEqual(error_context.exception.status_code, 403)
-        self.assertEqual(error_context.exception.message, "This account must have support, operations, or admin access.")
+        self.assertEqual(error_context.exception.message, "This account must have team, support, operations, or admin access.")
         sync_support_staff_account_from_legacy_auth_user.assert_not_called()
         register_agent_session.assert_not_called()
 
@@ -5480,6 +5563,108 @@ class AdminLoginTests(SimpleTestCase):
 
         self.assertEqual(error_context.exception.status_code, 403)
         self.assertEqual(error_context.exception.message, "Your Microsoft account does not have access to the support portal.")
+
+    def test_admin_microsoft_login_allows_custom_team_access_user_without_entra_admin_role(self):
+        id_token = build_unverified_jwt(
+            {
+                "nonce": "nonce-curriculum",
+                "preferred_username": "curriculum.agent@kentbusinesscollege.com",
+            }
+        )
+        curriculum_agent = {
+            "id": 31,
+            "username": "curriculum1",
+            "full_name": "Curriculum Agent",
+            "email": "curriculum.agent@kentbusinesscollege.com",
+            "role": "agent",
+            "account_scope": "staff",
+            "is_active": True,
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "canReceiveTickets": True,
+                },
+            ],
+            "metadata": {
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+            },
+        }
+        refreshed_agent = {
+            **curriculum_agent,
+            "metadata": {
+                **curriculum_agent["metadata"],
+                "entra_object_id": "entra-object-curriculum",
+                "entra_email": "curriculum.agent@kentbusinesscollege.com",
+            },
+        }
+        registered_session = {
+            "id": 31,
+            "username": "curriculum1",
+            "fullName": "Curriculum Agent",
+            "email": "curriculum.agent@kentbusinesscollege.com",
+            "role": "agent",
+            "sessionActive": True,
+            "consoleStatus": "Off",
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.settings, "AZURE_LOGIN_TENANT_ID", "tenant-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_ID", "client-123"),
+            patch.object(services.settings, "AZURE_LOGIN_CLIENT_SECRET", "secret-123"),
+            patch.object(
+                services,
+                "post_form_request",
+                return_value=(True, True, 200, {"access_token": "access-token-curriculum", "id_token": id_token}),
+            ),
+            patch.object(
+                services,
+                "fetch_microsoft_graph_me",
+                return_value=(
+                    True,
+                    True,
+                    200,
+                    {
+                        "id": "entra-object-curriculum",
+                        "mail": "curriculum.agent@kentbusinesscollege.com",
+                        "userPrincipalName": "curriculum.agent@kentbusinesscollege.com",
+                        "displayName": "Curriculum Agent",
+                    },
+                ),
+            ),
+            patch.object(services, "fetch_microsoft_graph_directory_roles", return_value=(True, True, 200, [])),
+            patch.object(services, "fetch_staff_support_account_by_email", return_value=curriculum_agent) as fetch_staff_support_account_by_email,
+            patch.object(services, "fetch_legacy_support_user_by_email") as fetch_legacy_support_user_by_email,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "fetch_agent_account_by_id", return_value=refreshed_agent),
+            patch.object(services, "register_agent_session", return_value=registered_session) as register_agent_session,
+        ):
+            response = services.get_admin_microsoft_login_response(
+                {
+                    "code": "auth-code-curriculum",
+                    "redirectUri": "http://127.0.0.1:3000/api/admin/microsoft/callback",
+                    "expectedNonce": "nonce-curriculum",
+                    "instanceId": "instance-curriculum",
+                }
+            )
+
+        self.assertEqual(response["admin"], registered_session)
+        fetch_staff_support_account_by_email.assert_called()
+        fetch_legacy_support_user_by_email.assert_not_called()
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertEqual(saved_metadata["entra_object_id"], "entra-object-curriculum")
+        self.assertEqual(saved_metadata["entra_email"], "curriculum.agent@kentbusinesscollege.com")
+        register_agent_session.assert_called_once_with("curriculum1", "instance-curriculum", "Off")
 
     def test_admin_microsoft_login_syncs_operations_access_user_without_entra_admin_role(self):
         id_token = build_unverified_jwt(

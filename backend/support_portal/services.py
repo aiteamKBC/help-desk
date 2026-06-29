@@ -8100,6 +8100,32 @@ def fetch_optional_account_team_access(account_id: Any, team_key: Any) -> bool:
         return False
 
 
+def fetch_optional_any_account_team_access(account_id: Any) -> bool:
+    normalized_account_id = parse_int(account_id)
+    if normalized_account_id <= 0:
+        return False
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM support_account_team_access ata
+                JOIN support_teams st
+                  ON st.id = ata.team_id
+                WHERE ata.account_id = %s
+                  AND st.is_active = TRUE
+                  AND ata.can_receive_tickets = TRUE
+                LIMIT 1
+                """,
+                [normalized_account_id],
+            )
+            row = cursor.fetchone()
+            return isinstance(row, (list, tuple, dict))
+    except Exception:
+        return False
+
+
 def normalize_preloaded_team_access_keys(value: Any) -> set[str]:
     team_keys: set[str] = set()
     if isinstance(value, dict):
@@ -8617,6 +8643,28 @@ def actor_has_team_routing_access(actor: dict[str, Any] | None, policy: dict[str
     return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
         actor.get("id"),
         policy["key"],
+    )
+
+
+def account_has_any_team_receiver_access(account: dict[str, Any] | None) -> bool:
+    if not is_active_staff_support_account(account):
+        return False
+
+    if get_preloaded_account_team_access_keys(account):
+        return True
+
+    return fetch_optional_any_account_team_access(account.get("id"))
+
+
+def actor_has_support_portal_login_access(actor: dict[str, Any] | None) -> bool:
+    if not is_active_staff_support_account(actor):
+        return False
+
+    return (
+        actor_has_support_dashboard_access(actor)
+        or actor_has_operations_dashboard_access(actor)
+        or actor_has_admin_dashboard_access(actor)
+        or account_has_any_team_receiver_access(actor)
     )
 
 
@@ -13050,11 +13098,7 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
             [normalize_email(username), ACCOUNT_SCOPE_STAFF],
         )
     )
-    if dashboard_access_agent and (
-        actor_has_support_dashboard_access(dashboard_access_agent)
-        or actor_has_operations_dashboard_access(dashboard_access_agent)
-        or actor_has_admin_dashboard_access(dashboard_access_agent)
-    ):
+    if dashboard_access_agent and actor_has_support_portal_login_access(dashboard_access_agent):
         agent_metadata = normalize_json_object(dashboard_access_agent.get("metadata"))
         if get_agent_password_hash(agent_metadata):
             if not verify_agent_password(dashboard_access_agent, password):
@@ -13072,6 +13116,12 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
         # fallback below or Microsoft sign-in.
         if not fetch_legacy_support_user_by_username(username):
             raise ApiError(401, "This account does not have a password set. Please sign in with Microsoft.")
+    elif dashboard_access_agent:
+        agent_metadata = normalize_json_object(dashboard_access_agent.get("metadata"))
+        if get_agent_password_hash(agent_metadata):
+            if not verify_agent_password(dashboard_access_agent, password):
+                raise ApiError(401, "Invalid username or password.")
+            raise ApiError(403, "This account must have team, support, operations, or admin access.")
 
     # Fallback: legacy database login
     legacy_user = fetch_legacy_support_user_by_username(username)
@@ -13083,7 +13133,7 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
         raise ApiError(401, "Invalid username or password.")
 
     if not legacy_auth_user_has_admin_login_access(legacy_user):
-        raise ApiError(403, "This account must have support, operations, or admin access.")
+        raise ApiError(403, "This account must have team, support, operations, or admin access.")
 
     matched_agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
@@ -13289,16 +13339,27 @@ def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[st
 def _login_support_access_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
     """Login path for staff who have KBC auth access but no Entra admin role."""
     candidate_emails = list(dict.fromkeys([normalized_email, *extract_microsoft_login_email_candidates(profile)]))
-    legacy_user = next(
-        (candidate for email in candidate_emails if (candidate := fetch_legacy_support_user_by_email(email))),
+    agent = next(
+        (
+            candidate
+            for email in candidate_emails
+            if (candidate := fetch_staff_support_account_by_email(email))
+            and actor_has_support_portal_login_access(candidate)
+        ),
         None,
     )
-    if not legacy_user:
-        raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
-    if not legacy_auth_user_has_admin_login_access(legacy_user):
-        raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
 
-    agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
+    if not agent:
+        legacy_user = next(
+            (candidate for email in candidate_emails if (candidate := fetch_legacy_support_user_by_email(email))),
+            None,
+        )
+        if not legacy_user:
+            raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+        if not legacy_auth_user_has_admin_login_access(legacy_user):
+            raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+
+        agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
     if not normalize_bool(agent.get("is_active")):
         raise ApiError(403, "Your account has been disabled. Please contact an administrator.")
