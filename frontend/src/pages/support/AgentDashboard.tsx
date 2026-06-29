@@ -724,6 +724,10 @@ function getLegacyReceiverAccessKey(teamKey: string): LegacyTeamReceiverAccessKe
   return undefined;
 }
 
+function isBuiltInTeamPolicy(policy: Pick<TeamRoutingPolicy, "key"> | null | undefined) {
+  return policy?.key === supportTeamRoutingPolicy.key || policy?.key === learningPlanTeamRoutingPolicy.key;
+}
+
 function buildTeamRoutingPoliciesFromTeams(teams: AdminTeam[] | null | undefined): TeamRoutingPolicy[] {
   if (!Array.isArray(teams) || teams.length === 0) {
     return defaultTeamRoutingPolicies;
@@ -1063,6 +1067,11 @@ const AgentDashboard = () => {
   const [newTeamName, setNewTeamName] = useState("");
   const [newTeamDescription, setNewTeamDescription] = useState("");
   const [isCreatingTeam, setIsCreatingTeam] = useState(false);
+  const [teamSettingsKey, setTeamSettingsKey] = useState("");
+  const [teamSettingsName, setTeamSettingsName] = useState("");
+  const [teamSettingsDescription, setTeamSettingsDescription] = useState("");
+  const [savingTeamKey, setSavingTeamKey] = useState("");
+  const [disablingTeamKey, setDisablingTeamKey] = useState("");
   const [teamRoutingPolicyState, setTeamRoutingPolicyState] = useState<TeamRoutingPolicy[]>(defaultTeamRoutingPolicies);
   const [managementAccessTab, setManagementAccessTab] = useState<ManagementAccessTab>(buildManagementTeamTabValue(supportTeamRoutingPolicy.key));
   const [togglingAccessIds, setTogglingAccessIds] = useState<Set<number>>(new Set());
@@ -1073,6 +1082,8 @@ const AgentDashboard = () => {
     value: buildManagementTeamTabValue(policy.key),
     policy,
   }));
+  const selectedManagementTeamKey = getManagementTeamKeyFromTab(managementAccessTab);
+  const selectedManagementTeamPolicy = teamRoutingPolicies.find((policy) => policy.key === selectedManagementTeamKey) || null;
   const chatPreviewAttachmentUrl = chatPreviewAttachment ? getChatAttachmentOpenUrl(chatPreviewAttachment) : "";
   const chatPreviewAttachmentKind = getChatAttachmentPreviewKind(chatPreviewAttachment);
   const [chatbotWorkflowConfigured, setChatbotWorkflowConfigured] = useState(false);
@@ -1347,6 +1358,25 @@ const AgentDashboard = () => {
 
     setManagementAccessTab(buildManagementTeamTabValue(teamRoutingPolicies[0]?.key || supportTeamRoutingPolicy.key));
   }, [managementAccessTab, teamRoutingPolicies]);
+
+  useEffect(() => {
+    if (!selectedManagementTeamPolicy || isBuiltInTeamPolicy(selectedManagementTeamPolicy)) {
+      if (teamSettingsKey) {
+        setTeamSettingsKey("");
+        setTeamSettingsName("");
+        setTeamSettingsDescription("");
+      }
+      return;
+    }
+
+    if (teamSettingsKey === selectedManagementTeamPolicy.key) {
+      return;
+    }
+
+    setTeamSettingsKey(selectedManagementTeamPolicy.key);
+    setTeamSettingsName(selectedManagementTeamPolicy.label);
+    setTeamSettingsDescription(selectedManagementTeamPolicy.description);
+  }, [selectedManagementTeamPolicy, teamSettingsKey]);
 
   useEffect(() => {
     if (typeof document === "undefined" || isStackedAdminLayout) {
@@ -2744,6 +2774,96 @@ const AgentDashboard = () => {
       toast.error("Could not create this team.");
     } finally {
       setIsCreatingTeam(false);
+    }
+  }
+
+  async function saveTeamSettings(event: FormEvent<HTMLFormElement>, policy: TeamRoutingPolicy) {
+    event.preventDefault();
+    if (isBuiltInTeamPolicy(policy)) {
+      return;
+    }
+
+    const draftName = (teamSettingsKey === policy.key ? teamSettingsName : policy.label).trim();
+    const draftDescription = (teamSettingsKey === policy.key ? teamSettingsDescription : policy.description).trim();
+    if (!draftName) {
+      toast.error("Team name is required.");
+      return;
+    }
+
+    setSavingTeamKey(policy.key);
+    try {
+      const response = await fetch(`/api/admin/teams/${encodeURIComponent(policy.key)}`, {
+        method: "PATCH",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({
+          name: draftName,
+          description: draftDescription,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as TeamMutationResponse | null;
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "Could not update this team.");
+        return;
+      }
+
+      const updatedPolicy = buildTeamRoutingPolicyFromTeam(payload?.team);
+      if (updatedPolicy) {
+        const policiesByKey = new Map(teamRoutingPolicies.map((teamPolicy) => [teamPolicy.key, teamPolicy]));
+        policiesByKey.set(updatedPolicy.key, updatedPolicy);
+        applyTeamRoutingPolicies([...policiesByKey.values()]);
+        setTeamSettingsKey(updatedPolicy.key);
+        setTeamSettingsName(updatedPolicy.label);
+        setTeamSettingsDescription(updatedPolicy.description);
+      }
+
+      void refreshTicketsOnly(true);
+      toast.success(`${updatedPolicy?.label || draftName} team updated.`);
+    } catch {
+      toast.error("Could not update this team.");
+    } finally {
+      setSavingTeamKey("");
+    }
+  }
+
+  async function disableTeam(policy: TeamRoutingPolicy) {
+    if (isBuiltInTeamPolicy(policy)) {
+      return;
+    }
+
+    if (typeof window !== "undefined" && !window.confirm(`Disable ${policy.label}? Active tickets must be moved or closed first.`)) {
+      return;
+    }
+
+    setDisablingTeamKey(policy.key);
+    try {
+      const response = await fetch(`/api/admin/teams/${encodeURIComponent(policy.key)}`, {
+        method: "DELETE",
+        headers: buildAdminJsonHeaders(),
+      });
+      const payload = (await response.json().catch(() => null)) as TeamMutationResponse | null;
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "Could not disable this team.");
+        return;
+      }
+
+      const nextPolicies = teamRoutingPolicies.filter((teamPolicy) => teamPolicy.key !== policy.key);
+      applyTeamRoutingPolicies(nextPolicies);
+      setManagementAccessTab(buildManagementTeamTabValue(nextPolicies[0]?.key || supportTeamRoutingPolicy.key));
+      setTeamSettingsKey("");
+      setTeamSettingsName("");
+      setTeamSettingsDescription("");
+      void refreshAgentsOnly(true);
+      toast.success(`${policy.label} team disabled.`);
+    } catch {
+      toast.error("Could not disable this team.");
+    } finally {
+      setDisablingTeamKey("");
     }
   }
 
@@ -5919,6 +6039,89 @@ const AgentDashboard = () => {
     return "bg-sky-100 text-sky-700";
   }
 
+  function renderManagementTeamSettings(policy: TeamRoutingPolicy): ReactNode {
+    if (isBuiltInTeamPolicy(policy)) {
+      return null;
+    }
+
+    const draftName = teamSettingsKey === policy.key ? teamSettingsName : policy.label;
+    const draftDescription = teamSettingsKey === policy.key ? teamSettingsDescription : policy.description;
+    const isSavingTeam = savingTeamKey === policy.key;
+    const isDisablingTeam = disablingTeamKey === policy.key;
+    const hasChanges = (
+      draftName.trim() !== policy.label
+      || draftDescription.trim() !== policy.description
+    );
+
+    return (
+      <form
+        onSubmit={(event) => void saveTeamSettings(event, policy)}
+        className="border-b bg-sky-50/45 px-4 py-4 sm:px-5"
+      >
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+          <div className="min-w-0 flex-1">
+            <Label htmlFor={`team-name-${policy.key}`} className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Team Name
+            </Label>
+            <Input
+              id={`team-name-${policy.key}`}
+              value={draftName}
+              onChange={(event) => {
+                setTeamSettingsKey(policy.key);
+                setTeamSettingsName(event.target.value);
+                if (teamSettingsKey !== policy.key) {
+                  setTeamSettingsDescription(policy.description);
+                }
+              }}
+              className="mt-1 bg-background"
+              disabled={isSavingTeam || isDisablingTeam}
+            />
+          </div>
+          <div className="min-w-0 flex-[1.4]">
+            <Label htmlFor={`team-description-${policy.key}`} className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Transfer Description
+            </Label>
+            <Input
+              id={`team-description-${policy.key}`}
+              value={draftDescription}
+              onChange={(event) => {
+                setTeamSettingsKey(policy.key);
+                if (teamSettingsKey !== policy.key) {
+                  setTeamSettingsName(policy.label);
+                }
+                setTeamSettingsDescription(event.target.value);
+              }}
+              className="mt-1 bg-background"
+              disabled={isSavingTeam || isDisablingTeam}
+            />
+          </div>
+          <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+            <Button
+              type="submit"
+              disabled={isSavingTeam || isDisablingTeam || !draftName.trim() || !hasChanges}
+            >
+              {isSavingTeam ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+              Save Team
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              className="border-rose-200 bg-white text-rose-700 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-800"
+              disabled={isSavingTeam || isDisablingTeam}
+              onClick={() => void disableTeam(policy)}
+            >
+              {isDisablingTeam ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Archive className="mr-2 h-4 w-4" />}
+              Disable
+            </Button>
+          </div>
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          Renaming a team also updates tickets currently assigned to the old team name.
+        </p>
+      </form>
+    );
+  }
+
   function renderManagementAccessRows(tab: ManagementAccessTab): ReactNode {
     const selectedTeamPolicy = tab === "admins"
       ? null
@@ -6570,8 +6773,9 @@ const AgentDashboard = () => {
                       </TabsTrigger>
                     </TabsList>
                   </div>
-                  {managementTeamTabs.map(({ value }) => (
+                  {managementTeamTabs.map(({ value, policy }) => (
                     <TabsContent key={value} value={value} className="m-0">
+                      {renderManagementTeamSettings(policy)}
                       <div className="divide-y">{renderManagementAccessRows(value)}</div>
                     </TabsContent>
                   ))}

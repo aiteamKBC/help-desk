@@ -21,6 +21,7 @@ urlpatterns = [
     path("admin/session-heartbeat", views.admin_session_heartbeat, name="admin-session-heartbeat"),
     path("admin/accounts", views.admin_accounts, name="admin-accounts"),
     path("admin/teams", views.admin_teams, name="admin-teams"),
+    path("admin/teams/<str:team_key>", views.admin_team_detail, name="admin-team-detail"),
     path("admin/agents", views.admin_accounts, name="admin-agents"),
     path("admin/agents/search", views.admin_agents_search, name="admin-agents-search"),
     path("admin/accounts/<int:account_id>/team-access", views.admin_account_team_access, name="admin-account-team-access"),

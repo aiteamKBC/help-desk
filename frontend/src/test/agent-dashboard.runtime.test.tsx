@@ -597,6 +597,129 @@ describe("AgentDashboard runtime", () => {
     expect(screen.getByText(/No support access/i)).toBeInTheDocument();
   });
 
+  it("loads dynamic teams into the transfer menu", async () => {
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/teams")) {
+        return new Response(JSON.stringify({
+          teams: [
+            {
+              id: 7,
+              key: "curriculum",
+              name: "Curriculum Team",
+              assignedTeam: "Curriculum Team",
+              label: "Curriculum Team",
+              description: "Route this ticket to the curriculum queue.",
+              receiverAccessMetadataKey: "team_access:curriculum",
+              isActive: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Overview");
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith("/api/admin/teams", { cache: "no-store" });
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Transfer ticket KBC-000001 to another team/i }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(await screen.findByRole("menuitem", { name: /Curriculum Team/i })).toBeInTheDocument();
+  });
+
+  it("toggles dynamic team receiver access through the team-access endpoint", async () => {
+    const originalFetch = global.fetch;
+    const teamAccessRequests: Array<Record<string, unknown>> = [];
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/teams")) {
+        return new Response(JSON.stringify({
+          teams: [
+            {
+              id: 7,
+              key: "curriculum",
+              name: "Curriculum Team",
+              assignedTeam: "Curriculum Team",
+              label: "Curriculum Team",
+              description: "Route this ticket to the curriculum queue.",
+              receiverAccessMetadataKey: "team_access:curriculum",
+              isActive: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.endsWith("/api/admin/accounts/41/team-access") && init?.method === "PATCH") {
+        const parsedBody = JSON.parse(String(init.body || "{}")) as Record<string, unknown>;
+        teamAccessRequests.push(parsedBody);
+        return new Response(JSON.stringify({
+          agent: {
+            ...dashboardPayload.accounts.accounts[1],
+            teamAccess: [
+              {
+                key: "curriculum",
+                name: "Curriculum Team",
+                assignedTeam: "Curriculum Team",
+                label: "Curriculum Team",
+                canReceiveTickets: true,
+              },
+            ],
+            teamAccessKeys: ["curriculum"],
+          },
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=management"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("tab", { name: /Curriculum Team/i })).toBeInTheDocument();
+    const curriculumTab = screen.getByRole("tab", { name: /Curriculum Team/i });
+    fireEvent.mouseDown(curriculumTab, {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.mouseUp(curriculumTab);
+    fireEvent.click(curriculumTab);
+    await waitFor(() => {
+      expect(curriculumTab).toHaveAttribute("data-state", "active");
+    });
+    fireEvent.click(screen.getByRole("switch", { name: /Toggle Curriculum Team access for Test Test/i }));
+
+    await waitFor(() => {
+      expect(teamAccessRequests).toEqual([{ teamKey: "curriculum", receiveTickets: true }]);
+    });
+  });
+
   it("surfaces live handoffs from ticketState even before chatIsActive is set", async () => {
     const originalFetch = global.fetch;
     const waitingLiveTicket = {

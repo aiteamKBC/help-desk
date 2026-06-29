@@ -8327,6 +8327,114 @@ def create_support_team(payload: dict[str, Any]) -> dict[str, Any]:
     return {"team": serialize_support_team(row)}
 
 
+def require_mutable_support_team(team_key: str) -> None:
+    if team_key in LEGACY_TEAM_ROUTING_POLICY_KEYS:
+        raise ApiError(400, "Built-in teams cannot be changed from Team Management.")
+
+
+def support_team_transaction():
+    return transaction.atomic()
+
+
+def support_team_cursor():
+    return connection.cursor()
+
+
+def update_support_team(team_key: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    require_mutable_support_team(normalized_team_key)
+
+    current_row = fetch_support_team_by_key(normalized_team_key)
+    if not current_row:
+        raise ApiError(404, "Team not found.")
+
+    next_name = sanitize_text(payload.get("name") or payload.get("label") or payload.get("assignedTeam"))
+    if not next_name:
+        raise ApiError(400, "Team name is required.")
+
+    next_description = sanitize_text(payload.get("description"))
+    next_receiver_error_ticket_label = sanitize_text(payload.get("receiverErrorTicketLabel")) or next_name
+    previous_name = sanitize_text(current_row.get("name"))
+
+    with support_team_transaction():
+        row = run_query_one(
+            """
+            UPDATE support_teams
+            SET name = %s,
+                description = %s,
+                receiver_error_ticket_label = %s,
+                updated_at = NOW()
+            WHERE key = %s
+              AND is_active = TRUE
+            RETURNING id, key, name, description, receiver_access_metadata_key,
+                      receiver_error_ticket_label, is_active, metadata
+            """,
+            [
+                next_name,
+                next_description,
+                next_receiver_error_ticket_label,
+                normalized_team_key,
+            ],
+        )
+        if not row:
+            raise ApiError(404, "Team not found.")
+
+        if previous_name and previous_name.casefold() != next_name.casefold():
+            with support_team_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET assigned_team = %s,
+                        updated_at = NOW()
+                    WHERE LOWER(TRIM(assigned_team)) = %s
+                    """,
+                    [next_name, previous_name.lower()],
+                )
+
+    return {"team": serialize_support_team(row)}
+
+
+def disable_support_team(team_key: Any) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    require_mutable_support_team(normalized_team_key)
+
+    current_row = fetch_support_team_by_key(normalized_team_key)
+    if not current_row:
+        raise ApiError(404, "Team not found.")
+
+    team_name = sanitize_text(current_row.get("name"))
+    active_ticket_count_row = run_query_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM tickets
+        WHERE LOWER(TRIM(assigned_team)) = %s
+          AND status <> 'Closed'
+          AND is_archived = FALSE
+        """,
+        [team_name.lower()],
+    )
+    active_ticket_count = parse_int(active_ticket_count_row.get("count") if active_ticket_count_row else 0)
+    if active_ticket_count > 0:
+        raise ApiError(400, "Move or close active tickets before disabling this team.")
+
+    row = run_query_one(
+        """
+        UPDATE support_teams
+        SET is_active = FALSE,
+            updated_at = NOW()
+        WHERE key = %s
+          AND is_active = TRUE
+        RETURNING id, key, name, description, receiver_access_metadata_key,
+                  receiver_error_ticket_label, is_active, metadata
+        """,
+        [normalized_team_key],
+    )
+    if not row:
+        raise ApiError(404, "Team not found.")
+
+    return {"team": serialize_support_team(row)}
+
+
 def persist_account_team_access(
     account_id: int,
     team_key: Any,

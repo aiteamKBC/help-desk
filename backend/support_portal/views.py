@@ -42,6 +42,7 @@ from .services import (
     create_support_session_request,
     create_ticket,
     delete_admin_ticket_permanently,
+    disable_support_team,
     get_admin_login_response,
     get_admin_microsoft_login_response,
     get_admin_ticket_attachment_file,
@@ -84,6 +85,7 @@ from .services import (
     update_agent_team_access,
     update_agent_operations_access,
     update_agent_support_access,
+    update_support_team,
     update_ticket,
 )
 
@@ -686,6 +688,17 @@ def admin_teams(request):
 
         require_request_admin_session(request)
         return JsonResponse(list_support_teams())
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["PATCH", "DELETE"])
+def admin_team_detail(request, team_key: str):
+    try:
+        require_request_admin_session(request, allowed_roles=ADMIN_ACCESS_ROLES)
+        if request.method == "DELETE":
+            return JsonResponse(disable_support_team(team_key))
+        return JsonResponse(update_support_team(team_key, parse_json_body(request)))
     except Exception as error:
         return handle_api_error(error)
 

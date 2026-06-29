@@ -3091,6 +3091,66 @@ class SupportSessionValidationTests(SimpleTestCase):
         )
 
 
+class SupportTeamManagementTests(SimpleTestCase):
+    def build_team_row(self, **overrides):
+        return {
+            "id": 3,
+            "key": "curriculum",
+            "name": "Curriculum Team",
+            "description": "",
+            "receiver_access_metadata_key": "team_access:curriculum",
+            "receiver_error_ticket_label": "Curriculum Team",
+            "is_active": True,
+            "metadata": {},
+            **overrides,
+        }
+
+    def test_update_support_team_renames_matching_ticket_assignments(self):
+        current_team = self.build_team_row()
+        updated_team = self.build_team_row(
+            name="Curriculum Ops",
+            description="Curriculum routing",
+            receiver_error_ticket_label="Curriculum Ops",
+        )
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+
+        with (
+            patch.object(services, "run_query_one", side_effect=[current_team, updated_team]) as run_query_one,
+            patch.object(services, "support_team_transaction", return_value=nullcontext()),
+            patch.object(services, "support_team_cursor", return_value=cursor_context),
+        ):
+            result = services.update_support_team(
+                "curriculum",
+                {"name": "Curriculum Ops", "description": "Curriculum routing"},
+            )
+
+        self.assertEqual(result["team"]["name"], "Curriculum Ops")
+        self.assertEqual(run_query_one.call_count, 2)
+        cursor.execute.assert_called_once()
+        self.assertIn("UPDATE tickets", cursor.execute.call_args.args[0])
+        self.assertEqual(cursor.execute.call_args.args[1], ["Curriculum Ops", "curriculum team"])
+
+    def test_disable_support_team_rejects_active_tickets(self):
+        with patch.object(services, "run_query_one", side_effect=[self.build_team_row(), {"count": 2}]):
+            with self.assertRaises(services.ApiError) as context:
+                services.disable_support_team("curriculum")
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertEqual(context.exception.message, "Move or close active tickets before disabling this team.")
+
+    def test_disable_support_team_soft_disables_custom_team(self):
+        disabled_team = self.build_team_row(is_active=False)
+
+        with patch.object(services, "run_query_one", side_effect=[self.build_team_row(), {"count": 0}, disabled_team]) as run_query_one:
+            result = services.disable_support_team("curriculum")
+
+        self.assertFalse(result["team"]["isActive"])
+        self.assertEqual(run_query_one.call_count, 3)
+
+
 class SlaPolicyTests(SimpleTestCase):
     def test_open_ticket_keeps_pending_review(self):
         sla_status, attention_required, attention_reason = services.derive_sla_state(
