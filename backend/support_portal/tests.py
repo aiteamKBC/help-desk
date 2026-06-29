@@ -1218,10 +1218,71 @@ class AdminSessionViewTests(SimpleTestCase):
                     "legacyOperationsAccess": False,
                     "legacyAdminAccess": False,
                     "entraDirectoryAdmin": False,
+                    "teamAccess": [],
+                    "teamAccessKeys": [],
                 }
             },
         )
         self.assertIn("csrftoken", response.cookies)
+
+    def test_admin_session_returns_dynamic_team_access(self):
+        request = self.factory.get("/api/admin/session")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 4,
+                    "username": "omar1",
+                    "fullName": "Omar One",
+                    "email": None,
+                    "role": "agent",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+        actor = {
+            "id": 4,
+            "username": "omar1",
+            "full_name": "Omar One",
+            "email": None,
+            "role": "agent",
+            "metadata": {},
+        }
+        actor_with_team_access = {
+            **actor,
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "label": "Curriculum Team",
+                    "canReceiveTickets": True,
+                }
+            ],
+        }
+
+        with (
+            patch.object(views, "require_agent_session_actor", return_value=actor),
+            patch.object(views, "attach_account_team_access", return_value=[actor_with_team_access]),
+            patch.object(views, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = views.admin_session(request)
+
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.content.decode())
+        self.assertEqual(payload["admin"]["teamAccessKeys"], ["curriculum"])
+        self.assertEqual(
+            payload["admin"]["teamAccess"],
+            [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "label": "Curriculum Team",
+                    "canReceiveTickets": True,
+                }
+            ],
+        )
 
     def test_admin_session_heartbeat_returns_server_managed_admin_identity(self):
         request = self.factory.post(
@@ -1284,6 +1345,8 @@ class AdminSessionViewTests(SimpleTestCase):
                     "legacyOperationsAccess": False,
                     "legacyAdminAccess": False,
                     "entraDirectoryAdmin": False,
+                    "teamAccess": [],
+                    "teamAccessKeys": [],
                 },
             },
         )

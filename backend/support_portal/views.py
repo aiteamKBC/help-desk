@@ -27,6 +27,7 @@ from .services import (
     acknowledge_learning_plan_transfer_notification,
     acknowledge_coverage_tutor_response,
     accept_ticket_transfer_request,
+    attach_account_team_access,
     ApiError,
     confirm_coverage_tutor_session,
     reject_ticket_transfer_request,
@@ -428,8 +429,9 @@ def build_session_bound_admin_payload(
 
 
 def build_admin_session_response(actor: dict, session_payload: dict) -> dict:
+    actor_with_team_access = attach_account_team_access([actor])[0]
     serialized_actor = serialize_agent(
-        actor,
+        actor_with_team_access,
         open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
     )
     return {
@@ -446,6 +448,8 @@ def build_admin_session_response(actor: dict, session_payload: dict) -> dict:
         "legacyOperationsAccess": bool(serialized_actor.get("legacyOperationsAccess")),
         "legacyAdminAccess": bool(serialized_actor.get("legacyAdminAccess")),
         "entraDirectoryAdmin": bool(serialized_actor.get("entraDirectoryAdmin")),
+        "teamAccess": serialized_actor.get("teamAccess") or [],
+        "teamAccessKeys": serialized_actor.get("teamAccessKeys") or [],
     }
 
 
