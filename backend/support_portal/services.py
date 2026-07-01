@@ -8293,6 +8293,23 @@ def account_has_preloaded_team_access(account: dict[str, Any] | None, team_key: 
     return sanitize_text(team_key).lower() in get_preloaded_account_team_access_keys(account)
 
 
+def apply_metadata_team_access_key(metadata: Any, team_key: Any, enabled: bool) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    normalized_metadata = normalize_json_object(metadata)
+    team_keys = get_preloaded_account_team_access_keys({"metadata": normalized_metadata})
+    if enabled:
+        team_keys.add(normalized_team_key)
+    else:
+        team_keys.discard(normalized_team_key)
+
+    # Keep one canonical local cache so stale legacy-shaped keys cannot re-enable a receiver.
+    normalized_metadata["team_access_keys"] = sorted(team_keys)
+    normalized_metadata.pop("teamAccessKeys", None)
+    normalized_metadata.pop("team_access", None)
+    normalized_metadata.pop("teamAccess", None)
+    return normalized_metadata
+
+
 def serialize_agent_team_access_from_policy(policy: dict[str, Any]) -> dict[str, Any]:
     return {
         "key": sanitize_text(policy.get("key")).lower(),
@@ -8757,6 +8774,13 @@ def update_agent_team_access(agent_id: int, *, team_key: Any, receive_tickets: b
     if not team:
         raise ApiError(404, "Team not found.")
 
+    metadata = normalize_json_object(agent.get("metadata"))
+    updated_metadata = (
+        apply_metadata_team_access_key(metadata, normalized_team_key, False)
+        if normalized_team_key not in LEGACY_TEAM_ROUTING_POLICY_KEYS and not receive_tickets
+        else metadata
+    )
+
     with transaction.atomic():
         persist_account_team_access(
             agent_id,
@@ -8764,7 +8788,10 @@ def update_agent_team_access(agent_id: int, *, team_key: Any, receive_tickets: b
             receive_tickets,
             strict=True,
         )
+        if updated_metadata != metadata:
+            persist_agent_metadata(agent_id, updated_metadata)
         sync_account_team_access_group_membership(agent, team, receive_tickets)
+    agent["metadata"] = updated_metadata
     return serialize_agent(
         attach_account_team_access([agent])[0],
         open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),

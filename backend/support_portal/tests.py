@@ -3361,6 +3361,43 @@ class SupportTeamManagementTests(SimpleTestCase):
         persist_account_team_access.assert_called_once_with(21, "curriculum", True, strict=True)
         sync_legacy_access_group_membership.assert_called_once_with(42, "Curriculum Team Access", True)
 
+    def test_update_agent_team_access_disable_removes_stale_metadata_key(self):
+        agent = {
+            "id": 21,
+            "username": "curriculum.agent",
+            "full_name": "Curriculum Agent",
+            "email": "curriculum.agent@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 42,
+                "team_access_keys": ["curriculum", "other_team"],
+                "teamAccessKeys": ["curriculum"],
+                "team_access": [{"key": "curriculum", "canReceiveTickets": True}],
+            },
+        }
+        team = self.build_team_row(metadata={"auth_group_name": "Curriculum Team Access"})
+
+        with (
+            patch.object(services, "run_query_one", side_effect=[agent, team]),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "persist_account_team_access") as persist_account_team_access,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "sync_legacy_access_group_membership") as sync_legacy_access_group_membership,
+            patch.object(services, "attach_account_team_access", side_effect=lambda accounts: accounts),
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            result = services.update_agent_team_access(21, team_key="curriculum", receive_tickets=False)
+
+        self.assertNotIn("curriculum", result["teamAccessKeys"])
+        persist_account_team_access.assert_called_once_with(21, "curriculum", False, strict=True)
+        sync_legacy_access_group_membership.assert_called_once_with(42, "Curriculum Team Access", False)
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertEqual(saved_metadata["team_access_keys"], ["other_team"])
+        self.assertNotIn("teamAccessKeys", saved_metadata)
+        self.assertNotIn("team_access", saved_metadata)
+
     def test_update_agent_team_access_allows_admin_receiver_enable(self):
         admin_account = {
             "id": 22,
