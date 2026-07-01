@@ -78,6 +78,7 @@ import {
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import {
   DropdownMenu,
@@ -567,6 +568,20 @@ interface ListResponse {
   agent?: AdminAgent;
 }
 
+interface EntraAgentSearchResult {
+  entraId: string;
+  displayName: string;
+  email: string;
+  username: string;
+  alreadyAdded?: boolean;
+  existingAccountId?: number | null;
+}
+
+interface EntraAgentSearchResponse {
+  message?: string;
+  results?: EntraAgentSearchResult[];
+}
+
 interface TicketListPagination {
   page: number;
   pageSize: number;
@@ -657,9 +672,9 @@ const autoManagedSlaStatuses = new Set<TicketSummary["status"]>(["Open", "Pendin
 const adminConsoleStatuses = ["Available", "Busy", "Off"] as const;
 const adminSelectableConsoleStatuses = ["Available", "Off"] as const;
 const consolePollIntervalMs = 2500;
-const dashboardTicketPollIntervalMs = 5000;
+const dashboardTicketPollIntervalMs = 10000;
 const dashboardAgentPollIntervalMs = 15000;
-const dashboardPageSizeOptions = [10, 25, 50, 100];
+const defaultDashboardPageSize = 50;
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
@@ -667,6 +682,10 @@ const supportDeskAssignedTeam = "Support Desk";
 const learningPlanAssignedTeam = "Learning Plan Team";
 const managementTeamTabPrefix = "team:";
 const teamDashboardViewPrefix = "team:";
+
+function isBrowserTabHidden() {
+  return typeof document !== "undefined" && document.hidden;
+}
 
 type TeamAccessInfo = {
   key: string;
@@ -961,9 +980,7 @@ function hasLegacySupportDashboardAccess(
     return hasPreloadedTeamAccess(session, supportTeamRoutingPolicy.key);
   }
 
-  // Older sessions did not carry the access flags; keep agent sessions on the
-  // support dashboard unless the newer operations-only flag is explicit.
-  return getNormalizedAdminRole(session) === "agent" && session.legacyOperationsAccess !== true;
+  return false;
 }
 
 function hasLegacyOperationsDashboardAccess(
@@ -1049,6 +1066,8 @@ const AgentDashboard = () => {
   const sessionRef = useRef<AdminSession | null>(session);
   const previousConsoleChatStateRef = useRef<{ ticketId: string; chatState: string } | null>(null);
   const processedConsoleDeepLinkRef = useRef<string>("");
+  const activeTicketDetailRequestRef = useRef(0);
+  const consoleTicketDetailRequestRef = useRef(0);
   const pendingConsoleStatusRef = useRef<AdminSelectableConsoleStatus | null>(null);
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [agents, setAgents] = useState<AdminAgent[]>([]);
@@ -1088,14 +1107,18 @@ const AgentDashboard = () => {
   const [learningPlanTeamSection, setLearningPlanTeamSection] = useState<LearningPlanTeamSection>("coverage");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [dashboardPage, setDashboardPage] = useState(1);
-  const [dashboardPageSize, setDashboardPageSize] = useState(25);
+  const dashboardPageSize = defaultDashboardPageSize;
   const [serverDashboardTickets, setServerDashboardTickets] = useState<TicketSummary[]>([]);
   const [serverDashboardPagination, setServerDashboardPagination] = useState<TicketListPagination | null>(null);
+  const [serverDashboardRequestKey, setServerDashboardRequestKey] = useState("");
+  const [pendingDashboardRequestKey, setPendingDashboardRequestKey] = useState("");
   const [isDashboardPageLoading, setIsDashboardPageLoading] = useState(false);
   const [dashboardPageError, setDashboardPageError] = useState("");
   const [serverDashboardMetrics, setServerDashboardMetrics] = useState<DashboardTicketMetrics | null>(null);
   const [isDashboardMetricsLoading, setIsDashboardMetricsLoading] = useState(false);
   const [dashboardMetricsError, setDashboardMetricsError] = useState("");
+  const [serverDashboardMetricsRequestKey, setServerDashboardMetricsRequestKey] = useState("");
+  const [pendingDashboardMetricsRequestKey, setPendingDashboardMetricsRequestKey] = useState("");
   const [documentationDraft, setDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [activeDocumentationDraft, setActiveDocumentationDraft] = useState<AdminDocumentation | null>(null);
   const [standardDocumentationDraftsByTicketId, setStandardDocumentationDraftsByTicketId] = useState<Record<string, AdminDocumentation>>({});
@@ -1137,12 +1160,17 @@ const AgentDashboard = () => {
   const [deleteConfirmationTicketId, setDeleteConfirmationTicketId] = useState("");
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
+  const [entraAgentSearchResults, setEntraAgentSearchResults] = useState<EntraAgentSearchResult[]>([]);
+  const [isSearchingEntraAgents, setIsSearchingEntraAgents] = useState(false);
+  const [entraAgentSearchError, setEntraAgentSearchError] = useState("");
+  const [addingEntraAgentKey, setAddingEntraAgentKey] = useState("");
   const [newTeamName, setNewTeamName] = useState("");
   const [newTeamDescription, setNewTeamDescription] = useState("");
   const [isCreatingTeam, setIsCreatingTeam] = useState(false);
   const [teamSettingsKey, setTeamSettingsKey] = useState("");
   const [teamSettingsName, setTeamSettingsName] = useState("");
   const [teamSettingsDescription, setTeamSettingsDescription] = useState("");
+  const [editingTeamKey, setEditingTeamKey] = useState("");
   const [savingTeamKey, setSavingTeamKey] = useState("");
   const [disablingTeamKey, setDisablingTeamKey] = useState("");
   const [teamRoutingPolicyState, setTeamRoutingPolicyState] = useState<TeamRoutingPolicy[]>(defaultTeamRoutingPolicies);
@@ -1165,7 +1193,15 @@ const AgentDashboard = () => {
   const [notificationLog, setNotificationLog] = useState<AdminNotificationLogItem[]>([]);
   const seenTransferNotificationKeysRef = useRef<Set<string>>(new Set());
   const hasHydratedTransferNotificationsRef = useRef(false);
+  const loadDashboardInFlightRef = useRef(false);
+  const refreshTicketsInFlightRef = useRef(false);
+  const pendingTicketsRefreshRef = useRef(false);
+  const refreshAgentsInFlightRef = useRef(false);
+  const pendingAgentsRefreshRef = useRef(false);
+  const dashboardPageLoadInFlightKeyRef = useRef("");
+  const dashboardMetricsLoadInFlightKeyRef = useRef("");
   const loadDashboardRef = useRef<() => Promise<void>>(async () => {});
+  const fetchNotificationLogRef = useRef<() => Promise<AdminNotificationLogItem[]>>(async () => []);
   const syncAgentSessionHeartbeatRef = useRef<
     (silent?: boolean, statusOverride?: AdminSelectableConsoleStatus) => Promise<boolean>
   >(async () => false);
@@ -1402,6 +1438,11 @@ const AgentDashboard = () => {
     return !nextSession;
   }
 
+  const reconcileAdminAuthorizationFailureRef = useRef(reconcileAdminAuthorizationFailure);
+  useEffect(() => {
+    reconcileAdminAuthorizationFailureRef.current = reconcileAdminAuthorizationFailure;
+  });
+
   useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
       return;
@@ -1450,11 +1491,29 @@ const AgentDashboard = () => {
 
   useEffect(() => {
     if (!selectedManagementTeamPolicy || isBuiltInTeamPolicy(selectedManagementTeamPolicy)) {
+      if (teamSettingsKey || editingTeamKey) {
+        setEditingTeamKey("");
+        setTeamSettingsKey("");
+        setTeamSettingsName("");
+        setTeamSettingsDescription("");
+      }
+      return;
+    }
+
+    if (!editingTeamKey) {
       if (teamSettingsKey) {
         setTeamSettingsKey("");
         setTeamSettingsName("");
         setTeamSettingsDescription("");
       }
+      return;
+    }
+
+    if (editingTeamKey !== selectedManagementTeamPolicy.key) {
+      setEditingTeamKey("");
+      setTeamSettingsKey("");
+      setTeamSettingsName("");
+      setTeamSettingsDescription("");
       return;
     }
 
@@ -1465,7 +1524,55 @@ const AgentDashboard = () => {
     setTeamSettingsKey(selectedManagementTeamPolicy.key);
     setTeamSettingsName(selectedManagementTeamPolicy.label);
     setTeamSettingsDescription(selectedManagementTeamPolicy.description);
-  }, [selectedManagementTeamPolicy, teamSettingsKey]);
+  }, [editingTeamKey, selectedManagementTeamPolicy, teamSettingsKey]);
+
+  useEffect(() => {
+    const query = managementSearch.trim();
+    if (!canManageUsers || managementAccessTab === "admins" || !selectedManagementTeamPolicy || query.length < 2) {
+      setEntraAgentSearchResults([]);
+      setEntraAgentSearchError("");
+      setIsSearchingEntraAgents(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      setIsSearchingEntraAgents(true);
+      setEntraAgentSearchError("");
+
+      fetch(`/api/admin/agents/search?q=${encodeURIComponent(query)}`, {
+        cache: "no-store",
+        signal: controller.signal,
+      })
+        .then(async (response) => {
+          const payload = (await response.json().catch(() => null)) as EntraAgentSearchResponse | null;
+          if (!response.ok) {
+            if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailureRef.current()) {
+              return;
+            }
+            throw new Error(payload?.message || "We could not search Microsoft Entra right now.");
+          }
+          setEntraAgentSearchResults(payload?.results || []);
+        })
+        .catch((error) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setEntraAgentSearchResults([]);
+          setEntraAgentSearchError(error instanceof Error ? error.message : "We could not search Microsoft Entra right now.");
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setIsSearchingEntraAgents(false);
+          }
+        });
+    }, 350);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [canManageUsers, managementAccessTab, managementSearch, selectedManagementTeamPolicy]);
 
   useEffect(() => {
     if (typeof document === "undefined" || isStackedAdminLayout) {
@@ -1632,9 +1739,28 @@ const AgentDashboard = () => {
   });
   const selectedDraftAgent = sortedAgents.find((agent) => String(agent.id) === draftAgentId) || null;
   const ticketReceivingAgents = sortedAgents.filter(hasTicketAccess);
-  const availableAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Available").length;
-  const busyAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
-  const offAgentCount = ticketReceivingAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
+  const teamStatusPolicy = isAdminDashboardView
+    ? null
+    : adminView === "dashboard"
+      ? getSupportTeamRoutingPolicy()
+      : isCoverageDashboardView
+        ? getLearningPlanTeamRoutingPolicy()
+        : selectedDashboardTeamPolicy;
+  const teamStatusAgents = teamStatusPolicy
+    ? sortedAgents.filter((agent) => canReceiveTeamTickets(agent, teamStatusPolicy))
+    : ticketReceivingAgents;
+  const teamStatusLabel = teamStatusPolicy?.label || "Ticket";
+  const teamStatusDescription = teamStatusPolicy
+    ? `Live availability for staff who can receive ${teamStatusLabel} tickets.`
+    : "Live availability for all ticket-enabled staff.";
+  const teamStatusEmptyMessage = teamStatusPolicy
+    ? `No receivers are enabled for ${teamStatusLabel} tickets.`
+    : "No ticket-enabled staff found.";
+  const availableAgentCount = teamStatusAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Available").length;
+  const busyAgentCount = teamStatusAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Busy").length;
+  const offAgentCount = teamStatusAgents.filter((agent) => normalizeAdminConsoleStatus(agent.consoleStatus) === "Off").length;
+  const teamStatusAgentCount = teamStatusAgents.length;
+  const teamStatusAgentCountLabel = `${teamStatusAgentCount} ${teamStatusAgentCount === 1 ? "receiver" : "receivers"}`;
   const dashboardAgentFilterOptions = [
     {
       value: "all" as DashboardAssignedFilter,
@@ -1648,12 +1774,14 @@ const AgentDashboard = () => {
     },
     ...(dashboardSessionAgentId ? [{ value: "me" as DashboardAssignedFilter, label: "Me" }] : []),
     { value: "unassigned" as DashboardAssignedFilter, label: "Unassigned" },
-    ...sortedAgents
-      .filter((agent) => agent.id !== dashboardSessionAgentId)
-      .map((agent) => ({
-        value: buildDashboardAssignedAgentFilterValue(agent.id),
-        label: getAgentDisplayName(agent),
-      })),
+    ...(hasFullAdminAccess
+      ? sortedAgents
+        .filter((agent) => agent.id !== dashboardSessionAgentId)
+        .map((agent) => ({
+          value: buildDashboardAssignedAgentFilterValue(agent.id),
+          label: getAgentDisplayName(agent),
+        }))
+      : []),
   ];
   const activeTicketAssignableAgents = sortedAgents.filter((agent) => (
     canReceiveTicketAssignment(agent, activeDetail?.ticket)
@@ -1847,20 +1975,48 @@ const AgentDashboard = () => {
     dashboardAssignedFilter !== "all",
     dashboardAssignedFilterLabel,
   );
-  const dashboardDisplayedTickets = serverDashboardPagination ? serverDashboardTickets : visibleDashboardTickets;
-  const dashboardDisplayedTableCountLabel = serverDashboardPagination
+  const dashboardTicketPageRequestKey = buildDashboardTicketPageSearchParams().toString();
+  const hasCurrentServerDashboardPage = Boolean(
+    serverDashboardPagination && serverDashboardRequestKey === dashboardTicketPageRequestKey,
+  );
+  const activeServerDashboardPagination = hasCurrentServerDashboardPage ? serverDashboardPagination : null;
+  const hasPendingDashboardPageRequest = pendingDashboardRequestKey === dashboardTicketPageRequestKey;
+  const shouldShowDashboardTableSkeleton = Boolean(
+    isDashboardLikeView
+    && hasCheckedTeamRoutingPolicies
+    && !dashboardPageError
+    && !activeServerDashboardPagination
+    && isDashboardPageLoading
+    && hasPendingDashboardPageRequest,
+  );
+  const dashboardDisplayedTickets = activeServerDashboardPagination
+    ? serverDashboardTickets
+    : shouldShowDashboardTableSkeleton
+      ? emptyTicketSummaryList
+      : visibleDashboardTickets;
+  const dashboardDisplayedTableCountLabel = activeServerDashboardPagination
     ? getServerDashboardTableCountLabel(
-        serverDashboardPagination,
+        activeServerDashboardPagination,
         Boolean(normalizedDashboardSearch),
         dashboardAssignedFilter !== "all",
         dashboardAssignedFilterLabel,
       )
-    : dashboardTableCountLabel;
-  const isDashboardTableLoading = isLoading || (isDashboardPageLoading && !serverDashboardPagination);
-  const dashboardPaginationTotalPages = Math.max(serverDashboardPagination?.totalPages || 0, 1);
-  const dashboardPaginationRangeLabel = serverDashboardPagination
-    ? getDashboardPaginationRangeLabel(serverDashboardPagination)
+    : shouldShowDashboardTableSkeleton
+      ? "Loading tickets..."
+      : dashboardTableCountLabel;
+  const hasResolvedDashboardPage = Boolean(activeServerDashboardPagination);
+  const hasAnyDashboardRowsReady = dashboardDisplayedTickets.length > 0 || hasResolvedDashboardPage;
+  const isDashboardTableLoading = shouldShowDashboardTableSkeleton || (!hasAnyDashboardRowsReady && (
+    isDashboardPageLoading
+    || (isLoading && tickets.length === 0)
+  ));
+  const dashboardPaginationTotalPages = Math.max(activeServerDashboardPagination?.totalPages || 0, 1);
+  const dashboardPaginationRangeLabel = activeServerDashboardPagination
+    ? getDashboardPaginationRangeLabel(activeServerDashboardPagination)
     : "";
+  const shouldShowDashboardPagination = Boolean(
+    activeServerDashboardPagination && activeServerDashboardPagination.totalPages > 1,
+  );
   const dashboardEmptyMessage = normalizedDashboardSearch
     ? "No matching tickets found for this search."
     : dashboardArchiveScope === "archived"
@@ -1896,6 +2052,7 @@ const AgentDashboard = () => {
     ticket: Pick<TicketSummary, "technicalSubcategory" | "assignedTeam" | "isArchived"> & Partial<Pick<TicketSummary, "ticketState">>,
   ) => Boolean(
     !isArchivedTicket(ticket)
+    && !isCoverageTicket(ticket)
     && (
       canAssignTickets
       || hasTeamRoutingDashboardAccess(accessSession, getTicketRoutingPolicy(ticket))
@@ -2353,6 +2510,10 @@ const AgentDashboard = () => {
     }
 
     const intervalId = window.setInterval(() => {
+      if (isBrowserTabHidden()) {
+        return;
+      }
+
       void refreshTicketsOnlyRef.current(true);
 
       if (consoleTicketId && !isConsoleOpening && !isSendingConsoleChat) {
@@ -2369,10 +2530,24 @@ const AgentDashboard = () => {
     }
 
     const ticketsIntervalId = window.setInterval(() => {
-      void refreshTicketsOnlyRef.current(true);
+      if (isBrowserTabHidden()) {
+        return;
+      }
+
+      void loadDashboardTicketPageRef.current({ silent: true });
+      void loadDashboardMetricsRef.current({ silent: true });
+      void fetchNotificationLogRef.current()
+        .then((nextNotificationLog) => setNotificationLog(nextNotificationLog))
+        .catch(() => {
+          // Notification log polling should not destabilize the visible ticket table.
+        });
     }, dashboardTicketPollIntervalMs);
 
     const agentsIntervalId = window.setInterval(() => {
+      if (isBrowserTabHidden()) {
+        return;
+      }
+
       void refreshAgentsOnlyRef.current(true);
     }, dashboardAgentPollIntervalMs);
 
@@ -2407,9 +2582,17 @@ const AgentDashboard = () => {
   ]);
 
   useEffect(() => {
+    if (!hasFullAdminAccess && dashboardAssignedFilter.startsWith("agent:")) {
+      setDashboardAssignedFilter("all");
+    }
+  }, [dashboardAssignedFilter, hasFullAdminAccess]);
+
+  useEffect(() => {
     if (!isDashboardLikeView || !hasCheckedTeamRoutingPolicies) {
       setServerDashboardTickets([]);
       setServerDashboardPagination(null);
+      setServerDashboardRequestKey("");
+      setPendingDashboardRequestKey("");
       setDashboardPageError("");
       setIsDashboardPageLoading(false);
       return;
@@ -2437,6 +2620,8 @@ const AgentDashboard = () => {
   useEffect(() => {
     if (!isDashboardLikeView || !hasCheckedTeamRoutingPolicies) {
       setServerDashboardMetrics(null);
+      setServerDashboardMetricsRequestKey("");
+      setPendingDashboardMetricsRequestKey("");
       setDashboardMetricsError("");
       setIsDashboardMetricsLoading(false);
       return;
@@ -2888,7 +3073,20 @@ const AgentDashboard = () => {
       learningPlanOther: learningPlanOtherAssignmentScopedTickets.length,
     },
   };
-  const dashboardMetrics = serverDashboardMetrics || localDashboardMetrics;
+  const dashboardMetricsRequestKey = buildDashboardMetricsSearchParams().toString();
+  const hasCurrentServerDashboardMetrics = Boolean(
+    serverDashboardMetrics && serverDashboardMetricsRequestKey === dashboardMetricsRequestKey,
+  );
+  const hasPendingDashboardMetricsRequest = pendingDashboardMetricsRequestKey === dashboardMetricsRequestKey;
+  const shouldShowDashboardMetricsSkeleton = Boolean(
+    isDashboardLikeView
+    && hasCheckedTeamRoutingPolicies
+    && !dashboardMetricsError
+    && !hasCurrentServerDashboardMetrics
+    && isDashboardMetricsLoading
+    && hasPendingDashboardMetricsRequest,
+  );
+  const dashboardMetrics = hasCurrentServerDashboardMetrics ? serverDashboardMetrics : localDashboardMetrics;
   const kpis = [
     {
       label: "Open Tickets",
@@ -3048,9 +3246,10 @@ const AgentDashboard = () => {
         const policiesByKey = new Map(teamRoutingPolicies.map((teamPolicy) => [teamPolicy.key, teamPolicy]));
         policiesByKey.set(updatedPolicy.key, updatedPolicy);
         applyTeamRoutingPolicies([...policiesByKey.values()]);
-        setTeamSettingsKey(updatedPolicy.key);
-        setTeamSettingsName(updatedPolicy.label);
-        setTeamSettingsDescription(updatedPolicy.description);
+        setEditingTeamKey("");
+        setTeamSettingsKey("");
+        setTeamSettingsName("");
+        setTeamSettingsDescription("");
       }
 
       void refreshTicketsOnly(true);
@@ -3089,6 +3288,7 @@ const AgentDashboard = () => {
       const nextPolicies = teamRoutingPolicies.filter((teamPolicy) => teamPolicy.key !== policy.key);
       applyTeamRoutingPolicies(nextPolicies);
       setManagementAccessTab(buildManagementTeamTabValue(nextPolicies[0]?.key || supportTeamRoutingPolicy.key));
+      setEditingTeamKey("");
       setTeamSettingsKey("");
       setTeamSettingsName("");
       setTeamSettingsDescription("");
@@ -3204,7 +3404,8 @@ const AgentDashboard = () => {
 
   async function fetchDashboardTicketPage(signal?: AbortSignal) {
     const params = buildDashboardTicketPageSearchParams();
-    const response = await fetch(`/api/admin/tickets?${params.toString()}`, {
+    const requestKey = params.toString();
+    const response = await fetch(`/api/admin/tickets?${requestKey}`, {
       cache: "no-store",
       signal,
     });
@@ -3220,6 +3421,7 @@ const AgentDashboard = () => {
     return {
       tickets: payload?.tickets || [],
       pagination: payload?.pagination || null,
+      requestKey,
     };
   }
 
@@ -3228,11 +3430,16 @@ const AgentDashboard = () => {
       return;
     }
 
+    const requestKey = buildDashboardTicketPageSearchParams().toString();
+    if (dashboardPageLoadInFlightKeyRef.current === requestKey) {
+      return;
+    }
+    dashboardPageLoadInFlightKeyRef.current = requestKey;
+
     if (!options?.silent) {
       setIsDashboardPageLoading(true);
       setDashboardPageError("");
-      setServerDashboardTickets([]);
-      setServerDashboardPagination(null);
+      setPendingDashboardRequestKey(requestKey);
     }
 
     try {
@@ -3243,6 +3450,7 @@ const AgentDashboard = () => {
 
       setServerDashboardTickets(result.tickets);
       setServerDashboardPagination(result.pagination);
+      setServerDashboardRequestKey(result.requestKey);
       setDashboardPageError("");
 
       if (result.pagination?.isPaginated && result.pagination.page !== dashboardPage) {
@@ -3256,10 +3464,17 @@ const AgentDashboard = () => {
       if (!options?.silent) {
         setServerDashboardTickets([]);
         setServerDashboardPagination(null);
+        setServerDashboardRequestKey("");
         setDashboardPageError(fetchError instanceof Error ? fetchError.message : "We could not load this ticket page right now.");
       }
     } finally {
-      if (!options?.signal?.aborted) {
+      if (dashboardPageLoadInFlightKeyRef.current === requestKey) {
+        dashboardPageLoadInFlightKeyRef.current = "";
+      }
+      if (!options?.silent) {
+        setPendingDashboardRequestKey((currentKey) => (currentKey === requestKey ? "" : currentKey));
+      }
+      if (!options?.silent) {
         setIsDashboardPageLoading(false);
       }
     }
@@ -3317,8 +3532,15 @@ const AgentDashboard = () => {
       return;
     }
 
+    const requestKey = buildDashboardMetricsSearchParams().toString();
+    if (dashboardMetricsLoadInFlightKeyRef.current === requestKey) {
+      return;
+    }
+    dashboardMetricsLoadInFlightKeyRef.current = requestKey;
+
     if (!options?.silent) {
       setIsDashboardMetricsLoading(true);
+      setPendingDashboardMetricsRequestKey(requestKey);
       setDashboardMetricsError("");
     }
 
@@ -3329,6 +3551,7 @@ const AgentDashboard = () => {
       }
 
       setServerDashboardMetrics(nextMetrics);
+      setServerDashboardMetricsRequestKey(requestKey);
       setDashboardMetricsError("");
     } catch (fetchError) {
       if (options?.signal?.aborted) {
@@ -3336,16 +3559,28 @@ const AgentDashboard = () => {
       }
 
       setServerDashboardMetrics(null);
+      setServerDashboardMetricsRequestKey("");
       setDashboardMetricsError(fetchError instanceof Error ? fetchError.message : "We could not load ticket metrics right now.");
     } finally {
-      if (!options?.signal?.aborted) {
+      if (dashboardMetricsLoadInFlightKeyRef.current === requestKey) {
+        dashboardMetricsLoadInFlightKeyRef.current = "";
+      }
+      if (!options?.silent) {
+        setPendingDashboardMetricsRequestKey((currentKey) => (currentKey === requestKey ? "" : currentKey));
+      }
+      if (!options?.silent) {
         setIsDashboardMetricsLoading(false);
       }
     }
   }
 
-  async function fetchAgentsList() {
-    const response = await fetch("/api/admin/accounts");
+  async function fetchAgentsList(options: { refreshLegacy?: boolean } = {}) {
+    const params = new URLSearchParams();
+    if (options.refreshLegacy !== true) {
+      params.set("refreshLegacy", "false");
+    }
+    const queryString = params.toString();
+    const response = await fetch(`/api/admin/accounts${queryString ? `?${queryString}` : ""}`);
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
 
     if (!response.ok) {
@@ -3423,6 +3658,10 @@ const AgentDashboard = () => {
   }
 
   async function loadDashboard() {
+    if (loadDashboardInFlightRef.current) {
+      return;
+    }
+    loadDashboardInFlightRef.current = true;
     setIsLoading(true);
     setError("");
 
@@ -3519,11 +3758,17 @@ const AgentDashboard = () => {
     } catch (fetchError) {
       setError(fetchError instanceof Error ? fetchError.message : "We could not load the dashboard right now.");
     } finally {
+      loadDashboardInFlightRef.current = false;
       setIsLoading(false);
     }
   }
 
   async function refreshTicketsOnly(silent = false) {
+    if (refreshTicketsInFlightRef.current) {
+      pendingTicketsRefreshRef.current = true;
+      return;
+    }
+    refreshTicketsInFlightRef.current = true;
     try {
       const [nextTickets, nextNotificationLog] = await Promise.all([
         fetchTicketsList(),
@@ -3575,10 +3820,21 @@ const AgentDashboard = () => {
       if (!silent) {
         setError(fetchError instanceof Error ? fetchError.message : "We could not load tickets right now.");
       }
+    } finally {
+      refreshTicketsInFlightRef.current = false;
+      if (pendingTicketsRefreshRef.current) {
+        pendingTicketsRefreshRef.current = false;
+        void refreshTicketsOnly(true);
+      }
     }
   }
 
   async function refreshAgentsOnly(silent = false) {
+    if (refreshAgentsInFlightRef.current) {
+      pendingAgentsRefreshRef.current = true;
+      return;
+    }
+    refreshAgentsInFlightRef.current = true;
     try {
       const requestSession = sessionRef.current;
       const nextAgents = await fetchAgentsList();
@@ -3590,6 +3846,12 @@ const AgentDashboard = () => {
     } catch (fetchError) {
       if (!silent) {
         setError(fetchError instanceof Error ? fetchError.message : "We could not load support accounts right now.");
+      }
+    } finally {
+      refreshAgentsInFlightRef.current = false;
+      if (pendingAgentsRefreshRef.current) {
+        pendingAgentsRefreshRef.current = false;
+        void refreshAgentsOnly(true);
       }
     }
   }
@@ -3654,7 +3916,13 @@ const AgentDashboard = () => {
   }
 
   function applyUpdatedAgentState(updatedAgent: AdminAgent) {
-    setAgents((prev) => prev.map((agent) => (agent.id === updatedAgent.id ? { ...agent, ...updatedAgent } : agent)));
+    setAgents((prev) => {
+      const hasExistingAgent = prev.some((agent) => agent.id === updatedAgent.id);
+      if (hasExistingAgent) {
+        return prev.map((agent) => (agent.id === updatedAgent.id ? { ...agent, ...updatedAgent } : agent));
+      }
+      return [...prev, updatedAgent];
+    });
 
     const currentSession = sessionRef.current;
     const isUpdatedSignedInAgent = (
@@ -3778,6 +4046,53 @@ const AgentDashboard = () => {
         next.delete(agent.id);
         return next;
       });
+    }
+  }
+
+  async function addEntraAgentToTeam(result: EntraAgentSearchResult, policy: TeamRoutingPolicy) {
+    const actionKey = `${policy.key}:${result.entraId || result.email}`;
+    setAddingEntraAgentKey(actionKey);
+    try {
+      const response = await fetch("/api/admin/agents", {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({
+          entraId: result.entraId,
+          displayName: result.displayName,
+          email: result.email,
+          username: result.username,
+          teamKey: policy.key,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as ListResponse | null;
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || `Could not add this person to ${policy.label}.`);
+        return;
+      }
+
+      if (payload?.agent) {
+        applyUpdatedAgentState(payload.agent);
+        setEntraAgentSearchResults((currentResults) => currentResults.map((currentResult) => (
+          (currentResult.entraId && currentResult.entraId === result.entraId)
+          || (currentResult.email && currentResult.email.toLowerCase() === result.email.toLowerCase())
+            ? {
+                ...currentResult,
+                alreadyAdded: true,
+                existingAccountId: payload.agent?.id || currentResult.existingAccountId || null,
+              }
+            : currentResult
+        )));
+      }
+
+      void refreshAgentsOnly(true);
+      toast.success(`${result.displayName || result.email} can now receive ${policy.label} tickets.`);
+    } catch {
+      toast.error(`Could not add this person to ${policy.label}.`);
+    } finally {
+      setAddingEntraAgentKey("");
     }
   }
 
@@ -3920,7 +4235,34 @@ const AgentDashboard = () => {
     return payload;
   }
 
+  async function acknowledgeTicketNotificationsInBackground(
+    initialPayload: TicketDetailResponse,
+    options: { includeLearningPlanTransfer?: boolean } = {},
+  ) {
+    let latestPayload = initialPayload;
+    const acknowledgers = [
+      acknowledgeSupportQueueNotificationSilently,
+      acknowledgeCoverageTicketNotificationSilently,
+      ...(options.includeLearningPlanTransfer ? [acknowledgeLearningPlanTransferNotificationSilently] : []),
+      acknowledgeCoverageTutorResponseSilently,
+    ];
+
+    try {
+      for (const acknowledgeTicketNotification of acknowledgers) {
+        const acknowledgedPayload = await acknowledgeTicketNotification(latestPayload.ticket);
+        if (acknowledgedPayload?.ticket) {
+          latestPayload = acknowledgedPayload;
+          syncDetailAcrossViews(acknowledgedPayload);
+        }
+      }
+    } catch {
+      // The ticket is already visible; notification cleanup can recover on the next refresh.
+    }
+  }
+
   async function openTicket(ticketId: string, initialTab: TicketDetailTab = "conversation") {
+    const requestId = activeTicketDetailRequestRef.current + 1;
+    activeTicketDetailRequestRef.current = requestId;
     setActiveTicketId(ticketId);
     setActiveTicketTab(initialTab);
     setActiveDetail(null);
@@ -3928,22 +4270,9 @@ const AgentDashboard = () => {
     setIsOpening(true);
 
     try {
-      let payload = await fetchTicketDetail(ticketId);
-      const acknowledgedSupportQueuePayload = await acknowledgeSupportQueueNotificationSilently(payload.ticket);
-      if (acknowledgedSupportQueuePayload?.ticket) {
-        payload = acknowledgedSupportQueuePayload;
-      }
-      const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
-      if (acknowledgedCoverageTicketPayload?.ticket) {
-        payload = acknowledgedCoverageTicketPayload;
-      }
-      const acknowledgedLearningPlanTransferPayload = await acknowledgeLearningPlanTransferNotificationSilently(payload.ticket);
-      if (acknowledgedLearningPlanTransferPayload?.ticket) {
-        payload = acknowledgedLearningPlanTransferPayload;
-      }
-      const acknowledgedPayload = await acknowledgeCoverageTutorResponseSilently(payload.ticket);
-      if (acknowledgedPayload?.ticket) {
-        payload = acknowledgedPayload;
+      const payload = await fetchTicketDetail(ticketId);
+      if (activeTicketDetailRequestRef.current !== requestId) {
+        return;
       }
 
       if (!canShowTicketConversation(payload.ticket) && initialTab === "conversation") {
@@ -3951,45 +4280,41 @@ const AgentDashboard = () => {
       }
 
       setActiveDetail(payload);
-      setTickets((currentTickets) => currentTickets.map((ticket) => (
-        ticket.id === payload.ticket.id ? payload.ticket : ticket
-      )));
-      setConsoleDetail((currentDetail) => (
-        currentDetail?.ticket.id === payload.ticket.id ? payload : currentDetail
-      ));
+      syncDetailAcrossViews(payload);
       syncDrafts(payload);
+      void acknowledgeTicketNotificationsInBackground(payload, { includeLearningPlanTransfer: true });
     } catch (fetchError) {
+      if (activeTicketDetailRequestRef.current !== requestId) {
+        return;
+      }
       closePanel();
       toast.error(fetchError instanceof Error ? fetchError.message : "We could not connect to the server. Please try again.");
     } finally {
-      setIsOpening(false);
+      if (activeTicketDetailRequestRef.current === requestId) {
+        setIsOpening(false);
+      }
     }
   }
 
   async function openConsoleChat(ticketId: string) {
     if (consoleTicketId === ticketId && consoleDetail?.ticket.id === ticketId) {
+      consoleTicketDetailRequestRef.current += 1;
+      setIsConsoleOpening(false);
       setConsoleTicketId("");
       setConsoleDetail(null);
       return;
     }
 
+    const requestId = consoleTicketDetailRequestRef.current + 1;
+    consoleTicketDetailRequestRef.current = requestId;
     setConsoleTicketId(ticketId);
     setConsoleDetail(null);
     setIsConsoleOpening(true);
 
     try {
-      let payload = await fetchTicketDetail(ticketId);
-      const acknowledgedSupportQueuePayload = await acknowledgeSupportQueueNotificationSilently(payload.ticket);
-      if (acknowledgedSupportQueuePayload?.ticket) {
-        payload = acknowledgedSupportQueuePayload;
-      }
-      const acknowledgedCoverageTicketPayload = await acknowledgeCoverageTicketNotificationSilently(payload.ticket);
-      if (acknowledgedCoverageTicketPayload?.ticket) {
-        payload = acknowledgedCoverageTicketPayload;
-      }
-      const acknowledgedPayload = await acknowledgeCoverageTutorResponseSilently(payload.ticket);
-      if (acknowledgedPayload?.ticket) {
-        payload = acknowledgedPayload;
+      const payload = await fetchTicketDetail(ticketId);
+      if (consoleTicketDetailRequestRef.current !== requestId) {
+        return;
       }
 
       if (shouldRouteConsoleChatToMyOpenQueue({
@@ -4002,15 +4327,19 @@ const AgentDashboard = () => {
         setConsoleQueueTab("open");
       }
       setConsoleDetail(payload);
-      setTickets((currentTickets) => currentTickets.map((ticket) => (
-        ticket.id === payload.ticket.id ? payload.ticket : ticket
-      )));
+      syncDetailAcrossViews(payload);
+      void acknowledgeTicketNotificationsInBackground(payload);
     } catch (fetchError) {
+      if (consoleTicketDetailRequestRef.current !== requestId) {
+        return;
+      }
       setConsoleTicketId("");
       setConsoleDetail(null);
       toast.error(fetchError instanceof Error ? fetchError.message : "We could not open this chat right now.");
     } finally {
-      setIsConsoleOpening(false);
+      if (consoleTicketDetailRequestRef.current === requestId) {
+        setIsConsoleOpening(false);
+      }
     }
   }
 
@@ -4135,6 +4464,11 @@ const AgentDashboard = () => {
 
     if (ticket.isArchived) {
       toast.error("Restore this ticket before transferring it to another team.");
+      return;
+    }
+
+    if (isCoverageTicket(ticket)) {
+      toast.error("Coverage tickets must stay in the Learning Plan Team workflow.");
       return;
     }
 
@@ -5688,6 +6022,8 @@ const AgentDashboard = () => {
   }
 
   function closePanel() {
+    activeTicketDetailRequestRef.current += 1;
+    setIsOpening(false);
     setActiveTicketId("");
     setActiveTicketTab("conversation");
     setActiveDetail(null);
@@ -5696,6 +6032,8 @@ const AgentDashboard = () => {
   }
 
   function collapseConsoleWorkspace() {
+    consoleTicketDetailRequestRef.current += 1;
+    setIsConsoleOpening(false);
     setIsTransferMenuOpen(false);
     setTransferReason("");
     setConsoleTicketId("");
@@ -5875,6 +6213,7 @@ const AgentDashboard = () => {
   }
 
   loadDashboardRef.current = loadDashboard;
+  fetchNotificationLogRef.current = fetchNotificationLog;
   syncAgentSessionHeartbeatRef.current = syncAgentSessionHeartbeat;
   refreshTicketsOnlyRef.current = refreshTicketsOnly;
   loadDashboardTicketPageRef.current = loadDashboardTicketPage;
@@ -5932,7 +6271,11 @@ const AgentDashboard = () => {
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-sm font-semibold text-foreground">{section.label}</div>
                     <div className="rounded-full border bg-background px-2.5 py-1 text-xs font-semibold text-muted-foreground">
-                      {section.count}
+                      {shouldShowDashboardMetricsSkeleton ? (
+                        <Skeleton className="h-3.5 w-6 rounded-full" />
+                      ) : (
+                        section.count
+                      )}
                     </div>
                   </div>
                   <div className="mt-1 text-xs text-muted-foreground">{section.description}</div>
@@ -5963,8 +6306,11 @@ const AgentDashboard = () => {
                 <kpi.icon className="h-5 w-5" />
               </div>
               <div className="flex items-center gap-2 text-2xl font-bold">
-                {kpi.value}
-                {isDashboardMetricsLoading ? <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" /> : null}
+                {shouldShowDashboardMetricsSkeleton ? (
+                  <Skeleton className="h-7 w-12" />
+                ) : (
+                  kpi.value
+                )}
               </div>
               <div className="text-xs text-muted-foreground">{kpi.label}</div>
               <div className="mt-2 text-[11px] font-medium text-primary">
@@ -5989,8 +6335,11 @@ const AgentDashboard = () => {
                 <FileText className="h-5 w-5" />
               </div>
               <div className="flex items-center gap-2 text-2xl font-bold">
-                {dashboardMetrics.quickResolution}
-                {isDashboardMetricsLoading ? <LoaderCircle className="h-4 w-4 animate-spin text-muted-foreground" /> : null}
+                {shouldShowDashboardMetricsSkeleton ? (
+                  <Skeleton className="h-7 w-12" />
+                ) : (
+                  dashboardMetrics.quickResolution
+                )}
               </div>
               <div className="text-xs text-muted-foreground">Quick Tickets</div>
               <div className="mt-2 text-[11px] font-medium text-primary">
@@ -6047,7 +6396,7 @@ const AgentDashboard = () => {
                 </div>
                 <div className="flex items-center gap-3 lg:shrink-0">
                   <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                    {isDashboardPageLoading && serverDashboardPagination ? (
+                    {(isDashboardPageLoading || isDashboardMetricsLoading) ? (
                       <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
                     ) : null}
                     {dashboardDisplayedTableCountLabel}
@@ -6162,15 +6511,18 @@ const AgentDashboard = () => {
                             Team Status
                           </span>
                           <span className="text-xs text-muted-foreground">
-                            {availableAgentCount} available
+                            {teamStatusAgentCountLabel}
                           </span>
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-[min(92vw,340px)] p-0">
                       <div className="border-b px-4 py-3">
-                        <div className="text-sm font-semibold">Agent Status</div>
+                        <div className="text-sm font-semibold">Receiver Status</div>
                         <div className="mt-1 text-xs text-muted-foreground">
-                          Live availability from the support accounts table.
+                          {teamStatusDescription}
+                        </div>
+                        <div className="mt-2 text-xs font-medium text-foreground">
+                          {teamStatusAgentCountLabel} enabled
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
                           {([
@@ -6190,13 +6542,13 @@ const AgentDashboard = () => {
                         </div>
                       </div>
                       <div className="max-h-[320px] overflow-y-auto p-2">
-                        {ticketReceivingAgents.length === 0 ? (
+                        {teamStatusAgents.length === 0 ? (
                           <div className="rounded-xl border border-dashed px-3 py-4 text-sm text-muted-foreground">
-                            No ticket-enabled agents found.
+                            {teamStatusEmptyMessage}
                           </div>
                         ) : (
                           <div className="space-y-2">
-                            {ticketReceivingAgents.map((agent) => {
+                            {teamStatusAgents.map((agent) => {
                               const agentStatus = normalizeAdminConsoleStatus(agent.consoleStatus);
 
                               return (
@@ -6254,8 +6606,53 @@ const AgentDashboard = () => {
           ) : null}
 
           {isDashboardTableLoading ? (
-            <div className="p-10 text-sm text-muted-foreground flex items-center justify-center gap-2">
-              <LoaderCircle className="h-4 w-4 animate-spin" /> Loading dashboard...
+            <div className="overflow-hidden" aria-busy="true" aria-live="polite">
+              <table className="w-full table-fixed text-sm">
+                {useCompactDashboardTable ? (
+                  <colgroup>
+                    <col style={{ width: "16%" }} />
+                    <col style={{ width: "18%" }} />
+                    <col style={{ width: "13%" }} />
+                    <col style={{ width: "11%" }} />
+                    <col style={{ width: "18%" }} />
+                    <col style={{ width: "8%" }} />
+                    <col style={{ width: "7%" }} />
+                    <col style={{ width: "9%" }} />
+                  </colgroup>
+                ) : null}
+                <thead className="bg-secondary/50 text-muted-foreground">
+                  <tr className="text-left">
+                    {dashboardTableHeadings.map((heading) => (
+                      <th
+                        key={heading}
+                        className={cn(
+                          dashboardCellClassName,
+                          "font-medium",
+                          useCompactDashboardTable ? "whitespace-normal" : "whitespace-nowrap",
+                        )}
+                      >
+                        {heading}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {Array.from({ length: 7 }).map((_, rowIndex) => (
+                    <tr key={`dashboard-skeleton-${rowIndex}`} className="bg-background/70">
+                      {dashboardTableHeadings.map((heading, columnIndex) => (
+                        <td key={`${heading}-${rowIndex}`} className={dashboardCellClassName}>
+                          <div className="space-y-2">
+                            <Skeleton className={cn("h-4", columnIndex === 0 ? "w-24" : columnIndex === dashboardTableHeadings.length - 1 ? "w-20" : "w-3/4")} />
+                            {columnIndex < 5 ? (
+                              <Skeleton className="h-3 w-1/2" />
+                            ) : null}
+                          </div>
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           ) : dashboardDisplayedTickets.length === 0 ? (
             <div className="p-10 text-sm text-muted-foreground text-center">
@@ -6502,41 +6899,22 @@ const AgentDashboard = () => {
               </table>
             </div>
           )}
-          {serverDashboardPagination?.isPaginated ? (
+          {shouldShowDashboardPagination && activeServerDashboardPagination ? (
             <div className="flex flex-col gap-3 border-t bg-secondary/20 px-4 py-3 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-5">
               <div className="flex flex-wrap items-center gap-2">
                 <span>
-                  Page {serverDashboardPagination.page} of {dashboardPaginationTotalPages}
+                  Page {activeServerDashboardPagination.page} of {dashboardPaginationTotalPages}
                 </span>
                 <span className="hidden sm:inline">-</span>
                 <span>{dashboardPaginationRangeLabel}</span>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Select
-                  value={String(serverDashboardPagination.pageSize)}
-                  onValueChange={(value) => {
-                    setDashboardPageSize(Number(value));
-                    setDashboardPage(1);
-                  }}
-                  disabled={isDashboardPageLoading}
-                >
-                  <SelectTrigger className="h-8 w-[118px]" aria-label="Tickets per page">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {dashboardPageSizeOptions.map((pageSize) => (
-                      <SelectItem key={pageSize} value={String(pageSize)}>
-                        {pageSize} / page
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
                   onClick={() => setDashboardPage((currentPage) => Math.max(1, currentPage - 1))}
-                  disabled={!serverDashboardPagination.hasPrevious || isDashboardPageLoading}
+                  disabled={!activeServerDashboardPagination.hasPrevious || isDashboardPageLoading}
                 >
                   Previous
                 </Button>
@@ -6545,7 +6923,7 @@ const AgentDashboard = () => {
                   size="sm"
                   variant="outline"
                   onClick={() => setDashboardPage((currentPage) => currentPage + 1)}
-                  disabled={!serverDashboardPagination.hasNext || isDashboardPageLoading}
+                  disabled={!activeServerDashboardPagination.hasNext || isDashboardPageLoading}
                 >
                   Next
                 </Button>
@@ -6577,6 +6955,15 @@ const AgentDashboard = () => {
       managementAgents.filter((agent) => canReceiveTeamTickets(agent, policy)).length,
     ]),
   );
+
+  function findManagementAgentForEntraResult(result: EntraAgentSearchResult) {
+    const resultEmail = (result.email || "").trim().toLowerCase();
+    const resultUsername = (result.username || "").trim().toLowerCase();
+    return managementAgents.find((agent) => (
+      (resultEmail && (agent.email || "").trim().toLowerCase() === resultEmail)
+      || (resultUsername && agent.username.trim().toLowerCase() === resultUsername)
+    )) || null;
+  }
 
   function getAdminAccessLabel(agent: AdminAgent) {
     const normalizedRole = getNormalizedAdminRole(agent);
@@ -6619,8 +7006,9 @@ const AgentDashboard = () => {
       return null;
     }
 
-    const draftName = teamSettingsKey === policy.key ? teamSettingsName : policy.label;
-    const draftDescription = teamSettingsKey === policy.key ? teamSettingsDescription : policy.description;
+    const isEditingTeam = editingTeamKey === policy.key;
+    const draftName = isEditingTeam && teamSettingsKey === policy.key ? teamSettingsName : policy.label;
+    const draftDescription = isEditingTeam && teamSettingsKey === policy.key ? teamSettingsDescription : policy.description;
     const isSavingTeam = savingTeamKey === policy.key;
     const isDisablingTeam = disablingTeamKey === policy.key;
     const hasChanges = (
@@ -6649,7 +7037,7 @@ const AgentDashboard = () => {
                 }
               }}
               className="mt-1 bg-background"
-              disabled={isSavingTeam || isDisablingTeam}
+              disabled={!isEditingTeam || isSavingTeam || isDisablingTeam}
             />
           </div>
           <div className="min-w-0 flex-[1.4]">
@@ -6667,33 +7055,161 @@ const AgentDashboard = () => {
                 setTeamSettingsDescription(event.target.value);
               }}
               className="mt-1 bg-background"
-              disabled={isSavingTeam || isDisablingTeam}
+              disabled={!isEditingTeam || isSavingTeam || isDisablingTeam}
             />
           </div>
           <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
-            <Button
-              type="submit"
-              disabled={isSavingTeam || isDisablingTeam || !draftName.trim() || !hasChanges}
-            >
-              {isSavingTeam ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
-              Save Team
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              className="border-rose-200 bg-white text-rose-700 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-800"
-              disabled={isSavingTeam || isDisablingTeam}
-              onClick={() => void disableTeam(policy)}
-            >
-              {isDisablingTeam ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Archive className="mr-2 h-4 w-4" />}
-              Disable
-            </Button>
+            {isEditingTeam ? (
+              <>
+                <Button
+                  type="submit"
+                  disabled={isSavingTeam || isDisablingTeam || !draftName.trim() || !hasChanges}
+                >
+                  {isSavingTeam ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+                  Save Team
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={isSavingTeam || isDisablingTeam}
+                  onClick={() => {
+                    setEditingTeamKey("");
+                    setTeamSettingsKey("");
+                    setTeamSettingsName("");
+                    setTeamSettingsDescription("");
+                  }}
+                >
+                  <X className="mr-2 h-4 w-4" />
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={isDisablingTeam}
+                  onClick={() => {
+                    setEditingTeamKey(policy.key);
+                    setTeamSettingsKey(policy.key);
+                    setTeamSettingsName(policy.label);
+                    setTeamSettingsDescription(policy.description);
+                  }}
+                >
+                  <Settings2 className="mr-2 h-4 w-4" />
+                  Edit
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="border-rose-200 bg-white text-rose-700 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-800"
+                  disabled={isDisablingTeam}
+                  onClick={() => void disableTeam(policy)}
+                >
+                  {isDisablingTeam ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Archive className="mr-2 h-4 w-4" />}
+                  Disable
+                </Button>
+              </>
+            )}
           </div>
         </div>
         <p className="mt-2 text-xs text-muted-foreground">
-          Renaming a team also updates tickets currently assigned to the old team name.
+          {isEditingTeam
+            ? "Renaming a team also updates tickets currently assigned to the old team name."
+            : "Press Edit before changing team details."}
         </p>
       </form>
+    );
+  }
+
+  function renderManagementEntraSearch(policy: TeamRoutingPolicy | null): ReactNode {
+    if (!policy || managementAccessTab === "admins") {
+      return null;
+    }
+
+    const query = managementSearch.trim();
+    if (query.length < 2) {
+      return null;
+    }
+
+    return (
+      <div className="border-b bg-background px-4 py-3 sm:px-5">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Microsoft Entra Results
+            </div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              Add people from Entra directly to {policy.label} ticket access.
+            </div>
+          </div>
+          {isSearchingEntraAgents ? (
+            <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+              Searching Entra...
+            </span>
+          ) : null}
+        </div>
+
+        {entraAgentSearchError ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+            {entraAgentSearchError}
+          </div>
+        ) : null}
+
+        {!entraAgentSearchError && !isSearchingEntraAgents && entraAgentSearchResults.length === 0 ? (
+          <div className="rounded-xl border border-dashed px-3 py-3 text-sm text-muted-foreground">
+            No Entra users matched "{query}".
+          </div>
+        ) : null}
+
+        {entraAgentSearchResults.length > 0 ? (
+          <div className="space-y-2">
+            {entraAgentSearchResults.map((result) => {
+              const localAgent = findManagementAgentForEntraResult(result);
+              const localHasTeamAccess = Boolean(localAgent && canReceiveTeamTickets(localAgent, policy));
+              const actionKey = `${policy.key}:${result.entraId || result.email}`;
+              const isAdding = addingEntraAgentKey === actionKey;
+              const displayName = result.displayName || result.email || result.username;
+              const statusLabel = localHasTeamAccess
+                ? `Already receives ${policy.label} tickets`
+                : localAgent || result.alreadyAdded
+                  ? "Existing support account"
+                  : "Not added yet";
+
+              return (
+                <div key={`${result.entraId || result.email}-${policy.key}`} className="flex flex-col gap-3 rounded-2xl border bg-secondary/20 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium text-foreground">{displayName}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {result.email || result.username}
+                    </div>
+                    <div className={cn(
+                      "mt-1 text-xs font-medium",
+                      localHasTeamAccess ? "text-emerald-600" : "text-muted-foreground",
+                    )}>
+                      {statusLabel}
+                    </div>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={localHasTeamAccess || isAdding}
+                    onClick={() => void addEntraAgentToTeam(result, policy)}
+                  >
+                    {isAdding ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Users className="mr-2 h-4 w-4" />}
+                    {localHasTeamAccess
+                      ? "Enabled"
+                      : localAgent || result.alreadyAdded
+                        ? `Enable ${policy.label}`
+                        : `Add to ${policy.label}`}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+      </div>
     );
   }
 
@@ -7317,7 +7833,7 @@ const AgentDashboard = () => {
                       <Input
                         value={managementSearch}
                         onChange={(e) => setManagementSearch(e.target.value)}
-                        placeholder="Search agents..."
+                        placeholder="Search local or Entra agents..."
                         className="pl-10"
                       />
                     </div>
@@ -7378,6 +7894,7 @@ const AgentDashboard = () => {
                   {managementTeamTabs.map(({ value, policy }) => (
                     <TabsContent key={value} value={value} className="m-0">
                       {renderManagementTeamSettings(policy)}
+                      {renderManagementEntraSearch(policy)}
                       <div className="divide-y">{renderManagementAccessRows(value)}</div>
                     </TabsContent>
                   ))}
@@ -10302,7 +10819,6 @@ const CoverageTicketWorkspace = ({
         .flat()
         .forEach(revokeCoverageAttachmentObjectUrl);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Revoke only the current pending object URLs when the panel unmounts.
   ), []);
 
   useEffect(() => {
@@ -10364,8 +10880,11 @@ const CoverageTicketWorkspace = ({
 
   useEffect(() => {
     let cancelled = false;
+    const sessionDates = coverageInquirySessionDateKey
+      ? coverageInquirySessionDateKey.split("|").filter(Boolean)
+      : [];
 
-    if (!coverageInquiryTime || coverageInquirySessionDates.length === 0) {
+    if (!coverageInquiryTime || sessionDates.length === 0) {
       setTutorAvailabilityItems([]);
       return () => {
         cancelled = true;
@@ -10374,7 +10893,7 @@ const CoverageTicketWorkspace = ({
 
     void fetchCoverageTutorAvailability({
       time: coverageInquiryTime,
-      sessionDates: coverageInquirySessionDates,
+      sessionDates,
     })
       .then((items) => {
         if (!cancelled) {
@@ -15881,8 +16400,12 @@ function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">)
   return normalizedScope === "staff";
 }
 
+function isTicketReceiverStaffAccount(agent: Pick<AdminAgent, "accountScope" | "role">) {
+  return isStaffSupportAccount(agent);
+}
+
 function hasCurrentCommunicationCentreAccess(
-  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess" | "teamAccess" | "teamAccessKeys">,
+  agent: Pick<AdminAgent, "accountScope" | "role" | "legacySupportAccess" | "legacyOperationsAccess" | "legacyAdminAccess" | "teamAccess" | "teamAccessKeys">,
 ) {
   return Boolean(
     getActiveTeamRoutingPolicies().some((policy) => canReceiveTeamTickets(agent, policy))
@@ -15892,9 +16415,13 @@ function hasCurrentCommunicationCentreAccess(
 }
 
 function canReceiveTeamTickets(
-  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">,
+  agent: Pick<AdminAgent, "accountScope" | "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">,
   policy: TeamRoutingPolicy,
 ) {
+  if (!isTicketReceiverStaffAccount(agent)) {
+    return false;
+  }
+
   if (policy.receiverAccessKey && agent[policy.receiverAccessKey] === true) {
     return true;
   }
@@ -15902,22 +16429,26 @@ function canReceiveTeamTickets(
   return hasPreloadedTeamAccess(agent, policy.key);
 }
 
-function canReceiveSupportTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+function canReceiveSupportTickets(agent: Pick<AdminAgent, "accountScope" | "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
   return canReceiveTeamTickets(agent, getSupportTeamRoutingPolicy());
 }
 
-function canReceiveLearningPlanTickets(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+function canReceiveLearningPlanTickets(agent: Pick<AdminAgent, "accountScope" | "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
   return canReceiveTeamTickets(agent, getLearningPlanTeamRoutingPolicy());
 }
 
 function canReceiveTicketAssignment(
-  agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">,
+  agent: Pick<AdminAgent, "accountScope" | "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">,
   ticket?: (Pick<TicketSummary, "technicalSubcategory" | "assignedTeam"> & Partial<Pick<TicketSummary, "ticketState">>) | null,
 ) {
   return canReceiveTeamTickets(agent, getTicketRoutingPolicy(ticket));
 }
 
-function hasTicketAccess(agent: Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+function hasTicketAccess(agent: Pick<AdminAgent, "accountScope" | "role" | "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">) {
+  if (!isTicketReceiverStaffAccount(agent)) {
+    return false;
+  }
+
   return getActiveTeamRoutingPolicies().some((policy) => canReceiveTeamTickets(agent, policy))
     || hasAnyPreloadedTeamAccess(agent);
 }

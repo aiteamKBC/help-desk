@@ -1514,7 +1514,42 @@ class AdminSessionViewTests(SimpleTestCase):
             "instance-1",
             allowed_roles=views.SUPPORT_PORTAL_ACCESS_ROLES,
         )
-        list_agents.assert_called_once_with(include_inactive=True)
+        list_agents.assert_called_once_with(include_inactive=True, refresh_legacy=True)
+
+    def test_admin_accounts_get_can_skip_legacy_refresh_for_fast_local_load(self):
+        request = self.factory.get("/api/admin/accounts?refreshLegacy=false")
+        self.attach_session(
+            request,
+            {
+                views.ADMIN_SESSION_KEY: {
+                    "id": 7,
+                    "username": "admin1",
+                    "fullName": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                    "instanceId": "instance-1",
+                }
+            },
+        )
+
+        with (
+            patch.object(
+                views,
+                "require_agent_session_actor",
+                return_value={
+                    "id": 7,
+                    "username": "admin1",
+                    "full_name": "Admin One",
+                    "email": None,
+                    "role": "admin",
+                },
+            ),
+            patch.object(views, "list_agents", return_value={"accounts": []}) as list_agents,
+        ):
+            response = views.admin_accounts(request)
+
+        self.assertEqual(response.status_code, 200)
+        list_agents.assert_called_once_with(include_inactive=True, refresh_legacy=False)
 
     def test_admin_accounts_post_still_requires_admin_access_role(self):
         request = self.factory.post(
@@ -3238,6 +3273,165 @@ class SupportTeamManagementTests(SimpleTestCase):
             **overrides,
         }
 
+    def test_create_support_team_stores_auth_group_name_and_ensures_group(self):
+        created_team = self.build_team_row(metadata={"auth_group_name": "Curriculum Team Access"})
+
+        with (
+            patch.object(services, "run_query_one", side_effect=[None, created_team]) as run_query_one,
+            patch.object(services, "ensure_legacy_auth_group_exists") as ensure_legacy_auth_group_exists,
+        ):
+            result = services.create_support_team({"name": "Curriculum Team"})
+
+        self.assertEqual(result["team"]["authGroupName"], "Curriculum Team Access")
+        ensure_legacy_auth_group_exists.assert_called_once_with("Curriculum Team Access")
+        insert_params = run_query_one.call_args_list[1].args[1]
+        self.assertEqual(insert_params[0], "curriculum_team")
+        self.assertEqual(json.loads(insert_params[5])["auth_group_name"], "Curriculum Team Access")
+
+    def test_create_support_team_reactivates_inactive_team_and_ensures_group(self):
+        inactive_team = self.build_team_row(
+            key="curriculum_team",
+            is_active=False,
+            metadata={},
+        )
+        reactivated_team = self.build_team_row(
+            key="curriculum_team",
+            metadata={"auth_group_name": "Curriculum Team Access"},
+        )
+
+        with (
+            patch.object(services, "run_query_one", side_effect=[inactive_team, reactivated_team]) as run_query_one,
+            patch.object(services, "ensure_legacy_auth_group_exists") as ensure_legacy_auth_group_exists,
+        ):
+            result = services.create_support_team({"name": "Curriculum Team"})
+
+        self.assertTrue(result["team"]["isActive"])
+        self.assertEqual(result["team"]["key"], "curriculum_team")
+        self.assertEqual(result["team"]["authGroupName"], "Curriculum Team Access")
+        ensure_legacy_auth_group_exists.assert_called_once_with("Curriculum Team Access")
+        update_sql = run_query_one.call_args_list[1].args[0]
+        update_params = run_query_one.call_args_list[1].args[1]
+        self.assertIn("UPDATE support_teams", update_sql)
+        self.assertEqual(update_params[2], "team_access:curriculum_team")
+        self.assertEqual(json.loads(update_params[4])["auth_group_name"], "Curriculum Team Access")
+
+    def test_create_support_team_rejects_active_duplicate_with_clear_error(self):
+        with patch.object(services, "run_query_one", return_value=self.build_team_row()):
+            with self.assertRaises(services.ApiError) as context:
+                services.create_support_team({"name": "Curriculum Team"})
+
+        self.assertEqual(context.exception.status_code, 400)
+        self.assertEqual(context.exception.message, "Team already exists.")
+
+    def test_update_agent_team_access_syncs_custom_group_for_legacy_user(self):
+        agent = {
+            "id": 21,
+            "username": "curriculum.agent",
+            "full_name": "Curriculum Agent",
+            "email": "curriculum.agent@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {"legacy_auth_user_id": 42},
+        }
+        team = self.build_team_row(metadata={"auth_group_name": "Curriculum Team Access"})
+        attached_agent = {
+            **agent,
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "canReceiveTickets": True,
+                }
+            ],
+        }
+
+        with (
+            patch.object(services, "run_query_one", side_effect=[agent, team]),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "persist_account_team_access") as persist_account_team_access,
+            patch.object(services, "sync_legacy_access_group_membership") as sync_legacy_access_group_membership,
+            patch.object(services, "attach_account_team_access", return_value=[attached_agent]),
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            result = services.update_agent_team_access(21, team_key="curriculum", receive_tickets=True)
+
+        self.assertIn("curriculum", result["teamAccessKeys"])
+        persist_account_team_access.assert_called_once_with(21, "curriculum", True, strict=True)
+        sync_legacy_access_group_membership.assert_called_once_with(42, "Curriculum Team Access", True)
+
+    def test_update_agent_team_access_allows_admin_receiver_enable(self):
+        admin_account = {
+            "id": 22,
+            "username": "curriculum.admin",
+            "full_name": "Curriculum Admin",
+            "email": "curriculum.admin@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {"legacy_auth_user_id": 43},
+        }
+        team = self.build_team_row(metadata={"auth_group_name": "Curriculum Team Access"})
+        attached_admin = {
+            **admin_account,
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "canReceiveTickets": True,
+                }
+            ],
+        }
+
+        with (
+            patch.object(services, "run_query_one", side_effect=[admin_account, team]),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "persist_account_team_access") as persist_account_team_access,
+            patch.object(services, "sync_legacy_access_group_membership") as sync_legacy_access_group_membership,
+            patch.object(services, "attach_account_team_access", return_value=[attached_admin]),
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            result = services.update_agent_team_access(22, team_key="curriculum", receive_tickets=True)
+
+        self.assertEqual(result["role"], "admin")
+        self.assertIn("curriculum", result["teamAccessKeys"])
+        persist_account_team_access.assert_called_once_with(22, "curriculum", True, strict=True)
+        sync_legacy_access_group_membership.assert_called_once_with(43, "Curriculum Team Access", True)
+
+    def test_legacy_auth_user_from_row_accepts_custom_team_group_only(self):
+        legacy_user = services._legacy_support_user_from_row(
+            (
+                42,
+                "curriculum.agent",
+                "Curriculum",
+                "Agent",
+                "curriculum.agent@kentbusinesscollege.com",
+                "hashed-password",
+                False,
+                False,
+                True,
+                False,
+                False,
+                False,
+                ["curriculum team access"],
+            ),
+            {"curriculum team access": "curriculum"},
+        )
+
+        self.assertIsNotNone(legacy_user)
+        self.assertEqual(legacy_user["team_access_keys"], ["curriculum"])
+        self.assertTrue(services.legacy_auth_user_has_admin_login_access(legacy_user))
+
+    def test_metadata_team_access_keys_count_as_preloaded_access(self):
+        self.assertEqual(
+            services.get_preloaded_account_team_access_keys(
+                {"metadata": {"team_access_keys": ["curriculum"]}}
+            ),
+            {"curriculum"},
+        )
+
     def test_update_support_team_renames_matching_ticket_assignments(self):
         current_team = self.build_team_row()
         updated_team = self.build_team_row(
@@ -3254,6 +3448,7 @@ class SupportTeamManagementTests(SimpleTestCase):
             patch.object(services, "run_query_one", side_effect=[current_team, updated_team]) as run_query_one,
             patch.object(services, "support_team_transaction", return_value=nullcontext()),
             patch.object(services, "support_team_cursor", return_value=cursor_context),
+            patch.object(services, "ensure_legacy_auth_group_exists"),
         ):
             result = services.update_support_team(
                 "curriculum",
@@ -3836,13 +4031,21 @@ class SlaPolicyTests(SimpleTestCase):
         }
         support_agent = {
             "account_scope": "staff",
+            "role": "agent",
             "is_active": True,
             "metadata": {"legacy_support_access": True, "legacy_operations_access": False},
         }
         operations_agent = {
             "account_scope": "staff",
+            "role": "agent",
             "is_active": True,
             "metadata": {"legacy_support_access": False, "legacy_operations_access": True},
+        }
+        support_admin = {
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True, "legacy_operations_access": True},
         }
 
         self.assertEqual(services.get_ticket_receiver_scope(support_ticket), "support")
@@ -3852,6 +4055,8 @@ class SlaPolicyTests(SimpleTestCase):
         self.assertFalse(services.account_can_receive_ticket_assignment(support_agent, learning_plan_ticket))
         self.assertTrue(services.account_can_receive_ticket_assignment(operations_agent, learning_plan_ticket))
         self.assertTrue(services.account_can_receive_ticket_assignment(operations_agent, coverage_ticket_with_legacy_team))
+        self.assertTrue(services.account_can_receive_ticket_assignment(support_admin, support_ticket))
+        self.assertTrue(services.account_can_receive_ticket_assignment(support_admin, learning_plan_ticket))
 
     def test_dynamic_team_routing_policy_uses_team_access(self):
         curriculum_team = {
@@ -3887,12 +4092,40 @@ class SlaPolicyTests(SimpleTestCase):
             "is_active": True,
             "metadata": {"legacy_support_access": True},
         }
+        curriculum_admin = {
+            "id": 93,
+            "account_scope": "staff",
+            "role": "superadmin",
+            "is_active": True,
+            "metadata": {},
+            "team_access": [
+                {
+                    "key": "curriculum",
+                    "name": "Curriculum Team",
+                    "assignedTeam": "Curriculum Team",
+                    "canReceiveTickets": True,
+                }
+            ],
+        }
 
         with patch.object(services, "fetch_optional_dynamic_team_row_by_assigned_team", return_value=curriculum_team):
             self.assertEqual(services.normalize_assigned_team("Curriculum Team"), "Curriculum Team")
             self.assertEqual(services.get_ticket_receiver_scope(curriculum_ticket), "curriculum")
             self.assertTrue(services.account_can_receive_ticket_assignment(curriculum_agent, curriculum_ticket))
             self.assertFalse(services.account_can_receive_ticket_assignment(support_agent, curriculum_ticket))
+            self.assertTrue(services.account_can_receive_ticket_assignment(curriculum_admin, curriculum_ticket))
+
+    def test_agent_role_does_not_imply_support_access_without_explicit_permission(self):
+        actor = {
+            "id": 91,
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {},
+        }
+
+        with patch.object(services, "fetch_optional_account_team_access", return_value=False):
+            self.assertFalse(services.actor_has_support_dashboard_access(actor))
 
     def test_serialize_ticket_summary_marks_chat_active_only_when_conversation_is_active(self):
         ticket_row = {
@@ -4556,14 +4789,23 @@ class SlaPolicyTests(SimpleTestCase):
             "updated_at": datetime(2026, 5, 14, 9, 0, tzinfo=timezone.utc),
         }
 
+        pagination = {
+            "page": 2,
+            "pageSize": 1,
+            "total": 2,
+            "totalPages": 2,
+            "hasNext": False,
+            "hasPrevious": True,
+            "isPaginated": True,
+        }
+
         with (
             patch.object(services, "trigger_ticket_background_sync"),
             patch.object(
                 services,
-                "run_query",
-                return_value=[hidden_archive_ticket, newer_matching_ticket, hidden_status_ticket, older_matching_ticket],
-            ),
-            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+                "fetch_admin_ticket_page_for_actor",
+                return_value=([newer_matching_ticket], pagination),
+            ) as fetch_page,
         ):
             result = services.list_admin_tickets(
                 query_params={
@@ -4576,7 +4818,14 @@ class SlaPolicyTests(SimpleTestCase):
                 }
             )
 
+        list_params = fetch_page.call_args.args[1]
         self.assertEqual([ticket["id"] for ticket in result["tickets"]], ["KBC-000022"])
+        self.assertEqual(list_params["search"], "alice")
+        self.assertEqual(list_params["status"], "Open")
+        self.assertEqual(list_params["archiveScope"], "active")
+        self.assertEqual(list_params["sort"], "oldest")
+        self.assertEqual(list_params["page"], 2)
+        self.assertEqual(list_params["pageSize"], 1)
         self.assertEqual(
             result["pagination"],
             {
@@ -4814,10 +5063,21 @@ class SlaPolicyTests(SimpleTestCase):
             "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
         }
 
+        expected_metrics = {
+            "total": 1,
+            "open": 0,
+            "pending": 1,
+            "escalation": 0,
+            "closed": 0,
+            "slaBreached": 0,
+            "coverage": 1,
+            "quickResolution": 0,
+            "sections": {"coverage": 1, "learningPlanOther": 1},
+        }
+
         with (
             patch.object(services, "trigger_ticket_background_sync"),
-            patch.object(services, "run_query", return_value=[coverage_ticket, other_learning_plan_ticket, support_ticket]),
-            patch.object(services, "apply_ticket_sla_policy", side_effect=lambda ticket, persist=True: ticket),
+            patch.object(services, "get_admin_ticket_metrics_from_sql", return_value=expected_metrics) as get_metrics_from_sql,
         ):
             result = services.get_admin_ticket_metrics(
                 {"id": 5, "role": "admin", "metadata": {"legacy_admin_access": True}},
@@ -4830,10 +5090,14 @@ class SlaPolicyTests(SimpleTestCase):
                 },
             )
 
+        metrics_params = get_metrics_from_sql.call_args.args[1]
         self.assertEqual(result["metrics"]["total"], 1)
         self.assertEqual(result["metrics"]["pending"], 1)
         self.assertEqual(result["metrics"]["coverage"], 1)
         self.assertEqual(result["metrics"]["sections"], {"coverage": 1, "learningPlanOther": 1})
+        self.assertEqual(metrics_params["dashboardFilter"], "coverage")
+        self.assertEqual(metrics_params["status"], "")
+        self.assertEqual(metrics_params["search"], "")
         self.assertEqual(result["filters"]["assigned"], "me")
         self.assertEqual(result["filters"]["team"], "operations")
         self.assertEqual(result["filters"]["dashboardFilter"], "coverage")
@@ -5643,6 +5907,7 @@ class AdminLoginTests(SimpleTestCase):
             ),
             patch.object(services, "fetch_microsoft_graph_directory_roles", return_value=(True, True, 200, [])),
             patch.object(services, "fetch_staff_support_account_by_email", return_value=curriculum_agent) as fetch_staff_support_account_by_email,
+            patch.object(services, "refresh_staff_account_legacy_access", return_value=curriculum_agent) as refresh_staff_account_legacy_access,
             patch.object(services, "fetch_legacy_support_user_by_email") as fetch_legacy_support_user_by_email,
             patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
             patch.object(services, "connection", mock_connection),
@@ -5660,11 +5925,78 @@ class AdminLoginTests(SimpleTestCase):
 
         self.assertEqual(response["admin"], registered_session)
         fetch_staff_support_account_by_email.assert_called()
+        refresh_staff_account_legacy_access.assert_called_once_with(curriculum_agent, persist=True)
         fetch_legacy_support_user_by_email.assert_not_called()
         saved_metadata = persist_agent_metadata.call_args.args[1]
         self.assertEqual(saved_metadata["entra_object_id"], "entra-object-curriculum")
         self.assertEqual(saved_metadata["entra_email"], "curriculum.agent@kentbusinesscollege.com")
         register_agent_session.assert_called_once_with("curriculum1", "instance-curriculum", "Off")
+
+    def test_support_access_entra_login_refreshes_stale_local_account_before_permission_check(self):
+        stale_agent = {
+            "id": 694,
+            "username": "test.test.kentbusinesscollege.com",
+            "full_name": "test test",
+            "email": "test.test@kentbusinesscollege.com",
+            "role": "agent",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {
+                "legacy_support_access": True,
+                "legacy_operations_access": True,
+                "legacy_admin_access": False,
+            },
+        }
+        refreshed_agent = {
+            **stale_agent,
+            "metadata": {
+                "legacy_support_access": False,
+                "legacy_operations_access": False,
+                "legacy_admin_access": False,
+                "team_access_keys": ["curriculum_team"],
+            },
+        }
+        final_agent = {
+            **refreshed_agent,
+            "metadata": {
+                **refreshed_agent["metadata"],
+                "entra_object_id": "entra-object-test",
+                "entra_email": "test.test@kentbusinesscollege.com",
+            },
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services, "fetch_staff_support_account_by_email", return_value=stale_agent) as fetch_staff_support_account_by_email,
+            patch.object(services, "refresh_staff_account_legacy_access", return_value=refreshed_agent) as refresh_staff_account_legacy_access,
+            patch.object(services, "fetch_legacy_support_user_by_email") as fetch_legacy_support_user_by_email,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "fetch_agent_account_by_id", return_value=final_agent),
+        ):
+            agent = services._login_support_access_agent_from_entra(
+                {
+                    "id": "entra-object-test",
+                    "displayName": "test test",
+                    "mail": "test.test@kentbusinesscollege.com",
+                },
+                "test.test@kentbusinesscollege.com",
+            )
+
+        self.assertEqual(agent, final_agent)
+        fetch_staff_support_account_by_email.assert_called_once_with("test.test@kentbusinesscollege.com")
+        refresh_staff_account_legacy_access.assert_called_once_with(stale_agent, persist=True)
+        fetch_legacy_support_user_by_email.assert_not_called()
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertFalse(saved_metadata["legacy_support_access"])
+        self.assertFalse(saved_metadata["legacy_operations_access"])
+        self.assertEqual(saved_metadata["team_access_keys"], ["curriculum_team"])
+        self.assertEqual(saved_metadata["entra_object_id"], "entra-object-test")
 
     def test_admin_microsoft_login_syncs_operations_access_user_without_entra_admin_role(self):
         id_token = build_unverified_jwt(
@@ -5806,7 +6138,7 @@ class SupportDirectoryTests(SimpleTestCase):
             "full_name": "Omar One",
             "email": "omar1@kentbusinesscollege.com",
             "account_scope": "staff",
-            "role": "admin",
+            "role": "agent",
             "is_active": True,
             "metadata": {
                 "legacy_auth_user_id": 77,
@@ -5827,6 +6159,36 @@ class SupportDirectoryTests(SimpleTestCase):
         saved_metadata = persist_agent_metadata.call_args.args[1]
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(response["legacySupportAccess"])
+
+    def test_update_agent_ticket_access_allows_admin_receiver_enable(self):
+        admin_account = {
+            "id": 29,
+            "username": "admin.user",
+            "full_name": "Admin User",
+            "email": "admin.user@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "admin",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 79,
+                "legacy_admin_access": True,
+                "legacy_support_access": False,
+            },
+        }
+
+        with (
+            patch.object(services, "run_query_one", return_value=admin_account),
+            patch.object(services, "sync_legacy_support_access_group_membership") as sync_legacy_support_access_group_membership,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
+        ):
+            response = services.update_agent_support_access(29, support_access=True)
+
+        self.assertEqual(response["role"], "admin")
+        self.assertTrue(response["legacySupportAccess"])
+        sync_legacy_support_access_group_membership.assert_called_once_with(79, True)
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertTrue(saved_metadata["legacy_support_access"])
 
     def test_update_agent_operations_access_syncs_linked_kbc_auth_group(self):
         agent = {
@@ -6014,6 +6376,7 @@ class SupportStaffSyncTests(SimpleTestCase):
             "is_active": True,
             "has_support_access": True,
             "has_admin_access": True,
+            "team_access_keys": ["curriculum"],
         }
         existing_account = {
             "id": 601,
@@ -6046,10 +6409,12 @@ class SupportStaffSyncTests(SimpleTestCase):
             patch.object(services, "find_agent_account_by_email", return_value=None),
             patch.object(services, "resolve_unique_support_staff_username", return_value="rewan.yasser"),
             patch.object(services, "fetch_agent_account_by_id", return_value=refreshed_account),
+            patch.object(services, "sync_account_team_access_from_legacy_user") as sync_account_team_access_from_legacy_user,
         ):
             response = services.sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
         self.assertEqual(response, refreshed_account)
+        sync_account_team_access_from_legacy_user.assert_called_once_with(601, legacy_user)
         update_params = cursor.execute.call_args.args[1]
         updated_metadata = json.loads(update_params[5])
         self.assertTrue(updated_metadata["session_active"])
@@ -6057,6 +6422,171 @@ class SupportStaffSyncTests(SimpleTestCase):
         self.assertEqual(updated_metadata["console_status"], "Available")
         self.assertTrue(updated_metadata["legacy_support_access"])
         self.assertTrue(updated_metadata["legacy_admin_access"])
+        self.assertEqual(updated_metadata["team_access_keys"], ["curriculum"])
+
+    def test_add_entra_agent_to_custom_team_does_not_grant_support_access(self):
+        team = {
+            "id": 8,
+            "key": "curriculum_team",
+            "name": "Curriculum Team",
+            "description": "",
+            "receiver_access_metadata_key": "team_access:curriculum_team",
+            "receiver_error_ticket_label": "Curriculum Team",
+            "is_active": True,
+            "metadata": {"auth_group_name": "Curriculum Team Access"},
+        }
+        new_account = {
+            "id": 77,
+            "username": "curriculum.user",
+            "full_name": "Curriculum User",
+            "email": "curriculum.user@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {},
+        }
+        serialized_agent = {
+            "id": 77,
+            "username": "curriculum.user",
+            "fullName": "Curriculum User",
+            "legacySupportAccess": False,
+            "teamAccessKeys": ["curriculum_team"],
+        }
+
+        with (
+            patch.object(services, "fetch_support_team_by_key", return_value=team),
+            patch.object(services, "_ensure_django_support_access", return_value=424) as ensure_django_support_access,
+            patch.object(services, "run_query_one", side_effect=[None, None, new_account]) as run_query_one,
+            patch.object(services, "update_agent_team_access", return_value=serialized_agent) as update_agent_team_access,
+        ):
+            response = services.add_entra_agent(
+                {
+                    "entraId": "entra-user-77",
+                    "displayName": "Curriculum User",
+                    "email": "curriculum.user@kentbusinesscollege.com",
+                    "username": "curriculum.user",
+                    "teamKey": "curriculum_team",
+                }
+            )
+
+        self.assertEqual(response["agent"], serialized_agent)
+        ensure_django_support_access.assert_called_once_with(
+            "curriculum.user@kentbusinesscollege.com",
+            "Curriculum User",
+            add_support_access=False,
+        )
+        insert_params = run_query_one.call_args_list[2].args[1]
+        inserted_metadata = json.loads(insert_params[5])
+        self.assertFalse(inserted_metadata["legacy_support_access"])
+        self.assertEqual(inserted_metadata["legacy_auth_user_id"], 424)
+        update_agent_team_access.assert_called_once_with(77, team_key="curriculum_team", receive_tickets=True)
+
+    def test_search_entra_agents_marks_existing_staff_account_without_support_access(self):
+        graph_payload = {
+            "value": [
+                {
+                    "id": "entra-user-77",
+                    "displayName": "Curriculum User",
+                    "mail": "curriculum.user@kentbusinesscollege.com",
+                    "userPrincipalName": "curriculum.user@kentbusinesscollege.com",
+                    "accountEnabled": True,
+                }
+            ]
+        }
+        existing_staff_account = {
+            "id": 77,
+            "username": "curriculum.user",
+            "email": "curriculum.user@kentbusinesscollege.com",
+            "is_active": True,
+            "metadata": {
+                "entra_object_id": "entra-user-77",
+                "legacy_support_access": False,
+                "team_access_keys": ["curriculum_team"],
+            },
+        }
+
+        with (
+            patch.object(services, "is_microsoft_admin_login_configured", return_value=True),
+            patch.object(
+                services,
+                "request_microsoft_login_graph_access_token",
+                return_value=(True, True, 200, {"access_token": "graph-token"}),
+            ),
+            patch.object(services, "get_json_request", return_value=(True, True, 200, graph_payload)),
+            patch.object(services, "run_query", return_value=[existing_staff_account]),
+        ):
+            response = services.search_entra_agents("curr")
+
+        self.assertEqual(len(response["results"]), 1)
+        self.assertTrue(response["results"][0]["alreadyAdded"])
+        self.assertEqual(response["results"][0]["existingAccountId"], 77)
+
+    def test_sync_account_team_access_from_legacy_user_disables_stale_builtin_access(self):
+        legacy_user = {
+            "id": 424,
+            "has_support_access": False,
+            "has_operations_access": False,
+            "team_access_keys": ["curriculum_team"],
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        cursor_context.__exit__.return_value = None
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services, "get_custom_support_team_auth_group_lookup", return_value={"curriculum team access": "curriculum_team"}),
+            patch.object(services, "persist_account_team_access") as persist_account_team_access,
+            patch.object(services, "connection", mock_connection),
+        ):
+            services.sync_account_team_access_from_legacy_user(694, legacy_user)
+
+        persist_account_team_access.assert_called_once_with(
+            694,
+            "curriculum_team",
+            True,
+            source="legacy_auth_group_sync",
+        )
+        update_params = cursor.execute.call_args.args[1]
+        self.assertEqual(update_params[1], 694)
+        self.assertEqual(update_params[2], ["operations", "support"])
+
+    def test_refresh_staff_account_legacy_access_clears_team_rows_when_legacy_user_loses_access(self):
+        account = {
+            "id": 694,
+            "username": "test.test.kentbusinesscollege.com",
+            "full_name": "test test",
+            "email": "test.test@kentbusinesscollege.com",
+            "account_scope": "staff",
+            "role": "agent",
+            "is_active": True,
+            "metadata": {
+                "legacy_auth_user_id": 424,
+                "legacy_support_access": True,
+                "legacy_operations_access": True,
+                "legacy_admin_access": False,
+                "team_access_keys": ["curriculum_team"],
+            },
+        }
+
+        with (
+            patch.object(services, "get_support_auth_database_url", return_value="postgres://auth-db"),
+            patch.object(services, "fetch_legacy_support_user_by_id", return_value=None),
+            patch.object(services, "fetch_legacy_support_user_by_email", return_value=None),
+            patch.object(services, "fetch_legacy_support_user_by_username", return_value=None),
+            patch.object(services, "sync_account_team_access_from_legacy_user") as sync_account_team_access_from_legacy_user,
+            patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+        ):
+            refreshed = services.refresh_staff_account_legacy_access(account, persist=True)
+
+        sync_account_team_access_from_legacy_user.assert_called_once_with(694, {})
+        saved_metadata = persist_agent_metadata.call_args.args[1]
+        self.assertFalse(saved_metadata["legacy_support_access"])
+        self.assertFalse(saved_metadata["legacy_operations_access"])
+        self.assertFalse(saved_metadata["legacy_admin_access"])
+        self.assertEqual(saved_metadata["team_access_keys"], [])
+        self.assertFalse(services.normalize_json_object(refreshed["metadata"])["session_active"])
 
     def test_sync_entra_support_staff_account_preserves_existing_console_session_metadata(self):
         profile = {
@@ -6152,6 +6682,7 @@ class SupportStaffSyncTests(SimpleTestCase):
             patch.object(services, "find_agent_account_by_email", return_value={"id": 380, "email": "rewan.yasser@kentbusinesscollege.com"}),
             patch.object(services, "resolve_unique_support_staff_username", return_value="rewan.yasser.staff"),
             patch.object(services, "fetch_agent_account_by_id", return_value=created_account),
+            patch.object(services, "sync_account_team_access_from_legacy_user"),
         ):
             response = services.sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
@@ -6257,6 +6788,175 @@ class ChatInactivitySyncCommandTests(SimpleTestCase):
             output.getvalue(),
         )
         sync_open_ticket_inactivity.assert_called_once_with(public_id=None)
+
+
+class AdminTicketListPrefilterTests(SimpleTestCase):
+    def test_fetch_admin_ticket_rows_prefilters_dynamic_team_in_sql(self):
+        team = {
+            "id": 7,
+            "key": "curriculum_team",
+            "name": "Curriculum Team",
+            "metadata": {},
+        }
+
+        with (
+            patch.object(services, "fetch_support_team_by_key", return_value=team),
+            patch.object(services, "run_query", return_value=[]) as run_query,
+        ):
+            services.fetch_admin_ticket_rows({
+                "team": "curriculum_team",
+                "archiveScope": "active",
+                "status": "Pending",
+            })
+
+        sql = run_query.call_args.args[0]
+        params = run_query.call_args.args[1]
+        self.assertIn("t.is_archived = FALSE", sql)
+        self.assertIn("t.status = %s", sql)
+        self.assertIn("NULLIF(LOWER(TRIM(COALESCE(t.queue_scope, ''))), '')", sql)
+        self.assertIn("Pending", params)
+        self.assertIn("curriculum_team", params)
+
+    def test_fetch_admin_ticket_rows_prefilters_legacy_team_in_sql(self):
+        with (
+            patch.object(services, "fetch_support_team_by_key") as fetch_support_team_by_key,
+            patch.object(services, "run_query", return_value=[]) as run_query,
+        ):
+            services.fetch_admin_ticket_rows({
+                "team": "support",
+                "archiveScope": "active",
+            })
+
+        fetch_support_team_by_key.assert_not_called()
+        sql = run_query.call_args.args[0]
+        params = run_query.call_args.args[1]
+        self.assertIn("t.is_archived = FALSE", sql)
+        self.assertIn("NULLIF(LOWER(TRIM(COALESCE(t.queue_scope, ''))), '')", sql)
+        self.assertIn(services.TICKET_RECEIVER_SCOPE_SUPPORT, params)
+
+    def test_fetch_admin_ticket_rows_prefilters_dashboard_and_sla_in_sql(self):
+        with patch.object(services, "run_query", return_value=[]) as run_query:
+            services.fetch_admin_ticket_rows({
+                "archiveScope": "active",
+                "dashboardFilter": "coverage",
+                "slaStatus": "Breached",
+            })
+
+        sql = run_query.call_args.args[0]
+        params = run_query.call_args.args[1]
+        self.assertIn("t.is_archived = FALSE", sql)
+        self.assertIn("t.sla_status = %s", sql)
+        self.assertIn("LOWER(TRIM(COALESCE(t.technical_subcategory, ''))) = 'coverage'", sql)
+        self.assertIn("Breached", params)
+
+    def test_fetch_admin_ticket_rows_prefilters_quick_resolution_in_sql(self):
+        with patch.object(services, "run_query", return_value=[]) as run_query:
+            services.fetch_admin_ticket_rows({"dashboardFilter": "quickResolution"})
+
+        sql = run_query.call_args.args[0]
+        params = run_query.call_args.args[1]
+        self.assertIn("t.status_reason = ANY(%s::text[])", sql)
+        self.assertIn("NOT (", sql)
+        self.assertIn("LOWER(TRIM(COALESCE(t.technical_subcategory, ''))) = 'coverage'", sql)
+        self.assertIn(services.STATUS_REASON_QUICK_TICKET, params[0])
+
+    def test_team_filter_uses_final_routing_policy_for_coverage_tickets(self):
+        ticket = {
+            "technical_subcategory": "Coverage",
+            "assigned_team": "Curriculum Team",
+            "metadata": {},
+        }
+
+        self.assertFalse(services.admin_ticket_matches_team_filter(ticket, "curriculum_team"))
+        self.assertFalse(services.admin_ticket_matches_team_filter(ticket, "Curriculum Team"))
+        self.assertTrue(services.admin_ticket_matches_team_filter(ticket, services.TICKET_RECEIVER_SCOPE_OPERATIONS))
+        self.assertTrue(services.admin_ticket_matches_team_filter(ticket, services.ASSIGNED_TEAM_LEARNING_PLAN))
+
+    def test_list_admin_tickets_passes_normalized_params_as_prefilter(self):
+        actor = {"id": 4, "role": services.ROLE_SUPERADMIN}
+        pagination = {
+            "page": 1,
+            "pageSize": 25,
+            "total": 0,
+            "totalPages": 0,
+            "hasNext": False,
+            "hasPrevious": False,
+            "isPaginated": True,
+        }
+
+        with (
+            patch.object(services, "trigger_ticket_background_sync"),
+            patch.object(services, "fetch_admin_ticket_page_for_actor", return_value=([], pagination)) as fetch_page,
+        ):
+            response = services.list_admin_tickets(
+                actor,
+                query_params={
+                    "team": "curriculum_team",
+                    "archiveScope": "active",
+                    "status": "Pending",
+                    "page": "1",
+                    "pageSize": "25",
+                },
+            )
+
+        self.assertEqual(response["pagination"]["total"], 0)
+        self.assertEqual(fetch_page.call_args.args[0], actor)
+        list_params = fetch_page.call_args.args[1]
+        self.assertEqual(list_params["team"], "curriculum_team")
+        self.assertEqual(list_params["archiveScope"], "active")
+        self.assertEqual(list_params["status"], "Pending")
+        self.assertEqual(list_params["pageSize"], 25)
+
+    def test_fetch_admin_ticket_page_uses_sql_count_limit_and_offset(self):
+        actor = {"id": 4, "role": services.ROLE_SUPERADMIN}
+        params = services.normalize_admin_ticket_list_params({
+            "page": "2",
+            "pageSize": "25",
+            "archiveScope": "active",
+            "sort": "newest",
+        })
+
+        with (
+            patch.object(services, "run_query_one", return_value={"total": 51}) as run_query_one,
+            patch.object(services, "run_query", return_value=[]) as run_query,
+        ):
+            _rows, pagination = services.fetch_admin_ticket_page_for_actor(actor, params)
+
+        count_sql = run_query_one.call_args.args[0]
+        page_sql = run_query.call_args.args[0]
+        page_params = run_query.call_args.args[1]
+        self.assertIn("COUNT(*) AS total", count_sql)
+        self.assertIn("LIMIT %s OFFSET %s", page_sql)
+        self.assertEqual(page_params[-2:], [25, 25])
+        self.assertEqual(pagination["total"], 51)
+        self.assertEqual(pagination["page"], 2)
+
+    def test_list_admin_tickets_does_not_trigger_background_sync_by_default(self):
+        with (
+            patch.object(services, "trigger_ticket_background_sync") as trigger_ticket_background_sync,
+            patch.object(services, "get_admin_ticket_rows_for_actor", return_value=[]),
+        ):
+            services.list_admin_tickets()
+
+        trigger_ticket_background_sync.assert_not_called()
+
+    def test_list_admin_tickets_can_trigger_background_sync_when_requested(self):
+        with (
+            patch.object(services, "trigger_ticket_background_sync") as trigger_ticket_background_sync,
+            patch.object(services, "get_admin_ticket_rows_for_actor", return_value=[]),
+        ):
+            services.list_admin_tickets(run_background_sync=True)
+
+        trigger_ticket_background_sync.assert_called_once_with()
+
+    def test_admin_ticket_metrics_does_not_trigger_background_sync_by_default(self):
+        with (
+            patch.object(services, "trigger_ticket_background_sync") as trigger_ticket_background_sync,
+            patch.object(services, "get_admin_ticket_metrics_from_sql", return_value={"total": 0, "sections": {"coverage": 0, "learningPlanOther": 0}}),
+        ):
+            services.get_admin_ticket_metrics()
+
+        trigger_ticket_background_sync.assert_not_called()
 
 
 class AdminTicketUpdateTests(SimpleTestCase):
@@ -8300,6 +9000,9 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "full_name": "Support Agent",
             "role": "agent",
             "email": "agent@example.com",
+            "account_scope": "staff",
+            "is_active": True,
+            "metadata": {"legacy_support_access": True},
         }
 
         with (
@@ -8403,6 +9106,62 @@ class AdminTicketUpdateTests(SimpleTestCase):
         self.assertEqual(raised_error.exception.status_code, 400)
         self.assertEqual(raised_error.exception.message, "Add a transfer note before moving this ticket to another team.")
 
+    def test_update_admin_ticket_rejects_coverage_transfer_to_dynamic_team(self):
+        ticket = {
+            "id": 17,
+            "public_id": "KBC-000017",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_COVERAGE_TICKET,
+            "assigned_agent_id": None,
+            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
+            "sla_status": "On Track",
+            "metadata": {},
+            "is_archived": False,
+            "created_at": datetime.now(timezone.utc),
+            "closed_at": None,
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage request",
+        }
+        actor_row = {
+            "id": 1,
+            "username": "manager",
+            "full_name": "Support Manager",
+            "role": "admin",
+            "email": "manager@example.com",
+        }
+        curriculum_team = {
+            "id": 101,
+            "key": "curriculum_team",
+            "name": "Curriculum Team",
+            "description": "",
+            "receiver_access_metadata_key": "team_access:curriculum_team",
+            "receiver_error_ticket_label": "Curriculum Team",
+            "is_active": True,
+            "metadata": {},
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "apply_ticket_sla_policy"),
+            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
+            patch.object(services, "fetch_optional_dynamic_team_row_by_assigned_team", return_value=curriculum_team),
+        ):
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.update_admin_ticket(
+                    "KBC-000017",
+                    {
+                        "actorUsername": "manager",
+                        "assignedTeam": "Curriculum Team",
+                        "note": "Move to Curriculum.",
+                    },
+                )
+
+        self.assertEqual(raised_error.exception.status_code, 409)
+        self.assertEqual(raised_error.exception.message, "Coverage tickets must stay in the Learning Plan Team workflow.")
+
     def test_support_agent_can_transfer_ticket_to_learning_plan_team_with_note(self):
         ticket = {
             "id": 17,
@@ -8488,6 +9247,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             {
                 "fromTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
                 "toTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                "note": "Needs Learning Plan review.",
             },
         )
         notify_learning_plan_ticket_transfer.assert_called_once()
@@ -8734,6 +9494,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             {
                 "fromTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
                 "toTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
+                "note": "Please review the learning plan request.",
             },
         )
         notify_learning_plan_ticket_transfer.assert_called_once()

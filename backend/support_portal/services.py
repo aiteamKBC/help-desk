@@ -84,6 +84,7 @@ TEAM_ROUTING_POLICIES = {
     },
 }
 LEGACY_TEAM_ROUTING_POLICY_KEYS = {policy["key"] for policy in TEAM_ROUTING_POLICIES.values()}
+SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY = "auth_group_name"
 ALLOWED_ASSIGNED_TEAMS = {ASSIGNED_TEAM_UNASSIGNED, *TEAM_ROUTING_POLICIES.keys()}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
@@ -284,6 +285,8 @@ _last_open_ticket_inactivity_sync_started_monotonic = 0.0
 _ticket_background_sync_lock = threading.Lock()
 _ticket_background_sync_in_progress = False
 _last_ticket_background_sync_started_monotonic = 0.0
+_ticket_detail_inactivity_sync_lock = threading.Lock()
+_ticket_detail_inactivity_sync_public_ids: set[str] = set()
 
 
 @dataclass
@@ -7203,6 +7206,8 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
     auth_database_url = get_support_auth_database_url()
     if not normalized_value or not auth_database_url:
         return None
+    team_group_lookup = get_custom_support_team_auth_group_lookup()
+    team_group_names = list(team_group_lookup.keys())
 
     lookup_params: list[Any]
     if lookup_kind == "id":
@@ -7253,7 +7258,14 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
                     INNER JOIN auth_group g ON g.id = ug.group_id
                     WHERE ug.user_id = u.id
                       AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_admin_access
+                  ) AS has_admin_access,
+                  ARRAY(
+                    SELECT LOWER(TRIM(g.name))
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = ANY(%s::text[])
+                  ) AS team_access_group_names
                 FROM auth_user u
                 WHERE {lookup_clause}
                   AND u.is_active = TRUE
@@ -7263,6 +7275,7 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
                     SUPPORT_ACCESS_GROUP_NAME,
                     OPERATIONS_ACCESS_GROUP_NAME,
                     ADMIN_ACCESS_GROUP_NAME,
+                    team_group_names,
                     *lookup_params,
                 ],
             )
@@ -7284,8 +7297,10 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
         has_support_access,
         has_operations_access,
         has_admin_access,
+        team_access_group_names,
     ) = row
-    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access)):
+    team_access_keys = build_team_access_keys_from_auth_groups(team_access_group_names, team_group_lookup)
+    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access) or team_access_keys):
         return None
 
     full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
@@ -7304,6 +7319,7 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
         "has_support_access": bool(has_support_access),
         "has_operations_access": bool(has_operations_access),
         "has_admin_access": bool(has_admin_access),
+        "team_access_keys": team_access_keys,
     }
 
 
@@ -7357,7 +7373,10 @@ def apply_public_requester_role_overrides(email: Any, requester_role: Any) -> st
     return normalized_role
 
 
-def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None:
+def _legacy_support_user_from_row(
+    row: tuple[Any, ...],
+    team_group_lookup: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     (
         user_id,
         username_val,
@@ -7371,8 +7390,10 @@ def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None
         has_support_access,
         has_operations_access,
         has_admin_access,
+        team_access_group_names,
     ) = row
-    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access)):
+    team_access_keys = build_team_access_keys_from_auth_groups(team_access_group_names, team_group_lookup or {})
+    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access) or team_access_keys):
         return None
 
     full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
@@ -7391,6 +7412,7 @@ def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None
         "has_support_access": bool(has_support_access),
         "has_operations_access": bool(has_operations_access),
         "has_admin_access": bool(has_admin_access),
+        "team_access_keys": team_access_keys,
     }
 
 
@@ -7432,6 +7454,8 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
 
     if not legacy_ids and not emails and not usernames:
         return {"id": {}, "email": {}, "username": {}}
+    team_group_lookup = get_custom_support_team_auth_group_lookup()
+    team_group_names = list(team_group_lookup.keys())
 
     with psycopg.connect(auth_database_url) as source_connection:
         with source_connection.cursor() as cursor:
@@ -7467,7 +7491,14 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
                     INNER JOIN auth_group g ON g.id = ug.group_id
                     WHERE ug.user_id = u.id
                       AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_admin_access
+                  ) AS has_admin_access,
+                  ARRAY(
+                    SELECT LOWER(TRIM(g.name))
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = ANY(%s::text[])
+                  ) AS team_access_group_names
                 FROM auth_user u
                 WHERE u.is_active = TRUE
                   AND (
@@ -7480,6 +7511,7 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
                     SUPPORT_ACCESS_GROUP_NAME,
                     OPERATIONS_ACCESS_GROUP_NAME,
                     ADMIN_ACCESS_GROUP_NAME,
+                    team_group_names,
                     list(legacy_ids),
                     list(emails),
                     list(usernames),
@@ -7491,7 +7523,7 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
     users_by_email: dict[str, dict[str, Any]] = {}
     users_by_username: dict[str, dict[str, Any]] = {}
     for row in rows:
-        legacy_user = _legacy_support_user_from_row(row)
+        legacy_user = _legacy_support_user_from_row(row, team_group_lookup)
         if not legacy_user:
             continue
         users_by_id[int(legacy_user["id"])] = legacy_user
@@ -7582,6 +7614,7 @@ def refresh_staff_account_legacy_access(
                 "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
                 "legacy_operations_access": normalize_bool(legacy_user.get("has_operations_access")),
                 "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
+                "team_access_keys": sorted(normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys"))),
             }
         )
     elif has_legacy_marker:
@@ -7591,10 +7624,17 @@ def refresh_staff_account_legacy_access(
                 "legacy_support_access": False,
                 "legacy_operations_access": False,
                 "legacy_admin_access": False,
+                "team_access_keys": [],
                 "session_active": False,
                 "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
             }
         )
+
+    if persist:
+        if legacy_user:
+            sync_account_team_access_from_legacy_user(int(account["id"]), legacy_user)
+        elif has_legacy_marker:
+            sync_account_team_access_from_legacy_user(int(account["id"]), {})
 
     if refreshed_metadata != metadata:
         if persist:
@@ -7988,6 +8028,86 @@ def normalize_support_team_key(value: Any) -> str:
     return normalized_value
 
 
+def normalize_auth_group_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", sanitize_text(value)).strip()
+
+
+def normalize_auth_group_lookup(value: Any) -> str:
+    return normalize_auth_group_name(value).casefold()
+
+
+def build_support_team_access_group_name(team_name: Any, team_key: Any = "") -> str:
+    label = normalize_auth_group_name(team_name)
+    if not label:
+        label = normalize_auth_group_name(re.sub(r"[-_]+", " ", sanitize_text(team_key)))
+    if not label:
+        raise ApiError(400, "Team name is required.")
+    if label.casefold().endswith(" access"):
+        return label
+    return f"{label} Access"
+
+
+def get_support_team_auth_group_name(team: dict[str, Any] | None) -> str:
+    if not isinstance(team, dict):
+        return ""
+
+    team_key = sanitize_text(team.get("key")).lower()
+    if team_key == TICKET_RECEIVER_SCOPE_SUPPORT:
+        return SUPPORT_ACCESS_GROUP_NAME
+    if team_key == TICKET_RECEIVER_SCOPE_OPERATIONS:
+        return OPERATIONS_ACCESS_GROUP_NAME
+
+    metadata = normalize_json_object(team.get("metadata"))
+    for metadata_key in (
+        SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY,
+        "authGroupName",
+        "legacy_auth_group_name",
+        "legacyAuthGroupName",
+    ):
+        group_name = normalize_auth_group_name(metadata.get(metadata_key))
+        if group_name:
+            return group_name
+
+    return build_support_team_access_group_name(team.get("name"), team_key)
+
+
+def get_custom_support_team_auth_group_lookup() -> dict[str, str]:
+    try:
+        rows = run_query(
+            """
+            SELECT key, name, metadata
+            FROM support_teams
+            WHERE is_active = TRUE
+            """
+        )
+    except Exception:
+        return {}
+
+    lookup: dict[str, str] = {}
+    for row in rows:
+        team_key = sanitize_text(row.get("key")).lower()
+        if not team_key or team_key in LEGACY_TEAM_ROUTING_POLICY_KEYS:
+            continue
+        group_lookup = normalize_auth_group_lookup(get_support_team_auth_group_name(row))
+        if group_lookup:
+            lookup[group_lookup] = team_key
+    return lookup
+
+
+def build_team_access_keys_from_auth_groups(group_names: Any, group_lookup: dict[str, str]) -> list[str]:
+    if not isinstance(group_names, (list, tuple, set)):
+        return []
+
+    team_keys: list[str] = []
+    seen: set[str] = set()
+    for group_name in group_names:
+        team_key = group_lookup.get(normalize_auth_group_lookup(group_name))
+        if team_key and team_key not in seen:
+            seen.add(team_key)
+            team_keys.append(team_key)
+    return team_keys
+
+
 def build_team_routing_policy_from_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(row, dict):
         return None
@@ -8021,6 +8141,7 @@ def serialize_support_team(row: dict[str, Any]) -> dict[str, Any]:
         "receiverAccessMetadataKey": policy.get("receiver_access_metadata_key") or "",
         "receiverErrorTicketLabel": policy.get("receiver_error_ticket_label") or "",
         "isActive": normalize_bool(row.get("is_active")) if "is_active" in row else True,
+        "authGroupName": get_support_team_auth_group_name(row),
         "metadata": normalize_json_object(row.get("metadata")),
     }
 
@@ -8163,6 +8284,8 @@ def get_preloaded_account_team_access_keys(account: dict[str, Any] | None) -> se
     metadata = normalize_json_object(account.get("metadata"))
     team_keys.update(normalize_preloaded_team_access_keys(metadata.get("team_access")))
     team_keys.update(normalize_preloaded_team_access_keys(metadata.get("teamAccess")))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("team_access_keys")))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("teamAccessKeys")))
     return team_keys
 
 
@@ -8313,6 +8436,61 @@ def fetch_support_team_by_key(team_key: Any, *, active_only: bool = True) -> dic
     )
 
 
+def fetch_support_team_create_candidate(team_key: Any, team_name: Any) -> dict[str, Any] | None:
+    normalized_team_key = normalize_support_team_key(team_key)
+    normalized_team_name = sanitize_text(team_name).lower()
+    if not normalized_team_name:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, key, name, description, receiver_access_metadata_key,
+               receiver_error_ticket_label, is_active, metadata
+        FROM support_teams
+        WHERE key = %s
+           OR LOWER(TRIM(name)) = %s
+        ORDER BY
+          CASE WHEN key = %s THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [normalized_team_key, normalized_team_name, normalized_team_key],
+    )
+
+
+def ensure_legacy_auth_group_exists(group_name: Any, *, strict: bool = False) -> None:
+    normalized_group_name = normalize_auth_group_name(group_name)
+    normalized_group_lookup = normalize_auth_group_lookup(normalized_group_name)
+    if not normalized_group_name:
+        if strict:
+            raise ApiError(400, "A valid KBC auth access group is required.")
+        return
+
+    auth_database_url = get_support_auth_database_url()
+    if not auth_database_url:
+        if strict:
+            raise ApiError(503, "KBC auth database is not configured.")
+        return
+
+    try:
+        with psycopg.connect(auth_database_url) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
+                    [normalized_group_lookup],
+                )
+                if cursor.fetchone():
+                    return
+                cursor.execute("INSERT INTO auth_group (name) VALUES (%s)", [normalized_group_name])
+    except ApiError:
+        raise
+    except Exception as exc:
+        if strict:
+            log_unexpected_api_error("Failed to ensure KBC access group exists.", exc)
+            raise ApiError(502, "We could not update the KBC auth database right now.") from exc
+        logger.warning("Could not ensure KBC auth group exists.", exc_info=(type(exc), exc, exc.__traceback__))
+
+
 def create_support_team(payload: dict[str, Any]) -> dict[str, Any]:
     name = sanitize_text(payload.get("name") or payload.get("label") or payload.get("assignedTeam"))
     if not name:
@@ -8323,6 +8501,51 @@ def create_support_team(payload: dict[str, Any]) -> dict[str, Any]:
     description = sanitize_text(payload.get("description"))
     receiver_error_ticket_label = sanitize_text(payload.get("receiverErrorTicketLabel")) or name
     metadata = normalize_json_object(payload.get("metadata"))
+    existing_team = fetch_support_team_create_candidate(team_key, name)
+    existing_metadata = normalize_json_object(existing_team.get("metadata")) if existing_team else {}
+    auth_group_name = build_support_team_access_group_name(
+        payload.get("authGroupName")
+        or metadata.get(SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY)
+        or existing_metadata.get(SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY)
+        or name,
+        team_key,
+    )
+    metadata = {**existing_metadata, **metadata}
+    metadata[SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY] = auth_group_name
+
+    if existing_team:
+        if normalize_bool(existing_team.get("is_active")):
+            raise ApiError(400, "Team already exists.")
+
+        existing_team_key = sanitize_text(existing_team.get("key")).lower() or team_key
+        row = run_query_one(
+            """
+            UPDATE support_teams
+            SET name = %s,
+                description = %s,
+                receiver_access_metadata_key = %s,
+                receiver_error_ticket_label = %s,
+                is_active = TRUE,
+                metadata = %s::jsonb,
+                updated_at = NOW()
+            WHERE id = %s
+            RETURNING id, key, name, description, receiver_access_metadata_key,
+                      receiver_error_ticket_label, is_active, metadata
+            """,
+            [
+                name,
+                description,
+                f"team_access:{existing_team_key}",
+                receiver_error_ticket_label,
+                json.dumps(metadata),
+                int(existing_team["id"]),
+            ],
+        )
+        if not row:
+            raise ApiError(500, "We could not reactivate this team right now.")
+
+        ensure_legacy_auth_group_exists(auth_group_name)
+        return {"team": serialize_support_team(row)}
 
     row = run_query_one(
         """
@@ -8349,6 +8572,8 @@ def create_support_team(payload: dict[str, Any]) -> dict[str, Any]:
     )
     if not row:
         raise ApiError(500, "We could not create this team right now.")
+
+    ensure_legacy_auth_group_exists(auth_group_name)
 
     return {"team": serialize_support_team(row)}
 
@@ -8381,6 +8606,10 @@ def update_support_team(team_key: Any, payload: dict[str, Any]) -> dict[str, Any
     next_description = sanitize_text(payload.get("description"))
     next_receiver_error_ticket_label = sanitize_text(payload.get("receiverErrorTicketLabel")) or next_name
     previous_name = sanitize_text(current_row.get("name"))
+    metadata = normalize_json_object(current_row.get("metadata"))
+    auth_group_name = get_support_team_auth_group_name(current_row)
+    if SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY not in metadata and auth_group_name:
+        metadata[SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY] = auth_group_name
 
     with support_team_transaction():
         row = run_query_one(
@@ -8389,6 +8618,7 @@ def update_support_team(team_key: Any, payload: dict[str, Any]) -> dict[str, Any
             SET name = %s,
                 description = %s,
                 receiver_error_ticket_label = %s,
+                metadata = %s::jsonb,
                 updated_at = NOW()
             WHERE key = %s
               AND is_active = TRUE
@@ -8399,6 +8629,7 @@ def update_support_team(team_key: Any, payload: dict[str, Any]) -> dict[str, Any
                 next_name,
                 next_description,
                 next_receiver_error_ticket_label,
+                json.dumps(metadata),
                 normalized_team_key,
             ],
         )
@@ -8416,6 +8647,9 @@ def update_support_team(team_key: Any, payload: dict[str, Any]) -> dict[str, Any
                     """,
                     [next_name, previous_name.lower()],
                 )
+
+    if auth_group_name:
+        ensure_legacy_auth_group_exists(auth_group_name)
 
     return {"team": serialize_support_team(row)}
 
@@ -8519,19 +8753,53 @@ def update_agent_team_access(agent_id: int, *, team_key: Any, receive_tickets: b
     )
     if not agent:
         raise ApiError(404, "Agent not found.")
-    if not fetch_support_team_by_key(normalized_team_key):
+    team = fetch_support_team_by_key(normalized_team_key)
+    if not team:
         raise ApiError(404, "Team not found.")
 
-    persist_account_team_access(
-        agent_id,
-        normalized_team_key,
-        receive_tickets,
-        strict=True,
-    )
+    with transaction.atomic():
+        persist_account_team_access(
+            agent_id,
+            normalized_team_key,
+            receive_tickets,
+            strict=True,
+        )
+        sync_account_team_access_group_membership(agent, team, receive_tickets)
     return serialize_agent(
         attach_account_team_access([agent])[0],
         open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
     )
+
+
+def sync_account_team_access_group_membership(
+    agent: dict[str, Any],
+    team: dict[str, Any],
+    enabled: bool,
+) -> None:
+    group_name = get_support_team_auth_group_name(team)
+    if not group_name:
+        return
+
+    metadata = normalize_json_object(agent.get("metadata"))
+    legacy_auth_user_id = _positive_int(metadata.get("legacy_auth_user_id"))
+    if legacy_auth_user_id:
+        sync_legacy_access_group_membership(legacy_auth_user_id, group_name, enabled)
+        return
+
+    from django.contrib.auth import get_user_model
+    from .admin import sync_access_group_membership
+
+    User = get_user_model()
+    django_user = None
+    agent_email = normalize_email(agent.get("email") or metadata.get("legacy_auth_email") or metadata.get("entra_email"))
+    if agent_email:
+        django_user = User.objects.filter(email__iexact=agent_email).first()
+    if not django_user:
+        username = sanitize_text(agent.get("username")).lower()
+        if username:
+            django_user = User.objects.filter(username__iexact=username).first()
+    if django_user:
+        sync_access_group_membership(django_user, group_name, enabled)
 
 
 def sync_legacy_team_access_memberships(
@@ -8554,6 +8822,58 @@ def sync_legacy_team_access_memberships(
             operations_access,
             source="legacy_operations_access",
         )
+
+
+def sync_account_team_access_from_legacy_user(account_id: int, legacy_user: dict[str, Any]) -> None:
+    normalized_account_id = parse_int(account_id)
+    if normalized_account_id <= 0:
+        return
+
+    managed_team_keys = set(LEGACY_TEAM_ROUTING_POLICY_KEYS)
+    managed_team_keys.update(get_custom_support_team_auth_group_lookup().values())
+    if not managed_team_keys:
+        return
+
+    enabled_team_keys = normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys")) & managed_team_keys
+    if normalize_bool(legacy_user.get("has_support_access")):
+        enabled_team_keys.add(TICKET_RECEIVER_SCOPE_SUPPORT)
+    if normalize_bool(legacy_user.get("has_operations_access")):
+        enabled_team_keys.add(TICKET_RECEIVER_SCOPE_OPERATIONS)
+
+    for team_key in sorted(enabled_team_keys):
+        persist_account_team_access(
+            normalized_account_id,
+            team_key,
+            True,
+            source="legacy_auth_group_sync",
+        )
+
+    disabled_team_keys = sorted(managed_team_keys - enabled_team_keys)
+    if not disabled_team_keys:
+        return
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE support_account_team_access ata
+                SET can_receive_tickets = FALSE,
+                    metadata = ata.metadata || %s::jsonb,
+                    updated_at = NOW()
+                FROM support_teams st
+                WHERE ata.team_id = st.id
+                  AND ata.account_id = %s
+                  AND st.key = ANY(%s::text[])
+                  AND ata.can_receive_tickets = TRUE
+                """,
+                [
+                    json.dumps({"source": "legacy_auth_group_sync", "disabledByMissingAuthGroup": True}),
+                    normalized_account_id,
+                    disabled_team_keys,
+                ],
+            )
+    except Exception as exc:
+        logger.warning("Could not sync disabled legacy auth team access.", exc_info=(type(exc), exc, exc.__traceback__))
 
 
 def get_team_routing_policy_by_assigned_team(assigned_team: Any) -> dict[str, Any]:
@@ -8628,12 +8948,10 @@ def actor_has_team_routing_access(actor: dict[str, Any] | None, policy: dict[str
     if not isinstance(actor, dict):
         return False
 
-    role = sanitize_text(actor.get("role")).lower()
-    legacy_default = policy["key"] == TICKET_RECEIVER_SCOPE_SUPPORT and role == ROLE_AGENT
     if actor_has_metadata_flag(
         actor,
         policy["receiver_access_metadata_key"],
-        default=legacy_default,
+        default=False,
     ):
         return True
 
@@ -8686,15 +9004,26 @@ def actor_can_transfer_ticket_between_teams(
     if not isinstance(ticket, dict):
         return False
 
-    if actor_has_admin_dashboard_access(actor):
-        return True
-
     try:
-        normalize_assigned_team(target_assigned_team)
+        normalized_target_team = normalize_assigned_team(target_assigned_team)
+        ensure_ticket_can_transfer_to_assigned_team(ticket, normalized_target_team)
     except ApiError:
         return False
 
+    if actor_has_admin_dashboard_access(actor):
+        return True
+
     return actor_has_team_routing_access(actor, get_ticket_routing_policy(ticket))
+
+
+def ensure_ticket_can_transfer_to_assigned_team(ticket: dict[str, Any], target_assigned_team: Any) -> None:
+    normalized_target_team = normalize_assigned_team(target_assigned_team)
+    if not is_coverage_ticket_record(ticket):
+        return
+
+    target_policy = get_team_routing_policy_by_assigned_team(normalized_target_team)
+    if target_policy["key"] != TICKET_RECEIVER_SCOPE_OPERATIONS:
+        raise ApiError(409, "Coverage tickets must stay in the Learning Plan Team workflow.")
 
 
 def require_actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> None:
@@ -11346,6 +11675,7 @@ def legacy_auth_user_has_admin_login_access(legacy_user: dict[str, Any]) -> bool
         normalize_bool(legacy_user.get("has_support_access"))
         or normalize_bool(legacy_user.get("has_operations_access"))
         or normalize_bool(legacy_user.get("has_admin_access"))
+        or bool(normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys")))
     )
 
 
@@ -11419,6 +11749,7 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
         "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
         "legacy_operations_access": normalize_bool(legacy_user.get("has_operations_access")),
         "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
+        "team_access_keys": sorted(normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys"))),
     }
 
     existing_account = (
@@ -11462,6 +11793,8 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
                     ],
                 )
 
+            sync_account_team_access_from_legacy_user(int(existing_account["id"]), legacy_user)
+
         refreshed_account = fetch_agent_account_by_id(int(existing_account["id"]))
         if refreshed_account:
             return refreshed_account
@@ -11504,6 +11837,8 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
                 ],
             )
             created_row = cursor.fetchone()
+            if created_row:
+                sync_account_team_access_from_legacy_user(int(created_row[0]), legacy_user)
 
     if not created_row:
         raise ApiError(500, "We could not create the linked support account right now.")
@@ -11906,8 +12241,9 @@ def sync_legacy_access_group_membership(legacy_auth_user_id: int, group_name: st
     normalized_user_id = int(legacy_auth_user_id or 0)
     if normalized_user_id <= 0:
         raise ApiError(400, "A linked KBC auth user is required.")
-    normalized_group_name = sanitize_text(group_name).lower()
-    if not normalized_group_name:
+    display_group_name = normalize_auth_group_name(group_name)
+    normalized_group_name = normalize_auth_group_lookup(display_group_name)
+    if not display_group_name:
         raise ApiError(400, "A valid KBC auth access group is required.")
     auth_database_url = get_support_auth_database_url()
     if not auth_database_url:
@@ -11933,7 +12269,7 @@ def sync_legacy_access_group_membership(legacy_auth_user_id: int, group_name: st
                 elif enabled:
                     cursor.execute(
                         "INSERT INTO auth_group (name) VALUES (%s) RETURNING id",
-                        [SUPPORT_ACCESS_GROUP_NAME],
+                        [display_group_name],
                     )
                     group_id = int(cursor.fetchone()[0])
                 else:
@@ -11995,7 +12331,6 @@ def update_agent_ticket_access(
     )
     if not agent:
         raise ApiError(404, "Agent not found.")
-
     metadata = normalize_json_object(agent.get("metadata"))
     legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
     if legacy_auth_user_id > 0:
@@ -13339,15 +13674,15 @@ def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[st
 def _login_support_access_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
     """Login path for staff who have KBC auth access but no Entra admin role."""
     candidate_emails = list(dict.fromkeys([normalized_email, *extract_microsoft_login_email_candidates(profile)]))
-    agent = next(
-        (
-            candidate
-            for email in candidate_emails
-            if (candidate := fetch_staff_support_account_by_email(email))
-            and actor_has_support_portal_login_access(candidate)
-        ),
-        None,
-    )
+    agent = None
+    for email in candidate_emails:
+        candidate = fetch_staff_support_account_by_email(email)
+        if not candidate:
+            continue
+        refreshed_candidate = refresh_staff_account_legacy_access(candidate, persist=True)
+        if actor_has_support_portal_login_access(refreshed_candidate):
+            agent = refreshed_candidate
+            break
 
     if not agent:
         legacy_user = next(
@@ -13468,7 +13803,7 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
     }
 
 
-def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
+def list_agents(*, include_inactive: bool = True, refresh_legacy: bool = True) -> dict[str, Any]:
     where_clause = "WHERE account_scope = %s"
     query_params: list[Any] = [ACCOUNT_SCOPE_STAFF]
     if not include_inactive:
@@ -13486,11 +13821,14 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         query_params,
     )
     open_assigned_chat_agent_ids = get_open_assigned_live_chat_agent_ids()
-    legacy_lookup = fetch_legacy_support_users_for_accounts(accounts)
-    refreshed_accounts = [
-        refresh_staff_account_legacy_access(account, legacy_lookup)
-        for account in accounts
-    ]
+    if refresh_legacy:
+        legacy_lookup = fetch_legacy_support_users_for_accounts(accounts)
+        refreshed_accounts = [
+            refresh_staff_account_legacy_access(account, legacy_lookup)
+            for account in accounts
+        ]
+    else:
+        refreshed_accounts = accounts
     refreshed_accounts = attach_account_team_access(refreshed_accounts)
     serialized_accounts = [
         serialize_agent(account, open_assigned_chat_agent_ids=open_assigned_chat_agent_ids)
@@ -13545,22 +13883,24 @@ def search_entra_agents(q: str) -> dict[str, Any]:
     if not isinstance(values, list):
         return {"results": []}
 
-    existing_usernames: set[str] = set()
-    existing_emails: set[str] = set()
+    existing_accounts_by_username: dict[str, dict[str, Any]] = {}
+    existing_accounts_by_email: dict[str, dict[str, Any]] = {}
+    existing_accounts_by_entra_id: dict[str, dict[str, Any]] = {}
     for account in run_query(
         """
-        SELECT username, email
+        SELECT id, username, email, is_active, metadata
         FROM support_accounts
         WHERE account_scope = %s
-          AND is_active = TRUE
-          AND (metadata->>'legacy_support_access')::boolean = TRUE
         """,
         [ACCOUNT_SCOPE_STAFF],
     ):
         if account.get("username"):
-            existing_usernames.add(sanitize_text(account["username"]).lower())
+            existing_accounts_by_username[sanitize_text(account["username"]).lower()] = account
         if account.get("email"):
-            existing_emails.add(normalize_email(account["email"]))
+            existing_accounts_by_email[normalize_email(account["email"])] = account
+        account_entra_id = sanitize_text(normalize_json_object(account.get("metadata")).get("entra_object_id"))
+        if account_entra_id:
+            existing_accounts_by_entra_id[account_entra_id] = account
 
     results = []
     for user in values:
@@ -13575,13 +13915,19 @@ def search_entra_agents(q: str) -> dict[str, Any]:
         if not mail and not upn:
             continue
         username = (upn.split("@")[0] if upn else mail.split("@")[0]).lower()
-        already_added = username in existing_usernames or (mail and mail in existing_emails)
+        existing_account = (
+            existing_accounts_by_entra_id.get(entra_id)
+            or existing_accounts_by_email.get(mail)
+            or existing_accounts_by_username.get(username)
+        )
+        already_added = bool(existing_account and normalize_bool(existing_account.get("is_active", True)))
         results.append({
             "entraId": entra_id,
             "displayName": display_name,
             "email": mail or upn,
             "username": username,
             "alreadyAdded": already_added,
+            "existingAccountId": parse_int(existing_account.get("id")) if existing_account else None,
         })
 
     return {"results": results}
@@ -13595,8 +13941,8 @@ def _get_kbc_auth_db_connection():
     return None
 
 
-def _ensure_django_support_access(email: str, full_name: str) -> int | None:
-    """Ensure the person has a Django user in the KBC auth database Support Access group. Returns the Django user id."""
+def _ensure_django_support_access(email: str, full_name: str, *, add_support_access: bool = True) -> int | None:
+    """Ensure the person has a Django user in the KBC auth database. Returns the Django user id."""
     kbc_conn = _get_kbc_auth_db_connection()
     normalized_email = email.strip().lower()
     try:
@@ -13636,6 +13982,11 @@ def _ensure_django_support_access(email: str, full_name: str) -> int | None:
                 )
                 django_user_id = cursor.fetchone()[0]
 
+            if not add_support_access:
+                if kbc_conn:
+                    kbc_conn.commit()
+                return django_user_id
+
             cursor.execute(
                 "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
                 [SUPPORT_ACCESS_GROUP_NAME],
@@ -13666,11 +14017,21 @@ def _ensure_django_support_access(email: str, full_name: str) -> int | None:
             kbc_conn.close()
 
 
+def apply_entra_agent_team_access(agent_id: int, team_key: str) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    if normalized_team_key == TICKET_RECEIVER_SCOPE_SUPPORT:
+        return update_agent_support_access(agent_id, support_access=True)
+    if normalized_team_key == TICKET_RECEIVER_SCOPE_OPERATIONS:
+        return update_agent_operations_access(agent_id, operations_access=True)
+    return update_agent_team_access(agent_id, team_key=normalized_team_key, receive_tickets=True)
+
+
 def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     entra_id = sanitize_text(payload.get("entraId"))
     display_name = sanitize_text(payload.get("displayName"))
     email = normalize_email(sanitize_text(payload.get("email") or ""))
     username = sanitize_text(payload.get("username") or "").lower()
+    requested_team_key = sanitize_text(payload.get("teamKey") or payload.get("team_key")).lower()
 
     if not entra_id or not email:
         raise ApiError(400, "Entra ID and email are required.")
@@ -13678,18 +14039,53 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_valid_email(email):
         raise ApiError(400, "Invalid email address.")
 
+    if requested_team_key:
+        requested_team_key = normalize_support_team_key(requested_team_key)
+        if requested_team_key not in LEGACY_TEAM_ROUTING_POLICY_KEYS and not fetch_support_team_by_key(requested_team_key):
+            raise ApiError(404, "Team not found.")
+
+    should_enable_support_access = (
+        not requested_team_key
+        or requested_team_key == TICKET_RECEIVER_SCOPE_SUPPORT
+    )
+    full_name = display_name or email
+
     existing = run_query_one(
-        "SELECT id, role, is_active, metadata FROM support_accounts WHERE LOWER(TRIM(email)) = %s AND account_scope = %s LIMIT 1",
-        [email, ACCOUNT_SCOPE_STAFF],
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE account_scope = %s
+          AND (
+            LOWER(TRIM(email)) = %s
+            OR metadata->>'entra_object_id' = %s
+          )
+        ORDER BY
+          CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [ACCOUNT_SCOPE_STAFF, email, entra_id],
     )
     if existing:
         existing_metadata = normalize_json_object(existing.get("metadata"))
-        if normalize_bool(existing_metadata.get("legacy_support_access")) and normalize_bool(existing.get("is_active", True)):
+        if (
+            not requested_team_key
+            and normalize_bool(existing_metadata.get("legacy_support_access"))
+            and normalize_bool(existing.get("is_active", True))
+        ):
             raise ApiError(409, "This person is already added as an agent.")
-        existing_metadata["legacy_support_access"] = True
+        django_user_id = _ensure_django_support_access(
+            email,
+            full_name,
+            add_support_access=should_enable_support_access,
+        )
+        existing_metadata["entra_object_id"] = entra_id
+        existing_metadata["entra_user_principal_name"] = sanitize_text(payload.get("email") or "")
+        existing_metadata["entra_directory_admin_access"] = normalize_bool(existing_metadata.get("entra_directory_admin_access"))
+        if should_enable_support_access:
+            existing_metadata["legacy_support_access"] = True
         existing_metadata.pop("manually_added_agent", None)
         existing_metadata.pop("agent_removed_at", None)
-        django_user_id = _ensure_django_support_access(email, display_name or email)
         if django_user_id and not existing_metadata.get("legacy_auth_user_id"):
             existing_metadata["legacy_auth_user_id"] = django_user_id
         persist_agent_metadata(int(existing["id"]), existing_metadata)
@@ -13706,11 +14102,19 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
             """,
             [display_name, next_role, int(existing["id"]), ACCOUNT_SCOPE_STAFF],
         )
+        if requested_team_key:
+            return {"agent": apply_entra_agent_team_access(int(existing["id"]), requested_team_key)}
+
         updated = run_query_one(
             "SELECT id, username, full_name, email, account_scope, role, is_active, metadata FROM support_accounts WHERE id = %s LIMIT 1",
             [int(existing["id"])],
         )
-        return {"agent": serialize_agent(updated, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())}
+        return {
+            "agent": serialize_agent(
+                attach_account_team_access([updated])[0],
+                open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+            )
+        }
 
     if not username:
         username = email.split("@")[0].lower()
@@ -13722,8 +14126,11 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     if username_taken:
         username = f"{username}.{entra_id[:6].lower()}"
 
-    full_name = display_name or email
-    django_user_id = _ensure_django_support_access(email, full_name)
+    django_user_id = _ensure_django_support_access(
+        email,
+        full_name,
+        add_support_access=should_enable_support_access,
+    )
 
     new_account = run_query_one(
         """
@@ -13741,7 +14148,7 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
                 "entra_object_id": entra_id,
                 "entra_user_principal_name": sanitize_text(payload.get("email") or ""),
                 "entra_directory_admin_access": False,
-                "legacy_support_access": True,
+                "legacy_support_access": should_enable_support_access,
                 **({"legacy_auth_user_id": django_user_id} if django_user_id else {}),
             }),
         ],
@@ -13749,7 +14156,15 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     if not new_account:
         raise ApiError(500, "We could not add this agent right now.")
 
-    return {"agent": serialize_agent(new_account, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())}
+    if requested_team_key:
+        return {"agent": apply_entra_agent_team_access(int(new_account["id"]), requested_team_key)}
+
+    return {
+        "agent": serialize_agent(
+            attach_account_team_access([new_account])[0],
+            open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+        )
+    }
 
 
 def _remove_django_support_access(email: str) -> None:
@@ -13818,6 +14233,7 @@ def _sync_tickets_background() -> None:
     global _ticket_background_sync_in_progress
 
     try:
+        close_old_connections()
         sync_open_ticket_inactivity()
         tickets = run_query(
             """
@@ -13865,6 +14281,7 @@ def _sync_tickets_background() -> None:
     except Exception:
         pass
     finally:
+        close_old_connections()
         with _ticket_background_sync_lock:
             _ticket_background_sync_in_progress = False
 
@@ -13887,6 +14304,37 @@ def trigger_ticket_background_sync() -> None:
         _last_ticket_background_sync_started_monotonic = comparison_now
 
     threading.Thread(target=_sync_tickets_background, daemon=True).start()
+
+
+def _sync_ticket_detail_inactivity_background(public_id: str) -> None:
+    try:
+        close_old_connections()
+        sync_open_ticket_inactivity(public_id=public_id)
+    except Exception:
+        pass
+    finally:
+        close_old_connections()
+        with _ticket_detail_inactivity_sync_lock:
+            _ticket_detail_inactivity_sync_public_ids.discard(public_id)
+
+
+def trigger_ticket_detail_inactivity_sync(public_id: Any) -> None:
+    normalized_public_id = sanitize_text(public_id)
+    if not normalized_public_id:
+        return
+    if getattr(settings, "IS_TESTING", False):
+        return
+
+    with _ticket_detail_inactivity_sync_lock:
+        if normalized_public_id in _ticket_detail_inactivity_sync_public_ids:
+            return
+        _ticket_detail_inactivity_sync_public_ids.add(normalized_public_id)
+
+    threading.Thread(
+        target=_sync_ticket_detail_inactivity_background,
+        args=(normalized_public_id,),
+        daemon=True,
+    ).start()
 
 
 ADMIN_TICKET_LIST_DEFAULT_PAGE_SIZE = 50
@@ -14059,11 +14507,12 @@ def admin_ticket_matches_team_filter(ticket: dict[str, Any], team_filter: str) -
     if not team_filter or team_filter == "all":
         return True
 
-    assigned_team = sanitize_text(ticket.get("assigned_team")).casefold()
-    if assigned_team == team_filter.casefold():
-        return True
-
-    return get_ticket_receiver_scope(ticket).casefold() == team_filter.casefold()
+    normalized_team_filter = team_filter.casefold()
+    ticket_routing_policy = get_ticket_routing_policy(ticket)
+    return normalized_team_filter in {
+        sanitize_text(ticket_routing_policy.get("key")).casefold(),
+        sanitize_text(ticket_routing_policy.get("assigned_team")).casefold(),
+    }
 
 
 def get_admin_ticket_dashboard_bucket(ticket: dict[str, Any]) -> str:
@@ -14263,9 +14712,117 @@ def build_admin_ticket_list_filter_response(params: dict[str, Any]) -> dict[str,
     }
 
 
-def fetch_admin_ticket_rows() -> list[dict[str, Any]]:
-    return run_query(
-        """
+def sql_literal(value: Any) -> str:
+    return f"'{sanitize_text(value).replace("'", "''")}'"
+
+
+ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION = "LOWER(TRIM(COALESCE(t.technical_subcategory, '')))"
+ADMIN_TICKET_SQL_ASSIGNED_TEAM_EXPRESSION = "LOWER(TRIM(COALESCE(t.assigned_team, '')))"
+ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION = (
+    "LOWER(COALESCE(NULLIF(c.metadata->>'live_chat_requested', ''), "
+    "NULLIF(t.metadata->>'live_chat_requested', ''), 'false')) IN ('true', '1', 'yes', 'on')"
+)
+ADMIN_TICKET_SQL_ACTIVE_CONVERSATION_EXPRESSION = (
+    "LOWER(COALESCE(NULLIF(c.metadata->>'is_active_conversation', ''), 'false')) IN ('true', '1', 'yes', 'on')"
+)
+ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION = f"""
+COALESCE(
+  NULLIF(LOWER(TRIM(COALESCE(t.queue_scope, ''))), ''),
+  CASE
+    WHEN {ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION} = 'coverage'
+      THEN {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)}
+    WHEN {ADMIN_TICKET_SQL_ASSIGNED_TEAM_EXPRESSION} IN (
+      {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)},
+      {sql_literal(ASSIGNED_TEAM_LEARNING_PLAN.casefold())}
+    )
+      THEN {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)}
+    WHEN routed_team.key IS NOT NULL
+      THEN LOWER(TRIM(routed_team.key))
+    ELSE {sql_literal(TICKET_RECEIVER_SCOPE_SUPPORT)}
+  END
+)
+"""
+ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION = f"""
+COALESCE(
+  NULLIF(LOWER(TRIM(COALESCE(t.dashboard_bucket, ''))), ''),
+  CASE
+    WHEN t.status = 'Closed' THEN 'closed'
+    WHEN {ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION} = 'coverage' THEN 'coverage'
+    WHEN {ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)} THEN 'learning_plan'
+    WHEN LOWER(TRIM(COALESCE(t.ticket_type, ''))) = 'quick' THEN 'quick'
+    WHEN t.status_reason = {sql_literal(STATUS_REASON_ESCALATION)} THEN 'escalation'
+    WHEN {ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION} THEN 'live_chat'
+    WHEN t.status = 'Pending' THEN 'pending'
+    WHEN {ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} NOT IN (
+      {sql_literal(TICKET_RECEIVER_SCOPE_SUPPORT)},
+      {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)}
+    ) THEN {ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION}
+    ELSE 'support'
+  END
+)
+"""
+ADMIN_TICKET_SQL_OPEN_FILTER_EXPRESSION = f"""
+(
+  t.status = 'Open'
+  AND LOWER(COALESCE(c.status, 'open')) <> 'closed'
+  AND (
+    NOT ({ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION})
+    OR (
+      {ADMIN_TICKET_SQL_ACTIVE_CONVERSATION_EXPRESSION}
+      AND COALESCE(c.metadata->>'latest_ticket_public_id', '') IN ('', t.public_id)
+    )
+  )
+)
+"""
+ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION = f"""
+(
+  {ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION} = 'coverage'
+  OR LOWER(TRIM(COALESCE(t.ticket_type, ''))) = 'coverage'
+  OR LOWER(TRIM(COALESCE(t.metadata #>> '{{ticket_state,ticketType}}', ''))) = 'coverage'
+  OR LOWER(TRIM(COALESCE(t.metadata->>'technical_subcategory', ''))) = 'coverage'
+)
+"""
+ADMIN_TICKET_SQL_QUICK_FILTER_EXPRESSION = f"""
+(
+  LOWER(TRIM(COALESCE(t.ticket_type, ''))) = 'quick'
+  OR LOWER(TRIM(COALESCE(t.metadata #>> '{{ticket_state,ticketType}}', ''))) = 'quick'
+  OR LOWER(COALESCE(NULLIF(t.metadata->>'{QUICK_TICKET_ORIGIN_METADATA_KEY}', ''), 'false')) IN ('true', '1', 'yes', 'on')
+  OR t.status_reason = ANY(%s::text[])
+)
+"""
+
+
+def get_admin_ticket_sql_from_clause() -> str:
+    return f"""
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        LEFT JOIN learners submitted_for
+          ON submitted_for.id = t.submitted_for_learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        LEFT JOIN support_teams routed_team
+          ON routed_team.is_active = TRUE
+         AND {ADMIN_TICKET_SQL_ASSIGNED_TEAM_EXPRESSION} IN (
+           LOWER(TRIM(routed_team.key)),
+           LOWER(TRIM(routed_team.name))
+         )
+        LEFT JOIN LATERAL (
+          SELECT ssr.status, ssr.metadata
+          FROM support_session_requests ssr
+          WHERE ssr.ticket_id = t.id
+          ORDER BY ssr.created_at DESC, ssr.id DESC
+          LIMIT 1
+        ) latest_session_request ON TRUE
+        LEFT JOIN support_accounts a
+          ON a.id = t.assigned_agent_id
+        LEFT JOIN support_accounts archived_by
+          ON archived_by.id = t.archived_by_id
+    """
+
+
+def get_admin_ticket_sql_select_clause() -> str:
+    return """
         SELECT
           t.id,
           t.public_id,
@@ -14278,6 +14835,13 @@ def fetch_admin_ticket_rows() -> list[dict[str, Any]]:
           t.status_reason,
           t.priority,
           t.assigned_team,
+          t.ticket_type,
+          t.workflow_stage,
+          t.queue_scope,
+          t.dashboard_bucket,
+          t.can_show_conversation,
+          t.can_receive_chat,
+          t.resolution_reason,
           t.sla_status,
           t.metadata,
           t.evidence_count,
@@ -14296,6 +14860,8 @@ def fetch_admin_ticket_rows() -> list[dict[str, Any]]:
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
+          l.source AS learner_source,
+          l.metadata AS learner_metadata,
           submitted_for.external_learner_id AS submitted_for_external_learner_id,
           submitted_for.full_name AS submitted_for_learner_name,
           submitted_for.email AS submitted_for_learner_email,
@@ -14304,24 +14870,361 @@ def fetch_admin_ticket_rows() -> list[dict[str, Any]]:
           a.full_name AS assigned_agent_name,
           archived_by.username AS archived_by_username,
           archived_by.full_name AS archived_by_name
-        FROM tickets t
-        JOIN learners l
-          ON l.id = t.learner_id
-        LEFT JOIN learners submitted_for
-          ON submitted_for.id = t.submitted_for_learner_id
-        LEFT JOIN conversations c
-          ON c.id = t.conversation_id
-        LEFT JOIN LATERAL (
-          SELECT ssr.status, ssr.metadata
-          FROM support_session_requests ssr
-          WHERE ssr.ticket_id = t.id
-          ORDER BY ssr.created_at DESC, ssr.id DESC
-          LIMIT 1
-        ) latest_session_request ON TRUE
-        LEFT JOIN support_accounts a
-          ON a.id = t.assigned_agent_id
-        LEFT JOIN support_accounts archived_by
-          ON archived_by.id = t.archived_by_id
+    """
+
+
+def get_admin_ticket_sql_order_by(sort_order: str) -> str:
+    if sort_order == "newest":
+        return "ORDER BY t.created_at DESC, t.id DESC"
+    if sort_order == "oldest":
+        return "ORDER BY t.created_at ASC, t.id ASC"
+    if sort_order == "updatedNewest":
+        return "ORDER BY t.updated_at DESC, t.id DESC"
+    if sort_order == "updatedOldest":
+        return "ORDER BY t.updated_at ASC, t.id ASC"
+    if sort_order == "priorityAsc":
+        return """
+        ORDER BY
+          CASE WHEN t.status = ANY(%s::text[]) THEN 0 ELSE 1 END,
+          CASE
+            WHEN t.status = ANY(%s::text[]) THEN
+              CASE t.priority
+                WHEN 'Low' THEN 0
+                WHEN 'Normal' THEN 1
+                WHEN 'High' THEN 2
+                WHEN 'Urgent' THEN 3
+                ELSE 4
+              END
+            ELSE 4
+          END,
+          t.created_at ASC,
+          t.id ASC
+        """
+
+    return """
+        ORDER BY
+          CASE WHEN t.status = ANY(%s::text[]) THEN 0 ELSE 1 END,
+          CASE
+            WHEN t.status = ANY(%s::text[]) THEN
+              CASE t.priority
+                WHEN 'Urgent' THEN 0
+                WHEN 'High' THEN 1
+                WHEN 'Normal' THEN 2
+                WHEN 'Low' THEN 3
+                ELSE 2
+              END
+            ELSE 2
+          END,
+          CASE WHEN t.status = ANY(%s::text[]) THEN t.created_at ELSE COALESCE(t.closed_at, t.updated_at, t.created_at) END DESC,
+          t.id DESC
+    """
+
+
+def get_admin_ticket_sql_order_params(sort_order: str) -> list[Any]:
+    if sort_order == "priorityAsc":
+        return [sorted(ACTIVE_PRIORITY_TICKET_STATUSES), sorted(ACTIVE_PRIORITY_TICKET_STATUSES)]
+    if sort_order not in {"newest", "oldest", "updatedNewest", "updatedOldest"}:
+        active_statuses = sorted(ACTIVE_PRIORITY_TICKET_STATUSES)
+        return [active_statuses, active_statuses, active_statuses]
+    return []
+
+
+def fetch_account_team_access_keys(account_id: Any) -> set[str]:
+    normalized_account_id = parse_int(account_id)
+    if normalized_account_id <= 0:
+        return set()
+
+    try:
+        rows = run_query(
+            """
+            SELECT st.key
+            FROM support_account_team_access ata
+            JOIN support_teams st
+              ON st.id = ata.team_id
+            WHERE ata.account_id = %s
+              AND st.is_active = TRUE
+              AND ata.can_receive_tickets = TRUE
+            """,
+            [normalized_account_id],
+        )
+    except Exception:
+        return set()
+
+    return {
+        sanitize_text(row.get("key")).lower()
+        for row in rows
+        if sanitize_text(row.get("key")).lower()
+    }
+
+
+def get_actor_ticket_access_team_keys(actor: dict[str, Any] | None) -> set[str] | None:
+    if actor is None or actor_has_admin_dashboard_access(actor):
+        return None
+
+    metadata = normalize_json_object(actor.get("metadata"))
+    team_keys = get_preloaded_account_team_access_keys(actor)
+    if normalize_bool(metadata.get(TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]["receiver_access_metadata_key"])):
+        team_keys.add(TICKET_RECEIVER_SCOPE_SUPPORT)
+    if normalize_bool(metadata.get(TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN]["receiver_access_metadata_key"])):
+        team_keys.add(TICKET_RECEIVER_SCOPE_OPERATIONS)
+    team_keys.update(fetch_account_team_access_keys(actor.get("id")))
+    return team_keys
+
+
+def resolve_admin_ticket_team_filter_key(team_filter: Any) -> str:
+    normalized_team_filter = sanitize_text(team_filter).lower()
+    if not normalized_team_filter or normalized_team_filter == "all":
+        return ""
+
+    for policy in TEAM_ROUTING_POLICIES.values():
+        if normalized_team_filter in {
+            sanitize_text(policy.get("key")).lower(),
+            sanitize_text(policy.get("assigned_team")).lower(),
+        }:
+            return policy["key"]
+
+    team = fetch_admin_ticket_sql_prefilter_team_row(normalized_team_filter)
+    if team:
+        return sanitize_text(team.get("key")).lower()
+
+    return "__no_matching_team__"
+
+
+def build_admin_ticket_search_sql(search: str) -> tuple[str, list[Any]]:
+    normalized_search = sanitize_text(search).casefold()
+    if not normalized_search:
+        return "", []
+
+    compact_search = re.sub(r"[\s_-]+", "", normalized_search)
+    like_value = f"%{normalized_search}%"
+    compact_like_value = f"%{compact_search}%"
+    searchable_fields = [
+        "t.public_id",
+        "('CHAT-' || LPAD(t.conversation_id::text, 6, '0'))",
+        "(c.metadata->>'chat_public_id')",
+        "l.full_name",
+        "l.email",
+        "l.phone",
+        "submitted_for.external_learner_id",
+        "submitted_for.full_name",
+        "submitted_for.email",
+        "t.category",
+        "t.technical_subcategory",
+        "t.subject",
+        "t.inquiry",
+        "t.status",
+        "t.status_reason",
+        "t.priority",
+        "t.assigned_team",
+        "a.full_name",
+        "a.username",
+        "(t.metadata->>'requester_role')",
+        "l.source",
+        "(l.metadata->>'legacy_source')",
+    ]
+    clauses = [f"LOWER(COALESCE({field}, '')) LIKE %s" for field in searchable_fields]
+    params: list[Any] = [like_value for _field in searchable_fields]
+    if compact_search:
+        clauses.extend([
+            f"REPLACE(REPLACE(REPLACE(LOWER(COALESCE({field}, '')), ' ', ''), '_', ''), '-', '') LIKE %s"
+            for field in searchable_fields
+        ])
+        params.extend([compact_like_value for _field in searchable_fields])
+
+    return f"({' OR '.join(clauses)})", params
+
+
+def build_admin_ticket_assigned_sql(assigned_filter: str, actor: dict[str, Any] | None) -> tuple[str, list[Any]]:
+    normalized_assigned_filter = sanitize_text(assigned_filter).lower()
+    if not normalized_assigned_filter or normalized_assigned_filter == "all":
+        return "", []
+    if normalized_assigned_filter == "unassigned":
+        return "t.assigned_agent_id IS NULL", []
+
+    if normalized_assigned_filter == "me":
+        agent_id = parse_int((actor or {}).get("id"))
+    else:
+        agent_id = parse_int(normalized_assigned_filter.replace("agent:", ""))
+
+    if agent_id <= 0:
+        return "FALSE", []
+
+    agent_id_text = str(agent_id)
+    return (
+        """
+        (
+          t.assigned_agent_id = %s
+          OR COALESCE(t.metadata #>> '{pending_transfer_request,toAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{pending_transfer_request,fromAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{pending_escalation_notification,toAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{pending_escalation_notification,fromAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{latest_escalation_closure,toAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{latest_escalation_closure,fromAgentId}', '') = %s
+          OR (
+            t.status_reason = %s
+            AND COALESCE(t.metadata #>> '{admin_documentation,escalationAgentId}', '') = %s
+          )
+        )
+        """,
+        [agent_id, agent_id_text, agent_id_text, agent_id_text, agent_id_text, agent_id_text, agent_id_text, STATUS_REASON_ESCALATION, agent_id_text],
+    )
+
+
+def build_admin_ticket_hidden_sql() -> str:
+    return f"""
+    NOT (
+      (
+        t.is_archived = FALSE
+        AND t.status = 'Open'
+        AND COALESCE(t.metadata->>'{SUPPORT_FLOW_STAGE_METADATA_KEY}', '') = {sql_literal(SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS)}
+      )
+      OR (
+        t.is_archived = FALSE
+        AND t.status = 'Open'
+        AND COALESCE(t.status_reason, '') = ''
+        AND LOWER(COALESCE(latest_session_request.status, '')) = 'cancelled'
+        AND COALESCE(latest_session_request.metadata->>'return_path', '') = '/support/options'
+        AND NOT ({ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION})
+      )
+    )
+    """
+
+
+def fetch_admin_ticket_sql_prefilter_team_row(team_filter: Any) -> dict[str, Any] | None:
+    normalized_team_filter = sanitize_text(team_filter).lower()
+    if not normalized_team_filter or normalized_team_filter == "all":
+        return None
+
+    for policy in TEAM_ROUTING_POLICIES.values():
+        if normalized_team_filter in {
+            sanitize_text(policy.get("key")).lower(),
+            sanitize_text(policy.get("assigned_team")).lower(),
+        }:
+            return None
+
+    try:
+        team = fetch_support_team_by_key(normalized_team_filter)
+    except Exception:
+        team = None
+
+    if team:
+        return team
+
+    try:
+        return fetch_optional_dynamic_team_row_by_assigned_team(normalized_team_filter)
+    except Exception:
+        return None
+
+
+def build_admin_ticket_sql_prefilter(
+    params: dict[str, Any] | None = None,
+    actor: dict[str, Any] | None = None,
+    *,
+    include_actor: bool = False,
+    include_search: bool = False,
+    include_assigned: bool = False,
+    include_hidden: bool = False,
+) -> tuple[str, list[Any]]:
+    if not isinstance(params, dict):
+        params = {}
+
+    where_clauses: list[str] = []
+    query_params: list[Any] = []
+
+    archive_scope = sanitize_text(params.get("archiveScope")).lower()
+    if archive_scope == "active":
+        where_clauses.append("t.is_archived = FALSE")
+    elif archive_scope == "archived":
+        where_clauses.append("t.is_archived = TRUE")
+
+    status_filter = sanitize_text(params.get("status"))
+    if status_filter in ALLOWED_STATUSES:
+        where_clauses.append("t.status = %s")
+        query_params.append(status_filter)
+
+    sla_filter = sanitize_text(params.get("slaStatus"))
+    if sla_filter in ALLOWED_SLA_STATUSES:
+        where_clauses.append("t.sla_status = %s")
+        query_params.append(sla_filter)
+
+    dashboard_filter = sanitize_text(params.get("dashboardFilter"))
+    if dashboard_filter == "coverage":
+        where_clauses.append(ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION)
+    elif dashboard_filter == "learningPlanOther":
+        where_clauses.append(
+            f"({ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = %s AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION}))"
+        )
+        query_params.append(TICKET_RECEIVER_SCOPE_OPERATIONS)
+    elif dashboard_filter == "slaBreached":
+        where_clauses.append("t.sla_status = %s")
+        query_params.append("Breached")
+    elif dashboard_filter == "quickResolution":
+        where_clauses.append(f"({ADMIN_TICKET_SQL_QUICK_FILTER_EXPRESSION} AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION}))")
+        query_params.append(sorted(QUICK_TICKET_STATUS_REASONS))
+    elif dashboard_filter == "escalation":
+        where_clauses.append(f"(t.status_reason = %s OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'escalation')")
+        query_params.append(STATUS_REASON_ESCALATION)
+    elif dashboard_filter == "open":
+        where_clauses.append(ADMIN_TICKET_SQL_OPEN_FILTER_EXPRESSION)
+    elif dashboard_filter == "pending":
+        where_clauses.append(f"(t.status = 'Pending' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'pending')")
+    elif dashboard_filter == "closed":
+        where_clauses.append(f"(t.status = 'Closed' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'closed')")
+
+    team_filter_key = resolve_admin_ticket_team_filter_key(params.get("team"))
+    if team_filter_key == "__no_matching_team__":
+        where_clauses.append("FALSE")
+    elif team_filter_key:
+        where_clauses.append(f"{ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = %s")
+        query_params.append(team_filter_key)
+
+    if include_search:
+        search_clause, search_params = build_admin_ticket_search_sql(params.get("search"))
+        if search_clause:
+            where_clauses.append(search_clause)
+            query_params.extend(search_params)
+
+    if include_assigned:
+        assigned_clause, assigned_params = build_admin_ticket_assigned_sql(params.get("assigned"), actor)
+        if assigned_clause:
+            where_clauses.append(assigned_clause)
+            query_params.extend(assigned_params)
+
+    if include_actor:
+        actor_team_keys = get_actor_ticket_access_team_keys(actor)
+        if actor_team_keys is not None:
+            if actor_team_keys:
+                where_clauses.append(f"{ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = ANY(%s::text[])")
+                query_params.append(sorted(actor_team_keys))
+            else:
+                where_clauses.append("FALSE")
+
+    if include_hidden:
+        where_clauses.append(build_admin_ticket_hidden_sql())
+
+    if not where_clauses:
+        return "", query_params
+
+    return f"WHERE {' AND '.join(where_clauses)}", query_params
+
+
+def fetch_admin_ticket_rows(
+    prefilter_params: dict[str, Any] | None = None,
+    actor: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    where_clause, query_params = build_admin_ticket_sql_prefilter(
+        prefilter_params,
+        actor,
+        include_actor=actor is not None,
+        include_search=False,
+        include_assigned=False,
+        include_hidden=False,
+    )
+    return run_query(
+        f"""
+        {get_admin_ticket_sql_select_clause()}
+        {get_admin_ticket_sql_from_clause()}
+        {where_clause}
         ORDER BY
           CASE t.priority
             WHEN 'Urgent' THEN 0
@@ -14331,15 +15234,83 @@ def fetch_admin_ticket_rows() -> list[dict[str, Any]]:
           END,
           t.created_at DESC,
           t.id DESC
-        """
+        """,
+        query_params,
     )
 
 
-def get_admin_ticket_rows_for_actor(actor: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    tickets = fetch_admin_ticket_rows()
+def get_admin_ticket_rows_for_actor(
+    actor: dict[str, Any] | None = None,
+    *,
+    prefilter_params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    tickets = fetch_admin_ticket_rows(prefilter_params, actor)
     tickets = [ticket for ticket in tickets if not is_admin_hidden_support_flow_ticket_record(ticket)]
     tickets = filter_admin_tickets_for_actor(tickets, actor)
     return [apply_ticket_sla_policy(ticket) for ticket in tickets]
+
+
+def build_admin_ticket_sql_list_where(
+    params: dict[str, Any],
+    actor: dict[str, Any] | None,
+) -> tuple[str, list[Any]]:
+    return build_admin_ticket_sql_prefilter(
+        params,
+        actor,
+        include_actor=actor is not None,
+        include_search=True,
+        include_assigned=True,
+        include_hidden=True,
+    )
+
+
+def build_admin_ticket_pagination(total: int, params: dict[str, Any]) -> dict[str, Any]:
+    page_size = params["pageSize"]
+    page = params["page"]
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    if total_pages:
+        page = min(page, total_pages)
+
+    return {
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": total_pages,
+        "hasNext": bool(total_pages and page < total_pages),
+        "hasPrevious": page > 1,
+        "isPaginated": True,
+    }
+
+
+def fetch_admin_ticket_page_for_actor(
+    actor: dict[str, Any] | None,
+    params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    where_clause, where_params = build_admin_ticket_sql_list_where(params, actor)
+    count_row = run_query_one(
+        f"""
+        SELECT COUNT(*) AS total
+        {get_admin_ticket_sql_from_clause()}
+        {where_clause}
+        """,
+        where_params,
+    )
+    total = parse_int((count_row or {}).get("total"))
+    pagination = build_admin_ticket_pagination(total, params)
+    offset = max(pagination["page"] - 1, 0) * pagination["pageSize"]
+    order_by = get_admin_ticket_sql_order_by(params["sort"])
+    order_params = get_admin_ticket_sql_order_params(params["sort"])
+    rows = run_query(
+        f"""
+        {get_admin_ticket_sql_select_clause()}
+        {get_admin_ticket_sql_from_clause()}
+        {where_clause}
+        {order_by}
+        LIMIT %s OFFSET %s
+        """,
+        [*where_params, *order_params, pagination["pageSize"], offset],
+    )
+    return [apply_ticket_sla_policy(row) for row in rows], pagination
 
 
 def get_admin_ticket_metrics_params(query_params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -14373,27 +15344,90 @@ def build_admin_ticket_section_metric_counts(tickets: list[dict[str, Any]]) -> d
     }
 
 
+def build_admin_ticket_metric_count_sql(where_clause: str) -> str:
+    return f"""
+    SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN {ADMIN_TICKET_SQL_OPEN_FILTER_EXPRESSION} THEN 1 ELSE 0 END), 0) AS open,
+      COALESCE(SUM(CASE WHEN (t.status = 'Pending' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'pending') THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN (t.status_reason = %s OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'escalation') THEN 1 ELSE 0 END), 0) AS escalation,
+      COALESCE(SUM(CASE WHEN (t.status = 'Closed' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'closed') THEN 1 ELSE 0 END), 0) AS closed,
+      COALESCE(SUM(CASE WHEN t.sla_status = 'Breached' THEN 1 ELSE 0 END), 0) AS sla_breached,
+      COALESCE(SUM(CASE WHEN {ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION} THEN 1 ELSE 0 END), 0) AS coverage,
+      COALESCE(SUM(CASE WHEN ({ADMIN_TICKET_SQL_QUICK_FILTER_EXPRESSION} AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION})) THEN 1 ELSE 0 END), 0) AS quick_resolution
+    {get_admin_ticket_sql_from_clause()}
+    {where_clause}
+    """
+
+
+def normalize_admin_ticket_metric_row(row: dict[str, Any] | None) -> dict[str, int]:
+    return {
+        "total": parse_int((row or {}).get("total")),
+        "open": parse_int((row or {}).get("open")),
+        "pending": parse_int((row or {}).get("pending")),
+        "escalation": parse_int((row or {}).get("escalation")),
+        "closed": parse_int((row or {}).get("closed")),
+        "slaBreached": parse_int((row or {}).get("sla_breached")),
+        "coverage": parse_int((row or {}).get("coverage")),
+        "quickResolution": parse_int((row or {}).get("quick_resolution")),
+    }
+
+
+def get_admin_ticket_metrics_from_sql(
+    actor: dict[str, Any] | None,
+    metrics_params: dict[str, Any],
+    section_params: dict[str, Any],
+) -> dict[str, Any]:
+    metric_where_clause, metric_where_params = build_admin_ticket_sql_list_where(metrics_params, actor)
+    metric_row = run_query_one(
+        build_admin_ticket_metric_count_sql(metric_where_clause),
+        [
+            STATUS_REASON_ESCALATION,
+            sorted(QUICK_TICKET_STATUS_REASONS),
+            *metric_where_params,
+        ],
+    )
+
+    section_where_clause, section_where_params = build_admin_ticket_sql_list_where(section_params, actor)
+    section_row = run_query_one(
+        f"""
+        SELECT
+          COALESCE(SUM(CASE WHEN {ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION} THEN 1 ELSE 0 END), 0) AS coverage,
+          COALESCE(SUM(CASE WHEN ({ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = %s AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION})) THEN 1 ELSE 0 END), 0) AS learning_plan_other
+        {get_admin_ticket_sql_from_clause()}
+        {section_where_clause}
+        """,
+        [
+            TICKET_RECEIVER_SCOPE_OPERATIONS,
+            *section_where_params,
+        ],
+    )
+
+    return {
+        **normalize_admin_ticket_metric_row(metric_row),
+        "sections": {
+            "coverage": parse_int((section_row or {}).get("coverage")),
+            "learningPlanOther": parse_int((section_row or {}).get("learning_plan_other")),
+        },
+    }
+
+
 def get_admin_ticket_metrics(
     actor: dict[str, Any] | None = None,
     *,
     query_params: dict[str, Any] | None = None,
+    run_background_sync: bool = False,
 ) -> dict[str, Any]:
-    trigger_ticket_background_sync()
+    if run_background_sync:
+        trigger_ticket_background_sync()
     metrics_params = get_admin_ticket_metrics_params(query_params)
     section_params = {
         **metrics_params,
         "dashboardFilter": "all",
     }
 
-    tickets = get_admin_ticket_rows_for_actor(actor)
-    section_scope_tickets = filter_admin_ticket_list(tickets, section_params, actor)
-    metric_scope_tickets = filter_admin_ticket_list(tickets, metrics_params, actor)
-
     return {
-        "metrics": {
-            **build_admin_ticket_metric_counts(metric_scope_tickets),
-            "sections": build_admin_ticket_section_metric_counts(section_scope_tickets),
-        },
+        "metrics": get_admin_ticket_metrics_from_sql(actor, metrics_params, section_params),
         "filters": build_admin_ticket_list_filter_response(metrics_params),
     }
 
@@ -14402,11 +15436,21 @@ def list_admin_tickets(
     actor: dict[str, Any] | None = None,
     *,
     query_params: dict[str, Any] | None = None,
+    run_background_sync: bool = False,
 ) -> dict[str, Any]:
-    trigger_ticket_background_sync()
+    if run_background_sync:
+        trigger_ticket_background_sync()
     list_params = normalize_admin_ticket_list_params(query_params)
 
-    tickets = get_admin_ticket_rows_for_actor(actor)
+    if list_params["paginationRequested"]:
+        paged_tickets, pagination = fetch_admin_ticket_page_for_actor(actor, list_params)
+        return {
+            "tickets": [serialize_ticket_summary(ticket) for ticket in paged_tickets],
+            "pagination": pagination,
+            "filters": build_admin_ticket_list_filter_response(list_params),
+        }
+
+    tickets = get_admin_ticket_rows_for_actor(actor, prefilter_params=list_params)
     tickets = filter_admin_ticket_list(tickets, list_params, actor)
     tickets = sort_admin_ticket_list(tickets, list_params["sort"])
     paged_tickets, pagination = paginate_admin_ticket_list(tickets, list_params)
@@ -14625,7 +15669,7 @@ def get_admin_ticket_detail_response(public_id: str, actor: dict[str, Any] | Non
             raise ApiError(404, "Ticket not found.")
         require_actor_can_access_admin_ticket(actor, ticket_scope)
 
-    sync_open_ticket_inactivity(public_id=public_id)
+    trigger_ticket_detail_inactivity_sync(public_id)
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:
         raise ApiError(404, "Ticket not found.")
@@ -18023,6 +19067,8 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         if requested_assigned_team is not None:
             normalized_requested_assigned_team = normalize_assigned_team(requested_assigned_team)
             requested_team_changed = normalized_requested_assigned_team != current_assigned_team
+            if requested_team_changed:
+                ensure_ticket_can_transfer_to_assigned_team(ticket, normalized_requested_assigned_team)
             if requested_team_changed and not actor_can_transfer_ticket_between_teams(
                 actor_row,
                 ticket,
@@ -18387,6 +19433,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 {
                     "fromTeam": current_assigned_team,
                     "toTeam": next_assigned_team,
+                    **({"note": note} if note else {}),
                 },
             )
             if next_assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold():

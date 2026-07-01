@@ -679,7 +679,9 @@ def admin_accounts(request):
             agent = add_entra_agent(parse_json_body(request))
             return JsonResponse(agent, status=201)
         require_request_admin_session(request)
-        return JsonResponse(list_agents(include_inactive=True))
+        refresh_legacy_value = sanitize_text(request.GET.get("refreshLegacy", request.GET.get("refresh_legacy", "true"))).lower()
+        refresh_legacy = refresh_legacy_value not in {"0", "false", "no", "off"}
+        return JsonResponse(list_agents(include_inactive=True, refresh_legacy=refresh_legacy))
     except Exception as error:
         return handle_api_error(error)
 
