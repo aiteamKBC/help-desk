@@ -8807,6 +8807,7 @@ def sync_legacy_team_access_memberships(
     *,
     support_access: bool | None = None,
     operations_access: bool | None = None,
+    strict: bool = False,
 ) -> None:
     if support_access is not None:
         persist_account_team_access(
@@ -8814,6 +8815,7 @@ def sync_legacy_team_access_memberships(
             TICKET_RECEIVER_SCOPE_SUPPORT,
             support_access,
             source="legacy_support_access",
+            strict=strict,
         )
     if operations_access is not None:
         persist_account_team_access(
@@ -8821,6 +8823,7 @@ def sync_legacy_team_access_memberships(
             TICKET_RECEIVER_SCOPE_OPERATIONS,
             operations_access,
             source="legacy_operations_access",
+            strict=strict,
         )
 
 
@@ -12354,7 +12357,14 @@ def update_agent_ticket_access(
         metadata["legacy_support_access"] = support_access
     if operations_access is not None:
         metadata["legacy_operations_access"] = operations_access
-    persist_agent_metadata(agent_id, metadata)
+    with transaction.atomic():
+        persist_agent_metadata(agent_id, metadata)
+        sync_legacy_team_access_memberships(
+            agent_id,
+            support_access=support_access,
+            operations_access=operations_access,
+            strict=True,
+        )
 
     agent["metadata"] = metadata
     return serialize_agent(

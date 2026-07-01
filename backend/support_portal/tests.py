@@ -6150,12 +6150,20 @@ class SupportDirectoryTests(SimpleTestCase):
         with (
             patch.object(services, "run_query_one", return_value=agent),
             patch.object(services, "sync_legacy_support_access_group_membership") as sync_legacy_support_access_group_membership,
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "sync_legacy_team_access_memberships") as sync_legacy_team_access_memberships,
             patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
         ):
             response = services.update_agent_support_access(23, support_access=False)
 
         sync_legacy_support_access_group_membership.assert_called_once_with(77, False)
+        sync_legacy_team_access_memberships.assert_called_once_with(
+            23,
+            support_access=False,
+            operations_access=None,
+            strict=True,
+        )
         saved_metadata = persist_agent_metadata.call_args.args[1]
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(response["legacySupportAccess"])
@@ -6179,7 +6187,9 @@ class SupportDirectoryTests(SimpleTestCase):
         with (
             patch.object(services, "run_query_one", return_value=admin_account),
             patch.object(services, "sync_legacy_support_access_group_membership") as sync_legacy_support_access_group_membership,
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "sync_legacy_team_access_memberships") as sync_legacy_team_access_memberships,
             patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
         ):
             response = services.update_agent_support_access(29, support_access=True)
@@ -6187,6 +6197,12 @@ class SupportDirectoryTests(SimpleTestCase):
         self.assertEqual(response["role"], "admin")
         self.assertTrue(response["legacySupportAccess"])
         sync_legacy_support_access_group_membership.assert_called_once_with(79, True)
+        sync_legacy_team_access_memberships.assert_called_once_with(
+            29,
+            support_access=True,
+            operations_access=None,
+            strict=True,
+        )
         saved_metadata = persist_agent_metadata.call_args.args[1]
         self.assertTrue(saved_metadata["legacy_support_access"])
 
@@ -6210,12 +6226,20 @@ class SupportDirectoryTests(SimpleTestCase):
         with (
             patch.object(services, "run_query_one", return_value=agent),
             patch.object(services, "sync_legacy_operations_access_group_membership") as sync_legacy_operations_access_group_membership,
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "persist_agent_metadata") as persist_agent_metadata,
+            patch.object(services, "sync_legacy_team_access_memberships") as sync_legacy_team_access_memberships,
             patch.object(services, "get_open_assigned_live_chat_agent_ids", return_value=set()),
         ):
             response = services.update_agent_operations_access(24, operations_access=True)
 
         sync_legacy_operations_access_group_membership.assert_called_once_with(78, True)
+        sync_legacy_team_access_memberships.assert_called_once_with(
+            24,
+            support_access=None,
+            operations_access=True,
+            strict=True,
+        )
         saved_metadata = persist_agent_metadata.call_args.args[1]
         self.assertTrue(saved_metadata["legacy_operations_access"])
         self.assertTrue(response["legacyOperationsAccess"])
