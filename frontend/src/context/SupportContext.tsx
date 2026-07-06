@@ -5,7 +5,7 @@ import { SupportContext } from "@/context/support-context-value";
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
-export type TechnicalSubcategory = "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
+export type TechnicalSubcategory = "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
 export type RequesterRole = "user" | "coach" | "employer";
 export type RequesterSource = "kbc_users_data" | "microsoft_entra" | "support_portal_requester" | "";
 
@@ -46,6 +46,8 @@ export interface Ticket {
   technicalSubcategory: TechnicalSubcategory;
   subject: string;
   inquiry: string;
+  aiTeamPersonName: string;
+  aiTeamPersonEmail: string;
   submittedForLearner: SubmittedForLearner | null;
   notifySubmittedForLearner: boolean;
   evidence: EvidenceFile[];
@@ -82,6 +84,8 @@ const defaultTicket: Ticket = {
   technicalSubcategory: "",
   subject: "",
   inquiry: "",
+  aiTeamPersonName: "",
+  aiTeamPersonEmail: "",
   submittedForLearner: null,
   notifySubmittedForLearner: false,
   evidence: [],
@@ -113,6 +117,7 @@ function normalizeTechnicalSubcategory(
 ): TechnicalSubcategory {
   if (
     value === "Aptem"
+    || value === "AI Team"
     || value === "Coverage"
     || value === "LMS"
     || value === "Teams"
@@ -223,6 +228,8 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
     technicalSubcategory: normalizeTechnicalSubcategory(nextTicket.technicalSubcategory),
     subject: normalizeString(nextTicket.subject),
     inquiry: normalizeString(nextTicket.inquiry),
+    aiTeamPersonName: normalizeString(nextTicket.aiTeamPersonName),
+    aiTeamPersonEmail: normalizeString(nextTicket.aiTeamPersonEmail),
     submittedForLearner: normalizeSubmittedForLearner(nextTicket.submittedForLearner),
     notifySubmittedForLearner: Boolean(nextTicket.notifySubmittedForLearner),
     evidence: Array.isArray(nextTicket.evidence) ? nextTicket.evidence : [],
@@ -263,6 +270,8 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     technicalSubcategory: ticket.technicalSubcategory,
     subject: ticket.subject,
     inquiry: ticket.inquiry,
+    aiTeamPersonName: ticket.aiTeamPersonName,
+    aiTeamPersonEmail: ticket.aiTeamPersonEmail,
     submittedForLearner: ticket.submittedForLearner,
     notifySubmittedForLearner: ticket.notifySubmittedForLearner,
     status: ticket.status,

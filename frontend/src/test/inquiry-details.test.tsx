@@ -1,18 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { SupportProvider } from "@/context/SupportContext";
 import { buildCoverageInquiry, parseCoverageInquiry } from "@/lib/coverageSupport";
 import InquiryDetails from "@/pages/support/InquiryDetails";
 
 const supportStorageKey = "kbc-support-state-v2";
 
+const LocationProbe = () => {
+  const location = useLocation();
+  return <span data-testid="location">{location.pathname}</span>;
+};
+
 describe("InquiryDetails", () => {
   beforeEach(() => {
     window.localStorage.clear();
     vi.stubGlobal(
       "fetch",
-      vi.fn((input: RequestInfo | URL) => {
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
 
         if (url.includes("/api/coverage-options?type=tutors")) {
@@ -49,6 +54,10 @@ describe("InquiryDetails", () => {
         }
 
         if (url === "/api/tickets") {
+          const body = init?.body instanceof FormData ? init.body : null;
+          const technicalSubcategory = String(body?.get("technicalSubcategory") || "Coverage");
+          const isAiTeamTicket = technicalSubcategory === "AI Team";
+
           return Promise.resolve({
             ok: true,
             json: async () => ({
@@ -59,16 +68,13 @@ describe("InquiryDetails", () => {
                 requesterRole: "user",
                 requesterSource: "microsoft_entra",
                 category: "Technical",
-                technicalSubcategory: "Coverage",
-                inquiry: buildCoverageInquiry({
-                  tutor: "Ray",
-                  module: "APM",
-                  time: "Friday 12:00 - 14:00 | Fri-12 | Feb 2026",
-                  sessionDates: ["Friday 06 Jun 2026"],
-                  sessionSubject: "Assessment review",
-                }),
+                technicalSubcategory,
+                subject: String(body?.get("subject") || ""),
+                inquiry: String(body?.get("inquiry") || ""),
+                aiTeamPersonName: String(body?.get("aiTeamPersonName") || ""),
+                aiTeamPersonEmail: String(body?.get("aiTeamPersonEmail") || ""),
                 status: "Open",
-                assignedTeam: "Unassigned",
+                assignedTeam: isAiTeamTicket ? "Ai Team" : "Unassigned",
                 slaStatus: "Pending Review",
                 createdAt: "2026-06-03T12:00:00+00:00",
                 chatState: "open",
@@ -85,7 +91,7 @@ describe("InquiryDetails", () => {
               ticket: {
                 status: "Pending",
                 statusReason: "Quick Ticket",
-                assignedTeam: "Unassigned",
+                assignedTeam: "Ai Team",
                 slaStatus: "Pending Review",
                 createdAt: "2026-06-03T12:00:00+00:00",
                 chatState: "closed",
@@ -295,5 +301,62 @@ describe("InquiryDetails", () => {
         }),
       );
     });
+  });
+
+  it("submits AI Team tickets directly with the person details", async () => {
+    window.localStorage.setItem(
+      supportStorageKey,
+      JSON.stringify({
+        ticket: {
+          email: "omar2@gmail.com",
+          requesterRole: "user",
+          requesterSource: "microsoft_entra",
+          subject: "AI Team access issue",
+          technicalSubcategory: "AI Team",
+          inquiry: "Cannot access the AI Team workspace.",
+        },
+      }),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/support/inquiry"]}>
+        <SupportProvider>
+          <InquiryDetails />
+          <LocationProbe />
+        </SupportProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.change(screen.getByLabelText("Person name"), { target: { value: "Khaled Ashraf" } });
+    fireEvent.change(screen.getByLabelText("Person email"), { target: { value: "khaled.ashraf@kentbusinesscollege.com" } });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /submit ticket/i })).toBeEnabled();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /submit ticket/i }));
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(
+        "/api/tickets",
+        expect.objectContaining({
+          method: "POST",
+          body: expect.any(FormData),
+        }),
+      );
+      expect(global.fetch).toHaveBeenCalledWith(
+        "/api/tickets/KBC-000321/chat-history",
+        expect.objectContaining({
+          method: "POST",
+        }),
+      );
+      expect(screen.getByTestId("location")).toHaveTextContent("/support/status");
+    });
+
+    const createCall = vi.mocked(global.fetch).mock.calls.find(([input]) => String(input) === "/api/tickets");
+    const formData = createCall?.[1]?.body as FormData;
+    expect(formData.get("technicalSubcategory")).toBe("AI Team");
+    expect(formData.get("aiTeamPersonName")).toBe("Khaled Ashraf");
+    expect(formData.get("aiTeamPersonEmail")).toBe("khaled.ashraf@kentbusinesscollege.com");
   });
 });

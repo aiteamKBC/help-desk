@@ -16,6 +16,8 @@ interface PublicTicketPayload {
   technicalSubcategory: TechnicalSubcategory;
   subject?: string;
   inquiry: string;
+  aiTeamPersonName?: string;
+  aiTeamPersonEmail?: string;
   submittedForLearner?: Ticket["submittedForLearner"];
   notifySubmittedForLearner?: boolean;
   status: Ticket["status"];
@@ -62,6 +64,8 @@ export function buildTicketStateFromPayload(payloadTicket: PublicTicketPayload, 
     technicalSubcategory: payloadTicket.technicalSubcategory || currentTicket.technicalSubcategory,
     subject: payloadTicket.subject || currentTicket.subject,
     inquiry: payloadTicket.inquiry || currentTicket.inquiry,
+    aiTeamPersonName: payloadTicket.aiTeamPersonName ?? currentTicket.aiTeamPersonName,
+    aiTeamPersonEmail: payloadTicket.aiTeamPersonEmail ?? currentTicket.aiTeamPersonEmail,
     submittedForLearner: hasSubmittedForLearner ? payloadTicket.submittedForLearner ?? null : currentTicket.submittedForLearner,
     notifySubmittedForLearner: hasNotifySubmittedForLearner ? Boolean(payloadTicket.notifySubmittedForLearner) : currentTicket.notifySubmittedForLearner,
     status: payloadTicket.status || currentTicket.status,
@@ -83,6 +87,8 @@ export function buildTicketDraftFormData(currentTicket: Ticket) {
   formData.set("technicalSubcategory", currentTicket.technicalSubcategory);
   formData.set("subject", currentTicket.subject);
   formData.set("inquiry", currentTicket.inquiry);
+  formData.set("aiTeamPersonName", currentTicket.aiTeamPersonName);
+  formData.set("aiTeamPersonEmail", currentTicket.aiTeamPersonEmail);
   formData.set("submittedForLearnerId", currentTicket.submittedForLearner ? String(currentTicket.submittedForLearner.id) : "");
   formData.set("notifySubmittedForLearner", String(Boolean(currentTicket.submittedForLearner && currentTicket.notifySubmittedForLearner)));
   formData.set(

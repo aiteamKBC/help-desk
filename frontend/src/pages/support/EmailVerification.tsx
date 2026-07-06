@@ -90,9 +90,11 @@ interface RestoredTicketPayload {
   requesterRole?: RequesterRole;
   requesterSource?: RequesterSource;
   category: "" | "Learning" | "Technical" | "Others";
-  technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+  technicalSubcategory: "" | "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
   subject?: string;
   inquiry: string;
+  aiTeamPersonName?: string;
+  aiTeamPersonEmail?: string;
   submittedForLearner?: Ticket["submittedForLearner"];
   notifySubmittedForLearner?: boolean;
   status: "Open" | "Pending" | "Closed";
@@ -119,6 +121,8 @@ function buildRestoredTicket(
     technicalSubcategory: restoredTicket.technicalSubcategory,
     subject: restoredTicket.subject || "",
     inquiry: restoredTicket.inquiry,
+    aiTeamPersonName: restoredTicket.aiTeamPersonName || "",
+    aiTeamPersonEmail: restoredTicket.aiTeamPersonEmail || "",
     submittedForLearner: restoredTicket.submittedForLearner || null,
     notifySubmittedForLearner: restoredTicket.notifySubmittedForLearner || false,
     evidence: [],
@@ -186,6 +190,8 @@ const EmailVerification = () => {
       technicalSubcategory: "",
       subject: "",
       inquiry: "",
+      aiTeamPersonName: "",
+      aiTeamPersonEmail: "",
       submittedForLearner: null,
       notifySubmittedForLearner: false,
       evidence: [],
@@ -228,9 +234,11 @@ const EmailVerification = () => {
               requesterRole?: RequesterRole;
               requesterSource?: RequesterSource;
               category: "" | "Learning" | "Technical" | "Others";
-              technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+              technicalSubcategory: "" | "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
               subject?: string;
               inquiry: string;
+              aiTeamPersonName?: string;
+              aiTeamPersonEmail?: string;
               submittedForLearner?: Ticket["submittedForLearner"];
               notifySubmittedForLearner?: boolean;
               status: "Open" | "Pending" | "Closed";

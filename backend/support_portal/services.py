@@ -53,7 +53,8 @@ EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
-ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "Coverage", "LMS", "Teams", "Others"}
+TECHNICAL_SUBCATEGORY_AI_TEAM = "AI Team"
+ALLOWED_TECHNICAL_SUBCATEGORIES = {TECHNICAL_SUBCATEGORY_AI_TEAM, "Aptem", "Coverage", "LMS", "Teams", "Others"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
 ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
@@ -63,6 +64,7 @@ SUPPORT_TEAM_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 ASSIGNED_TEAM_UNASSIGNED = "Unassigned"
 ASSIGNED_TEAM_SUPPORT_DESK = "Support Desk"
 ASSIGNED_TEAM_LEARNING_PLAN = "Learning Plan Team"
+ASSIGNED_TEAM_AI_TEAM = "Ai Team"
 DEFAULT_ASSIGNED_TEAMS = {
     ASSIGNED_TEAM_UNASSIGNED,
     ASSIGNED_TEAM_SUPPORT_DESK,
@@ -198,6 +200,7 @@ PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY = "pending_teams_call_notification"
 PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY = "pending_support_queue_notification"
 PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY = "pending_coverage_ticket_notification"
 PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY = "pending_learning_plan_transfer_notification"
+AI_TEAM_REQUEST_METADATA_KEY = "ai_team_request"
 TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
 LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
 QUICK_TICKET_ORIGIN_METADATA_KEY = "quick_ticket_origin"
@@ -1095,13 +1098,14 @@ def build_support_queue_notification_payload(
     requester_role: Any,
     reason: str,
     created_at: Any,
+    queue: Any = ASSIGNED_TEAM_SUPPORT_DESK,
 ) -> dict[str, Any]:
     return {
         "ticketId": ticket_id,
         "requesterName": sanitize_text(requester_name),
         "requesterEmail": normalize_email(requester_email),
         "requesterRole": normalize_public_requester_role(requester_role),
-        "queue": ASSIGNED_TEAM_SUPPORT_DESK,
+        "queue": sanitize_text(queue) or ASSIGNED_TEAM_SUPPORT_DESK,
         "reason": sanitize_text(reason) or "support_ticket_created",
         "createdAt": serialize_datetime_value(coerce_datetime(created_at)) or serialize_datetime_value(datetime.now(timezone.utc)),
     }
@@ -3380,6 +3384,52 @@ def normalize_technical_subcategory(value: Any) -> str:
             return item
 
     return ""
+
+
+def is_ai_team_technical_subcategory(value: Any) -> bool:
+    return sanitize_text(value).casefold() == TECHNICAL_SUBCATEGORY_AI_TEAM.casefold()
+
+
+def is_ai_team_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    direct_value = get_ticket_scope_value(ticket, "technical_subcategory", "technicalSubcategory")
+    if is_ai_team_technical_subcategory(direct_value):
+        return True
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return is_ai_team_technical_subcategory(metadata.get("technical_subcategory"))
+
+
+def normalize_ai_team_request_payload(payload: dict[str, Any], technical_subcategory: Any) -> dict[str, str] | None:
+    if not is_ai_team_technical_subcategory(technical_subcategory):
+        return None
+
+    person_name = sanitize_text(payload.get("aiTeamPersonName"))
+    person_email = normalize_email(payload.get("aiTeamPersonEmail"))
+    if not person_name:
+        raise ApiError(400, "Please enter the AI Team person's name.")
+    if not is_valid_email(person_email):
+        raise ApiError(400, "Please enter a valid AI Team person email.")
+
+    return {
+        "personName": person_name,
+        "personEmail": person_email,
+    }
+
+
+def get_ai_team_request(metadata: Any) -> dict[str, str] | None:
+    payload = normalize_json_object(normalize_json_object(metadata).get(AI_TEAM_REQUEST_METADATA_KEY))
+    person_name = sanitize_text(payload.get("personName"))
+    person_email = normalize_email(payload.get("personEmail"))
+    if not person_name and not person_email:
+        return None
+
+    return {
+        "personName": person_name,
+        "personEmail": person_email,
+    }
 
 
 def build_public_ticket_id(ticket_id: int) -> str:
@@ -9445,6 +9495,7 @@ def serialize_ticket_sla_timestamp(metadata: dict[str, Any], key: str) -> str | 
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
+    ai_team_request = get_ai_team_request(ticket_metadata)
     requester_name = row.get("learner_name") or ""
     submitted_for_payload = normalize_json_object(ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
     if not submitted_for_payload and row.get("submitted_for_learner_id"):
@@ -9504,6 +9555,9 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "category": row["category"],
         "technicalSubcategory": row.get("technical_subcategory") or "",
         "subject": sanitize_text(row.get("subject")) or sanitize_text(ticket_metadata.get("subject")),
+        "aiTeamRequest": ai_team_request,
+        "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+        "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
         "submittedForLearner": submitted_for_payload or None,
         "notifySubmittedForLearner": normalize_bool(submitted_for_payload.get("notifyByEmail")) if submitted_for_payload else False,
         "inquiryPreview": sanitize_text(row.get("inquiry")),
@@ -11281,7 +11335,12 @@ def apply_ticket_chat_history_sync(
             ],
         )
 
-    if status == "Pending" and is_quick_ticket_status_reason(next_status_reason) and not is_coverage_ticket_record(ticket):
+    if (
+        status == "Pending"
+        and is_quick_ticket_status_reason(next_status_reason)
+        and not is_coverage_ticket_record(ticket)
+        and not is_ai_team_ticket_record(ticket)
+    ):
         assignment_ticket = {
             **ticket,
             "status": status,
@@ -12942,6 +13001,8 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
 def try_auto_assign_quick_ticket(ticket: dict[str, Any], now: datetime | None = None) -> dict[str, Any] | None:
     if ticket.get("assigned_agent_id"):
         return None
+    if is_ai_team_ticket_record(ticket):
+        return None
 
     agent_candidates = run_query(
         """
@@ -13417,6 +13478,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         existing_ticket_metadata,
         default=requester_source,
     )
+    ai_team_request = get_ai_team_request(existing_ticket_metadata)
     response["ticket"] = {
         "id": existing_ticket["public_id"],
         "learnerName": requester.get("display_name") or learner.get("full_name") or "",
@@ -13427,6 +13489,8 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         "technicalSubcategory": existing_ticket.get("technical_subcategory") or "",
         "subject": sanitize_text(existing_ticket.get("subject")),
         "inquiry": existing_ticket.get("inquiry") or "",
+        "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+        "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
         "status": existing_ticket["status"],
         "statusReason": existing_ticket.get("status_reason") or "",
         "assignedAgentId": int(existing_ticket["assigned_agent_id"]) if existing_ticket.get("assigned_agent_id") else None,
@@ -19812,6 +19876,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
         raise ApiError(400, "Inquiry details are required.")
     if not subject:
         subject = sanitize_text((inquiry.splitlines() or [""])[0])[:140] or technical_subcategory or category
+    ai_team_request = normalize_ai_team_request_payload(payload, technical_subcategory)
 
     try:
         with transaction.atomic():
@@ -19849,6 +19914,8 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 "requester_source": requester_source or None,
                 "subject": subject,
             }
+            if ai_team_request:
+                ticket_metadata[AI_TEAM_REQUEST_METADATA_KEY] = ai_team_request
             submitted_for_payload = build_submitted_for_learner_payload(
                 submitted_for_learner,
                 notify_by_email=notify_submitted_for_learner,
@@ -19911,6 +19978,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     raise ApiError(500, "We could not create the ticket right now.")
 
                 public_id = build_public_ticket_id(int(ticket_row["id"]))
+                initial_assigned_team = ASSIGNED_TEAM_AI_TEAM if ai_team_request else ticket_row["assigned_team"]
                 initial_sla_status = "On Track" if technical_subcategory == "Coverage" else ticket_row["sla_status"]
                 if technical_subcategory == "Coverage":
                     ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {
@@ -19928,6 +19996,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         requester_role=requester_role,
                         reason="support_ticket_created",
                         created_at=ticket_row.get("created_at") or datetime.now(timezone.utc),
+                        queue=initial_assigned_team,
                     )
                 if technical_subcategory == "Coverage":
                     ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
@@ -19952,7 +20021,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         "technical_subcategory": technical_subcategory or "",
                         "status": ticket_row["status"],
                         "status_reason": "",
-                        "assigned_team": ticket_row["assigned_team"],
+                        "assigned_team": initial_assigned_team,
                     },
                     chat_state="open",
                 )
@@ -19990,6 +20059,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                                 "learner_id": learner["id"],
                                 "technical_subcategory": technical_subcategory or None,
                                 "subject": subject,
+                                "ai_team_request": ai_team_request,
                                 "requester_role": requester_role,
                                 "requester_source": requester_source or None,
                                 "submitted_for_learner": submitted_for_payload,
@@ -20028,6 +20098,17 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         ticket_row["id"],
                     ],
                 )
+
+                if initial_assigned_team != ticket_row["assigned_team"]:
+                    cursor.execute(
+                        """
+                        UPDATE tickets
+                        SET assigned_team = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        [initial_assigned_team, ticket_row["id"]],
+                    )
 
                 if conversation_id:
                     cursor.execute(
@@ -20087,6 +20168,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     "category": category,
                     "technical_subcategory": technical_subcategory or None,
                     "subject": subject,
+                    "ai_team_request": ai_team_request,
                     "evidence_count": evidence_count,
                     "submitted_for_learner": submitted_for_payload,
                 },
@@ -20130,11 +20212,13 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             "technicalSubcategory": technical_subcategory,
             "subject": subject,
             "inquiry": inquiry,
+            "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+            "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
             "submittedForLearner": submitted_for_payload,
             "notifySubmittedForLearner": notify_submitted_for_learner,
             "status": ticket_row["status"],
             "statusReason": "",
-            "assignedTeam": ticket_row["assigned_team"],
+            "assignedTeam": initial_assigned_team,
             "slaStatus": initial_sla_status,
             "createdAt": ticket_row["created_at"],
             "chatState": "open",
@@ -20169,6 +20253,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
         raise ApiError(400, "Inquiry details are required.")
     if not subject:
         subject = sanitize_text((inquiry.splitlines() or [""])[0])[:140] or technical_subcategory or category
+    ai_team_request = normalize_ai_team_request_payload(payload, technical_subcategory)
 
     try:
         with transaction.atomic():
@@ -20236,6 +20321,11 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                     "subject": subject,
                 }
             )
+            if ai_team_request:
+                updated_ticket_metadata[AI_TEAM_REQUEST_METADATA_KEY] = ai_team_request
+            else:
+                updated_ticket_metadata.pop(AI_TEAM_REQUEST_METADATA_KEY, None)
+            next_assigned_team = ASSIGNED_TEAM_AI_TEAM if ai_team_request else existing_ticket["assigned_team"]
             if should_update_submitted_for:
                 submitted_for_learner = resolve_submitted_for_learner(
                     payload.get("submittedForLearnerId"),
@@ -20328,6 +20418,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                                     "latest_inquiry": inquiry,
                                     "evidence_count": evidence_count,
                                     "requester_source": requester_source or None,
+                                    "ai_team_request": ai_team_request,
                                     "submitted_for_learner": submitted_for_payload,
                                 }
                             ),
@@ -20371,6 +20462,17 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                             ],
                         )
 
+                if next_assigned_team != existing_ticket["assigned_team"]:
+                    cursor.execute(
+                        """
+                        UPDATE tickets
+                        SET assigned_team = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        [next_assigned_team, existing_ticket["id"]],
+                    )
+
             if should_replace_attachments:
                 transaction.on_commit(
                     lambda old_storage_keys=list(existing_attachment_storage_keys): [
@@ -20388,6 +20490,7 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                     "technical_subcategory": technical_subcategory or None,
                     "subject": subject,
                     "priority": next_priority,
+                    "ai_team_request": ai_team_request,
                     "evidence_count": evidence_count,
                 },
             )
@@ -20408,11 +20511,13 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
             "technicalSubcategory": technical_subcategory,
             "subject": subject,
             "inquiry": inquiry,
+            "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+            "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
             "submittedForLearner": submitted_for_payload or None,
             "notifySubmittedForLearner": normalize_bool(submitted_for_payload.get("notifyByEmail")) if submitted_for_payload else False,
             "status": existing_ticket["status"],
             "statusReason": existing_ticket.get("status_reason") or "",
-            "assignedTeam": existing_ticket["assigned_team"],
+            "assignedTeam": next_assigned_team,
             "slaStatus": existing_ticket["sla_status"],
             "createdAt": existing_ticket["created_at"],
             "chatState": derive_ticket_chat_state(existing_ticket.get("status"), None),

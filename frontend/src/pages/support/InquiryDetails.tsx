@@ -67,7 +67,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "Coverage", "Others"];
+const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "AI Team", "Coverage", "Others"];
 
 const getExtension = (name: string) => {
   const dotIndex = name.lastIndexOf(".");
@@ -162,6 +162,8 @@ const InquiryDetails = () => {
   const [inquiry, setInquiry] = useState(
     isCoverageSubcategory(ticket.technicalSubcategory) && initialCoverageDetails ? "" : ticket.inquiry,
   );
+  const [aiTeamPersonName, setAiTeamPersonName] = useState(ticket.aiTeamPersonName);
+  const [aiTeamPersonEmail, setAiTeamPersonEmail] = useState(ticket.aiTeamPersonEmail);
   const [requestFor, setRequestFor] = useState<RequestForMode>(ticket.submittedForLearner ? "learner" : "self");
   const [learnerSearch, setLearnerSearch] = useState("");
   const [learnerResults, setLearnerResults] = useState<SubmittedForLearner[]>([]);
@@ -213,11 +215,16 @@ const InquiryDetails = () => {
   );
   const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
 
+  const isAiTeamFlow = technicalSubcategory === "AI Team";
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
   const hasSubmittedForLearner = requestFor !== "learner" || Boolean(selectedSubmittedForLearner);
   const trimmedSubmittedForNotificationEmail = submittedForNotificationEmail.trim();
   const hasValidSubmittedForNotificationEmail = !notifySubmittedForLearner
     || (Boolean(selectedSubmittedForLearner) && isValidEmailFormat(trimmedSubmittedForNotificationEmail));
+  const trimmedAiTeamPersonName = aiTeamPersonName.trim();
+  const trimmedAiTeamPersonEmail = aiTeamPersonEmail.trim();
+  const hasValidAiTeamContact = !isAiTeamFlow
+    || (Boolean(trimmedAiTeamPersonName) && isValidEmailFormat(trimmedAiTeamPersonEmail));
   const hasSubject = subject.trim().length > 0;
   const canSubmit = isCoverageFlow
     ? Boolean(
@@ -231,7 +238,14 @@ const InquiryDetails = () => {
       && coverageSessionDates.length > 0
       && selectedCoverageSessionSubjects.every((value) => value.length > 0),
     )
-    : Boolean(hasSubject && hasSubmittedForLearner && hasValidSubmittedForNotificationEmail && technicalSubcategory && inquiry.trim().length > 0);
+    : Boolean(
+      hasSubject
+      && hasSubmittedForLearner
+      && hasValidSubmittedForNotificationEmail
+      && hasValidAiTeamContact
+      && technicalSubcategory
+      && inquiry.trim().length > 0,
+    );
 
   const loadCoverageSessionDateOptions = (tutorValue: string, moduleValue: string, timeValue: string) => {
     if (!isCoverageFlow || !tutorValue || !moduleValue || !timeValue) {
@@ -641,6 +655,8 @@ const InquiryDetails = () => {
         technicalSubcategory,
         subject: subject.trim(),
         inquiry: submittedInquiry,
+        aiTeamPersonName: isAiTeamFlow ? trimmedAiTeamPersonName : "",
+        aiTeamPersonEmail: isAiTeamFlow ? trimmedAiTeamPersonEmail.toLowerCase() : "",
         submittedForLearner,
         notifySubmittedForLearner: Boolean(submittedForLearner && notifySubmittedForLearner && isValidEmailFormat(submittedForLearner.notificationEmail || "")),
         evidence,
@@ -655,13 +671,15 @@ const InquiryDetails = () => {
         chatHistory: ticket.id ? ticket.chatHistory : [],
       };
 
-      if (isCoverageFlow) {
+      if (isCoverageFlow || isAiTeamFlow) {
         const persistedTicket = await persistTicketDraft(nextTicket);
         const submittedTicket = await submitTicketDirectlyForReview(persistedTicket);
 
         clearBookingSummary();
         updateTicket(submittedTicket);
-        toast.success("Your coverage ticket has been submitted to the Learning Plan team.");
+        toast.success(isAiTeamFlow
+          ? "Your AI Team ticket has been submitted."
+          : "Your coverage ticket has been submitted to the Learning Plan team.");
         navigate("/support/status");
         return;
       }
@@ -970,6 +988,32 @@ const InquiryDetails = () => {
                 </SelectContent>
               </Select>
             </div>
+
+            {isAiTeamFlow ? (
+              <div className="grid gap-4 rounded-2xl border border-primary/10 bg-primary/[0.03] p-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="ai-team-person-name">Person name</Label>
+                  <Input
+                    id="ai-team-person-name"
+                    value={aiTeamPersonName}
+                    onChange={(event) => setAiTeamPersonName(event.target.value)}
+                    placeholder="Enter the person's name"
+                    className="h-11 rounded-xl"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-team-person-email">Person email</Label>
+                  <Input
+                    id="ai-team-person-email"
+                    type="email"
+                    value={aiTeamPersonEmail}
+                    onChange={(event) => setAiTeamPersonEmail(event.target.value)}
+                    placeholder="Enter the person's email"
+                    className="h-11 rounded-xl"
+                  />
+                </div>
+              </div>
+            ) : null}
 
             <div className="space-y-2">
               <div className="flex items-end justify-between gap-3">
@@ -1302,7 +1346,7 @@ const InquiryDetails = () => {
                 onClick={() => void handleNext()}
                 className="w-full border-0 gradient-primary sm:w-auto"
               >
-                {isSubmitting ? "Saving..." : "Next"}
+                {isSubmitting ? "Saving..." : isAiTeamFlow ? "Submit ticket" : "Next"}
                 {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
               </Button>
             </div>

@@ -2096,6 +2096,101 @@ class SupportSessionValidationTests(SimpleTestCase):
         self.assertNotIn("pending_coverage_ticket_notification", persisted_metadata)
         notify_operations_team.assert_not_called()
 
+    def test_create_ticket_routes_ai_team_ticket_and_stores_person_details(self):
+        requester = {
+            "email": "learner@example.com",
+            "role": "user",
+            "display_name": "Learner One",
+            "learner": None,
+            "account": {
+                "id": 31,
+                "username": "learner1",
+                "full_name": "Learner One",
+                "email": "learner@example.com",
+                "role": "user",
+            },
+        }
+        learner = {
+            "id": 12,
+            "full_name": "Learner One",
+            "email": "learner@example.com",
+            "phone": None,
+        }
+        cursor = MagicMock()
+        cursor_manager = MagicMock()
+        cursor_manager.__enter__.return_value = cursor
+        cursor_manager.__exit__.return_value = False
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "resolve_public_support_requester", return_value=requester),
+            patch.object(services, "ensure_public_requester_learner", return_value=learner),
+            patch.object(
+                services,
+                "dictfetchone",
+                side_effect=[
+                    {
+                        "id": 73,
+                        "status": "Open",
+                        "assigned_team": "Unassigned",
+                        "sla_status": "Pending Review",
+                        "created_at": datetime(2026, 5, 23, 17, 0, tzinfo=timezone.utc),
+                    },
+                    {"id": 90},
+                ],
+            ),
+            patch.object(services, "build_public_ticket_id", return_value="KBC-000073"),
+            patch.object(services, "insert_history_event"),
+            patch.object(services.connection, "cursor", return_value=cursor_manager),
+        ):
+            response = services.create_ticket(
+                {
+                    "email": "learner@example.com",
+                    "category": "Technical",
+                    "technicalSubcategory": "AI Team",
+                    "subject": "AI Team access issue",
+                    "inquiry": "The AI Team member cannot access their workspace.",
+                    "aiTeamPersonName": "Khaled Ashraf",
+                    "aiTeamPersonEmail": "Khaled.Ashraf@KentBusinessCollege.com",
+                    "evidence": [],
+                }
+            )
+
+        self.assertEqual(response["ticket"]["technicalSubcategory"], "AI Team")
+        self.assertEqual(response["ticket"]["assignedTeam"], services.ASSIGNED_TEAM_AI_TEAM)
+        self.assertEqual(response["ticket"]["aiTeamPersonName"], "Khaled Ashraf")
+        self.assertEqual(response["ticket"]["aiTeamPersonEmail"], "khaled.ashraf@kentbusinesscollege.com")
+
+        ticket_insert_call = next(
+            call for call in cursor.execute.call_args_list
+            if "INSERT INTO tickets" in call.args[0]
+        )
+        ticket_metadata = json.loads(ticket_insert_call.args[1][9])
+        self.assertEqual(ticket_metadata["technical_subcategory"], "AI Team")
+        self.assertEqual(
+            ticket_metadata[services.AI_TEAM_REQUEST_METADATA_KEY],
+            {
+                "personName": "Khaled Ashraf",
+                "personEmail": "khaled.ashraf@kentbusinesscollege.com",
+            },
+        )
+
+        assigned_team_update_call = next(
+            call for call in cursor.execute.call_args_list
+            if "SET assigned_team = %s" in call.args[0]
+        )
+        self.assertEqual(assigned_team_update_call.args[1], [services.ASSIGNED_TEAM_AI_TEAM, 73])
+
+        ticket_state_update_call = next(
+            call for call in cursor.execute.call_args_list
+            if "UPDATE tickets" in call.args[0] and "SET public_id" in call.args[0]
+        )
+        persisted_metadata = json.loads(ticket_state_update_call.args[1][3])
+        self.assertEqual(
+            persisted_metadata["pending_support_queue_notification"]["queue"],
+            services.ASSIGNED_TEAM_AI_TEAM,
+        )
+
     def test_create_ticket_accepts_coverage_for_entra_requester(self):
         requester = {
             "email": "entra.user@kentbusinesscollege.com",

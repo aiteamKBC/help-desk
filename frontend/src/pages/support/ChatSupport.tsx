@@ -1343,6 +1343,8 @@ const ChatSupport = () => {
       technicalSubcategory: "",
       subject: "",
       inquiry: "",
+      aiTeamPersonName: "",
+      aiTeamPersonEmail: "",
       submittedForLearner: null,
       notifySubmittedForLearner: false,
       evidence: [],

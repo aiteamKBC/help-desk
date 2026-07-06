@@ -188,6 +188,11 @@ interface PendingSupportQueueNotification {
   createdAt: string;
 }
 
+interface AiTeamRequest {
+  personName: string;
+  personEmail: string;
+}
+
 interface PendingCoverageTicketNotification {
   ticketId: string;
   requesterName: string;
@@ -297,6 +302,9 @@ interface TicketSummary {
   category: string;
   technicalSubcategory: string;
   subject?: string;
+  aiTeamRequest?: AiTeamRequest | null;
+  aiTeamPersonName?: string;
+  aiTeamPersonEmail?: string;
   submittedForLearner?: SubmittedForLearnerSummary | null;
   notifySubmittedForLearner?: boolean;
   inquiryPreview: string;
@@ -6702,6 +6710,11 @@ const AgentDashboard = () => {
                       ? getCoverageTicketNextSessionDateInfo(ticket, coveragePriorityReferenceDate)?.label || ""
                       : "";
                     const slaContextLabel = getTicketSlaContextLabel(ticket);
+                    const ticketRowSubtitle = getDashboardTicketRowSubtitle(ticket);
+                    const isAiTeamTicketRowSubtitle = Boolean(
+                      ticket.technicalSubcategory === "AI Team"
+                      && (ticket.aiTeamRequest?.personName || ticket.aiTeamPersonName || "").trim(),
+                    );
 
                     return (
                       <tr
@@ -6725,8 +6738,14 @@ const AgentDashboard = () => {
                         {useCompactDashboardTable ? (
                           <td className={dashboardCellClassName}>
                             <div className="font-mono font-medium whitespace-nowrap">{ticket.id}</div>
-                            <div className="mt-1 truncate text-xs font-mono text-muted-foreground" title={getDisplayedChatReference(ticket)}>
-                              {getDisplayedChatReference(ticket)}
+                            <div
+                              className={cn(
+                                "mt-1 truncate text-xs text-muted-foreground",
+                                isAiTeamTicketRowSubtitle && "font-semibold text-foreground/80",
+                              )}
+                              title={ticketRowSubtitle}
+                            >
+                              {ticketRowSubtitle}
                             </div>
                             {isLearningPlanCoverageSection ? (
                               <div
@@ -8681,6 +8700,12 @@ const AgentDashboard = () => {
                       ) : null}
                       {activeDetail.ticket.subject ? (
                         <InfoCard label="Subject" value={activeDetail.ticket.subject} />
+                      ) : null}
+                      {activeDetail.ticket.aiTeamRequest ? (
+                        <>
+                          <InfoCard label="AI Team Person" value={activeDetail.ticket.aiTeamRequest.personName || "-"} />
+                          <InfoCard label="AI Team E-mail" value={activeDetail.ticket.aiTeamRequest.personEmail || "-"} />
+                        </>
                       ) : null}
                       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(activeDetail.ticket.requesterRole)} />
                       <InfoCard label="Assigned Team" value={activeDetail.ticket.assignedTeam} />
@@ -10654,6 +10679,12 @@ const CoverageTicketDetailsPanel = ({
       ) : null}
       {ticket.subject ? (
         <InfoCard label="Subject" value={ticket.subject} />
+      ) : null}
+      {ticket.aiTeamRequest ? (
+        <>
+          <InfoCard label="AI Team Person" value={ticket.aiTeamRequest.personName || "-"} />
+          <InfoCard label="AI Team E-mail" value={ticket.aiTeamRequest.personEmail || "-"} />
+        </>
       ) : null}
       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(ticket.requesterRole)} />
       <InfoCard label="Assigned Team" value={ticket.assignedTeam} />
@@ -16393,6 +16424,17 @@ function getDisplayedTicketStatus(source: {
   technicalSubcategory?: string | null;
 }) {
   return source.status || "-";
+}
+
+function getDashboardTicketRowSubtitle(ticket: TicketSummary) {
+  if (ticket.technicalSubcategory === "AI Team") {
+    const personName = ticket.aiTeamRequest?.personName || ticket.aiTeamPersonName || "";
+    if (personName.trim()) {
+      return personName.trim();
+    }
+  }
+
+  return getDisplayedChatReference(ticket);
 }
 
 function isStaffSupportAccount(agent: Pick<AdminAgent, "accountScope" | "role">) {
