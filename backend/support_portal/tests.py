@@ -10999,6 +10999,103 @@ class AgentQueueTests(SimpleTestCase):
         self.assertEqual(queue_submitted.call_args.kwargs["status_reason"], services.STATUS_REASON_QUICK_TICKET)
         queue_closed.assert_not_called()
 
+    def test_save_chat_history_queues_ai_team_ticket_submitted_notification(self):
+        ticket = {
+            "id": 24,
+            "public_id": "KBC-000024",
+            "conversation_id": 89,
+            "category": "Technical",
+            "technical_subcategory": services.TECHNICAL_SUBCATEGORY_AI_TEAM,
+            "priority": "Normal",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": services.ASSIGNED_TEAM_AI_TEAM,
+            "sla_status": "Pending Review",
+            "metadata": {
+                services.AI_TEAM_REQUEST_METADATA_KEY: {
+                    "personName": "Ahmed Hamamo",
+                    "personEmail": "ahmed.hamamo@example.com",
+                },
+            },
+            "created_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            "conversation_status": "open",
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+            "assigned_agent_username": None,
+        }
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "clear_prepared_support_teams_call"),
+            patch.object(
+                services,
+                "apply_ticket_chat_history_sync",
+                return_value=([], services.STATUS_REASON_QUICK_TICKET, "On Track", False),
+            ),
+            patch.object(services, "queue_quick_ticket_submitted_notification") as queue_submitted,
+            patch.object(services, "queue_ai_team_ticket_submitted_notification") as queue_ai_team_submitted,
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_closed,
+        ):
+            services.save_chat_history(
+                "KBC-000024",
+                {
+                    "status": "Pending",
+                    "statusReason": services.STATUS_REASON_QUICK_TICKET,
+                    "messages": [],
+                },
+            )
+
+        queue_ai_team_submitted.assert_called_once()
+        self.assertEqual(queue_ai_team_submitted.call_args.kwargs["status"], "Pending")
+        self.assertEqual(queue_ai_team_submitted.call_args.kwargs["status_reason"], services.STATUS_REASON_QUICK_TICKET)
+        queue_submitted.assert_not_called()
+        queue_closed.assert_not_called()
+
+    def test_build_support_notification_webhook_payload_includes_ai_team_person(self):
+        ticket = {
+            "id": 24,
+            "public_id": "KBC-000024",
+            "category": "Technical",
+            "technical_subcategory": services.TECHNICAL_SUBCATEGORY_AI_TEAM,
+            "subject": "Cannot access AI Team",
+            "inquiry": "The learner cannot access the AI Team workspace.",
+            "priority": "Normal",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_team": services.ASSIGNED_TEAM_AI_TEAM,
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "metadata": {
+                services.AI_TEAM_REQUEST_METADATA_KEY: {
+                    "personName": "Ahmed Hamamo",
+                    "personEmail": "ahmed.hamamo@example.com",
+                },
+            },
+            "created_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+        }
+
+        payload = services.build_support_notification_webhook_payload(
+            services.SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
+            ticket,
+            status="Pending",
+            status_reason=services.STATUS_REASON_QUICK_TICKET,
+        )
+
+        self.assertEqual(payload["event"], services.SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED)
+        self.assertEqual(payload["recipientType"], "ai_team_person")
+        self.assertEqual(
+            payload["aiTeamPerson"],
+            {"personName": "Ahmed Hamamo", "personEmail": "ahmed.hamamo@example.com"},
+        )
+        self.assertEqual(payload["requester"]["email"], "omar@example.com")
+        self.assertEqual(payload["ticket"]["assignedTeam"], services.ASSIGNED_TEAM_AI_TEAM)
+        self.assertEqual(payload["ticket"]["inquiry"], "The learner cannot access the AI Team workspace.")
+
     def test_save_chat_history_does_not_duplicate_quick_ticket_submitted_notification(self):
         ticket = {
             "id": 23,

@@ -207,11 +207,13 @@ QUICK_TICKET_ORIGIN_METADATA_KEY = "quick_ticket_origin"
 LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY = "latest_coverage_tutor_response"
 QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_confirmation_email_sent_at"
 QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_closed_email_sent_at"
+AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "ai_team_ticket_submitted_email_sent_at"
 LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailable_operations_notified_at"
 SUBMITTED_FOR_LEARNER_METADATA_KEY = "submitted_for_learner"
 NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY = "notify_submitted_for_learner"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
+SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED = "ai_team_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
@@ -223,6 +225,10 @@ SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED: (
         "quick_ticket_closed_email_sent",
         "quick_ticket_closed_email_failed",
+    ),
+    SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED: (
+        "ai_team_ticket_submitted_email_sent",
+        "ai_team_ticket_submitted_email_failed",
     ),
     SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE: (
         "live_agent_unavailable_operations_notified",
@@ -6175,8 +6181,14 @@ def build_support_notification_webhook_payload(
 ) -> dict[str, Any]:
     public_base_url = get_support_portal_public_base_url("")
     dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
-    recipient_type = "operations" if event == SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE else "requester"
+    if event == SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE:
+        recipient_type = "operations"
+    elif event == SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED:
+        recipient_type = "ai_team_person"
+    else:
+        recipient_type = "requester"
     ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    ai_team_request = get_ai_team_request(ticket_metadata)
     requester_role = get_ticket_requester_role(ticket_metadata)
     requester_source = get_ticket_requester_source(
         ticket_metadata,
@@ -6206,7 +6218,7 @@ def build_support_notification_webhook_payload(
             else ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY)
         )
 
-    return {
+    payload = {
         "event": event,
         "source": "support_portal",
         "recipientType": recipient_type,
@@ -6240,6 +6252,12 @@ def build_support_notification_webhook_payload(
             "closedAt": serialize_datetime_value(closed_at) if closed_at else "",
         },
     }
+    if ai_team_request:
+        payload["aiTeamPerson"] = ai_team_request
+    if event == SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED:
+        payload["ticket"]["inquiry"] = sanitize_text(ticket.get("inquiry"))
+
+    return payload
 
 
 def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6357,11 +6375,33 @@ def should_notify_quick_ticket_submitted(
     next_status: Any,
     next_status_reason: Any,
 ) -> bool:
-    if is_coverage_ticket_record(ticket):
+    if is_coverage_ticket_record(ticket) or is_ai_team_ticket_record(ticket):
         return False
 
     metadata = normalize_json_object(ticket.get("metadata"))
     if metadata.get(QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+
+    was_quick_ticket = sanitize_text(previous_status) == "Pending" and is_quick_ticket_status_reason(previous_status_reason)
+    is_now_quick_ticket = sanitize_text(next_status) == "Pending" and is_quick_ticket_status_reason(next_status_reason)
+    return is_now_quick_ticket and not was_quick_ticket
+
+
+def should_notify_ai_team_ticket_submitted(
+    ticket: dict[str, Any],
+    *,
+    previous_status: Any,
+    previous_status_reason: Any,
+    next_status: Any,
+    next_status_reason: Any,
+) -> bool:
+    if not is_ai_team_ticket_record(ticket):
+        return False
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    if metadata.get(AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+    if not get_ai_team_request(metadata):
         return False
 
     was_quick_ticket = sanitize_text(previous_status) == "Pending" and is_quick_ticket_status_reason(previous_status_reason)
@@ -6403,6 +6443,22 @@ def queue_quick_ticket_submitted_notification(ticket: dict[str, Any], *, status:
         event=SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
         payload=payload,
         sent_metadata_key=QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
+
+
+def queue_ai_team_ticket_submitted_notification(ticket: dict[str, Any], *, status: str, status_reason: str) -> None:
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
+        ticket,
+        status=status,
+        status_reason=status_reason,
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
+        payload=payload,
+        sent_metadata_key=AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
     )
 
 
@@ -20628,6 +20684,13 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
             next_status=status,
             next_status_reason=next_status_reason,
         )
+        should_queue_ai_team_submitted_notification = should_notify_ai_team_ticket_submitted(
+            ticket,
+            previous_status=previous_status,
+            previous_status_reason=previous_status_reason,
+            next_status=status,
+            next_status_reason=next_status_reason,
+        )
         should_queue_quick_closed_notification = should_notify_quick_ticket_closed(
             ticket,
             previous_status=previous_status,
@@ -20637,6 +20700,8 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
 
     if should_queue_quick_submitted_notification:
         queue_quick_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
+    if should_queue_ai_team_submitted_notification:
+        queue_ai_team_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
     if should_queue_quick_closed_notification:
         queue_quick_ticket_closed_notification(
             ticket,
