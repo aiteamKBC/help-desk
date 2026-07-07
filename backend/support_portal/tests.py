@@ -11270,6 +11270,100 @@ class AgentQueueTests(SimpleTestCase):
         self.assertTrue(insert_history_event.call_args.args[3]["webhookDelivered"])
         self.assertEqual(result["historyEventType"], "quick_ticket_confirmation_email_sent")
 
+    def test_queue_ai_team_ticket_submitted_notification_includes_evidence_attachments(self):
+        ticket = {
+            "id": 24,
+            "public_id": "KBC-000024",
+            "category": "Technical",
+            "technical_subcategory": services.TECHNICAL_SUBCATEGORY_AI_TEAM,
+            "subject": "Cannot access AI Team",
+            "inquiry": "The learner cannot access the AI Team workspace.",
+            "priority": "Normal",
+            "status": "Pending",
+            "status_reason": services.STATUS_REASON_QUICK_TICKET,
+            "assigned_team": services.ASSIGNED_TEAM_AI_TEAM,
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "metadata": {
+                services.AI_TEAM_REQUEST_METADATA_KEY: {
+                    "personName": "Ahmed Hamamo",
+                    "personEmail": "ahmed.hamamo@example.com",
+                },
+            },
+            "created_at": datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc),
+            "learner_name": "Omar Badr",
+            "learner_email": "omar@example.com",
+        }
+        evidence_file = {
+            "id": "ticket-attachment-77",
+            "attachmentId": 77,
+            "name": "screenshot.png",
+            "mimeType": "image/png",
+            "size": 1024,
+            "storageKey": "KBC-000024/2026/07/screenshot.png",
+        }
+
+        with (
+            patch.object(services, "list_ticket_evidence_webhook_files", return_value=[evidence_file]),
+            patch.object(services, "can_attach_support_notification_file", return_value=True),
+            patch.object(services, "queue_support_notification_delivery") as queue_support_notification_delivery,
+        ):
+            services.queue_ai_team_ticket_submitted_notification(
+                ticket,
+                status="Pending",
+                status_reason=services.STATUS_REASON_QUICK_TICKET,
+            )
+
+        queue_support_notification_delivery.assert_called_once()
+        queued_payload = queue_support_notification_delivery.call_args.kwargs["payload"]
+        queued_attachments = queue_support_notification_delivery.call_args.kwargs["attachments"]
+        self.assertEqual(queued_payload["event"], services.SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED)
+        self.assertEqual(queued_payload["evidence"]["count"], 1)
+        self.assertEqual(queued_payload["evidence"]["files"][0]["name"], "screenshot.png")
+        self.assertEqual(queued_payload["evidence"]["files"][0]["deliveryMode"], "attachment")
+        self.assertEqual(queued_payload["evidence"]["files"][0]["multipartField"], "file_0")
+        self.assertEqual(queued_attachments[0]["storageKey"], "KBC-000024/2026/07/screenshot.png")
+
+    @override_settings(SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification")
+    def test_send_support_notification_webhook_uses_multipart_for_attachments(self):
+        payload = {
+            "event": services.SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
+            "evidence": {
+                "files": [
+                    {
+                        "name": "screenshot.png",
+                        "mimeType": "image/png",
+                        "size": 1024,
+                        "storageKey": "KBC-000024/2026/07/screenshot.png",
+                        "deliveryMode": "attachment",
+                        "multipartField": "file_0",
+                    }
+                ],
+            },
+        }
+        attachments = [payload["evidence"]["files"][0]]
+
+        with (
+            patch.object(
+                services,
+                "post_multipart_webhook",
+                return_value=(True, True, 200, {"ok": True}),
+            ) as post_multipart_webhook,
+            patch.object(services, "post_json_webhook") as post_json_webhook,
+        ):
+            result = services.send_support_notification_webhook(payload, attachments=attachments)
+
+        self.assertTrue(result["delivered"])
+        post_json_webhook.assert_not_called()
+        post_multipart_webhook.assert_called_once()
+        sent_payload = post_multipart_webhook.call_args.args[1]
+        self.assertNotIn("storageKey", sent_payload["evidence"]["files"][0])
+        self.assertEqual(post_multipart_webhook.call_args.args[2], attachments)
+        self.assertEqual(
+            post_multipart_webhook.call_args.kwargs["timeout_seconds"],
+            services.SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
+        )
+
     def test_try_auto_assign_quick_ticket_prefers_available_ticket_receiving_agent_and_updates_ticket(self):
         ticket = {
             "id": 23,

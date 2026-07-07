@@ -217,6 +217,8 @@ SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED = "ai_team_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
+SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
+SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES = 18 * 1024 * 1024
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
         "quick_ticket_confirmation_email_sent",
@@ -354,6 +356,22 @@ def get_coverage_webhook_attachment_max_total_bytes() -> int:
     return get_int_setting(
         "COVERAGE_WEBHOOK_ATTACHMENT_MAX_TOTAL_BYTES",
         COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES,
+        minimum=0,
+    )
+
+
+def get_support_notification_attachment_max_file_bytes() -> int:
+    return get_int_setting(
+        "SUPPORT_NOTIFICATION_ATTACHMENT_MAX_FILE_BYTES",
+        SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_FILE_BYTES,
+        minimum=0,
+    )
+
+
+def get_support_notification_attachment_max_total_bytes() -> int:
+    return get_int_setting(
+        "SUPPORT_NOTIFICATION_ATTACHMENT_MAX_TOTAL_BYTES",
+        SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES,
         minimum=0,
     )
 
@@ -4939,6 +4957,106 @@ def prepare_coverage_follow_up_webhook_delivery_payload(payload: dict[str, Any])
     return prepared_payload, files_to_attach
 
 
+def list_ticket_evidence_webhook_files(ticket_id: Any) -> list[dict[str, Any]]:
+    try:
+        normalized_ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
+        normalized_ticket_id = 0
+    if normalized_ticket_id <= 0:
+        return []
+
+    rows = run_query(
+        """
+        SELECT id, file_name, mime_type, file_size, storage_url, created_at
+        FROM ticket_attachments
+        WHERE ticket_id = %s
+        ORDER BY created_at ASC, id ASC
+        """,
+        [normalized_ticket_id],
+    )
+    return [
+        {
+            "id": f"ticket-attachment-{int(row['id'])}",
+            "attachmentId": int(row["id"]),
+            "name": sanitize_support_attachment_name(row.get("file_name")),
+            "mimeType": sanitize_text(row.get("mime_type")) or "application/octet-stream",
+            "size": int(row.get("file_size") or 0),
+            "storageKey": sanitize_text(row.get("storage_url")),
+        }
+        for row in rows
+        if sanitize_text(row.get("storage_url"))
+    ]
+
+
+def can_attach_support_notification_file(file: dict[str, Any]) -> bool:
+    storage_key = sanitize_text(file.get("storageKey"))
+    if not storage_key:
+        return bool(sanitize_text(file.get("dataUrl")))
+    try:
+        attachment_path = resolve_support_attachment_path(storage_key)
+    except ApiError:
+        return False
+    return attachment_path.exists() and attachment_path.is_file()
+
+
+def prepare_support_notification_webhook_file_delivery(
+    file: dict[str, Any],
+    *,
+    current_total_bytes: int,
+    multipart_index: int,
+) -> tuple[dict[str, Any], bool, int]:
+    prepared_file = normalize_json_object(file)
+    file_size = parse_attachment_file_size(prepared_file.get("size"))
+    max_file_bytes = get_support_notification_attachment_max_file_bytes()
+    max_total_bytes = get_support_notification_attachment_max_total_bytes()
+    can_attach_binary = can_attach_support_notification_file(prepared_file)
+    within_file_limit = max_file_bytes <= 0 or file_size <= max_file_bytes
+    within_total_limit = max_total_bytes <= 0 or (current_total_bytes + file_size) <= max_total_bytes
+
+    if can_attach_binary and within_file_limit and within_total_limit:
+        prepared_file["deliveryMode"] = "attachment"
+        prepared_file["multipartField"] = f"file_{multipart_index}"
+        return prepared_file, True, file_size
+
+    prepared_file["deliveryMode"] = "metadata_only"
+    if not can_attach_binary:
+        prepared_file["deliveryReason"] = "file_unavailable"
+    elif not within_file_limit:
+        prepared_file["deliveryReason"] = "file_size_limit"
+    elif not within_total_limit:
+        prepared_file["deliveryReason"] = "total_size_limit"
+    return prepared_file, False, 0
+
+
+def prepare_support_notification_webhook_delivery_payload(
+    payload: dict[str, Any],
+    files: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prepared_payload = copy.deepcopy(payload)
+    prepared_files: list[dict[str, Any]] = []
+    files_to_attach: list[dict[str, Any]] = []
+    running_total = 0
+
+    for file in files:
+        prepared_file, should_attach, attached_size = prepare_support_notification_webhook_file_delivery(
+            normalize_json_object(file),
+            current_total_bytes=running_total,
+            multipart_index=len(files_to_attach),
+        )
+        prepared_files.append(prepared_file)
+        if should_attach:
+            files_to_attach.append(prepared_file)
+            running_total += attached_size
+
+    if prepared_files:
+        prepared_payload["evidence"] = {
+            "count": len(prepared_files),
+            "files": prepared_files,
+        }
+
+    return prepared_payload, files_to_attach
+
+
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_request_webhook_url()
     prepared_payload, files = prepare_coverage_request_webhook_delivery_payload(payload)
@@ -6260,10 +6378,33 @@ def build_support_notification_webhook_payload(
     return payload
 
 
-def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, response_payload = post_json_webhook(
+def send_webhook_with_optional_attachments(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    timeout_seconds: int = 20,
+) -> tuple[bool, bool, int | None, Any]:
+    files = [normalize_json_object(file) for file in (attachments or []) if normalize_json_object(file)]
+    if files:
+        return post_multipart_webhook(
+            url,
+            strip_webhook_attachment_binary_fields(payload),
+            files,
+            timeout_seconds=timeout_seconds,
+        )
+    return post_json_webhook(url, payload, timeout_seconds=timeout_seconds)
+
+
+def send_support_notification_webhook(
+    payload: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    configured, delivered, status, response_payload = send_webhook_with_optional_attachments(
         get_support_notification_webhook_url(),
         payload,
+        attachments=attachments,
         timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
     )
     return {
@@ -6281,6 +6422,7 @@ def deliver_support_notification(
     event: str,
     payload: dict[str, Any],
     sent_metadata_key: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     delivered_event_type, failed_event_type = SUPPORT_NOTIFICATION_HISTORY_EVENTS.get(
         event,
@@ -6288,7 +6430,12 @@ def deliver_support_notification(
     )
 
     try:
-        result = send_support_notification_webhook(payload)
+        files = [normalize_json_object(file) for file in (attachments or []) if normalize_json_object(file)]
+        result = (
+            send_support_notification_webhook(payload, attachments=files)
+            if files
+            else send_support_notification_webhook(payload)
+        )
     except Exception:
         result = {"configured": True, "delivered": False, "status": None, "response": None}
 
@@ -6342,6 +6489,7 @@ def queue_support_notification_delivery(
     event: str,
     payload: dict[str, Any],
     sent_metadata_key: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> None:
     if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
         return
@@ -6355,6 +6503,7 @@ def queue_support_notification_delivery(
                 event=event,
                 payload=payload,
                 sent_metadata_key=sent_metadata_key,
+                attachments=attachments,
             )
         finally:
             close_old_connections()
@@ -6453,12 +6602,17 @@ def queue_ai_team_ticket_submitted_notification(ticket: dict[str, Any], *, statu
         status=status,
         status_reason=status_reason,
     )
+    payload, files_to_attach = prepare_support_notification_webhook_delivery_payload(
+        payload,
+        list_ticket_evidence_webhook_files(ticket.get("id")),
+    )
     queue_support_notification_delivery(
         ticket_id=int(ticket["id"]),
         ticket_public_id=sanitize_text(ticket.get("public_id")),
         event=SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
         payload=payload,
         sent_metadata_key=AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+        attachments=files_to_attach,
     )
 
 

@@ -1,0 +1,640 @@
+  {
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "supportNotifications",
+          "responseMode": "responseNode",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          144,
+          2208
+        ],
+        "id": "26c4f1c7-76b5-47ad-98d6-04aa8161f25e",
+        "name": "Webhook1",
+        "webhookId": "f2daefbb-95cf-4b3b-9c86-338273b4b76f"
+      },
+      {
+        "parameters": {
+          "jsCode": "const envelope = $json.body ?? $json;\nlet payloadCandidate = envelope;\n\nif (envelope && typeof envelope === 'object' && !Array.isArray(envelope) && Object.prototype.hasOwnProperty.call(envelope, 'body')) {\n  payloadCandidate = envelope.body;\n}\n\nlet payload = payloadCandidate;\n\nif (typeof payloadCandidate === 'string') {\n  try {\n    payload = JSON.parse(payloadCandidate);\n  } catch (error) {\n    payload = { body: payloadCandidate };\n  }\n}\n\nif (!payload || typeof payload !== 'object' || Array.isArray(payload)) {\n  payload = { body: payloadCandidate };\n}\n\nconst binary = $binary ?? {};\nconst attachmentProperties = Object.keys(binary)\n  .filter((key) => /^file_\\d+$/.test(key))\n  .sort((left, right) => Number(left.replace('file_', '')) - Number(right.replace('file_', '')));\n\nreturn [\n  {\n    json: {\n      ...payload,\n      attachmentProperties: attachmentProperties.join(','),\n      hasAttachments: attachmentProperties.length > 0,\n    },\n    binary,\n  },\n];\n"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          368,
+          2208
+        ],
+        "id": "7d7db74f-346f-48ec-a7ba-edcc7a7c7e13",
+        "name": "Normalize Payload1"
+      },
+      {
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "leftValue": "={{ $json.event }}",
+                      "rightValue": "quick_ticket_submitted",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      },
+                      "id": "08dd67e4-bf48-412e-9619-c382b2dedbde"
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "bce6a022-25c6-4446-b9de-38e696c81a1a",
+                      "leftValue": "={{ $json.event }}",
+                      "rightValue": "quick_ticket_closed",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals",
+                        "name": "filter.operator.equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "6f32e2a1-5b46-47ec-9511-52356bdf6f6a",
+                      "leftValue": "={{ $json.event }}",
+                      "rightValue": "live_agent_unavailable",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals",
+                        "name": "filter.operator.equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "a6ef4ff8-a8ad-4fa0-b5a2-0d3d0de5f890",
+                      "leftValue": "={{ $json.event }}",
+                      "rightValue": "ai_team_ticket_submitted",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals",
+                        "name": "filter.operator.equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              }
+            ]
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3.4,
+        "position": [
+          592,
+          2192
+        ],
+        "id": "59cd916c-e61a-4956-a952-3d84273b9e77",
+        "name": "Route Event1"
+      },
+      {
+        "parameters": {
+          "sendTo": "={{ $node[\"Normalize Payload1\"].json.requester.email }}",
+          "subject": "=Support ticket {{ $node[\"Normalize Payload1\"].json.ticket.id }} submitted",
+          "message": "=<div style=\"margin:0;padding:0;background:#f4f6fb;font-family:Georgia,'Times New Roman',serif;color:#111827;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4f6fb;margin:0;padding:28px 0;\"><tr><td align=\"center\" style=\"padding:0 16px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:640px;background:#ffffff;border:1px solid #dedede;border-radius:8px;overflow:hidden;\"><tr><td style=\"background:#17172b;color:#ffffff;padding:24px 28px;\"><div style=\"font-size:13px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700;color:#dbe7ff;\">Kent Business College</div><div style=\"font-size:22px;font-weight:700;margin-top:8px;\">Support Ticket Submitted</div></td></tr><tr><td style=\"padding:26px 28px 30px;\"><p style=\"margin:0 0 14px;font-size:16px;line-height:1.6;\">Dear <strong>{{ $node[\"Normalize Payload1\"].json.requester.name || \"there\" }}</strong>,</p><p style=\"margin:0 0 22px;font-size:15px;line-height:1.7;\">Your support ticket has been submitted successfully. Our support team will review the details and follow up as soon as possible.</p><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;font-weight:700;color:#777;margin:0 0 8px;\">Ticket Info</div><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f8f9fc;border-left:4px solid #17172b;border-radius:4px;margin:0 0 22px;\"><tr><td style=\"padding:16px 18px;\"><div style=\"font-size:15px;line-height:1.7;\"><strong>Ticket ID</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.id }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Category</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.category }}{{ $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory ? \" - \" + $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory : \"\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Subject</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.subject || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Status</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.statusReason || $node[\"Normalize Payload1\"].json.ticket.status || \"Quick Ticket\" }}</div>{{ $node[\"Normalize Payload1\"].json.submittedFor ? \"<div style='font-size:15px;line-height:1.7;margin-top:10px;'><strong>Submitted for</strong><br>\" + ($node[\"Normalize Payload1\"].json.submittedFor.fullName || $node[\"Normalize Payload1\"].json.submittedFor.email || \"Learner\") + \"</div>\" : \"\" }}</td></tr></table><p style=\"margin:0;font-size:15px;line-height:1.6;\">Kind regards,<br><strong>Kent Business College Support</strong></p></td></tr></table></td></tr></table></div>",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          816,
+          2016
+        ],
+        "id": "7f57d4a6-95e4-483d-bb95-9c38b4ccc3ca",
+        "name": "Quick Ticket Submitted1",
+        "webhookId": "ce67b0f7-c84f-481c-8281-edaf911f6c39",
+        "credentials": {
+          "gmailOAuth2": {
+            "id": "DZ8VIkkppghFEoGg",
+            "name": "Charly Account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "b5973f4d-3826-4992-8c7a-26f4dc2438f1",
+                      "leftValue": "={{ $node[\"Normalize Payload1\"].json.submittedFor?.notifyByEmail && ($node[\"Normalize Payload1\"].json.submittedFor?.notificationEmail || $node[\"Normalize Payload1\"].json.submittedFor?.email) ? 'notify' : 'skip' }}",
+                      "rightValue": "notify",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "75684a6e-7a4a-4ec6-9f94-01576e670a0c",
+                      "leftValue": "={{ $node[\"Normalize Payload1\"].json.submittedFor?.notifyByEmail && ($node[\"Normalize Payload1\"].json.submittedFor?.notificationEmail || $node[\"Normalize Payload1\"].json.submittedFor?.email) ? 'notify' : 'skip' }}",
+                      "rightValue": "skip",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              }
+            ]
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3.4,
+        "position": [
+          1040,
+          2016
+        ],
+        "id": "ad81dda1-5e36-456d-88bf-a7fccb11a2a6",
+        "name": "Route Learner Notification"
+      },
+      {
+        "parameters": {
+          "sendTo": "={{ $node[\"Normalize Payload1\"].json.submittedFor.notificationEmail || $node[\"Normalize Payload1\"].json.submittedFor.email }}",
+          "subject": "=Support ticket {{ $node[\"Normalize Payload1\"].json.ticket.id }} has been created for you",
+          "message": "=<div style=\"margin:0;padding:0;background:#f4f6fb;font-family:Georgia,'Times New Roman',serif;color:#111827;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4f6fb;margin:0;padding:28px 0;\"><tr><td align=\"center\" style=\"padding:0 16px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:640px;background:#ffffff;border:1px solid #dedede;border-radius:8px;overflow:hidden;\"><tr><td style=\"background:#17172b;color:#ffffff;padding:24px 28px;\"><div style=\"font-size:13px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700;color:#dbe7ff;\">Kent Business College</div><div style=\"font-size:22px;font-weight:700;margin-top:8px;\">Support Ticket Created For You</div></td></tr><tr><td style=\"padding:26px 28px 30px;\"><p style=\"margin:0 0 14px;font-size:16px;line-height:1.6;\">Dear <strong>{{ $node[\"Normalize Payload1\"].json.submittedFor.fullName || \"there\" }}</strong>,</p><p style=\"margin:0 0 22px;font-size:15px;line-height:1.7;\">A support ticket has been submitted on your behalf by <strong>{{ $node[\"Normalize Payload1\"].json.requester.name || \"a staff member\" }}</strong>. Our support team will review the issue and follow up if needed.</p><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;font-weight:700;color:#777;margin:0 0 8px;\">Ticket Info</div><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f8f9fc;border-left:4px solid #2f855a;border-radius:4px;margin:0 0 22px;\"><tr><td style=\"padding:16px 18px;\"><div style=\"font-size:15px;line-height:1.7;\"><strong>Ticket ID</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.id }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Subject</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.subject || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Category</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.category }}{{ $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory ? \" - \" + $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory : \"\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Submitted by</strong><br>{{ $node[\"Normalize Payload1\"].json.requester.name || \"-\" }}</div></td></tr></table><p style=\"margin:0;font-size:15px;line-height:1.6;\"> <p>For any follow-up, please refer to the ticket number so we can locate the case quickly and avoid asking you to repeat the same information. </p> <br> Kind regards,<br><strong>Kent Business College Support</strong></p></td></tr></table></td></tr></table></div>",
+          "options": {
+            "appendAttribution": false
+          }
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          1264,
+          1936
+        ],
+        "id": "8a0ae01b-4fd0-4712-ab3b-61b6681edbd7",
+        "name": "Submitted Learner Notification",
+        "webhookId": "ce67b0f7-c84f-481c-8281-edaf911f6c39",
+        "credentials": {
+          "gmailOAuth2": {
+            "id": "DZ8VIkkppghFEoGg",
+            "name": "Charly Account"
+          }
+        },
+        "continueOnFail": true
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "{ \"ok\": true, \"event\": \"quick_ticket_submitted\" }",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1488,
+          2016
+        ],
+        "id": "c884d73d-8071-44fb-934e-88c90495010a",
+        "name": "Respond to Webhook1"
+      },
+      {
+        "parameters": {
+          "sendTo": "={{ $node[\"Normalize Payload1\"].json.requester.email }}",
+          "subject": "=Support ticket {{ $node[\"Normalize Payload1\"].json.ticket.id }} closed",
+          "message": "=<div style=\"margin:0;padding:0;background:#f4f6fb;font-family:Georgia,'Times New Roman',serif;color:#111827;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4f6fb;margin:0;padding:28px 0;\"><tr><td align=\"center\" style=\"padding:0 16px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:640px;background:#ffffff;border:1px solid #dedede;border-radius:8px;overflow:hidden;\"><tr><td style=\"background:#17172b;color:#ffffff;padding:24px 28px;\"><div style=\"font-size:13px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700;color:#dbe7ff;\">Kent Business College</div><div style=\"font-size:22px;font-weight:700;margin-top:8px;\">Support Ticket Closed</div></td></tr><tr><td style=\"padding:26px 28px 30px;\"><p style=\"margin:0 0 14px;font-size:16px;line-height:1.6;\">Dear <strong>{{ $node[\"Normalize Payload1\"].json.requester.name || \"there\" }}</strong>,</p><p style=\"margin:0 0 22px;font-size:15px;line-height:1.7;\">Your support ticket has now been closed. If you still need help, please submit a new support request through the support portal.</p><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f8f9fc;border-left:4px solid #2f855a;border-radius:4px;margin:0 0 22px;\"><tr><td style=\"padding:16px 18px;\"><div style=\"font-size:15px;line-height:1.7;\"><strong>Ticket ID</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.id }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Subject</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.subject || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Status</strong><br>Closed</div></td></tr></table><p style=\"margin:0;font-size:15px;line-height:1.6;\">Kind regards,<br><strong>Kent Business College Support</strong></p></td></tr></table></td></tr></table></div>",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          816,
+          2208
+        ],
+        "id": "d9b20034-c26d-4e0d-a26c-801ada488164",
+        "name": "Quick Ticket Closed1",
+        "webhookId": "ce67b0f7-c84f-481c-8281-edaf911f6c39",
+        "credentials": {
+          "gmailOAuth2": {
+            "id": "DZ8VIkkppghFEoGg",
+            "name": "Charly Account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "{ \"ok\": true, \"event\": \"quick_ticket_closed\" }",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1040,
+          2208
+        ],
+        "id": "8f881e14-0ce3-48f4-ac89-6c144521b20c",
+        "name": "Respond to Webhook9"
+      },
+      {
+        "parameters": {
+          "sendTo": "={{ $node[\"Normalize Payload1\"].json.requester.email }}",
+          "subject": "=Live chat waiting: {{ $node[\"Normalize Payload1\"].json.ticket.id }} has no available agent",
+          "message": "=<div style=\"margin:0;padding:0;background:#f4f6fb;font-family:Georgia,'Times New Roman',serif;color:#111827;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4f6fb;margin:0;padding:28px 0;\"><tr><td align=\"center\" style=\"padding:0 16px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:640px;background:#ffffff;border:1px solid #dedede;border-radius:8px;overflow:hidden;\"><tr><td style=\"background:#17172b;color:#ffffff;padding:24px 28px;\"><div style=\"font-size:13px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700;color:#dbe7ff;\">Kent Business College</div><div style=\"font-size:22px;font-weight:700;margin-top:8px;\">Live Agent Required</div></td></tr><tr><td style=\"padding:26px 28px 30px;\"><p style=\"margin:0 0 14px;font-size:16px;line-height:1.6;\">Dear Operations Team,</p><p style=\"margin:0 0 22px;font-size:15px;line-height:1.7;\">A requester selected Live Agent, but no available support agent could be assigned automatically. Please review and assign a team member as soon as possible.</p><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f8f9fc;border-left:4px solid #b7791f;border-radius:4px;margin:0 0 22px;\"><tr><td style=\"padding:16px 18px;\"><div style=\"font-size:15px;line-height:1.7;\"><strong>Ticket ID</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.id }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Requester</strong><br>{{ $node[\"Normalize Payload1\"].json.requester.name }} - {{ $node[\"Normalize Payload1\"].json.requester.email }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Subject</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.subject || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Category</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.category }}{{ $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory ? \" - \" + $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory : \"\" }}</div></td></tr></table><p style=\"margin:0 0 24px;font-size:15px;line-height:1.7;\">Open the admin dashboard and assign the ticket to an available support agent.</p><a href=\"{{ $node[\"Normalize Payload1\"].json.ticket.dashboardUrl }}\" style=\"display:inline-block;background:#17172b;color:#ffffff;text-decoration:none;font-weight:700;border-radius:6px;padding:12px 18px;\">Open Admin Dashboard</a></td></tr></table></td></tr></table></div>",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          816,
+          2400
+        ],
+        "id": "25212bb4-cdcc-415d-83eb-78257ce02a7c",
+        "name": "Live Agent Unavailable1",
+        "webhookId": "ce67b0f7-c84f-481c-8281-edaf911f6c39",
+        "credentials": {
+          "gmailOAuth2": {
+            "id": "DZ8VIkkppghFEoGg",
+            "name": "Charly Account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "{ \"ok\": true, \"event\": \"live_agent_unavailable\" }",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1040,
+          2400
+        ],
+        "id": "2e885d02-ac97-4ea0-a700-e4714a2feadf",
+        "name": "Respond to Webhook10"
+      },
+      {
+        "parameters": {
+          "authentication": "serviceAccount",
+          "sendTo": "={{ $node[\"Normalize Payload1\"].json.aiTeamPerson.personEmail }}",
+          "subject": "=AI Team ticket {{ $node[\"Normalize Payload1\"].json.ticket.id }} submitted",
+          "message": "=<div style=\"margin:0;padding:0;background:#f4f6fb;font-family:Georgia,'Times New Roman',serif;color:#111827;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4f6fb;margin:0;padding:28px 0;\"><tr><td align=\"center\" style=\"padding:0 16px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:640px;background:#ffffff;border:1px solid #dedede;border-radius:8px;overflow:hidden;\"><tr><td style=\"background:#17172b;color:#ffffff;padding:24px 28px;\"><div style=\"font-size:13px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700;color:#dbe7ff;\">Kent Business College</div><div style=\"font-size:22px;font-weight:700;margin-top:8px;\">AI Team Ticket Submitted</div></td></tr><tr><td style=\"padding:26px 28px 30px;\"><p style=\"margin:0 0 14px;font-size:16px;line-height:1.6;\">Dear <strong>{{ $node[\"Normalize Payload1\"].json.aiTeamPerson.personName || \"there\" }}</strong>,</p><p style=\"margin:0 0 22px;font-size:15px;line-height:1.7;\">A support ticket has been submitted for an AI Team issue linked to your details. Our AI Team will review the request and follow up if more information is needed.</p><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;font-weight:700;color:#777;margin:0 0 8px;\">Ticket Info</div><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f8f9fc;border-left:4px solid #17172b;border-radius:4px;margin:0 0 22px;\"><tr><td style=\"padding:16px 18px;\"><div style=\"font-size:15px;line-height:1.7;\"><strong>Ticket ID</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.id }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Subject</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.subject || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Category</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.category }}{{ $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory ? \" - \" + $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory : \"\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Status</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.statusReason || $node[\"Normalize Payload1\"].json.ticket.status || \"Quick Ticket\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Submitted by</strong><br>{{ $node[\"Normalize Payload1\"].json.requester.name || \"-\" }} - {{ $node[\"Normalize Payload1\"].json.requester.email || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Issue details</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.inquiry || \"-\" }}</div>{{ $node[\"Normalize Payload1\"].json.evidence?.count ? \"<div style='font-size:15px;line-height:1.7;margin-top:10px;'><strong>Evidence</strong><br>\" + $node[\"Normalize Payload1\"].json.evidence.count + \" file(s) attached to this email.</div>\" : \"\" }}</td></tr></table><p style=\"margin:0;font-size:15px;line-height:1.6;\">For any follow-up, please refer to the ticket number so we can locate the case quickly.</p><p style=\"margin:18px 0 0;font-size:15px;line-height:1.6;\">Kind regards,<br><strong>Kent Business College Support</strong></p></td></tr></table></td></tr></table></div>",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          1040,
+          2688
+        ],
+        "id": "9374a5bc-b638-415c-a300-a12abc778b76",
+        "name": "AI Team Ticket Submitted1",
+        "webhookId": "78a36675-1e73-48a2-b39c-09c693f4b0ad",
+        "credentials": {
+          "googleApi": {
+            "id": "8s7p8BFSXQUPSJTE",
+            "name": "Google Service Account account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "respondWith": "json",
+          "responseBody": "{ \"ok\": true, \"event\": \"ai_team_ticket_submitted\" }",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.respondToWebhook",
+        "typeVersion": 1.5,
+        "position": [
+          1264,
+          2592
+        ],
+        "id": "384395b2-82ea-4eb8-becd-70e0ae7fa49f",
+        "name": "Respond to Webhook11"
+      },
+      {
+        "parameters": {
+          "rules": {
+            "values": [
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "bf0708a9-284c-4fae-8ee5-61f2adcc82b4",
+                      "leftValue": "={{ $json.hasAttachments ? 'with_attachments' : 'without_attachments' }}",
+                      "rightValue": "with_attachments",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals",
+                        "name": "filter.operator.equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              },
+              {
+                "conditions": {
+                  "options": {
+                    "caseSensitive": true,
+                    "leftValue": "",
+                    "typeValidation": "strict",
+                    "version": 3
+                  },
+                  "conditions": [
+                    {
+                      "id": "fb816e85-c360-4902-9a05-e363ac2058ff",
+                      "leftValue": "={{ $json.hasAttachments ? 'with_attachments' : 'without_attachments' }}",
+                      "rightValue": "without_attachments",
+                      "operator": {
+                        "type": "string",
+                        "operation": "equals",
+                        "name": "filter.operator.equals"
+                      }
+                    }
+                  ],
+                  "combinator": "and"
+                }
+              }
+            ]
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.switch",
+        "typeVersion": 3.4,
+        "position": [
+          816,
+          2592
+        ],
+        "id": "d8f7e4b9-1b49-4f0e-b8e3-f9d4e210e6d2",
+        "name": "Route AI Team Attachments"
+      },
+      {
+        "parameters": {
+          "authentication": "serviceAccount",
+          "sendTo": "={{ $node[\"Normalize Payload1\"].json.aiTeamPerson.personEmail }}",
+          "subject": "=AI Team ticket {{ $node[\"Normalize Payload1\"].json.ticket.id }} submitted",
+          "message": "=<div style=\"margin:0;padding:0;background:#f4f6fb;font-family:Georgia,'Times New Roman',serif;color:#111827;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f4f6fb;margin:0;padding:28px 0;\"><tr><td align=\"center\" style=\"padding:0 16px;\"><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"max-width:640px;background:#ffffff;border:1px solid #dedede;border-radius:8px;overflow:hidden;\"><tr><td style=\"background:#17172b;color:#ffffff;padding:24px 28px;\"><div style=\"font-size:13px;letter-spacing:1.3px;text-transform:uppercase;font-weight:700;color:#dbe7ff;\">Kent Business College</div><div style=\"font-size:22px;font-weight:700;margin-top:8px;\">AI Team Ticket Submitted</div></td></tr><tr><td style=\"padding:26px 28px 30px;\"><p style=\"margin:0 0 14px;font-size:16px;line-height:1.6;\">Dear <strong>{{ $node[\"Normalize Payload1\"].json.aiTeamPerson.personName || \"there\" }}</strong>,</p><p style=\"margin:0 0 22px;font-size:15px;line-height:1.7;\">A support ticket has been submitted for an AI Team issue linked to your details. Our AI Team will review the request and follow up if more information is needed.</p><div style=\"font-size:12px;letter-spacing:1px;text-transform:uppercase;font-weight:700;color:#777;margin:0 0 8px;\">Ticket Info</div><table role=\"presentation\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" style=\"background:#f8f9fc;border-left:4px solid #17172b;border-radius:4px;margin:0 0 22px;\"><tr><td style=\"padding:16px 18px;\"><div style=\"font-size:15px;line-height:1.7;\"><strong>Ticket ID</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.id }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Subject</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.subject || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Category</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.category }}{{ $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory ? \" - \" + $node[\"Normalize Payload1\"].json.ticket.technicalSubcategory : \"\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Status</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.statusReason || $node[\"Normalize Payload1\"].json.ticket.status || \"Quick Ticket\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Submitted by</strong><br>{{ $node[\"Normalize Payload1\"].json.requester.name || \"-\" }} - {{ $node[\"Normalize Payload1\"].json.requester.email || \"-\" }}</div><div style=\"font-size:15px;line-height:1.7;margin-top:10px;\"><strong>Issue details</strong><br>{{ $node[\"Normalize Payload1\"].json.ticket.inquiry || \"-\" }}</div>{{ $node[\"Normalize Payload1\"].json.evidence?.count ? \"<div style='font-size:15px;line-height:1.7;margin-top:10px;'><strong>Evidence</strong><br>\" + $node[\"Normalize Payload1\"].json.evidence.count + \" file(s) attached to this email.</div>\" : \"\" }}</td></tr></table><p style=\"margin:0;font-size:15px;line-height:1.6;\">For any follow-up, please refer to the ticket number so we can locate the case quickly.</p><p style=\"margin:18px 0 0;font-size:15px;line-height:1.6;\">Kind regards,<br><strong>Kent Business College Support</strong></p></td></tr></table></td></tr></table></div>",
+          "options": {
+            "attachmentsUi": {
+              "attachmentsBinary": [
+                {
+                  "property": "={{ $json.attachmentProperties }}"
+                }
+              ]
+            }
+          }
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          1040,
+          2496
+        ],
+        "id": "ccad19bb-73fc-46d2-9197-c968ccfa8f0d",
+        "name": "AI Team Ticket Submitted With Attachments1",
+        "webhookId": "78a36675-1e73-48a2-b39c-09c693f4b0ad",
+        "credentials": {
+          "googleApi": {
+            "id": "8s7p8BFSXQUPSJTE",
+            "name": "Google Service Account account"
+          }
+        }
+      }
+    ],
+    "connections": {
+      "Webhook1": {
+        "main": [
+          [
+            {
+              "node": "Normalize Payload1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Normalize Payload1": {
+        "main": [
+          [
+            {
+              "node": "Route Event1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Event1": {
+        "main": [
+          [
+            {
+              "node": "Quick Ticket Submitted1",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Quick Ticket Closed1",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Live Agent Unavailable1",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Route AI Team Attachments",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Quick Ticket Submitted1": {
+        "main": [
+          [
+            {
+              "node": "Route Learner Notification",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route Learner Notification": {
+        "main": [
+          [
+            {
+              "node": "Submitted Learner Notification",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Respond to Webhook1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Submitted Learner Notification": {
+        "main": [
+          [
+            {
+              "node": "Respond to Webhook1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Quick Ticket Closed1": {
+        "main": [
+          [
+            {
+              "node": "Respond to Webhook9",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Live Agent Unavailable1": {
+        "main": [
+          [
+            {
+              "node": "Respond to Webhook10",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "AI Team Ticket Submitted1": {
+        "main": [
+          [
+            {
+              "node": "Respond to Webhook11",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Route AI Team Attachments": {
+        "main": [
+          [
+            {
+              "node": "AI Team Ticket Submitted With Attachments1",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "AI Team Ticket Submitted1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "AI Team Ticket Submitted With Attachments1": {
+        "main": [
+          [
+            {
+              "node": "Respond to Webhook11",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": true,
+      "instanceId": "1df6b8eb7cad6964c4019ffc034ca93b67e15d54f1ef0b486646f0918cb85bc3"
+    }
+  }
