@@ -11270,6 +11270,7 @@ class AgentQueueTests(SimpleTestCase):
         self.assertTrue(insert_history_event.call_args.args[3]["webhookDelivered"])
         self.assertEqual(result["historyEventType"], "quick_ticket_confirmation_email_sent")
 
+    @override_settings(SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net")
     def test_queue_ai_team_ticket_submitted_notification_includes_evidence_attachments(self):
         ticket = {
             "id": 24,
@@ -11322,6 +11323,11 @@ class AgentQueueTests(SimpleTestCase):
         self.assertEqual(queued_payload["evidence"]["files"][0]["name"], "screenshot.png")
         self.assertEqual(queued_payload["evidence"]["files"][0]["deliveryMode"], "attachment")
         self.assertEqual(queued_payload["evidence"]["files"][0]["multipartField"], "file_0")
+        self.assertTrue(
+            queued_payload["evidence"]["files"][0]["downloadUrl"].startswith(
+                "https://technicalsupport.kentbusinesscollege.net/api/public/support-notification-attachments/KBC-000024/77/download?token="
+            )
+        )
         self.assertEqual(queued_attachments[0]["storageKey"], "KBC-000024/2026/07/screenshot.png")
 
     @override_settings(SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification")
@@ -11906,6 +11912,43 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(attachment["mimeType"], "application/pdf")
         self.assertEqual(attachment["fileSize"], 4)
         self.assertTrue(download_url.startswith("https://technicalsupport.kentbusinesscollege.net/api/public/coverage-attachments/KBC-000045/101/download?token="))
+
+    @override_settings(SUPPORT_PORTAL_PUBLIC_BASE_URL="https://technicalsupport.kentbusinesscollege.net")
+    def test_public_support_notification_attachment_signed_link_resolves_ai_team_file(self):
+        with TemporaryDirectory() as temp_dir:
+            storage_key = "KBC-000063/2026/07/screenshot.png"
+            attachment_path = Path(temp_dir) / storage_key
+            attachment_path.parent.mkdir(parents=True)
+            attachment_path.write_bytes(b"image")
+            download_url = services.build_public_support_notification_attachment_download_url("KBC-000063", 205)
+            parsed_url = urllib_parse.urlparse(download_url)
+            token = urllib_parse.parse_qs(parsed_url.query)["token"][0]
+
+            with (
+                patch.object(services, "get_support_attachment_root", return_value=Path(temp_dir)),
+                patch.object(
+                    services,
+                    "run_query_one",
+                    return_value={
+                        "id": 205,
+                        "file_name": "screenshot.png",
+                        "mime_type": "image/png",
+                        "file_size": 5,
+                        "storage_url": storage_key,
+                        "attachment_metadata": {},
+                        "public_id": "KBC-000063",
+                        "technical_subcategory": services.TECHNICAL_SUBCATEGORY_AI_TEAM,
+                        "assigned_team": services.ASSIGNED_TEAM_AI_TEAM,
+                        "metadata": {},
+                    },
+                ),
+            ):
+                attachment = services.get_public_support_notification_attachment_file("KBC-000063", 205, token)
+
+        self.assertEqual(attachment["fileName"], "screenshot.png")
+        self.assertEqual(attachment["mimeType"], "image/png")
+        self.assertEqual(attachment["fileSize"], 5)
+        self.assertTrue(download_url.startswith("https://technicalsupport.kentbusinesscollege.net/api/public/support-notification-attachments/KBC-000063/205/download?token="))
 
     def test_send_coverage_tutor_request_webhook_uses_short_timeout(self):
         with (

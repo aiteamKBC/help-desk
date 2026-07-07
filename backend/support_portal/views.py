@@ -48,6 +48,7 @@ from .services import (
     get_admin_microsoft_login_response,
     get_admin_ticket_attachment_file,
     get_public_coverage_attachment_file,
+    get_public_support_notification_attachment_file,
     get_ticket_chat_attachment_file,
     list_admin_notifications,
     get_admin_ticket_detail_response,
@@ -852,6 +853,22 @@ def admin_ticket_attachment_download(request, public_id: str, attachment_id: int
 def public_coverage_attachment_download(request, public_id: str, attachment_id: int):
     try:
         attachment = get_public_coverage_attachment_file(public_id, attachment_id, request.GET.get("token"))
+        response = FileResponse(
+            attachment["path"].open("rb"),
+            as_attachment=False,
+            filename=attachment["fileName"],
+            content_type=attachment.get("mimeType") or "application/octet-stream",
+        )
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["GET"])
+def public_support_notification_attachment_download(request, public_id: str, attachment_id: int):
+    try:
+        attachment = get_public_support_notification_attachment_file(public_id, attachment_id, request.GET.get("token"))
         response = FileResponse(
             attachment["path"].open("rb"),
             as_attachment=False,

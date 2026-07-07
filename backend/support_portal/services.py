@@ -280,6 +280,8 @@ COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
 COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES = 18 * 1024 * 1024
 COVERAGE_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS = 60 * 24 * 60 * 60
 COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT = "support_portal.coverage_attachment_download"
+SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS = 60 * 24 * 60 * 60
+SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_DOWNLOAD_SALT = "support_portal.support_notification_attachment_download"
 COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT = "support_portal.coverage_tutor_email_delivery"
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_SLA_WEBHOOK_TIMEOUT_SECONDS = 8
@@ -380,6 +382,14 @@ def get_coverage_public_attachment_link_max_age_seconds() -> int:
     return get_int_setting(
         "COVERAGE_PUBLIC_ATTACHMENT_LINK_MAX_AGE_SECONDS",
         COVERAGE_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS,
+        minimum=60,
+    )
+
+
+def get_support_notification_public_attachment_link_max_age_seconds() -> int:
+    return get_int_setting(
+        "SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_LINK_MAX_AGE_SECONDS",
+        SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS,
         minimum=60,
     )
 
@@ -516,6 +526,59 @@ def build_public_coverage_attachment_download_url(public_id: str, attachment_id:
 
     return (
         f"{public_base_url}/api/public/coverage-attachments/"
+        f"{urllib_parse.quote(sanitize_text(public_id))}/{int(attachment_id)}/download?"
+        f"{urllib_parse.urlencode({'token': token})}"
+    )
+
+
+def build_public_support_notification_attachment_token(public_id: str, attachment_id: int) -> str:
+    normalized_public_id = sanitize_text(public_id)
+    try:
+        normalized_attachment_id = int(attachment_id)
+    except (TypeError, ValueError):
+        normalized_attachment_id = 0
+
+    if not normalized_public_id or normalized_attachment_id <= 0:
+        return ""
+
+    return signing.dumps(
+        {
+            "ticketId": normalized_public_id,
+            "attachmentId": normalized_attachment_id,
+            "purpose": "support_notification_attachment",
+        },
+        salt=SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+        compress=True,
+    )
+
+
+def decode_public_support_notification_attachment_token(token: Any) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        raise ApiError(403, "Attachment link is invalid.")
+
+    try:
+        payload = signing.loads(
+            normalized_token,
+            salt=SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+            max_age=get_support_notification_public_attachment_link_max_age_seconds(),
+        )
+    except signing.SignatureExpired as error:
+        raise ApiError(410, "Attachment link has expired.") from error
+    except signing.BadSignature as error:
+        raise ApiError(403, "Attachment link is invalid.") from error
+
+    return normalize_json_object(payload)
+
+
+def build_public_support_notification_attachment_download_url(public_id: str, attachment_id: int) -> str:
+    token = build_public_support_notification_attachment_token(public_id, attachment_id)
+    public_base_url = get_support_portal_public_base_url("")
+    if not token or not public_base_url:
+        return ""
+
+    return (
+        f"{public_base_url}/api/public/support-notification-attachments/"
         f"{urllib_parse.quote(sanitize_text(public_id))}/{int(attachment_id)}/download?"
         f"{urllib_parse.urlencode({'token': token})}"
     )
@@ -799,6 +862,7 @@ def get_admin_ticket_attachment_file(
         "fileSize": int(attachment.get("file_size") or 0),
         "metadata": normalize_json_object(attachment.get("attachment_metadata")),
         "technicalSubcategory": sanitize_text(attachment.get("technical_subcategory")),
+        "assignedTeam": get_effective_assigned_team(attachment.get("assigned_team")),
         "path": attachment_path,
     }
 
@@ -828,6 +892,37 @@ def get_public_coverage_attachment_file(public_id: str, attachment_id: int, toke
 
     attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
     if not is_public_coverage_attachment_allowed(attachment):
+        raise ApiError(404, "Attachment not found.")
+
+    return attachment
+
+
+def is_public_support_notification_attachment_allowed(attachment: dict[str, Any]) -> bool:
+    technical_subcategory = sanitize_text(attachment.get("technicalSubcategory"))
+    assigned_team = get_effective_assigned_team(attachment.get("assignedTeam"))
+    return (
+        technical_subcategory.casefold() == TECHNICAL_SUBCATEGORY_AI_TEAM.casefold()
+        or assigned_team.casefold() == ASSIGNED_TEAM_AI_TEAM.casefold()
+    )
+
+
+def get_public_support_notification_attachment_file(public_id: str, attachment_id: int, token: Any) -> dict[str, Any]:
+    token_payload = decode_public_support_notification_attachment_token(token)
+
+    try:
+        normalized_token_attachment_id = int(token_payload.get("attachmentId") or 0)
+    except (TypeError, ValueError):
+        normalized_token_attachment_id = 0
+
+    if (
+        sanitize_text(token_payload.get("ticketId")) != sanitize_text(public_id)
+        or normalized_token_attachment_id != int(attachment_id)
+        or sanitize_text(token_payload.get("purpose")) != "support_notification_attachment"
+    ):
+        raise ApiError(403, "Attachment link is invalid.")
+
+    attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
+    if not is_public_support_notification_attachment_allowed(attachment):
         raise ApiError(404, "Attachment not found.")
 
     return attachment
@@ -4814,6 +4909,13 @@ def build_coverage_file_public_download_url(ticket_public_id: str, file: dict[st
     return build_public_coverage_attachment_download_url(ticket_public_id, attachment_id)
 
 
+def build_support_notification_file_public_download_url(ticket_public_id: str, file: dict[str, Any]) -> str:
+    attachment_id = parse_attachment_id(file.get("attachmentId"))
+    if not attachment_id:
+        return ""
+    return build_public_support_notification_attachment_download_url(ticket_public_id, attachment_id)
+
+
 def prepare_coverage_webhook_file_delivery(
     file: dict[str, Any],
     *,
@@ -5002,6 +5104,7 @@ def can_attach_support_notification_file(file: dict[str, Any]) -> bool:
 def prepare_support_notification_webhook_file_delivery(
     file: dict[str, Any],
     *,
+    ticket_public_id: str,
     current_total_bytes: int,
     multipart_index: int,
 ) -> tuple[dict[str, Any], bool, int]:
@@ -5009,14 +5112,28 @@ def prepare_support_notification_webhook_file_delivery(
     file_size = parse_attachment_file_size(prepared_file.get("size"))
     max_file_bytes = get_support_notification_attachment_max_file_bytes()
     max_total_bytes = get_support_notification_attachment_max_total_bytes()
+    download_url = build_support_notification_file_public_download_url(ticket_public_id, prepared_file)
     can_attach_binary = can_attach_support_notification_file(prepared_file)
     within_file_limit = max_file_bytes <= 0 or file_size <= max_file_bytes
     within_total_limit = max_total_bytes <= 0 or (current_total_bytes + file_size) <= max_total_bytes
+
+    if download_url:
+        prepared_file["downloadUrl"] = download_url
 
     if can_attach_binary and within_file_limit and within_total_limit:
         prepared_file["deliveryMode"] = "attachment"
         prepared_file["multipartField"] = f"file_{multipart_index}"
         return prepared_file, True, file_size
+
+    if download_url:
+        prepared_file["deliveryMode"] = "link"
+        if not can_attach_binary:
+            prepared_file["deliveryReason"] = "download_link_only"
+        elif not within_file_limit:
+            prepared_file["deliveryReason"] = "file_size_limit"
+        elif not within_total_limit:
+            prepared_file["deliveryReason"] = "total_size_limit"
+        return prepared_file, False, 0
 
     prepared_file["deliveryMode"] = "metadata_only"
     if not can_attach_binary:
@@ -5036,10 +5153,12 @@ def prepare_support_notification_webhook_delivery_payload(
     prepared_files: list[dict[str, Any]] = []
     files_to_attach: list[dict[str, Any]] = []
     running_total = 0
+    ticket_public_id = sanitize_text(normalize_json_object(prepared_payload.get("ticket")).get("id"))
 
     for file in files:
         prepared_file, should_attach, attached_size = prepare_support_notification_webhook_file_delivery(
             normalize_json_object(file),
+            ticket_public_id=ticket_public_id,
             current_total_bytes=running_total,
             multipart_index=len(files_to_attach),
         )
