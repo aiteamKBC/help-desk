@@ -1,7 +1,7 @@
 import { Check } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useSupport } from "@/context/useSupport";
-import { shouldShowStatusStep } from "@/lib/supportFlow";
+import { isSubmittedSupportFlowLocked, shouldShowStatusStep } from "@/lib/supportFlow";
 import { cn } from "@/lib/utils";
 
 const supportSteps = [
@@ -17,6 +17,7 @@ export const StepIndicator = ({ current }: { current: number }) => {
   const steps = supportSteps;
   const normalizedCurrent = Math.min(Math.max(current, 1), steps.length);
   const isInterimStep = !Number.isInteger(current);
+  const isSubmittedFlowLocked = isSubmittedSupportFlowLocked(ticket, bookingSummary);
   const furthestStepReached = (() => {
     if (shouldShowStatusStep(ticket, bookingSummary)) {
       return 4;
@@ -33,7 +34,8 @@ export const StepIndicator = ({ current }: { current: number }) => {
     return 1;
   })();
 
-  const isStepAvailable = (stepIndex: number) => stepIndex <= furthestStepReached;
+  const isStepAvailable = (stepIndex: number) =>
+    stepIndex <= furthestStepReached && !(isSubmittedFlowLocked && stepIndex === 3);
 
   return (
     <div className="mx-auto mb-6 w-full max-w-3xl sm:mb-8">

@@ -759,6 +759,11 @@ const ChatSupport = () => {
       return;
     }
 
+    if (isSupportReviewChatLocked) {
+      toast.error("This ticket has already been submitted for team review.");
+      return;
+    }
+
     if (!ticket.id) {
       toast.error("This ticket is not ready for chatbot messaging yet.");
       return;
@@ -885,6 +890,11 @@ const ChatSupport = () => {
       return;
     }
 
+    if (isSupportReviewChatLocked) {
+      toast.error("This ticket has already been submitted for team review.");
+      return;
+    }
+
     setIsRequestingLiveAgent(true);
 
     try {
@@ -1005,6 +1015,11 @@ const ChatSupport = () => {
       return;
     }
 
+    if (isSupportReviewChatLocked) {
+      toast.error("This ticket has already been submitted for team review.");
+      return;
+    }
+
     if (!ticket.id || !ticket.email) {
       toast.error("We could not prepare your booking details right now.");
       return;
@@ -1019,6 +1034,10 @@ const ChatSupport = () => {
 
   const handleSubmitQuickTicket = async () => {
     if (!ticket.id || isQuickSubmitting) {
+      return;
+    }
+    if (isSupportReviewChatLocked) {
+      toast.error("This ticket has already been submitted for team review.");
       return;
     }
 
@@ -1387,7 +1406,13 @@ const ChatSupport = () => {
   const isChatClosed = isLearnerChatClosed(ticket);
   const isInactivityClosed = ticket.statusReason === inactivityClosingReason;
   const closedPanelTitle = isInactivityClosed ? "Chat closed due to inactivity" : "Chat closed";
-  const showReadOnlyPanel = !isChatClosed && isMeetingChatReadOnly;
+  const showReadOnlyPanel = !isChatClosed && (isMeetingChatReadOnly || isSupportReviewChatLocked);
+  const readOnlyPanelTitle = isSupportReviewChatLocked
+    ? "Ticket submitted for team review"
+    : "Chat is read-only during your booked session";
+  const readOnlyPanelDescription = isSupportReviewChatLocked
+    ? "You can review this conversation, but replies are disabled because the ticket is waiting for the support team."
+    : "You can still review the conversation here, but new messages are disabled until the support meeting is cancelled or completed.";
   const isWaitingForAssignment = isWaitingForLiveAgentAssignment(ticket);
 
   return (
@@ -1415,7 +1440,7 @@ const ChatSupport = () => {
                 variant="outline"
                 size="sm"
                 onClick={() => void handleClose()}
-                disabled={isClosing || isChatClosed || isMeetingChatReadOnly}
+                disabled={isClosing || isChatClosed || isMeetingChatReadOnly || isSupportReviewChatLocked}
               >
                 <X className="w-4 h-4 mr-1.5" /> Close
               </Button>
@@ -1435,7 +1460,7 @@ const ChatSupport = () => {
                   onAttachmentOpen={setPreviewAttachment}
                   onBookingClick={openBookingDialog}
                   onQuickTicketClick={handleSubmitQuickTicket}
-                  quickTicketDisabled={isQuickSubmitting}
+                  quickTicketDisabled={isQuickSubmitting || isSupportReviewChatLocked}
                 />
               ))}
 
@@ -1445,8 +1470,8 @@ const ChatSupport = () => {
             <SupportActionRail
               onBookingClick={openBookingDialog}
               onLiveAgentClick={handleRequestLiveAgent}
-              bookingDisabled={isChatClosed || isMeetingChatReadOnly || !ticket.id || !ticket.email}
-              liveAgentDisabled={isChatClosed || isMeetingChatReadOnly || isRequestingLiveAgent || ticket.liveChatRequested}
+              bookingDisabled={isChatClosed || isMeetingChatReadOnly || isSupportReviewChatLocked || !ticket.id || !ticket.email}
+              liveAgentDisabled={isChatClosed || isMeetingChatReadOnly || isSupportReviewChatLocked || isRequestingLiveAgent || ticket.liveChatRequested}
               liveAgentRequested={ticket.liveChatRequested}
             />
           </div>
@@ -1470,13 +1495,13 @@ const ChatSupport = () => {
               </div>
             ) : showReadOnlyPanel ? (
               <div className="rounded-2xl border border-primary/15 bg-primary/5 px-4 py-4 shadow-[0_10px_24px_-18px_hsl(var(--primary)/0.35)]">
-                <div className="text-sm font-semibold text-foreground">Chat is read-only during your booked session</div>
+                <div className="text-sm font-semibold text-foreground">{readOnlyPanelTitle}</div>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  You can still review the conversation here, but new messages are disabled until the support meeting is cancelled or completed.
+                  {readOnlyPanelDescription}
                 </p>
                 <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:justify-end">
                   <Button variant="outline" className="w-full sm:w-auto" onClick={() => navigate("/support/status")}>
-                    View Meeting Status
+                    {isSupportReviewChatLocked ? "View Ticket Status" : "View Meeting Status"}
                   </Button>
                 </div>
               </div>

@@ -44,6 +44,7 @@ import {
   parseCoverageInquiry,
   type CoverageTimeOption,
 } from "@/lib/coverageSupport";
+import { isSubmittedSupportFlowLocked } from "@/lib/supportFlow";
 import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/supportTicketDraft";
 import { toast } from "sonner";
 
@@ -155,7 +156,7 @@ const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
 
 const InquiryDetails = () => {
   const navigate = useNavigate();
-  const { ticket, updateTicket, clearBookingSummary } = useSupport();
+  const { ticket, updateTicket, clearBookingSummary, bookingSummary } = useSupport();
   const initialCoverageDetails = parseCoverageInquiry(ticket.inquiry);
   const [technicalSubcategory, setTechnicalSubcategory] = useState<TechnicalSubcategory>(ticket.technicalSubcategory);
   const [subject, setSubject] = useState(ticket.subject);
@@ -214,6 +215,7 @@ const InquiryDetails = () => {
     (sessionDate) => (coverageSessionSubjectByDate[sessionDate] || "").trim(),
   );
   const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
+  const isReadOnlyReview = isSubmittedSupportFlowLocked(ticket, bookingSummary);
 
   const isAiTeamFlow = technicalSubcategory === "AI Team";
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
@@ -226,7 +228,7 @@ const InquiryDetails = () => {
   const hasValidAiTeamContact = !isAiTeamFlow
     || (Boolean(trimmedAiTeamPersonName) && isValidEmailFormat(trimmedAiTeamPersonEmail));
   const hasSubject = subject.trim().length > 0;
-  const canSubmit = isCoverageFlow
+  const canSubmit = !isReadOnlyReview && (isCoverageFlow
     ? Boolean(
       hasSubject
       && hasSubmittedForLearner
@@ -245,7 +247,7 @@ const InquiryDetails = () => {
       && hasValidAiTeamContact
       && technicalSubcategory
       && inquiry.trim().length > 0,
-    );
+    ));
 
   const loadCoverageSessionDateOptions = (tutorValue: string, moduleValue: string, timeValue: string) => {
     if (!isCoverageFlow || !tutorValue || !moduleValue || !timeValue) {
@@ -301,12 +303,20 @@ const InquiryDetails = () => {
   }, [navigate, ticket.email, ticket.id]);
 
   useEffect(() => {
+    if (isReadOnlyReview) {
+      return;
+    }
+
     if (!canUseCoverage && technicalSubcategory === "Coverage") {
       setTechnicalSubcategory("");
     }
-  }, [canUseCoverage, technicalSubcategory]);
+  }, [canUseCoverage, isReadOnlyReview, technicalSubcategory]);
 
   useEffect(() => {
+    if (isReadOnlyReview) {
+      return;
+    }
+
     if (!canSubmitForLearner) {
       setRequestFor("self");
       setSelectedSubmittedForLearner(null);
@@ -316,7 +326,7 @@ const InquiryDetails = () => {
       setLearnerResults([]);
       setLearnerSearchError("");
     }
-  }, [canSubmitForLearner]);
+  }, [canSubmitForLearner, isReadOnlyReview]);
 
   useEffect(() => {
     if (!canSubmitForLearner || requestFor !== "learner") {
@@ -589,6 +599,7 @@ const InquiryDetails = () => {
   }, [coverageSessionDates, isCoverageFlow]);
 
   const onFiles = async (files: FileList | null) => {
+    if (isReadOnlyReview) return;
     if (!files) return;
 
     const selectedFiles = Array.from(files);
@@ -603,6 +614,8 @@ const InquiryDetails = () => {
   };
 
   const removeFile = (index: number) => {
+    if (isReadOnlyReview) return;
+
     setEvidence((prev) => {
       const fileToRemove = prev[index];
 
@@ -619,6 +632,7 @@ const InquiryDetails = () => {
   };
 
   const handleNext = async () => {
+    if (isReadOnlyReview) return;
     if (!canSubmit) return;
 
     setIsSubmitting(true);
@@ -700,6 +714,8 @@ const InquiryDetails = () => {
     : "Choose the inquiry category, add a subject, and describe the issue.";
 
   const handleCoverageTutorChange = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageTutor(value);
     setCoverageModule("");
     setCoverageTime("");
@@ -710,6 +726,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageModuleChange = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageModule(value);
     setCoverageTime("");
     setCoverageSessionDates([]);
@@ -719,6 +737,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageTimeChange = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageTime(value);
     setCoverageSessionDates([]);
     setCoverageSessionNumberByDate({});
@@ -726,6 +746,8 @@ const InquiryDetails = () => {
   };
 
   const toggleCoverageSessionDate = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageSessionDates((currentDates) => {
       if (currentDates.includes(value)) {
         return currentDates.filter((currentDate) => currentDate !== value);
@@ -736,6 +758,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageSessionNumberChange = (sessionDate: string, value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageSessionNumberByDate((currentSessionNumberByDate) => ({
       ...currentSessionNumberByDate,
       [sessionDate]: value.replace(/[^\d]/g, ""),
@@ -743,6 +767,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageSessionSubjectChange = (sessionDate: string, value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageSessionSubjectByDate((currentSessionSubjectByDate) => ({
       ...currentSessionSubjectByDate,
       [sessionDate]: value,
@@ -764,9 +790,20 @@ const InquiryDetails = () => {
       <StepIndicator current={2} />
       <div className="mx-auto max-w-4xl">
         <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8">
-          <h1 className="mb-1 text-2xl font-bold text-primary">Create Support Inquiry</h1>
+          <div className="mb-1 flex flex-wrap items-center gap-3">
+            <h1 className="text-2xl font-bold text-primary">
+              {isReadOnlyReview ? "Review Support Inquiry" : "Create Support Inquiry"}
+            </h1>
+            {isReadOnlyReview ? (
+              <span className="rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-primary">
+                Submitted - read only
+              </span>
+            ) : null}
+          </div>
           <p className="mb-6 text-sm text-muted-foreground">
-            {pageDescription}
+            {isReadOnlyReview
+              ? "This ticket has already been submitted. You can review the saved details, but they cannot be edited here."
+              : pageDescription}
           </p>
 
           <div className="space-y-5">
@@ -782,6 +819,8 @@ const InquiryDetails = () => {
                 <RadioGroup
                   value={requestFor}
                   onValueChange={(value) => {
+                    if (isReadOnlyReview) return;
+
                     const nextRequestFor = value as RequestForMode;
                     setRequestFor(nextRequestFor);
                     if (nextRequestFor === "self") {
@@ -792,11 +831,14 @@ const InquiryDetails = () => {
                       setLearnerResults([]);
                     }
                   }}
+                  disabled={isReadOnlyReview}
                   className="grid gap-3 sm:grid-cols-2"
                 >
                   <Label
                     htmlFor="request-for-self"
-                    className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                    className={`flex items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                      isReadOnlyReview ? "cursor-default opacity-80" : "cursor-pointer"
+                    } ${
                       requestFor === "self"
                         ? "border-primary bg-primary/[0.06] text-primary shadow-soft"
                         : "border-primary/10 bg-white hover:border-primary/25"
@@ -813,7 +855,9 @@ const InquiryDetails = () => {
 
                   <Label
                     htmlFor="request-for-learner"
-                    className={`flex cursor-pointer items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                    className={`flex items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                      isReadOnlyReview ? "cursor-default opacity-80" : "cursor-pointer"
+                    } ${
                       requestFor === "learner"
                         ? "border-primary bg-primary/[0.06] text-primary shadow-soft"
                         : "border-primary/10 bg-white hover:border-primary/25"
@@ -857,11 +901,14 @@ const InquiryDetails = () => {
                             variant="outline"
                             className="rounded-full"
                             onClick={() => {
+                              if (isReadOnlyReview) return;
+
                               setSelectedSubmittedForLearner(null);
                               setSubmittedForNotificationEmail("");
                               setNotifySubmittedForLearner(false);
                               setLearnerSearch("");
                             }}
+                            disabled={isReadOnlyReview}
                           >
                             Change
                           </Button>
@@ -875,8 +922,13 @@ const InquiryDetails = () => {
                           <Input
                             id="learner-search"
                             value={learnerSearch}
-                            onChange={(event) => setLearnerSearch(event.target.value)}
+                            onChange={(event) => {
+                              if (!isReadOnlyReview) {
+                                setLearnerSearch(event.target.value);
+                              }
+                            }}
                             placeholder="Type learner name, email, or learner ID..."
+                            readOnly={isReadOnlyReview}
                             className="h-11 rounded-xl pl-10"
                           />
                         </div>
@@ -901,11 +953,14 @@ const InquiryDetails = () => {
                                 key={learner.id}
                                 type="button"
                                 onClick={() => {
+                                  if (isReadOnlyReview) return;
+
                                   setSelectedSubmittedForLearner(learner);
                                   setSubmittedForNotificationEmail(learner.notificationEmail || learner.email);
                                   setLearnerResults([]);
                                   setLearnerSearch("");
                                 }}
+                                disabled={isReadOnlyReview}
                                 className="flex w-full flex-col gap-1 border-b border-primary/8 px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-primary/[0.05]"
                               >
                                 <span className="font-semibold text-foreground">{learner.fullName}</span>
@@ -932,8 +987,13 @@ const InquiryDetails = () => {
                           id="submitted-for-notification-email"
                           type="email"
                           value={submittedForNotificationEmail}
-                          onChange={(event) => setSubmittedForNotificationEmail(event.target.value)}
+                          onChange={(event) => {
+                            if (!isReadOnlyReview) {
+                              setSubmittedForNotificationEmail(event.target.value);
+                            }
+                          }}
                           placeholder={selectedSubmittedForLearner.email}
+                          readOnly={isReadOnlyReview}
                           className="h-11 rounded-xl"
                         />
                         <p className="text-xs leading-5 text-muted-foreground">
@@ -976,7 +1036,12 @@ const InquiryDetails = () => {
               <Label>Inquiry Category</Label>
               <Select
                 value={technicalSubcategory}
-                onValueChange={(value) => setTechnicalSubcategory(value as TechnicalSubcategory)}
+                onValueChange={(value) => {
+                  if (!isReadOnlyReview) {
+                    setTechnicalSubcategory(value as TechnicalSubcategory);
+                  }
+                }}
+                disabled={isReadOnlyReview}
               >
                 <SelectTrigger className="h-11">
                   <SelectValue placeholder="Select a category" />
@@ -996,8 +1061,13 @@ const InquiryDetails = () => {
                   <Input
                     id="ai-team-person-name"
                     value={aiTeamPersonName}
-                    onChange={(event) => setAiTeamPersonName(event.target.value)}
+                    onChange={(event) => {
+                      if (!isReadOnlyReview) {
+                        setAiTeamPersonName(event.target.value);
+                      }
+                    }}
                     placeholder="Enter the person's name"
+                    readOnly={isReadOnlyReview}
                     className="h-11 rounded-xl"
                   />
                 </div>
@@ -1007,8 +1077,13 @@ const InquiryDetails = () => {
                     id="ai-team-person-email"
                     type="email"
                     value={aiTeamPersonEmail}
-                    onChange={(event) => setAiTeamPersonEmail(event.target.value)}
+                    onChange={(event) => {
+                      if (!isReadOnlyReview) {
+                        setAiTeamPersonEmail(event.target.value);
+                      }
+                    }}
                     placeholder="Enter the person's email"
+                    readOnly={isReadOnlyReview}
                     className="h-11 rounded-xl"
                   />
                 </div>
@@ -1027,8 +1102,13 @@ const InquiryDetails = () => {
                 required
                 maxLength={SUBJECT_MAX_LENGTH}
                 value={subject}
-                onChange={(event) => setSubject(event.target.value)}
+                onChange={(event) => {
+                  if (!isReadOnlyReview) {
+                    setSubject(event.target.value);
+                  }
+                }}
                 placeholder="Write a short title for this issue..."
+                readOnly={isReadOnlyReview}
                 className="h-11 rounded-xl"
               />
               <p className="text-xs leading-5 text-muted-foreground">
@@ -1041,7 +1121,7 @@ const InquiryDetails = () => {
                 <div className="grid gap-5 md:grid-cols-2">
                   <div className="space-y-2">
                     <Label>Tutor</Label>
-                    <Select value={coverageTutor} onValueChange={handleCoverageTutorChange} disabled={isLoadingCoverageTutors}>
+                    <Select value={coverageTutor} onValueChange={handleCoverageTutorChange} disabled={isReadOnlyReview || isLoadingCoverageTutors}>
                       <SelectTrigger className="h-11">
                         <SelectValue placeholder={isLoadingCoverageTutors ? "Loading tutors..." : "Choose tutor"} />
                       </SelectTrigger>
@@ -1064,7 +1144,7 @@ const InquiryDetails = () => {
                     <Select
                       value={coverageModule}
                       onValueChange={handleCoverageModuleChange}
-                      disabled={!coverageTutor || isLoadingCoverageModules}
+                      disabled={isReadOnlyReview || !coverageTutor || isLoadingCoverageModules}
                     >
                       <SelectTrigger className="h-11">
                         <SelectValue
@@ -1102,7 +1182,7 @@ const InquiryDetails = () => {
                     <Select
                       value={coverageTime}
                       onValueChange={handleCoverageTimeChange}
-                      disabled={!coverageModule || isLoadingCoverageTimes}
+                      disabled={isReadOnlyReview || !coverageModule || isLoadingCoverageTimes}
                     >
                       <SelectTrigger className="h-11">
                         <SelectValue
@@ -1157,7 +1237,7 @@ const InquiryDetails = () => {
                         <Button
                           type="button"
                           variant="outline"
-                          disabled={!coverageTime || isLoadingCoverageSessionDates}
+                          disabled={isReadOnlyReview || !coverageTime || isLoadingCoverageSessionDates}
                           className="h-11 w-full justify-between rounded-xl border-primary/12 bg-white px-3 font-normal text-foreground shadow-sm hover:bg-white"
                         >
                           <span className="truncate text-left">
@@ -1234,6 +1314,7 @@ const InquiryDetails = () => {
                                 placeholder="Write the session subject"
                                 value={coverageSessionSubjectByDate[sessionDate] || ""}
                                 onChange={(event) => handleCoverageSessionSubjectChange(sessionDate, event.target.value)}
+                                readOnly={isReadOnlyReview}
                                 className="h-11 rounded-xl border-primary/12 bg-white shadow-none"
                               />
                             </div>
@@ -1252,6 +1333,7 @@ const InquiryDetails = () => {
                                 placeholder="No."
                                 value={coverageSessionNumberByDate[sessionDate] || ""}
                                 onChange={(event) => handleCoverageSessionNumberChange(sessionDate, event.target.value)}
+                                readOnly={isReadOnlyReview}
                                 className="h-11 rounded-xl border-primary/12 bg-white text-center font-semibold shadow-none"
                               />
                             </div>
@@ -1280,7 +1362,12 @@ const InquiryDetails = () => {
                   rows={6}
                   placeholder="Please describe your issue in detail..."
                   value={inquiry}
-                  onChange={(event) => setInquiry(event.target.value)}
+                  onChange={(event) => {
+                    if (!isReadOnlyReview) {
+                      setInquiry(event.target.value);
+                    }
+                  }}
+                  readOnly={isReadOnlyReview}
                   className="resize-none"
                 />
               </div>
@@ -1288,22 +1375,35 @@ const InquiryDetails = () => {
 
             <div className="space-y-2">
               <Label className="flex items-center gap-2">
-                <Paperclip className="w-4 h-4" /> Upload supporting evidence
+                <Paperclip className="w-4 h-4" /> Supporting evidence
               </Label>
               <div
-                onClick={() => fileRef.current?.click()}
-                className="p-6 text-center transition-colors border-2 border-dashed rounded-xl cursor-pointer border-border hover:border-primary hover:bg-primary/5"
+                onClick={() => {
+                  if (!isReadOnlyReview) {
+                    fileRef.current?.click();
+                  }
+                }}
+                className={`p-6 text-center transition-colors border-2 border-dashed rounded-xl ${
+                  isReadOnlyReview
+                    ? "cursor-default border-border bg-secondary/20"
+                    : "cursor-pointer border-border hover:border-primary hover:bg-primary/5"
+                }`}
               >
                 <Paperclip className="w-6 h-6 mx-auto mb-2 text-muted-foreground" />
-                <p className="text-sm font-medium">Click to upload files</p>
+                <p className="text-sm font-medium">
+                  {isReadOnlyReview ? "Submitted files are shown below" : "Click to upload files"}
+                </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  You can upload any file type. Multiple files are supported.
+                  {isReadOnlyReview
+                    ? "Evidence is read-only after the ticket has been submitted."
+                    : "You can upload any file type. Multiple files are supported."}
                 </p>
                 <input
                   ref={fileRef}
                   type="file"
                   multiple
                   className="hidden"
+                  disabled={isReadOnlyReview}
                   onChange={(event) => void onFiles(event.target.files)}
                 />
               </div>
@@ -1317,38 +1417,57 @@ const InquiryDetails = () => {
                       <button
                         type="button"
                         onClick={() => setPreviewFile(file)}
+                        disabled={!file.previewUrl && !file.textContent}
                         className="flex flex-1 min-w-0 items-center gap-2 text-left transition-colors hover:text-primary"
                       >
                         <FileText className="w-4 h-4 shrink-0 text-muted-foreground" />
                         <span className="truncate">{file.name}</span>
-                        <span className="shrink-0 text-xs text-primary">View</span>
+                        {file.previewUrl || file.textContent ? (
+                          <span className="shrink-0 text-xs text-primary">View</span>
+                        ) : null}
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => removeFile(index)}
-                        className="ml-3 shrink-0 text-muted-foreground hover:text-destructive"
-                        aria-label="Remove"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
+                      {!isReadOnlyReview ? (
+                        <button
+                          type="button"
+                          onClick={() => removeFile(index)}
+                          className="ml-3 shrink-0 text-muted-foreground hover:text-destructive"
+                          aria-label="Remove"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      ) : null}
                     </li>
                   ))}
                 </ul>
               )}
+              {isReadOnlyReview && evidence.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No supporting evidence was uploaded for this ticket.</p>
+              ) : null}
             </div>
 
             <div className="flex flex-col-reverse gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
-              <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/support")}>
-                <ArrowLeft className="w-4 h-4 mr-2" /> Back
-              </Button>
-              <Button
-                disabled={!canSubmit || isSubmitting}
-                onClick={() => void handleNext()}
-                className="w-full border-0 gradient-primary sm:w-auto"
-              >
-                {isSubmitting ? "Saving..." : isAiTeamFlow ? "Submit ticket" : "Next"}
-                {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
-              </Button>
+              {isReadOnlyReview ? (
+                <Button
+                  onClick={() => navigate("/support/status")}
+                  className="mx-auto w-full border-0 gradient-primary sm:w-auto"
+                >
+                  Return to Ticket Status
+                </Button>
+              ) : (
+                <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/support")}>
+                  <ArrowLeft className="w-4 h-4 mr-2" /> Back
+                </Button>
+              )}
+              {!isReadOnlyReview ? (
+                <Button
+                  disabled={!canSubmit || isSubmitting}
+                  onClick={() => void handleNext()}
+                  className="w-full border-0 gradient-primary sm:w-auto"
+                >
+                  {isSubmitting ? "Saving..." : isAiTeamFlow ? "Submit ticket" : "Next"}
+                  {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
+                </Button>
+              ) : null}
             </div>
           </div>
         </div>

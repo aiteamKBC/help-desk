@@ -251,6 +251,50 @@ describe("InquiryDetails", () => {
     expect(screen.queryByText("Coverage")).not.toBeInTheDocument();
   });
 
+  it("shows submitted tickets in read-only inquiry review mode", () => {
+    window.localStorage.setItem(
+      supportStorageKey,
+      JSON.stringify({
+        ticket: {
+          id: "KBC-000610",
+          email: "omar2@gmail.com",
+          requesterRole: "user",
+          requesterSource: "microsoft_entra",
+          category: "Technical",
+          technicalSubcategory: "LMS",
+          subject: "Submitted ticket",
+          inquiry: "Already submitted.",
+          status: "Pending",
+          statusReason: "Quick Ticket",
+          assignedAgentId: null,
+          assignedTeam: "Support Desk",
+          slaStatus: "On Track",
+          createdAt: "2026-07-06T12:00:00+00:00",
+          chatState: "open",
+          liveChatRequested: false,
+        },
+      }),
+    );
+
+    render(
+      <MemoryRouter initialEntries={["/support/inquiry"]}>
+        <SupportProvider>
+          <InquiryDetails />
+        </SupportProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("heading", { name: /review support inquiry/i })).toBeInTheDocument();
+    expect(screen.getByText(/submitted - read only/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("Subject")).toHaveValue("Submitted ticket");
+    expect(screen.getByLabelText("Subject")).toHaveAttribute("readonly");
+    expect(screen.getByPlaceholderText("Please describe your issue in detail...")).toHaveValue("Already submitted.");
+    expect(screen.getByPlaceholderText("Please describe your issue in detail...")).toHaveAttribute("readonly");
+    expect(screen.queryByRole("button", { name: /next/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /submit ticket/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /return to ticket status/i })).toBeInTheDocument();
+  });
+
   it("submits coverage directly to status after creating the ticket", async () => {
     window.localStorage.setItem(
       supportStorageKey,

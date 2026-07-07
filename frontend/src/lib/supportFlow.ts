@@ -42,6 +42,11 @@ export const shouldShowStatusStep = (
   bookingSummary: BookingSummary | null,
 ) => Boolean(bookingSummary || (ticket.id && ticket.status !== "Open"));
 
+export const isSubmittedSupportFlowLocked = (
+  ticket: Pick<Ticket, "id" | "status">,
+  bookingSummary: BookingSummary | null = null,
+) => shouldShowStatusStep(ticket, bookingSummary);
+
 export const getSupportResumePath = (
   ticket: Pick<Ticket, "id" | "status" | "requesterRole">,
   bookingSummary: BookingSummary | null,
