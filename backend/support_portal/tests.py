@@ -2191,6 +2191,37 @@ class SupportSessionValidationTests(SimpleTestCase):
             services.ASSIGNED_TEAM_AI_TEAM,
         )
 
+    def test_create_ticket_rejects_ai_team_for_standard_kbc_learner(self):
+        requester = {
+            "email": "learner@example.com",
+            "role": "user",
+            "display_name": "Learner One",
+            "source": "kbc_users_data",
+            "learner": None,
+            "account": None,
+        }
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "resolve_public_support_requester", return_value=requester),
+            patch.object(services, "ensure_public_requester_learner"),
+        ):
+            with self.assertRaises(services.ApiError) as error:
+                services.create_ticket(
+                    {
+                        "email": "learner@example.com",
+                        "category": "Technical",
+                        "technicalSubcategory": "AI Team",
+                        "subject": "AI Team access issue",
+                        "inquiry": "Cannot access the AI Team workspace.",
+                        "aiTeamPersonName": "Khaled Ashraf",
+                        "aiTeamPersonEmail": "khaled.ashraf@kentbusinesscollege.com",
+                    }
+                )
+
+        self.assertEqual(error.exception.status_code, 403)
+        self.assertEqual(error.exception.message, "AI Team requests are not available for standard KBC learner accounts.")
+
     def test_create_ticket_accepts_coverage_for_entra_requester(self):
         requester = {
             "email": "entra.user@kentbusinesscollege.com",
@@ -12268,6 +12299,11 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                 "responseToken": "token-1",
                 "sessionDetails": "Module: EVM",
                 "presentationFiles": [],
+                "selectedSessionIds": ["session-1", "session-3"],
+                "sessionFiles": [
+                    {"id": "session-1", "number": "7", "attachments": []},
+                    {"id": "session-3", "number": "9", "attachments": []},
+                ],
             },
             {
                 "id": 7,
@@ -12297,6 +12333,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         )
         self.assertEqual(payload["coach"]["name"], "Mona Adel")
         self.assertEqual(payload["coach"]["email"], "mona.adel@example.com")
+        self.assertEqual(payload["request"]["selectedSessionIds"], ["session-1", "session-3"])
+        self.assertEqual([group["id"] for group in payload["request"]["sessionFiles"]], ["session-1", "session-3"])
 
     def test_freeze_coverage_documentation_snapshot_locks_saved_cards_and_preserves_previous_content(self):
         existing_documentation = {
@@ -14354,6 +14392,94 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(webhook_payload["ticket"]["statusReason"], "Tutor Accepted")
         self.assertEqual(webhook_payload["response"]["outcome"], "accepted")
         self.assertEqual(webhook_payload["tutor"]["email"], "nathan@example.com")
+
+    def test_process_coverage_tutor_response_keeps_partial_acceptance_pending(self):
+        inquiry = (
+            "Tutor: Ray\n"
+            "Module: PMI PMO\n"
+            "Preferred Time: Friday 09:00 - 11:00 | G2 - Fri - 9AM | May 2025\n"
+            "Session Date: Friday 17 Jul 2026; Friday 24 Jul 2026; Friday 31 Jul 2026; Friday 07 Aug 2026\n"
+            "Session Number: 7; 8; 9; 10\n"
+            "Session Subject: 7; 8; 9; 10"
+        )
+        ticket = {
+            "id": 54,
+            "public_id": "KBC-000054",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "technical_subcategory": "Coverage",
+            "inquiry": inquiry,
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "ticketId": "KBC-000054",
+                    "inquiry": inquiry,
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Module: PMI PMO\nSessions:\n1. Friday 17 Jul 2026 | No. 7 | 7\n2. Friday 24 Jul 2026 | No. 8 | 8",
+                            "requestStatus": "requested",
+                            "selectedSessionIds": ["session-1", "session-2"],
+                            "sessionFiles": [
+                                {"id": "session-1", "number": "7", "attachments": []},
+                                {"id": "session-2", "number": "8", "attachments": []},
+                            ],
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "token-1",
+                            "requestSubmittedByAgentId": 7,
+                            "requestSubmittedByAgentName": "Ahmed Hamamo",
+                            "requestSubmittedByAgentUsername": "ahmed",
+                            "locked": True,
+                        }
+                    ],
+                },
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000054"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000054",
+                    "responseToken": "token-1",
+                    "outcome": "accepted",
+                    "message": "Can cover these sessions",
+                }
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000054")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[0], "Pending")
+        self.assertEqual(update_params[1], "Tutor Accepted")
+        persisted_metadata = json.loads(update_params[3])
+        self.assertEqual(
+            persisted_metadata["latest_coverage_tutor_response"]["selectedSessionIds"],
+            ["session-1", "session-2"],
+        )
+        persisted_cards = persisted_metadata["admin_documentation"]["coverageCards"]
+        self.assertEqual(persisted_cards[0]["requestStatus"], "accepted")
+        self.assertEqual(persisted_cards[0]["selectedSessionIds"], ["session-1", "session-2"])
+        self.assertEqual(persisted_cards[1]["replyOutcome"], "accepted")
+        self.assertEqual(persisted_cards[1]["selectedSessionIds"], ["session-1", "session-2"])
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["ticket"]["status"], "Pending")
+        self.assertEqual(webhook_payload["request"]["selectedSessionIds"], ["session-1", "session-2"])
 
     def test_process_coverage_tutor_response_sends_refusal_mail_webhook_on_rejection(self):
         ticket = {

@@ -205,9 +205,10 @@ const InquiryDetails = () => {
   const coverageSessionDateRequestRef = useRef(0);
   const canUseCoverage = ticket.requesterSource !== "kbc_users_data";
   const canSubmitForLearner = ticket.requesterSource !== "kbc_users_data" || ticket.requesterRole === "coach" || ticket.requesterRole === "employer";
-  const availableInquiryPlatforms = canUseCoverage
-    ? inquiryPlatforms
-    : inquiryPlatforms.filter((item) => item !== "Coverage");
+  const availableInquiryPlatforms = inquiryPlatforms.filter((item) => (
+    ticket.requesterSource !== "kbc_users_data"
+    || (item !== "Coverage" && item !== "AI Team")
+  ));
   const selectedCoverageSessionNumbers = coverageSessionDates.map(
     (sessionDate) => (coverageSessionNumberByDate[sessionDate] || getDefaultCoverageSessionNumber(sessionDate, coverageSessionDateOptions)).trim(),
   );

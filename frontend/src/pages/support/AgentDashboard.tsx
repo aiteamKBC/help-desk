@@ -78,6 +78,7 @@ import {
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import {
@@ -501,6 +502,7 @@ interface CoverageWorkflowCard {
   confirmedByAgentName?: string;
   confirmedByAgentUsername?: string;
   presentationFiles: CoverageCardAttachment[];
+  selectedSessionIds: string[];
   sessionFiles: CoverageSessionAttachmentGroup[];
 }
 
@@ -1870,6 +1872,7 @@ const AgentDashboard = () => {
         getDisplayedChatReference(ticket),
         ticket.id,
         ...getDashboardRequesterColumnSummary(ticket, { preferCoverageInquiry: isLearningPlanCoverageSection }).searchTerms,
+        ...getDashboardRelatedPersonSearchTerms(ticket),
         ticket.subject,
         ticket.submittedForLearner?.fullName,
         ticket.submittedForLearner?.email,
@@ -1953,9 +1956,6 @@ const AgentDashboard = () => {
     : dashboardActiveTableTitle;
   const isArchiveMode = dashboardArchiveScope === "archived";
   const useCompactDashboardTable = true;
-  const dashboardTableHeadings = useCompactDashboardTable
-    ? ["Ticket", "Requester", "Category", "Status", "Assigned Agent", "Created", "SLA", "Actions"]
-    : ["Chat ID", "Ticket ID", "Requester", "Category", "Status", "Status Reason", "Assigned Agent", "Created", "SLA", "Actions"];
   const dashboardCellClassName = useCompactDashboardTable ? "px-3 py-3 align-middle" : "px-4 py-3";
   const hasDashboardViewOverrides = (
     dashboardTicketFilter !== "all"
@@ -2002,6 +2002,51 @@ const AgentDashboard = () => {
     : shouldShowDashboardTableSkeleton
       ? emptyTicketSummaryList
       : visibleDashboardTickets;
+  const shouldShowDashboardRelatedPersonColumn = (
+    isLearningPlanCoverageSection
+    || dashboardDisplayedTickets.some(shouldShowDashboardRelatedPersonSummary)
+  );
+  const isAiTeamDashboardView = Boolean(
+    isCustomTeamDashboardView
+    && [
+      selectedDashboardTeamPolicy?.key,
+      selectedDashboardTeamPolicy?.label,
+      selectedDashboardTeamPolicy?.assignedTeam,
+    ].some((value) => compactConsoleSearchValue(value) === "aiteam"),
+  );
+  const shouldShowDashboardAssignedAgentColumn = !isAiTeamDashboardView;
+  const dashboardTableHeadings = useCompactDashboardTable
+    ? [
+        "Ticket",
+        "Requester",
+        ...(shouldShowDashboardRelatedPersonColumn ? ["Related Person"] : []),
+        "Category",
+        "Status",
+        ...(shouldShowDashboardAssignedAgentColumn ? ["Assigned Agent"] : []),
+        "Created",
+        "SLA",
+        "Actions",
+      ]
+    : [
+        "Chat ID",
+        "Ticket ID",
+        "Requester",
+        ...(shouldShowDashboardRelatedPersonColumn ? ["Related Person"] : []),
+        "Category",
+        "Status",
+        "Status Reason",
+        ...(shouldShowDashboardAssignedAgentColumn ? ["Assigned Agent"] : []),
+        "Created",
+        "SLA",
+        "Actions",
+      ];
+  const dashboardCompactColumnWidths = shouldShowDashboardRelatedPersonColumn
+    ? shouldShowDashboardAssignedAgentColumn
+      ? ["13%", "15%", "18%", "11%", "10%", "11%", "8%", "7%", "7%"]
+      : ["13%", "17%", "25%", "12%", "11%", "9%", "6%", "7%"]
+    : shouldShowDashboardAssignedAgentColumn
+      ? ["16%", "18%", "13%", "11%", "18%", "8%", "7%", "9%"]
+      : ["18%", "20%", "15%", "12%", "11%", "8%", "16%"];
   const dashboardDisplayedTableCountLabel = activeServerDashboardPagination
     ? getServerDashboardTableCountLabel(
         activeServerDashboardPagination,
@@ -4898,7 +4943,9 @@ const AgentDashboard = () => {
       return;
     }
 
-    const targetSessionFiles = buildCoverageSessionFileGroups(currentDraft.inquiry, targetCard.sessionFiles);
+    const allTargetSessionFiles = buildCoverageSessionFileGroups(currentDraft.inquiry, targetCard.sessionFiles);
+    const targetSessionFiles = filterCoverageSessionGroupsByCardSelection(targetCard, allTargetSessionFiles);
+    const selectedSessionIds = getCoverageCardSelectedSessionIds(targetCard, allTargetSessionFiles);
     const targetSessionAttachments = targetSessionFiles.flatMap((group) => group.attachments);
 
     if (targetSessionAttachments.some(isCoverageAttachmentUploadInProgress)) {
@@ -4924,6 +4971,7 @@ const AgentDashboard = () => {
       ...targetCard,
       sessionDetails: syncedSessionDetails,
       presentationFiles: presentationFileMetadata,
+      selectedSessionIds,
       sessionFiles: sessionFileMetadata,
     };
     const lightweightDocumentation: AdminDocumentation = {
@@ -4932,6 +4980,7 @@ const AgentDashboard = () => {
         ...card,
         sessionDetails: card.id === cardId ? syncedSessionDetails : card.sessionDetails,
         presentationFiles: card.id === cardId ? presentationFileMetadata : [],
+        selectedSessionIds: card.id === cardId ? selectedSessionIds : card.selectedSessionIds,
         sessionFiles: card.id === cardId
           ? sessionFileMetadata
           : serializeCoverageSessionFileGroupsForRequest(card.sessionFiles),
@@ -6618,14 +6667,9 @@ const AgentDashboard = () => {
               <table className="w-full table-fixed text-sm">
                 {useCompactDashboardTable ? (
                   <colgroup>
-                    <col style={{ width: "16%" }} />
-                    <col style={{ width: "18%" }} />
-                    <col style={{ width: "13%" }} />
-                    <col style={{ width: "11%" }} />
-                    <col style={{ width: "18%" }} />
-                    <col style={{ width: "8%" }} />
-                    <col style={{ width: "7%" }} />
-                    <col style={{ width: "9%" }} />
+                    {dashboardCompactColumnWidths.map((width, columnIndex) => (
+                      <col key={`dashboard-loading-column-${columnIndex}`} style={{ width }} />
+                    ))}
                   </colgroup>
                 ) : null}
                 <thead className="bg-secondary/50 text-muted-foreground">
@@ -6671,14 +6715,9 @@ const AgentDashboard = () => {
               <table className="w-full table-fixed text-sm">
                 {useCompactDashboardTable ? (
                   <colgroup>
-                    <col style={{ width: "16%" }} />
-                    <col style={{ width: "18%" }} />
-                    <col style={{ width: "13%" }} />
-                    <col style={{ width: "11%" }} />
-                    <col style={{ width: "18%" }} />
-                    <col style={{ width: "8%" }} />
-                    <col style={{ width: "7%" }} />
-                    <col style={{ width: "9%" }} />
+                    {dashboardCompactColumnWidths.map((width, columnIndex) => (
+                      <col key={`dashboard-column-${columnIndex}`} style={{ width }} />
+                    ))}
                   </colgroup>
                 ) : null}
                 <thead className="bg-secondary/50 text-muted-foreground">
@@ -6703,6 +6742,7 @@ const AgentDashboard = () => {
                       ticket,
                       { preferCoverageInquiry: isLearningPlanCoverageSection },
                     );
+                    const relatedPersonSummary = getDashboardRelatedPersonSummary(ticket);
                     const createdAtLabel = formatDateTime(ticket.createdAt);
                     const createdDateLabel = formatDateShort(ticket.createdAt);
                     const createdTimeLabel = formatTimeShort(ticket.createdAt);
@@ -6741,7 +6781,7 @@ const AgentDashboard = () => {
                             <div
                               className={cn(
                                 "mt-1 truncate text-xs text-muted-foreground",
-                                isAiTeamTicketRowSubtitle && "font-semibold text-foreground/80",
+                                isAiTeamTicketRowSubtitle && "hidden",
                               )}
                               title={ticketRowSubtitle}
                             >
@@ -6784,6 +6824,41 @@ const AgentDashboard = () => {
                             />
                           </div>
                         </td>
+                        {shouldShowDashboardRelatedPersonColumn ? (
+                          <td className={dashboardCellClassName}>
+                            {relatedPersonSummary ? (
+                              <div className="min-w-0 overflow-hidden">
+                                <div
+                                  className={cn(
+                                    "truncate font-semibold",
+                                    relatedPersonSummary.isMuted ? "text-muted-foreground" : "text-foreground",
+                                  )}
+                                  title={relatedPersonSummary.primaryText}
+                                >
+                                  {relatedPersonSummary.primaryText}
+                                </div>
+                                {relatedPersonSummary.secondaryText ? (
+                                  <div
+                                    className="mt-1 truncate text-xs text-muted-foreground"
+                                    title={relatedPersonSummary.secondaryText}
+                                  >
+                                    {relatedPersonSummary.secondaryText}
+                                  </div>
+                                ) : null}
+                                {relatedPersonSummary.tertiaryText ? (
+                                  <div
+                                    className="mt-1 truncate text-xs text-muted-foreground"
+                                    title={relatedPersonSummary.tertiaryText}
+                                  >
+                                    {relatedPersonSummary.tertiaryText}
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">-</span>
+                            )}
+                          </td>
+                        ) : null}
                         <td className={dashboardCellClassName}>
                           {useCompactDashboardTable ? (
                             <div className="min-w-0 overflow-hidden">
@@ -6813,17 +6888,19 @@ const AgentDashboard = () => {
                             <td className={cn(dashboardCellClassName, "text-muted-foreground")}>{getDisplayedTicketStatusReason(ticket)}</td>
                           </>
                         )}
-                        <td className={dashboardCellClassName}>
-                          <AssignedAgentBadge
-                            assignedAgentId={ticket.assignedAgentId}
-                            assignedAgentName={ticket.assignedAgentName}
-                            statusReason={ticket.statusReason}
-                            documentation={ticket.documentation}
-                            pendingEscalationNotification={ticket.pendingEscalationNotification}
-                            latestEscalationClosure={ticket.latestEscalationClosure}
-                            latestTransferDecision={ticket.latestTransferDecision}
-                          />
-                        </td>
+                        {shouldShowDashboardAssignedAgentColumn ? (
+                          <td className={dashboardCellClassName}>
+                            <AssignedAgentBadge
+                              assignedAgentId={ticket.assignedAgentId}
+                              assignedAgentName={ticket.assignedAgentName}
+                              statusReason={ticket.statusReason}
+                              documentation={ticket.documentation}
+                              pendingEscalationNotification={ticket.pendingEscalationNotification}
+                              latestEscalationClosure={ticket.latestEscalationClosure}
+                              latestTransferDecision={ticket.latestTransferDecision}
+                            />
+                          </td>
+                        ) : null}
                         <td className={cn(dashboardCellClassName, useCompactDashboardTable ? "text-xs align-middle" : "whitespace-nowrap")}>
                           {useCompactDashboardTable ? (
                             <>
@@ -11143,10 +11220,54 @@ const CoverageTicketWorkspace = ({
           sessionDetails: buildCoverageTutorSessionDetailsFromGroups(
             currentDraft.inquiry,
             card.sessionDetails,
-            nextGroups,
+            filterCoverageSessionGroupsByCardSelection(card, nextGroups),
           ),
           updatedAt: timestamp,
           ...buildCoverageCardActorFields(currentAdmin, "updated"),
+        };
+      }),
+    }));
+  };
+
+  const updateCoverageSessionSelection = (
+    cardId: string,
+    sessionId: string,
+    isSelected: boolean,
+  ) => {
+    const timestamp = new Date().toISOString();
+    expandCoverageHistoryCards();
+    onDraftUpdate((currentDraft) => ({
+      ...currentDraft,
+      coverageCards: currentDraft.coverageCards.map((card) => {
+        if (card.id !== cardId) {
+          return card;
+        }
+
+        const currentGroups = buildCoverageSessionFileGroups(currentDraft.inquiry, card.sessionFiles);
+        const currentSelectedIds = getCoverageCardSelectedSessionIds(card, currentGroups);
+        const nextSelectedIds = isSelected
+          ? Array.from(new Set([...currentSelectedIds, sessionId]))
+          : currentSelectedIds.filter((currentSessionId) => currentSessionId !== sessionId);
+
+        if (nextSelectedIds.length === 0) {
+          toast.error("Choose at least one session for this tutor request.");
+          return card;
+        }
+
+        const nextCard = {
+          ...card,
+          selectedSessionIds: nextSelectedIds,
+          updatedAt: timestamp,
+          ...buildCoverageCardActorFields(currentAdmin, "updated"),
+        };
+
+        return {
+          ...nextCard,
+          sessionDetails: buildCoverageTutorSessionDetailsFromGroups(
+            currentDraft.inquiry,
+            card.sessionDetails,
+            filterCoverageSessionGroupsByCardSelection(nextCard, currentGroups),
+          ),
         };
       }),
     }));
@@ -12112,17 +12233,20 @@ const CoverageTicketWorkspace = ({
             const canSendFollowUpFiles = !isArchived && canSendCoverageTutorFollowUp(card);
             const canRetryTutorRequestEmail = !isArchived && canRetryCoverageTutorRequestEmail(card);
             const pendingFollowUpFiles = pendingFollowUpFilesByCardId[card.id] || [];
-            const sessionFileGroups = buildCoverageSessionFileGroups(draft.inquiry, card.sessionFiles);
+            const allSessionFileGroups = buildCoverageSessionFileGroups(draft.inquiry, card.sessionFiles);
+            const selectedSessionIds = getCoverageCardSelectedSessionIds(card, allSessionFileGroups);
+            const selectedSessionIdSet = new Set(selectedSessionIds);
+            const selectedSessionFileGroups = filterCoverageSessionGroupsByCardSelection(card, allSessionFileGroups);
             const syncedSessionDetails = buildCoverageTutorSessionDetailsFromGroups(
               draft.inquiry,
               card.sessionDetails,
-              sessionFileGroups,
+              selectedSessionFileGroups,
             );
             const compactTutorRequestSummary = summarizeCoverageTutorRequestDetails(syncedSessionDetails);
-            const hasSessionFilesUploading = sessionFileGroups.some((group) => (
+            const hasSessionFilesUploading = selectedSessionFileGroups.some((group) => (
               group.attachments.some(isCoverageAttachmentUploadInProgress)
             ));
-            const hasSessionAttachments = sessionFileGroups.some((group) => group.attachments.length > 0);
+            const hasSessionAttachments = selectedSessionFileGroups.some((group) => group.attachments.length > 0);
             const isSessionDetailsExpanded = expandedSessionDetailsCardIds.has(card.id);
 
             if (showCompactTutorChoice && linkedTutorReplyCard) {
@@ -12289,7 +12413,7 @@ const CoverageTicketWorkspace = ({
                             Session Files
                           </div>
                           <div className="grid gap-2 md:grid-cols-2">
-                            {sessionFileGroups
+                            {selectedSessionFileGroups
                               .filter((sessionGroup) => sessionGroup.attachments.length > 0)
                               .map((sessionGroup, sessionIndex) => (
                                 <div
@@ -12510,8 +12634,8 @@ const CoverageTicketWorkspace = ({
                                   </span>
                                 ) : null}
                                 <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-700">
-                                  {sessionFileGroups.length || compactTutorRequestSummary.sessionCount || 0} session
-                                  {(sessionFileGroups.length || compactTutorRequestSummary.sessionCount) === 1 ? "" : "s"}
+                                  {selectedSessionFileGroups.length || compactTutorRequestSummary.sessionCount || 0} session
+                                  {(selectedSessionFileGroups.length || compactTutorRequestSummary.sessionCount) === 1 ? "" : "s"}
                                 </span>
                               </div>
                               <p className="mt-2 text-xs text-muted-foreground">
@@ -12572,7 +12696,7 @@ const CoverageTicketWorkspace = ({
                             <div className="text-sm text-muted-foreground xl:text-right">
                               {card.presentationFiles.length > 0
                                 ? `${card.presentationFiles.length} file${card.presentationFiles.length === 1 ? "" : "s"} selected`
-                                : "Shared across all requested sessions"}
+                                : "Shared across selected sessions"}
                             </div>
                           </div>
                           {card.presentationFiles.length > 0 ? (
@@ -12619,46 +12743,71 @@ const CoverageTicketWorkspace = ({
                             </div>
                           ) : null}
                           <p className="mt-3 text-xs text-muted-foreground">
-                            Use this only when the same file applies to every requested session.
+                            Use this only when the same file applies to every selected session.
                           </p>
                         </div>
                       </div>
 
-                      {sessionFileGroups.length > 0 ? (
+                      {allSessionFileGroups.length > 0 ? (
                         <div className="order-2 space-y-2 lg:col-span-2">
                           <div className="flex flex-wrap items-end justify-between gap-2">
                             <Label className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Sessions to Cover</Label>
                             <span className="text-xs text-muted-foreground">Attach files only to the sessions that need specific coverage.</span>
                           </div>
                           <div className="grid gap-3 xl:grid-cols-2">
-                            {sessionFileGroups.map((sessionGroup, sessionIndex) => {
+                            {allSessionFileGroups.map((sessionGroup, sessionIndex) => {
                               const inputId = `coverage-session-${card.id}-${sessionGroup.id}`;
+                              const checkboxId = `coverage-session-selected-${card.id}-${sessionGroup.id}`;
+                              const isSessionSelected = selectedSessionIdSet.has(sessionGroup.id);
 
                               return (
                                 <div
                                   key={sessionGroup.id}
-                                  className="rounded-2xl border border-primary/10 bg-white/90 p-3 shadow-sm"
+                                  className={cn(
+                                    "rounded-2xl border p-3 shadow-sm transition",
+                                    isSessionSelected
+                                      ? "border-primary/10 bg-white/90"
+                                      : "border-slate-200 bg-slate-50/70 opacity-75",
+                                  )}
                                 >
                                   <input
                                     id={inputId}
                                     type="file"
                                     multiple
                                     accept=".pdf,.ppt,.pptx,.odp,.key,image/*"
-                                    disabled={isSaving}
+                                    disabled={isSaving || !isSessionSelected}
                                     onChange={(event) => void handleSessionFilesAdded(card.id, sessionGroup.id, event)}
                                     className="sr-only"
                                   />
                                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                                    <div className="min-w-0">
-                                      <div className="text-sm font-semibold text-foreground">
-                                        {sessionGroup.label || `Session ${sessionIndex + 1}`}
+                                    <div className="min-w-0 space-y-2">
+                                      <div className="flex items-start gap-2">
+                                        <Checkbox
+                                          id={checkboxId}
+                                          checked={isSessionSelected}
+                                          disabled={isSaving}
+                                          onCheckedChange={(checked) => updateCoverageSessionSelection(
+                                            card.id,
+                                            sessionGroup.id,
+                                            checked === true,
+                                          )}
+                                          className="mt-0.5"
+                                        />
+                                        <label htmlFor={checkboxId} className="cursor-pointer text-sm font-semibold text-foreground">
+                                          {sessionGroup.label || `Session ${sessionIndex + 1}`}
+                                        </label>
                                       </div>
+                                      {!isSessionSelected ? (
+                                        <p className="text-xs text-muted-foreground">
+                                          This session will stay available for another tutor card.
+                                        </p>
+                                      ) : null}
                                     </div>
                                     <label
                                       htmlFor={inputId}
                                       className={cn(
                                         "inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-primary/15 bg-primary/[0.04] px-3 py-2 text-xs font-semibold text-primary transition hover:border-primary/30 hover:bg-primary/[0.08]",
-                                        isSaving && "cursor-not-allowed opacity-60",
+                                        (isSaving || !isSessionSelected) && "cursor-not-allowed opacity-60",
                                       )}
                                     >
                                       <Paperclip className="h-3.5 w-3.5" />
@@ -12673,7 +12822,7 @@ const CoverageTicketWorkspace = ({
                                       <Input
                                         value={sessionGroup.date}
                                         onChange={(event) => updateCoverageSessionGroupDetails(card.id, sessionGroup.id, { date: event.target.value })}
-                                        disabled={isSaving}
+                                        disabled={isSaving || !isSessionSelected}
                                         placeholder="Monday 10 Apr 2028"
                                         className="h-10 bg-white/95 text-sm"
                                       />
@@ -12685,7 +12834,7 @@ const CoverageTicketWorkspace = ({
                                       <Input
                                         value={sessionGroup.number}
                                         onChange={(event) => updateCoverageSessionGroupDetails(card.id, sessionGroup.id, { number: event.target.value })}
-                                        disabled={isSaving}
+                                        disabled={isSaving || !isSessionSelected}
                                         placeholder="5"
                                         className="h-10 bg-white/95 text-sm"
                                       />
@@ -12697,7 +12846,7 @@ const CoverageTicketWorkspace = ({
                                       <Textarea
                                         value={sessionGroup.subject}
                                         onChange={(event) => updateCoverageSessionGroupDetails(card.id, sessionGroup.id, { subject: event.target.value })}
-                                        disabled={isSaving}
+                                        disabled={isSaving || !isSessionSelected}
                                         placeholder="Session topic or notes for this covered session"
                                         className="min-h-[72px] resize-y bg-white/95 text-sm leading-6"
                                       />
@@ -12737,6 +12886,7 @@ const CoverageTicketWorkspace = ({
                                           <button
                                             type="button"
                                             onClick={() => removeSessionFile(card.id, sessionGroup.id, file.id)}
+                                            disabled={isSaving || !isSessionSelected}
                                             className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground transition hover:bg-secondary hover:text-foreground"
                                             aria-label={`Remove ${file.name}`}
                                           >
@@ -15225,6 +15375,43 @@ function serializeCoverageSessionFileGroupsForRequest(
   }));
 }
 
+function normalizeCoverageSelectedSessionIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seenIds = new Set<string>();
+  return value.flatMap((rawId) => {
+    const sessionId = String(rawId || "").trim();
+    if (!sessionId || seenIds.has(sessionId)) {
+      return [];
+    }
+
+    seenIds.add(sessionId);
+    return [sessionId];
+  });
+}
+
+function getCoverageCardSelectedSessionIds(
+  card: Pick<CoverageWorkflowCard, "selectedSessionIds">,
+  groups: CoverageSessionAttachmentGroup[],
+) {
+  const allSessionIds = groups.map((group) => group.id).filter(Boolean);
+  const availableSessionIds = new Set(allSessionIds);
+  const selectedIds = normalizeCoverageSelectedSessionIds(card.selectedSessionIds)
+    .filter((sessionId) => availableSessionIds.has(sessionId));
+
+  return selectedIds.length > 0 ? selectedIds : allSessionIds;
+}
+
+function filterCoverageSessionGroupsByCardSelection(
+  card: Pick<CoverageWorkflowCard, "selectedSessionIds">,
+  groups: CoverageSessionAttachmentGroup[],
+) {
+  const selectedIds = new Set(getCoverageCardSelectedSessionIds(card, groups));
+  return groups.filter((group) => selectedIds.has(group.id));
+}
+
 function CoverageInquirySummary({ inquiry }: { inquiry: string }) {
   const parsedInquiry = parseCoverageInquiry(inquiry);
   if (!parsedInquiry) {
@@ -15334,6 +15521,7 @@ function createCoverageTutorChoiceCard(
 ): CoverageWorkflowCard {
   const timestamp = new Date().toISOString();
   const parsedInquiry = parseCoverageInquiry(inquiry);
+  const sessionFiles = buildCoverageSessionFileGroups(inquiry);
 
   return {
     id: createCoverageCardId(),
@@ -15372,7 +15560,8 @@ function createCoverageTutorChoiceCard(
     confirmedByAgentName: "",
     confirmedByAgentUsername: "",
     presentationFiles: [],
-    sessionFiles: buildCoverageSessionFileGroups(inquiry),
+    selectedSessionIds: sessionFiles.map((group) => group.id),
+    sessionFiles,
   };
 }
 
@@ -15418,6 +15607,7 @@ function createCoverageNoteCard(
     confirmedByAgentName: "",
     confirmedByAgentUsername: "",
     presentationFiles: [],
+    selectedSessionIds: [],
     sessionFiles: [],
   };
 }
@@ -15572,6 +15762,7 @@ function normalizeCoverageWorkflowCards(cards: CoverageWorkflowCard[] | null | u
           confirmedByAgentName: card.confirmedByAgentName || "",
           confirmedByAgentUsername: card.confirmedByAgentUsername || "",
           presentationFiles,
+          selectedSessionIds: normalizeCoverageSelectedSessionIds(card.selectedSessionIds),
           sessionFiles,
         }];
       })
@@ -17577,6 +17768,132 @@ function getDashboardRequesterColumnSummary(
     secondaryText,
     searchTerms: [primaryText, secondaryText, tutor, moduleName, defaultPrimaryText, defaultSecondaryText].filter(Boolean),
   };
+}
+
+type DashboardRelatedPersonSummarySubject = Pick<
+  TicketSummary,
+  "technicalSubcategory" | "subject" | "inquiryPreview" | "aiTeamRequest" | "aiTeamPersonName" | "documentation"
+>;
+
+type DashboardRelatedPersonSummary = {
+  primaryText: string;
+  secondaryText: string;
+  tertiaryText: string;
+  searchTerms: string[];
+  isMuted?: boolean;
+};
+
+function shouldShowDashboardRelatedPersonSummary(ticket: Pick<TicketSummary, "technicalSubcategory"> | null | undefined) {
+  return ticket?.technicalSubcategory === "AI Team" || ticket?.technicalSubcategory === "Coverage";
+}
+
+function buildDashboardRelatedPersonLine(label: string, value: string | null | undefined) {
+  const normalizedValue = (value || "").trim();
+  return normalizedValue ? `${label}: ${normalizedValue}` : "";
+}
+
+function uniqueDashboardSummaryValues(values: string[]) {
+  const seenValues = new Set<string>();
+  return values.flatMap((value) => {
+    const normalizedValue = value.trim();
+    const normalizedKey = normalizedValue.toLowerCase();
+    if (!normalizedValue || seenValues.has(normalizedKey)) {
+      return [];
+    }
+
+    seenValues.add(normalizedKey);
+    return [normalizedValue];
+  });
+}
+
+function getCoverageRelatedPersonName(card: Pick<CoverageWorkflowCard, "tutor" | "coach">) {
+  return card.tutor.trim() || card.coach.trim();
+}
+
+function getCoverageRelatedSessionNumbers(card: Pick<CoverageWorkflowCard, "selectedSessionIds" | "sessionFiles" | "sessionDetails">) {
+  const selectedSessionFiles = filterCoverageSessionGroupsByCardSelection(card, card.sessionFiles || []);
+  const sessionNumbers = uniqueDashboardSummaryValues(
+    selectedSessionFiles.map((group) => normalizeCoverageSessionNumberValue(group.number || "")),
+  );
+  if (sessionNumbers.length > 0) {
+    return sessionNumbers;
+  }
+
+  return uniqueDashboardSummaryValues(
+    Array.from((card.sessionDetails || "").matchAll(/\bNo\.?\s*([A-Za-z0-9-]+)/gi))
+      .map((match) => match[1] || ""),
+  );
+}
+
+function getDashboardCoverageRelatedPersonSummary(
+  ticket: DashboardRelatedPersonSummarySubject,
+): DashboardRelatedPersonSummary {
+  const relatedCard = sortCoverageWorkflowCardsForDisplay(ticket.documentation?.coverageCards || [])
+    .find((card) => card.type === "tutor_choice" && getCoverageRelatedPersonName(card));
+
+  if (!relatedCard) {
+    return {
+      primaryText: "No tutor card yet",
+      secondaryText: "Coverage details pending",
+      tertiaryText: "",
+      searchTerms: ["No tutor card yet", "Coverage details pending"],
+      isMuted: true,
+    };
+  }
+
+  const personName = getCoverageRelatedPersonName(relatedCard);
+  const sessionNumbers = getCoverageRelatedSessionNumbers(relatedCard);
+  const sessionLine = sessionNumbers.length > 0 ? `Session number: ${sessionNumbers.join(", ")}` : "";
+  const statusLabel = getCoverageTutorCardStatusLabel(
+    relatedCard.requestStatus,
+    normalizeCoverageTutorEmailDeliveryStatus(relatedCard.emailDeliveryStatus),
+  );
+  const statusLine = buildDashboardRelatedPersonLine("Status", statusLabel);
+
+  return {
+    primaryText: personName,
+    secondaryText: sessionLine,
+    tertiaryText: statusLine,
+    searchTerms: [personName, sessionLine, statusLine, relatedCard.tutorEmail, relatedCard.coachEmail],
+  };
+}
+
+function getDashboardAiTeamRelatedPersonSummary(
+  ticket: DashboardRelatedPersonSummarySubject,
+): DashboardRelatedPersonSummary {
+  const personName = (ticket.aiTeamRequest?.personName || ticket.aiTeamPersonName || "").trim() || "AI Team request";
+  const subjectLine = buildDashboardRelatedPersonLine("Subject", ticket.subject);
+  const issueLine = buildDashboardRelatedPersonLine("Issue", ticket.inquiryPreview);
+
+  return {
+    primaryText: personName,
+    secondaryText: subjectLine,
+    tertiaryText: issueLine,
+    searchTerms: [personName, subjectLine, issueLine],
+    isMuted: personName === "AI Team request",
+  };
+}
+
+function getDashboardRelatedPersonSummary(
+  ticket: DashboardRelatedPersonSummarySubject | null | undefined,
+): DashboardRelatedPersonSummary | null {
+  if (!ticket) {
+    return null;
+  }
+
+  if (ticket.technicalSubcategory === "AI Team") {
+    return getDashboardAiTeamRelatedPersonSummary(ticket);
+  }
+
+  if (ticket.technicalSubcategory === "Coverage") {
+    return getDashboardCoverageRelatedPersonSummary(ticket);
+  }
+
+  return null;
+}
+
+function getDashboardRelatedPersonSearchTerms(ticket: DashboardRelatedPersonSummarySubject | null | undefined) {
+  return getDashboardRelatedPersonSummary(ticket)?.searchTerms || [];
 }
 
 function formatTicketHeaderCategoryLabel(category: string, technicalSubcategory: string) {

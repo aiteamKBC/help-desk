@@ -226,7 +226,7 @@ describe("InquiryDetails", () => {
     expect(screen.queryByText("Generated Inquiry Preview")).not.toBeInTheDocument();
   });
 
-  it("hides Coverage for standard KBC learner accounts", () => {
+  it("hides restricted categories for standard KBC learner accounts", () => {
     window.localStorage.setItem(
       supportStorageKey,
       JSON.stringify({
@@ -249,6 +249,8 @@ describe("InquiryDetails", () => {
 
     fireEvent.click(screen.getByRole("combobox"));
     expect(screen.queryByText("Coverage")).not.toBeInTheDocument();
+    expect(screen.queryByText("AI Team")).not.toBeInTheDocument();
+    expect(screen.getByText("LMS")).toBeInTheDocument();
   });
 
   it("shows submitted tickets in read-only inquiry review mode", () => {

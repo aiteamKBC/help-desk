@@ -1476,6 +1476,7 @@ def normalize_latest_coverage_tutor_response(value: Any) -> dict[str, Any] | Non
         "requestedAt": request_submitted_at,
         "respondedAt": responded_at,
         "sessionDetails": session_details,
+        "selectedSessionIds": normalize_coverage_selected_session_ids(payload.get("selectedSessionIds")),
         "replyText": reply_text,
         "sessionStartAt": session_start_at,
         "sessionEndAt": session_end_at,
@@ -1692,6 +1693,15 @@ def can_requester_submit_coverage_ticket(requester_source: Any) -> bool:
 def ensure_requester_can_submit_coverage_ticket(requester_source: Any) -> None:
     if not can_requester_submit_coverage_ticket(requester_source):
         raise ApiError(403, "Coverage requests are not available for standard KBC learner accounts.")
+
+
+def can_requester_submit_ai_team_ticket(requester_source: Any) -> bool:
+    return normalize_public_requester_source(requester_source) != KBC_USERS_DATA_REQUESTER_SOURCE
+
+
+def ensure_requester_can_submit_ai_team_ticket(requester_source: Any) -> None:
+    if not can_requester_submit_ai_team_ticket(requester_source):
+        raise ApiError(403, "AI Team requests are not available for standard KBC learner accounts.")
 
 
 def can_requester_submit_for_learner(requester_role: Any, requester_source: Any) -> bool:
@@ -1912,6 +1922,21 @@ def merge_coverage_session_attachments(
     return normalized_groups
 
 
+def normalize_coverage_selected_session_ids(value: Any) -> list[str]:
+    raw_values = value if isinstance(value, list) else []
+    normalized_values: list[str] = []
+    seen_values: set[str] = set()
+
+    for raw_value in raw_values:
+        session_id = sanitize_text(raw_value)
+        if not session_id or session_id in seen_values:
+            continue
+        seen_values.add(session_id)
+        normalized_values.append(session_id)
+
+    return normalized_values
+
+
 def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
     raw_cards = value if isinstance(value, list) else []
     normalized_cards: list[dict[str, Any]] = []
@@ -1998,6 +2023,7 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "confirmedByAgentName": sanitize_text(source.get("confirmedByAgentName")),
                 "confirmedByAgentUsername": sanitize_text(source.get("confirmedByAgentUsername")),
                 "presentationFiles": attachments,
+                "selectedSessionIds": normalize_coverage_selected_session_ids(source.get("selectedSessionIds")),
                 "sessionFiles": normalize_coverage_session_file_groups(source.get("sessionFiles")),
             }
         )
@@ -4732,6 +4758,7 @@ def build_coverage_tutor_request_webhook_payload(
             "sessionDetails": card.get("sessionDetails"),
             "notes": documentation.get("coverageNotes") or "",
             "presentationFiles": card.get("presentationFiles") or [],
+            "selectedSessionIds": normalize_coverage_selected_session_ids(card.get("selectedSessionIds")),
             "sessionFiles": card.get("sessionFiles") or [],
         },
         "requestedBy": {
@@ -5697,6 +5724,8 @@ def build_coverage_tutor_response_mail_webhook_payload(
             "coachEmail": sanitize_text(tutor_choice_card.get("coachEmail")),
             "sessionDetails": session_details,
             "presentationFiles": tutor_choice_card.get("presentationFiles") or [],
+            "selectedSessionIds": normalize_coverage_selected_session_ids(tutor_choice_card.get("selectedSessionIds")),
+            "sessionFiles": tutor_choice_card.get("sessionFiles") or [],
         },
         "response": {
             "outcome": "accepted" if was_accepted else "rejected",
@@ -5921,6 +5950,7 @@ def build_coverage_tutor_response_payload(
         "requestedAt": tutor_choice_card.get("submittedAt"),
         "respondedAt": responded_at,
         "sessionDetails": extract_coverage_tutor_response_session_details(response_payload),
+        "selectedSessionIds": normalize_coverage_selected_session_ids(tutor_choice_card.get("selectedSessionIds")),
         "replyText": sanitize_text(response_payload.get("replyText") or response_payload.get("message") or response_payload.get("note")),
         "sessionStartAt": serialize_datetime_value(
             coerce_datetime(
@@ -5990,6 +6020,8 @@ def build_coverage_tutor_reply_card(
         "confirmedByAgentName": "",
         "confirmedByAgentUsername": "",
         "presentationFiles": [],
+        "selectedSessionIds": normalize_coverage_selected_session_ids(tutor_choice_card.get("selectedSessionIds")),
+        "sessionFiles": tutor_choice_card.get("sessionFiles") or [],
     }
 
 
@@ -6107,6 +6139,62 @@ def build_coverage_session_items_from_inquiry_details(parsed_inquiry: dict[str, 
         )
 
     return sessions
+
+
+def build_coverage_session_ids_from_inquiry(inquiry: Any) -> list[str]:
+    return [
+        f"session-{session_item['index']}"
+        for session_item in build_coverage_session_items_from_inquiry_details(
+            parse_coverage_inquiry_details(inquiry)
+        )
+    ]
+
+
+def get_coverage_card_selected_session_ids(card: dict[str, Any]) -> list[str]:
+    return normalize_coverage_selected_session_ids(normalize_json_object(card).get("selectedSessionIds"))
+
+
+def get_coverage_card_session_file_ids(card: dict[str, Any]) -> list[str]:
+    session_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for group in normalize_coverage_session_file_groups(normalize_json_object(card).get("sessionFiles")):
+        session_id = sanitize_text(group.get("id"))
+        if not session_id or session_id in seen_ids:
+            continue
+        seen_ids.add(session_id)
+        session_ids.append(session_id)
+    return session_ids
+
+
+def is_coverage_tutor_acceptance_complete(documentation: dict[str, Any], inquiry: Any = "") -> bool:
+    original_session_ids = build_coverage_session_ids_from_inquiry(
+        normalize_json_object(documentation).get("inquiry") or inquiry
+    )
+    if not original_session_ids:
+        return True
+
+    original_session_id_set = set(original_session_ids)
+    covered_session_ids: set[str] = set()
+    for raw_card in normalize_json_object(documentation).get("coverageCards") or []:
+        card = normalize_json_object(raw_card)
+        if sanitize_text(card.get("type")) != "tutor_choice":
+            continue
+        if sanitize_text(card.get("requestStatus")).lower() != "accepted":
+            continue
+
+        selected_session_ids = get_coverage_card_selected_session_ids(card)
+        if not selected_session_ids:
+            selected_session_ids = get_coverage_card_session_file_ids(card)
+        if not selected_session_ids:
+            return True
+
+        covered_session_ids.update(
+            session_id
+            for session_id in selected_session_ids
+            if session_id in original_session_id_set
+        )
+
+    return original_session_id_set.issubset(covered_session_ids)
 
 
 def build_coverage_ticket_operations_webhook_payload(
@@ -6825,6 +6913,8 @@ def build_derived_coverage_tutor_choice_card(
         "confirmedByAgentName": "",
         "confirmedByAgentUsername": "",
         "presentationFiles": [],
+        "selectedSessionIds": [],
+        "sessionFiles": [],
     }
 
 
@@ -17659,6 +17749,7 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
               t.status,
               t.status_reason,
               t.technical_subcategory,
+              t.inquiry,
               t.metadata,
               t.assigned_team,
               t.assigned_agent_id,
@@ -17753,10 +17844,18 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
         )
         documentation["coverageCards"] = coverage_cards
 
-        next_status = "Closed" if outcome == "accepted" else "Pending"
+        acceptance_complete = outcome == "accepted" and is_coverage_tutor_acceptance_complete(
+            documentation,
+            inquiry=ticket.get("inquiry"),
+        )
+        next_status = "Closed" if acceptance_complete else "Pending"
         next_status_reason = STATUS_REASON_TUTOR_ACCEPTED if outcome == "accepted" else STATUS_REASON_TUTOR_REJECTED
         next_sla_status = "On Track"
-        updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
+        updated_ticket_metadata = (
+            build_resolved_coverage_sla_metadata(ticket_metadata)
+            if outcome != "accepted" or acceptance_complete
+            else normalize_json_object(ticket_metadata)
+        )
         updated_ticket_metadata["admin_documentation"] = documentation
         latest_response_payload = build_coverage_tutor_response_payload(
             ticket_public_id=ticket_public_id,
@@ -20217,6 +20316,8 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             requester_source = get_public_requester_source(requester)
             if technical_subcategory == "Coverage":
                 ensure_requester_can_submit_coverage_ticket(requester_source)
+            if is_ai_team_technical_subcategory(technical_subcategory):
+                ensure_requester_can_submit_ai_team_ticket(requester_source)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
             submitted_for_learner = resolve_submitted_for_learner(
