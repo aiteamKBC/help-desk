@@ -17825,13 +17825,25 @@ function getCoverageRelatedSessionNumbers(card: Pick<CoverageWorkflowCard, "sele
   );
 }
 
+function formatDashboardRelatedPersonList(values: string[]) {
+  const uniqueValues = uniqueDashboardSummaryValues(values);
+  if (uniqueValues.length === 0) {
+    return "";
+  }
+  if (uniqueValues.length === 1) {
+    return uniqueValues[0];
+  }
+
+  return `${uniqueValues[0]} + ${uniqueValues.length - 1} more`;
+}
+
 function getDashboardCoverageRelatedPersonSummary(
   ticket: DashboardRelatedPersonSummarySubject,
 ): DashboardRelatedPersonSummary {
-  const relatedCard = sortCoverageWorkflowCardsForDisplay(ticket.documentation?.coverageCards || [])
-    .find((card) => card.type === "tutor_choice" && getCoverageRelatedPersonName(card));
+  const relatedCards = sortCoverageWorkflowCardsForDisplay(ticket.documentation?.coverageCards || [])
+    .filter((card) => card.type === "tutor_choice" && getCoverageRelatedPersonName(card));
 
-  if (!relatedCard) {
+  if (relatedCards.length === 0) {
     return {
       primaryText: "No tutor card yet",
       secondaryText: "Coverage details pending",
@@ -17841,6 +17853,44 @@ function getDashboardCoverageRelatedPersonSummary(
     };
   }
 
+  const acceptedCards = relatedCards.filter((card) => normalizeCoverageTutorRequestStatus(card.requestStatus) === "accepted");
+  const requestedCards = relatedCards.filter((card) => normalizeCoverageTutorRequestStatus(card.requestStatus) === "requested");
+  if (acceptedCards.length > 0) {
+    const acceptedNames = uniqueDashboardSummaryValues(acceptedCards.map(getCoverageRelatedPersonName));
+    const coveredSessionNumbers = uniqueDashboardSummaryValues(
+      acceptedCards.flatMap((card) => getCoverageRelatedSessionNumbers(card)),
+    );
+    const pendingNames = uniqueDashboardSummaryValues(requestedCards.map(getCoverageRelatedPersonName));
+    const pendingSessionNumbers = uniqueDashboardSummaryValues(
+      requestedCards.flatMap((card) => getCoverageRelatedSessionNumbers(card)),
+    );
+    const primaryText = buildDashboardRelatedPersonLine("Accepted", formatDashboardRelatedPersonList(acceptedNames));
+    const secondaryText = coveredSessionNumbers.length > 0
+      ? buildDashboardRelatedPersonLine("Covered sessions", coveredSessionNumbers.join(", "))
+      : "Tutor accepted";
+    const pendingLine = pendingNames.length > 0
+      ? `Pending: ${formatDashboardRelatedPersonList(pendingNames)}${pendingSessionNumbers.length > 0 ? ` for ${pendingSessionNumbers.join(", ")}` : ""}`
+      : "";
+
+    return {
+      primaryText,
+      secondaryText,
+      tertiaryText: pendingLine,
+      searchTerms: [
+        primaryText,
+        secondaryText,
+        pendingLine,
+        ...acceptedNames,
+        ...coveredSessionNumbers,
+        ...pendingNames,
+        ...pendingSessionNumbers,
+        ...acceptedCards.flatMap((card) => [card.tutorEmail, card.coachEmail]),
+        ...requestedCards.flatMap((card) => [card.tutorEmail, card.coachEmail]),
+      ],
+    };
+  }
+
+  const relatedCard = requestedCards[0] || relatedCards[0];
   const personName = getCoverageRelatedPersonName(relatedCard);
   const sessionNumbers = getCoverageRelatedSessionNumbers(relatedCard);
   const sessionLine = sessionNumbers.length > 0 ? `Session number: ${sessionNumbers.join(", ")}` : "";

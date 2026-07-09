@@ -290,6 +290,7 @@ COVERAGE_SLA_STAGE_WARNING = "warning"
 COVERAGE_SLA_STAGE_ESCALATED = "escalated"
 COVERAGE_SLA_STAGES = {COVERAGE_SLA_STAGE_WARNING, COVERAGE_SLA_STAGE_ESCALATED}
 COVERAGE_SLA_STATE_METADATA_KEY = "coverage_sla_state"
+COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY = "coverage_original_sessions"
 COVERAGE_SLA_BREACH_LEAD_TIME = timedelta(days=3)
 COVERAGE_SLA_ESCALATION_AFTER = timedelta(days=1)
 SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE = "coverage_session_deadline"
@@ -6141,6 +6142,54 @@ def build_coverage_session_items_from_inquiry_details(parsed_inquiry: dict[str, 
     return sessions
 
 
+def normalize_coverage_original_session_items(value: Any, inquiry: Any = "") -> list[dict[str, Any]]:
+    raw_items: Any = value
+    if isinstance(raw_items, str):
+        try:
+            parsed_items = json.loads(raw_items)
+        except json.JSONDecodeError:
+            parsed_items = []
+        raw_items = parsed_items
+
+    normalized_items: list[dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        seen_ids: set[str] = set()
+        for index, raw_item in enumerate(raw_items):
+            item = normalize_json_object(raw_item)
+            if not item:
+                continue
+
+            session_id = sanitize_text(item.get("id")) or f"session-{index + 1}"
+            if session_id in seen_ids:
+                continue
+            seen_ids.add(session_id)
+            normalized_items.append(
+                {
+                    "id": session_id,
+                    "label": sanitize_text(item.get("label")) or f"Session {index + 1}",
+                    "date": sanitize_text(item.get("date")),
+                    "number": sanitize_text(item.get("number") or item.get("sessionNumber")),
+                    "subject": sanitize_text(item.get("subject")),
+                }
+            )
+
+    if normalized_items:
+        return normalized_items
+
+    return [
+        {
+            "id": f"session-{session_item['index']}",
+            "label": f"Session {session_item['index']}",
+            "date": sanitize_text(session_item.get("date")),
+            "number": sanitize_text(session_item.get("sessionNumber")),
+            "subject": sanitize_text(session_item.get("subject")),
+        }
+        for session_item in build_coverage_session_items_from_inquiry_details(
+            parse_coverage_inquiry_details(inquiry)
+        )
+    ]
+
+
 def build_coverage_session_ids_from_inquiry(inquiry: Any) -> list[str]:
     return [
         f"session-{session_item['index']}"
@@ -6148,6 +6197,107 @@ def build_coverage_session_ids_from_inquiry(inquiry: Any) -> list[str]:
             parse_coverage_inquiry_details(inquiry)
         )
     ]
+
+
+def build_coverage_original_session_ids(
+    *,
+    metadata: Any = None,
+    documentation: Any = None,
+    inquiry: Any = "",
+) -> list[str]:
+    return [
+        item["id"]
+        for item in build_coverage_original_session_items(
+            metadata=metadata,
+            documentation=documentation,
+            inquiry=inquiry,
+        )
+        if sanitize_text(item.get("id"))
+    ]
+
+
+def build_coverage_original_session_items(
+    *,
+    metadata: Any = None,
+    documentation: Any = None,
+    inquiry: Any = "",
+) -> list[dict[str, Any]]:
+    metadata_payload = normalize_json_object(metadata)
+    documentation_payload = normalize_json_object(documentation)
+    return normalize_coverage_original_session_items(
+        metadata_payload.get(COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY)
+        or documentation_payload.get("coverageOriginalSessions")
+        or documentation_payload.get("coverageSessions"),
+        inquiry,
+    )
+
+
+def normalize_coverage_session_match_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", sanitize_text(value).lower()).strip()
+
+
+def infer_coverage_card_session_ids_from_details(
+    card: dict[str, Any],
+    original_session_items: list[dict[str, Any]],
+) -> list[str]:
+    session_details = sanitize_text(card.get("sessionDetails"))
+    if not session_details or not original_session_items:
+        return []
+
+    detail_lines = [
+        normalize_coverage_session_match_text(line)
+        for line in session_details.splitlines()
+        if normalize_coverage_session_match_text(line)
+    ]
+    if not detail_lines:
+        detail_lines = [normalize_coverage_session_match_text(session_details)]
+
+    matched_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for item in original_session_items:
+        session_id = sanitize_text(item.get("id"))
+        if not session_id or session_id in seen_ids:
+            continue
+
+        date_text = normalize_coverage_session_match_text(item.get("date"))
+        number_text = normalize_coverage_session_match_text(item.get("number") or item.get("sessionNumber"))
+        subject_text = normalize_coverage_session_match_text(item.get("subject"))
+        for line in detail_lines:
+            date_matches = bool(date_text and date_text in line)
+            number_matches = bool(
+                number_text
+                and re.search(rf"(?:^|\b)(?:no\.?|number)?\s*{re.escape(number_text)}(?:\b|$)", line)
+            )
+            subject_matches = bool(subject_text and subject_text in line)
+            if date_matches or (number_matches and (subject_matches or not subject_text)):
+                seen_ids.add(session_id)
+                matched_ids.append(session_id)
+                break
+
+    return matched_ids
+
+
+def get_coverage_card_covered_session_ids(
+    card: dict[str, Any],
+    original_session_items: list[dict[str, Any]],
+) -> list[str]:
+    selected_session_ids = get_coverage_card_selected_session_ids(card)
+    if selected_session_ids:
+        return selected_session_ids
+
+    session_file_ids = get_coverage_card_session_file_ids(card)
+    if session_file_ids:
+        return session_file_ids
+
+    inferred_session_ids = infer_coverage_card_session_ids_from_details(card, original_session_items)
+    if inferred_session_ids:
+        return inferred_session_ids
+
+    if len(original_session_items) == 1:
+        session_id = sanitize_text(original_session_items[0].get("id"))
+        return [session_id] if session_id else []
+
+    return []
 
 
 def get_coverage_card_selected_session_ids(card: dict[str, Any]) -> list[str]:
@@ -6166,31 +6316,37 @@ def get_coverage_card_session_file_ids(card: dict[str, Any]) -> list[str]:
     return session_ids
 
 
-def is_coverage_tutor_acceptance_complete(documentation: dict[str, Any], inquiry: Any = "") -> bool:
-    original_session_ids = build_coverage_session_ids_from_inquiry(
-        normalize_json_object(documentation).get("inquiry") or inquiry
+def is_coverage_tutor_acceptance_complete(
+    documentation: dict[str, Any],
+    inquiry: Any = "",
+    metadata: Any = None,
+) -> bool:
+    documentation_payload = normalize_json_object(documentation)
+    original_session_items = build_coverage_original_session_items(
+        metadata=metadata,
+        documentation=documentation_payload,
+        inquiry=documentation_payload.get("inquiry") or inquiry,
     )
+    original_session_ids = [
+        item["id"]
+        for item in original_session_items
+        if sanitize_text(item.get("id"))
+    ]
     if not original_session_ids:
         return True
 
     original_session_id_set = set(original_session_ids)
     covered_session_ids: set[str] = set()
-    for raw_card in normalize_json_object(documentation).get("coverageCards") or []:
+    for raw_card in documentation_payload.get("coverageCards") or []:
         card = normalize_json_object(raw_card)
         if sanitize_text(card.get("type")) != "tutor_choice":
             continue
         if sanitize_text(card.get("requestStatus")).lower() != "accepted":
             continue
 
-        selected_session_ids = get_coverage_card_selected_session_ids(card)
-        if not selected_session_ids:
-            selected_session_ids = get_coverage_card_session_file_ids(card)
-        if not selected_session_ids:
-            return True
-
         covered_session_ids.update(
             session_id
-            for session_id in selected_session_ids
+            for session_id in get_coverage_card_covered_session_ids(card, original_session_items)
             if session_id in original_session_id_set
         )
 
@@ -17847,6 +18003,7 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
         acceptance_complete = outcome == "accepted" and is_coverage_tutor_acceptance_complete(
             documentation,
             inquiry=ticket.get("inquiry"),
+            metadata=ticket_metadata,
         )
         next_status = "Closed" if acceptance_complete else "Pending"
         next_status_reason = STATUS_REASON_TUTOR_ACCEPTED if outcome == "accepted" else STATUS_REASON_TUTOR_REJECTED
@@ -20344,6 +20501,13 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 "requester_source": requester_source or None,
                 "subject": subject,
             }
+            if technical_subcategory == "Coverage":
+                coverage_original_sessions = normalize_coverage_original_session_items(
+                    payload.get("coverageSessions"),
+                    inquiry,
+                )
+                if coverage_original_sessions:
+                    ticket_metadata[COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY] = coverage_original_sessions
             if ai_team_request:
                 ticket_metadata[AI_TEAM_REQUEST_METADATA_KEY] = ai_team_request
             submitted_for_payload = build_submitted_for_learner_payload(

@@ -658,6 +658,15 @@ const InquiryDetails = () => {
             }
           : null
         : null;
+      const coverageSessions = isCoverageFlow
+        ? coverageSessionDates.map((sessionDate, index) => ({
+            id: `session-${index + 1}`,
+            label: `Session ${index + 1}`,
+            date: sessionDate,
+            number: selectedCoverageSessionNumbers[index] || "",
+            subject: selectedCoverageSessionSubjects[index] || "",
+          }))
+        : [];
 
       const nextTicket: Ticket = {
         ...ticket,
@@ -672,6 +681,7 @@ const InquiryDetails = () => {
         inquiry: submittedInquiry,
         aiTeamPersonName: isAiTeamFlow ? trimmedAiTeamPersonName : "",
         aiTeamPersonEmail: isAiTeamFlow ? trimmedAiTeamPersonEmail.toLowerCase() : "",
+        coverageSessions,
         submittedForLearner,
         notifySubmittedForLearner: Boolean(submittedForLearner && notifySubmittedForLearner && isValidEmailFormat(submittedForLearner.notificationEmail || "")),
         evidence,

@@ -195,9 +195,10 @@ describe("InquiryDetails", () => {
             tutor: "Ray",
             module: "APM",
             time: "Friday 12:00 - 14:00 | Fri-12 | Feb 2026",
-            sessionDates: ["Friday 06 Jun 2026"],
-            sessionNumbers: ["1"],
-            sessionSubject: "Assessment review",
+            sessionDates: ["Friday 06 Jun 2026", "Friday 13 Jun 2026"],
+            sessionNumbers: ["1", "2"],
+            sessionSubjects: ["Assessment review", "Mock exam"],
+            sessionSubject: "",
           }),
         },
       }),
@@ -220,9 +221,11 @@ describe("InquiryDetails", () => {
     expect(screen.getAllByText("Time").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Session Date").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Session No.").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Friday 06 Jun 2026").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /2 session dates selected/i })).toBeInTheDocument();
     expect(screen.getByDisplayValue("1")).toBeInTheDocument();
-    expect(screen.getByLabelText("Session Subject")).toHaveValue("Assessment review");
+    expect(screen.getByDisplayValue("2")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Session Subject")[0]).toHaveValue("Assessment review");
+    expect(screen.getAllByLabelText("Session Subject")[1]).toHaveValue("Mock exam");
     expect(screen.queryByText("Generated Inquiry Preview")).not.toBeInTheDocument();
   });
 
@@ -311,9 +314,10 @@ describe("InquiryDetails", () => {
             tutor: "Ray",
             module: "APM",
             time: "Friday 12:00 - 14:00 | Fri-12 | Feb 2026",
-            sessionDates: ["Friday 06 Jun 2026"],
-            sessionNumbers: ["1"],
-            sessionSubject: "Assessment review",
+            sessionDates: ["Friday 06 Jun 2026", "Friday 13 Jun 2026"],
+            sessionNumbers: ["1", "2"],
+            sessionSubjects: ["Assessment review", "Mock exam"],
+            sessionSubject: "",
           }),
         },
       }),
@@ -347,6 +351,26 @@ describe("InquiryDetails", () => {
         }),
       );
     });
+
+    const createCall = vi.mocked(global.fetch).mock.calls.find(([input]) => String(input) === "/api/tickets");
+    const formData = createCall?.[1]?.body as FormData;
+    expect(formData.get("technicalSubcategory")).toBe("Coverage");
+    expect(JSON.parse(String(formData.get("coverageSessions") || "[]"))).toEqual([
+      {
+        id: "session-1",
+        label: "Session 1",
+        date: "Friday 06 Jun 2026",
+        number: "1",
+        subject: "Assessment review",
+      },
+      {
+        id: "session-2",
+        label: "Session 2",
+        date: "Friday 13 Jun 2026",
+        number: "2",
+        subject: "Mock exam",
+      },
+    ]);
   });
 
   it("submits AI Team tickets directly with the person details", async () => {

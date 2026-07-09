@@ -89,6 +89,9 @@ export function buildTicketDraftFormData(currentTicket: Ticket) {
   formData.set("inquiry", currentTicket.inquiry);
   formData.set("aiTeamPersonName", currentTicket.aiTeamPersonName);
   formData.set("aiTeamPersonEmail", currentTicket.aiTeamPersonEmail);
+  if (currentTicket.technicalSubcategory === "Coverage" && currentTicket.coverageSessions.length > 0) {
+    formData.set("coverageSessions", JSON.stringify(currentTicket.coverageSessions));
+  }
   formData.set("submittedForLearnerId", currentTicket.submittedForLearner ? String(currentTicket.submittedForLearner.id) : "");
   formData.set("notifySubmittedForLearner", String(Boolean(currentTicket.submittedForLearner && currentTicket.notifySubmittedForLearner)));
   formData.set(

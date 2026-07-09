@@ -2280,9 +2280,27 @@ class SupportSessionValidationTests(SimpleTestCase):
                         "Tutor: Amgad\n"
                         "Module: PMP 3 Months\n"
                         "Preferred Time: Friday 09:00 - 11:00 | G1-Fri-9 | Oct 2024\n"
-                        "Session Date: Friday 18 Oct 2024\n"
-                        "Session Number: 1\n"
-                        "Session Subject: test"
+                        "Session Date: Friday 18 Oct 2024; Friday 25 Oct 2024\n"
+                        "Session Number: 1; 2\n"
+                        "Session Subject: test; workshop"
+                    ),
+                    "coverageSessions": json.dumps(
+                        [
+                            {
+                                "id": "session-1",
+                                "label": "Session 1",
+                                "date": "Friday 18 Oct 2024",
+                                "number": "1",
+                                "subject": "test",
+                            },
+                            {
+                                "id": "session-2",
+                                "label": "Session 2",
+                                "date": "Friday 25 Oct 2024",
+                                "number": "2",
+                                "subject": "workshop",
+                            },
+                        ]
                     ),
                     "evidence": [],
                 }
@@ -2300,6 +2318,10 @@ class SupportSessionValidationTests(SimpleTestCase):
         ticket_metadata = json.loads(ticket_insert_params[9])
         self.assertEqual(ticket_metadata["technical_subcategory"], "Coverage")
         self.assertEqual(ticket_metadata["requester_source"], "microsoft_entra")
+        self.assertEqual(
+            [session["id"] for session in ticket_metadata["coverage_original_sessions"]],
+            ["session-1", "session-2"],
+        )
         ticket_update_call = next(
             call for call in cursor.execute.call_args_list
             if "UPDATE tickets" in call.args[0] and "SET public_id" in call.args[0]
@@ -14480,6 +14502,254 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         webhook_payload = notify_response_mail.call_args.args[1]
         self.assertEqual(webhook_payload["ticket"]["status"], "Pending")
         self.assertEqual(webhook_payload["request"]["selectedSessionIds"], ["session-1", "session-2"])
+
+    def test_process_coverage_tutor_response_keeps_legacy_partial_details_pending(self):
+        inquiry = (
+            "Tutor: Test\n"
+            "Module: MSP\n"
+            "Preferred Time: Monday 09:00 - 11:00 | G1 Mon | Feb 2027\n"
+            "Session Date: Monday 17 Jul 2028; Monday 24 Jul 2028; Monday 31 Jul 2028; Monday 07 Aug 2028\n"
+            "Session Number: 2; 3; 4; 5\n"
+            "Session Subject: test; test; test; test"
+        )
+        ticket = {
+            "id": 56,
+            "public_id": "KBC-000056",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "technical_subcategory": "Coverage",
+            "inquiry": inquiry,
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "ticketId": "KBC-000056",
+                    "inquiry": inquiry,
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Test",
+                            "tutorEmail": "test@example.com",
+                            "sessionDetails": (
+                                "Module: MSP\n"
+                                "Sessions:\n"
+                                "1. Monday 17 Jul 2028 | No. 222222 | test\n"
+                                "2. Monday 24 Jul 2028 | No. 3 | test"
+                            ),
+                            "requestStatus": "requested",
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "token-legacy-partial",
+                            "locked": True,
+                        }
+                    ],
+                },
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000056"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000056",
+                    "responseToken": "token-legacy-partial",
+                    "outcome": "accepted",
+                    "message": "Can cover these two sessions",
+                }
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000056")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[0], "Pending")
+        self.assertEqual(update_params[1], "Tutor Accepted")
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["ticket"]["status"], "Pending")
+
+    def test_process_coverage_tutor_response_closes_when_accepted_cards_cover_all_sessions(self):
+        original_sessions = [
+            {"id": "session-1", "label": "Session 1", "date": "Friday 17 Jul 2026", "number": "7", "subject": "7"},
+            {"id": "session-2", "label": "Session 2", "date": "Friday 24 Jul 2026", "number": "8", "subject": "8"},
+            {"id": "session-3", "label": "Session 3", "date": "Friday 31 Jul 2026", "number": "9", "subject": "9"},
+            {"id": "session-4", "label": "Session 4", "date": "Friday 07 Aug 2026", "number": "10", "subject": "10"},
+        ]
+        ticket = {
+            "id": 55,
+            "public_id": "KBC-000055",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage session request",
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "coverage_original_sessions": original_sessions,
+                "admin_documentation": {
+                    "ticketId": "KBC-000055",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Nathan",
+                            "tutorEmail": "nathan@example.com",
+                            "sessionDetails": "Sessions:\n1. Friday 17 Jul 2026 | No. 7\n2. Friday 24 Jul 2026 | No. 8",
+                            "requestStatus": "accepted",
+                            "selectedSessionIds": ["session-1", "session-2"],
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "respondedAt": "2026-06-04T10:20:00Z",
+                            "responseToken": "token-1",
+                            "locked": True,
+                        },
+                        {
+                            "id": "card-2",
+                            "type": "tutor_choice",
+                            "tutor": "Sarah",
+                            "tutorEmail": "sarah@example.com",
+                            "sessionDetails": "Sessions:\n1. Friday 31 Jul 2026 | No. 9\n2. Friday 07 Aug 2026 | No. 10",
+                            "requestStatus": "requested",
+                            "selectedSessionIds": ["session-3", "session-4"],
+                            "submittedAt": "2026-06-04T10:15:00Z",
+                            "responseToken": "token-2",
+                            "locked": True,
+                        },
+                        {
+                            "id": "card-3",
+                            "type": "tutor_choice",
+                            "tutor": "Amgad",
+                            "tutorEmail": "amgad@example.com",
+                            "sessionDetails": "Sessions:\n1. Friday 17 Jul 2026 | No. 7",
+                            "requestStatus": "requested",
+                            "selectedSessionIds": ["session-1"],
+                            "submittedAt": "2026-06-04T10:16:00Z",
+                            "responseToken": "token-3",
+                            "locked": True,
+                        },
+                    ],
+                },
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000055"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000055",
+                    "cardId": "card-2",
+                    "responseToken": "token-2",
+                    "outcome": "accepted",
+                    "message": "Can cover the remaining sessions",
+                }
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000055")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[0], "Closed")
+        self.assertEqual(update_params[1], "Tutor Accepted")
+        persisted_metadata = json.loads(update_params[3])
+        persisted_cards = persisted_metadata["admin_documentation"]["coverageCards"]
+        self.assertEqual(persisted_cards[1]["requestStatus"], "accepted")
+        self.assertEqual(persisted_cards[2]["requestStatus"], "requested")
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["ticket"]["status"], "Closed")
+
+    def test_process_coverage_tutor_response_closes_legacy_full_details(self):
+        inquiry = (
+            "Tutor: Test\n"
+            "Module: MSP\n"
+            "Preferred Time: Monday 09:00 - 11:00 | G1 Mon | Feb 2027\n"
+            "Session Date: Monday 17 Jul 2028; Monday 24 Jul 2028; Monday 31 Jul 2028; Monday 07 Aug 2028\n"
+            "Session Number: 2; 3; 4; 5\n"
+            "Session Subject: test; test; test; test"
+        )
+        ticket = {
+            "id": 57,
+            "public_id": "KBC-000057",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "technical_subcategory": "Coverage",
+            "inquiry": inquiry,
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "admin_documentation": {
+                    "ticketId": "KBC-000057",
+                    "inquiry": inquiry,
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Test",
+                            "tutorEmail": "test@example.com",
+                            "sessionDetails": (
+                                "Module: MSP\n"
+                                "Sessions:\n"
+                                "1. Monday 17 Jul 2028 | No. 2 | test\n"
+                                "2. Monday 24 Jul 2028 | No. 3 | test\n"
+                                "3. Monday 31 Jul 2028 | No. 4 | test\n"
+                                "4. Monday 07 Aug 2028 | No. 5 | test"
+                            ),
+                            "requestStatus": "requested",
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "token-legacy-full",
+                            "locked": True,
+                        }
+                    ],
+                },
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000057"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000057",
+                    "responseToken": "token-legacy-full",
+                    "outcome": "accepted",
+                    "message": "Can cover all sessions",
+                }
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000057")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[0], "Closed")
+        self.assertEqual(update_params[1], "Tutor Accepted")
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["ticket"]["status"], "Closed")
 
     def test_process_coverage_tutor_response_sends_refusal_mail_webhook_on_rejection(self):
         ticket = {

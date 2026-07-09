@@ -36,6 +36,14 @@ export interface SubmittedForLearner {
   notificationEmail?: string;
 }
 
+export interface CoverageSessionPlanItem {
+  id: string;
+  label: string;
+  date: string;
+  number: string;
+  subject: string;
+}
+
 export interface Ticket {
   id: string;
   learnerName: string;
@@ -48,6 +56,7 @@ export interface Ticket {
   inquiry: string;
   aiTeamPersonName: string;
   aiTeamPersonEmail: string;
+  coverageSessions: CoverageSessionPlanItem[];
   submittedForLearner: SubmittedForLearner | null;
   notifySubmittedForLearner: boolean;
   evidence: EvidenceFile[];
@@ -86,6 +95,7 @@ const defaultTicket: Ticket = {
   inquiry: "",
   aiTeamPersonName: "",
   aiTeamPersonEmail: "",
+  coverageSessions: [],
   submittedForLearner: null,
   notifySubmittedForLearner: false,
   evidence: [],
@@ -215,6 +225,35 @@ function normalizeSubmittedForLearner(value: unknown): SubmittedForLearner | nul
   };
 }
 
+function normalizeCoverageSessionPlanItem(item: unknown, index: number): CoverageSessionPlanItem | null {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const payload = item as Partial<Record<keyof CoverageSessionPlanItem, unknown>>;
+  const id = normalizeString(payload.id) || `session-${index + 1}`;
+  const label = normalizeString(payload.label) || `Session ${index + 1}`;
+  const date = normalizeString(payload.date);
+  const number = normalizeString(payload.number);
+  const subject = normalizeString(payload.subject);
+  if (!id && !date && !number && !subject) {
+    return null;
+  }
+
+  return { id, label, date, number, subject };
+}
+
+function normalizeCoverageSessionPlan(value: unknown): CoverageSessionPlanItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item, index) => {
+    const normalizedItem = normalizeCoverageSessionPlanItem(item, index);
+    return normalizedItem ? [normalizedItem] : [];
+  });
+}
+
 function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
   const nextTicket = { ...defaultTicket, ...(ticket || {}) };
 
@@ -230,6 +269,7 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
     inquiry: normalizeString(nextTicket.inquiry),
     aiTeamPersonName: normalizeString(nextTicket.aiTeamPersonName),
     aiTeamPersonEmail: normalizeString(nextTicket.aiTeamPersonEmail),
+    coverageSessions: normalizeCoverageSessionPlan(nextTicket.coverageSessions),
     submittedForLearner: normalizeSubmittedForLearner(nextTicket.submittedForLearner),
     notifySubmittedForLearner: Boolean(nextTicket.notifySubmittedForLearner),
     evidence: Array.isArray(nextTicket.evidence) ? nextTicket.evidence : [],
@@ -272,6 +312,7 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     inquiry: ticket.inquiry,
     aiTeamPersonName: ticket.aiTeamPersonName,
     aiTeamPersonEmail: ticket.aiTeamPersonEmail,
+    coverageSessions: ticket.coverageSessions,
     submittedForLearner: ticket.submittedForLearner,
     notifySubmittedForLearner: ticket.notifySubmittedForLearner,
     status: ticket.status,
