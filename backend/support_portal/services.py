@@ -6224,12 +6224,28 @@ def build_coverage_original_session_items(
 ) -> list[dict[str, Any]]:
     metadata_payload = normalize_json_object(metadata)
     documentation_payload = normalize_json_object(documentation)
-    return normalize_coverage_original_session_items(
-        metadata_payload.get(COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY)
-        or documentation_payload.get("coverageOriginalSessions")
-        or documentation_payload.get("coverageSessions"),
-        inquiry,
-    )
+    candidate_session_item_sets = [
+        normalize_coverage_original_session_items(
+            metadata_payload.get(COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY),
+            "",
+        ),
+        normalize_coverage_original_session_items(
+            documentation_payload.get("coverageOriginalSessions"),
+            "",
+        ),
+        normalize_coverage_original_session_items(
+            documentation_payload.get("coverageSessions"),
+            "",
+        ),
+        normalize_coverage_original_session_items(None, inquiry),
+    ]
+    candidate_session_item_sets = [items for items in candidate_session_item_sets if items]
+    if not candidate_session_item_sets:
+        return []
+
+    # Prefer the widest reliable session plan. This prevents a partial tutor card
+    # snapshot from replacing the original request and closing the ticket early.
+    return max(candidate_session_item_sets, key=len)
 
 
 def normalize_coverage_session_match_text(value: Any) -> str:

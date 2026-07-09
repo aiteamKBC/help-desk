@@ -14577,6 +14577,85 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         webhook_payload = notify_response_mail.call_args.args[1]
         self.assertEqual(webhook_payload["ticket"]["status"], "Pending")
 
+    def test_process_coverage_tutor_response_prefers_widest_original_session_plan(self):
+        inquiry = (
+            "Tutor: Test\n"
+            "Module: EVM\n"
+            "Preferred Time: Thursday 09:00 - 11:00 | Route A | Credit Cohort Copy\n"
+            "Session Date: Thursday 22 Jun 2028; Thursday 29 Jun 2028; Thursday 06 Jul 2028; Thursday 13 Jul 2028\n"
+            "Session Number: 3; 4; 5; 6\n"
+            "Session Subject: test; test; test; test"
+        )
+        ticket = {
+            "id": 58,
+            "public_id": "KBC-000058",
+            "status": "Pending",
+            "status_reason": "Tutor Requested",
+            "technical_subcategory": "Coverage",
+            "inquiry": inquiry,
+            "assigned_team": "Unassigned",
+            "assigned_agent_id": None,
+            "sla_status": "On Track",
+            "created_at": datetime(2026, 6, 4, 10, 0, tzinfo=timezone.utc),
+            "conversation_id": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "coverage_original_sessions": [
+                    {"id": "session-1", "label": "Session 1", "date": "Thursday 22 Jun 2028", "number": "3333333", "subject": "test"},
+                    {"id": "session-2", "label": "Session 2", "date": "Thursday 29 Jun 2028", "number": "4", "subject": "test"},
+                ],
+                "admin_documentation": {
+                    "ticketId": "KBC-000058",
+                    "inquiry": inquiry,
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Test",
+                            "tutorEmail": "test@example.com",
+                            "sessionDetails": (
+                                "Module: EVM\n"
+                                "Sessions:\n"
+                                "1. Thursday 22 Jun 2028 | No. 3333333 | test\n"
+                                "2. Thursday 29 Jun 2028 | No. 4 | test"
+                            ),
+                            "requestStatus": "requested",
+                            "selectedSessionIds": ["session-1", "session-2"],
+                            "submittedAt": "2026-06-04T10:10:00Z",
+                            "responseToken": "token-widest-plan",
+                            "locked": True,
+                        }
+                    ],
+                },
+            },
+        }
+        mock_connection, cursor = self.build_mock_connection()
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event"),
+            patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
+            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000058"}}),
+        ):
+            response = services.process_coverage_tutor_response(
+                {
+                    "ticketId": "KBC-000058",
+                    "responseToken": "token-widest-plan",
+                    "outcome": "accepted",
+                    "message": "Can cover these two sessions",
+                }
+            )
+
+        self.assertEqual(response["ticket"]["id"], "KBC-000058")
+        update_params = cursor.execute.call_args_list[0].args[1]
+        self.assertEqual(update_params[0], "Pending")
+        self.assertEqual(update_params[1], "Tutor Accepted")
+        webhook_payload = notify_response_mail.call_args.args[1]
+        self.assertEqual(webhook_payload["ticket"]["status"], "Pending")
+
     def test_process_coverage_tutor_response_closes_when_accepted_cards_cover_all_sessions(self):
         original_sessions = [
             {"id": "session-1", "label": "Session 1", "date": "Friday 17 Jul 2026", "number": "7", "subject": "7"},
