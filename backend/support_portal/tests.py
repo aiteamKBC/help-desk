@@ -12691,6 +12691,77 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(insert_history_event.call_args_list[0].args[1], "status_changed")
         self.assertEqual(insert_history_event.call_args_list[1].args[1], "coverage_tutor_response")
 
+    def test_synchronize_coverage_tutor_workflow_ticket_keeps_partial_acceptance_pending(self):
+        original_sessions = [
+            {"id": "session-1", "label": "Session 1", "date": "Thursday 22 Jun 2028", "number": "3", "subject": "test"},
+            {"id": "session-2", "label": "Session 2", "date": "Thursday 29 Jun 2028", "number": "4", "subject": "test"},
+            {"id": "session-3", "label": "Session 3", "date": "Thursday 06 Jul 2028", "number": "5", "subject": "test"},
+            {"id": "session-4", "label": "Session 4", "date": "Thursday 13 Jul 2028", "number": "6", "subject": "test"},
+        ]
+        ticket = {
+            "id": 646,
+            "public_id": "KBC-000646",
+            "learner_name": "Test",
+            "learner_email": "hamamoa842@example.com",
+            "learner_phone": "",
+            "category": "Technical",
+            "technical_subcategory": "Coverage",
+            "inquiry": "Coverage session request",
+            "status": "Pending",
+            "status_reason": "Tutor Accepted",
+            "priority": "Normal",
+            "assigned_agent_id": None,
+            "assigned_agent_name": None,
+            "assigned_agent_username": None,
+            "assigned_team": "Unassigned",
+            "conversation_id": None,
+            "conversation_metadata": {},
+            "conversation_status": None,
+            "chat_duration_minutes": 0,
+            "last_message_at": None,
+            "metadata": {
+                "technical_subcategory": "Coverage",
+                "coverage_original_sessions": original_sessions,
+                "admin_documentation": {
+                    "ticketId": "KBC-000646",
+                    "coverageCards": [
+                        {
+                            "id": "card-1",
+                            "type": "tutor_choice",
+                            "tutor": "Test",
+                            "tutorEmail": "test@example.com",
+                            "sessionDetails": (
+                                "1. Thursday 22 Jun 2028 | No. 3333333 | test\n"
+                                "2. Thursday 29 Jun 2028 | No. 4 | test"
+                            ),
+                            "requestStatus": "accepted",
+                            "selectedSessionIds": ["session-1", "session-2"],
+                            "submittedAt": "2026-07-09T10:10:00Z",
+                            "respondedAt": "2026-07-09T10:38:00Z",
+                            "responseToken": "token-1",
+                            "locked": True,
+                        }
+                    ],
+                },
+            },
+            "sla_status": "On Track",
+            "sla_attention_required": False,
+            "evidence_count": 0,
+            "created_at": datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 7, 9, 10, 40, tzinfo=timezone.utc),
+        }
+
+        with (
+            patch.object(services, "connection"),
+            patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            synchronized_ticket = services.synchronize_coverage_tutor_workflow_ticket(ticket)
+
+        self.assertEqual(synchronized_ticket["status"], "Pending")
+        self.assertIsNone(synchronized_ticket.get("closed_at"))
+        insert_history_event.assert_not_called()
+
     def test_synchronize_coverage_tutor_workflow_ticket_builds_accepted_cards_from_inquiry_when_missing(self):
         ticket = {
             "id": 353,

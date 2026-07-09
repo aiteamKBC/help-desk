@@ -7678,7 +7678,12 @@ def synchronize_coverage_tutor_workflow_ticket(
         else sanitize_text(ticket.get("status_reason"))
     )
     status_reason_changed = next_status_reason != sanitize_text(ticket.get("status_reason"))
-    next_status = "Closed" if effective_outcome == "accepted" else sanitize_text(ticket.get("status")) or "Pending"
+    acceptance_complete = effective_outcome == "accepted" and is_coverage_tutor_acceptance_complete(
+        derived_documentation,
+        inquiry=ticket.get("inquiry"),
+        metadata=ticket_metadata,
+    )
+    next_status = "Closed" if acceptance_complete else sanitize_text(ticket.get("status")) or "Pending"
     status_changed = next_status != sanitize_text(ticket.get("status"))
 
     if not documentation_changed and not latest_response_changed and not status_changed and not status_reason_changed:
