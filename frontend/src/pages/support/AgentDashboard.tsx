@@ -1998,7 +1998,9 @@ const AgentDashboard = () => {
     && hasPendingDashboardPageRequest,
   );
   const dashboardDisplayedTickets = activeServerDashboardPagination
-    ? serverDashboardTickets
+    ? serverDashboardTickets.filter((ticket) => (
+      dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
+    ))
     : shouldShowDashboardTableSkeleton
       ? emptyTicketSummaryList
       : visibleDashboardTickets;
@@ -6833,11 +6835,21 @@ const AgentDashboard = () => {
                                     "truncate font-semibold",
                                     relatedPersonSummary.isMuted ? "text-muted-foreground" : "text-foreground",
                                   )}
-                                  title={relatedPersonSummary.primaryText}
+                                  title={relatedPersonSummary.primaryTooltip || relatedPersonSummary.primaryText}
                                 >
                                   {relatedPersonSummary.primaryText}
                                 </div>
-                                {relatedPersonSummary.secondaryText ? (
+                                {relatedPersonSummary.detailLines.length > 0 ? (
+                                  relatedPersonSummary.detailLines.map((detailLine, detailLineIndex) => (
+                                    <div
+                                      key={`${detailLine}-${detailLineIndex}`}
+                                      className="mt-1 truncate text-xs text-muted-foreground"
+                                      title={detailLine}
+                                    >
+                                      {detailLine}
+                                    </div>
+                                  ))
+                                ) : relatedPersonSummary.secondaryText ? (
                                   <div
                                     className="mt-1 truncate text-xs text-muted-foreground"
                                     title={relatedPersonSummary.secondaryText}
@@ -17777,8 +17789,10 @@ type DashboardRelatedPersonSummarySubject = Pick<
 
 type DashboardRelatedPersonSummary = {
   primaryText: string;
+  primaryTooltip?: string;
   secondaryText: string;
   tertiaryText: string;
+  detailLines: string[];
   searchTerms: string[];
   isMuted?: boolean;
 };
@@ -17825,16 +17839,32 @@ function getCoverageRelatedSessionNumbers(card: Pick<CoverageWorkflowCard, "sele
   );
 }
 
+function sortDashboardSessionNumbers(values: string[]) {
+  return [...values].sort((a, b) => {
+    const numericA = Number(a);
+    const numericB = Number(b);
+    if (Number.isFinite(numericA) && Number.isFinite(numericB)) {
+      return numericA - numericB;
+    }
+
+    return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+  });
+}
+
+const DASHBOARD_RELATED_PERSON_LIST_VISIBLE_LIMIT = 3;
+
 function formatDashboardRelatedPersonList(values: string[]) {
   const uniqueValues = uniqueDashboardSummaryValues(values);
   if (uniqueValues.length === 0) {
     return "";
   }
-  if (uniqueValues.length === 1) {
-    return uniqueValues[0];
+  if (uniqueValues.length <= DASHBOARD_RELATED_PERSON_LIST_VISIBLE_LIMIT) {
+    return uniqueValues.join(", ");
   }
 
-  return `${uniqueValues[0]} + ${uniqueValues.length - 1} more`;
+  const visibleValues = uniqueValues.slice(0, DASHBOARD_RELATED_PERSON_LIST_VISIBLE_LIMIT);
+  const remainingCount = uniqueValues.length - visibleValues.length;
+  return `${visibleValues.join(", ")} + ${remainingCount} more`;
 }
 
 function getDashboardCoverageRelatedPersonSummary(
@@ -17848,6 +17878,7 @@ function getDashboardCoverageRelatedPersonSummary(
       primaryText: "No tutor card yet",
       secondaryText: "Coverage details pending",
       tertiaryText: "",
+      detailLines: [],
       searchTerms: ["No tutor card yet", "Coverage details pending"],
       isMuted: true,
     };
@@ -17857,31 +17888,37 @@ function getDashboardCoverageRelatedPersonSummary(
   const requestedCards = relatedCards.filter((card) => normalizeCoverageTutorRequestStatus(card.requestStatus) === "requested");
   if (acceptedCards.length > 0) {
     const acceptedNames = uniqueDashboardSummaryValues(acceptedCards.map(getCoverageRelatedPersonName));
-    const coveredSessionNumbers = uniqueDashboardSummaryValues(
-      acceptedCards.flatMap((card) => getCoverageRelatedSessionNumbers(card)),
-    );
+    const acceptedTutorLines = acceptedNames.map((name) => {
+      const sessionNumbers = sortDashboardSessionNumbers(
+        uniqueDashboardSummaryValues(
+          acceptedCards
+            .filter((card) => getCoverageRelatedPersonName(card) === name)
+            .flatMap((card) => getCoverageRelatedSessionNumbers(card)),
+        ),
+      );
+      return sessionNumbers.length > 0 ? `${name}: ${sessionNumbers.join(", ")}` : name;
+    });
     const pendingNames = uniqueDashboardSummaryValues(requestedCards.map(getCoverageRelatedPersonName));
-    const pendingSessionNumbers = uniqueDashboardSummaryValues(
-      requestedCards.flatMap((card) => getCoverageRelatedSessionNumbers(card)),
+    const pendingSessionNumbers = sortDashboardSessionNumbers(
+      uniqueDashboardSummaryValues(requestedCards.flatMap((card) => getCoverageRelatedSessionNumbers(card))),
     );
     const primaryText = buildDashboardRelatedPersonLine("Accepted", formatDashboardRelatedPersonList(acceptedNames));
-    const secondaryText = coveredSessionNumbers.length > 0
-      ? buildDashboardRelatedPersonLine("Covered sessions", coveredSessionNumbers.join(", "))
-      : "Tutor accepted";
+    const primaryTooltip = buildDashboardRelatedPersonLine("Accepted", acceptedNames.join(", "));
     const pendingLine = pendingNames.length > 0
       ? `Pending: ${formatDashboardRelatedPersonList(pendingNames)}${pendingSessionNumbers.length > 0 ? ` for ${pendingSessionNumbers.join(", ")}` : ""}`
       : "";
 
     return {
       primaryText,
-      secondaryText,
+      primaryTooltip,
+      secondaryText: "",
       tertiaryText: pendingLine,
+      detailLines: acceptedTutorLines,
       searchTerms: [
         primaryText,
-        secondaryText,
         pendingLine,
+        ...acceptedTutorLines,
         ...acceptedNames,
-        ...coveredSessionNumbers,
         ...pendingNames,
         ...pendingSessionNumbers,
         ...acceptedCards.flatMap((card) => [card.tutorEmail, card.coachEmail]),
@@ -17892,7 +17929,7 @@ function getDashboardCoverageRelatedPersonSummary(
 
   const relatedCard = requestedCards[0] || relatedCards[0];
   const personName = getCoverageRelatedPersonName(relatedCard);
-  const sessionNumbers = getCoverageRelatedSessionNumbers(relatedCard);
+  const sessionNumbers = sortDashboardSessionNumbers(getCoverageRelatedSessionNumbers(relatedCard));
   const sessionLine = sessionNumbers.length > 0 ? `Session number: ${sessionNumbers.join(", ")}` : "";
   const statusLabel = getCoverageTutorCardStatusLabel(
     relatedCard.requestStatus,
@@ -17904,6 +17941,7 @@ function getDashboardCoverageRelatedPersonSummary(
     primaryText: personName,
     secondaryText: sessionLine,
     tertiaryText: statusLine,
+    detailLines: [],
     searchTerms: [personName, sessionLine, statusLine, relatedCard.tutorEmail, relatedCard.coachEmail],
   };
 }
@@ -17919,6 +17957,7 @@ function getDashboardAiTeamRelatedPersonSummary(
     primaryText: personName,
     secondaryText: subjectLine,
     tertiaryText: issueLine,
+    detailLines: [],
     searchTerms: [personName, subjectLine, issueLine],
     isMuted: personName === "AI Team request",
   };
