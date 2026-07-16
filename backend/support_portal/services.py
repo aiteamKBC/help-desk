@@ -21163,6 +21163,7 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
               t.category,
               t.technical_subcategory,
               t.subject,
+              t.inquiry,
               t.submitted_for_learner_id,
               t.priority,
               t.status,
