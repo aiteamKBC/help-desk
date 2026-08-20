@@ -63,6 +63,7 @@ from .services import (
     get_ticket_chat_history_response,
     get_ticket_chat_context_response,
     get_verify_email_response,
+    list_public_requester_tickets,
     add_entra_agent,
     list_admin_tickets,
     get_admin_ticket_metrics,
@@ -498,6 +499,15 @@ def migration_status(_request):
 def verify_email(request):
     try:
         return JsonResponse(get_verify_email_response(parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def public_requester_tickets(request):
+    try:
+        return JsonResponse(list_public_requester_tickets(parse_json_body(request)))
     except Exception as error:
         return handle_api_error(error)
 

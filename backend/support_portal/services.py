@@ -8559,6 +8559,124 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
     )
 
 
+def serialize_public_requester_ticket(
+    ticket: dict[str, Any],
+    *,
+    requester_email: str,
+    requester_name: str,
+    requester_role: str,
+    requester_source: str,
+) -> dict[str, Any]:
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    ticket_requester_role = apply_public_requester_role_overrides(
+        requester_email,
+        get_ticket_requester_role(ticket_metadata, default=requester_role),
+    )
+    ticket_requester_source = get_ticket_requester_source(ticket_metadata, default=requester_source)
+    ai_team_request = get_ai_team_request(ticket_metadata)
+    serialized_ticket = {
+        "id": ticket["public_id"],
+        "learnerName": requester_name,
+        "requesterName": requester_name,
+        "email": requester_email,
+        "requesterRole": ticket_requester_role,
+        "category": ticket["category"],
+        "technicalSubcategory": ticket.get("technical_subcategory") or "",
+        "subject": sanitize_text(ticket.get("subject")),
+        "inquiry": ticket.get("inquiry") or "",
+        "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+        "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
+        "status": ticket["status"],
+        "statusReason": ticket.get("status_reason") or "",
+        "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
+        "assignedTeam": ticket.get("assigned_team") or "Unassigned",
+        "slaStatus": ticket["sla_status"],
+        "createdAt": ticket["created_at"],
+        "updatedAt": ticket.get("updated_at") or ticket["created_at"],
+        "chatState": derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status")),
+        "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
+    }
+    if ticket_requester_source:
+        serialized_ticket["requesterSource"] = ticket_requester_source
+    return serialized_ticket
+
+
+def list_public_requester_tickets(payload: dict[str, Any]) -> dict[str, Any]:
+    email = normalize_email(payload.get("email"))
+
+    if not is_valid_email(email):
+        raise ApiError(400, "Please enter a valid email address.")
+
+    requester = resolve_public_support_requester(email)
+    if not requester:
+        raise ApiError(404, "This email is not registered in our records.")
+
+    learner = requester.get("learner")
+    requester_role = requester["role"]
+    requester_source = get_public_requester_source(requester)
+    requester_name = requester.get("display_name") or (learner.get("full_name") if learner else "")
+    response = {
+        "exists": True,
+        "requesterRole": requester_role,
+        "requesterSource": requester_source,
+        "learner": {
+            "id": learner["id"] if learner else None,
+            "fullName": requester_name,
+            "email": email,
+        },
+        "tickets": [],
+    }
+
+    if not learner:
+        return response
+
+    tickets = run_query(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          t.category,
+          t.technical_subcategory,
+          t.subject,
+          t.submitted_for_learner_id,
+          t.inquiry,
+          t.status,
+          t.status_reason,
+          t.assigned_agent_id,
+          t.assigned_team,
+          t.sla_status,
+          t.created_at,
+          t.updated_at,
+          t.metadata,
+          c.status AS conversation_status,
+          c.metadata AS conversation_metadata
+        FROM tickets t
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        WHERE t.learner_id = %s
+          AND COALESCE(t.is_archived, FALSE) = FALSE
+        ORDER BY t.updated_at DESC, t.id DESC
+        LIMIT 25
+        """,
+        [int(learner["id"])],
+    )
+
+    response["tickets"] = [
+        {
+            **serialize_public_requester_ticket(
+                ticket,
+                requester_email=email,
+                requester_name=requester_name,
+                requester_role=requester_role,
+                requester_source=requester_source,
+            ),
+            "bookingSummary": get_latest_ticket_booking_summary(int(ticket["id"])),
+        }
+        for ticket in tickets
+    ]
+    return response
+
+
 def is_chat_locked_for_learner(ticket_status: Any, ticket_status_reason: Any) -> bool:
     return sanitize_text(ticket_status) == "Pending" and sanitize_text(ticket_status_reason) in {
         STATUS_REASON_AWAITING_MEETING,

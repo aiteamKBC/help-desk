@@ -14,6 +14,7 @@ urlpatterns = [
     path("public/coverage-attachments/<str:public_id>/<int:attachment_id>/download", views.public_coverage_attachment_download, name="public-coverage-attachment-download"),
     path("public/support-notification-attachments/<str:public_id>/<int:attachment_id>/download", views.public_support_notification_attachment_download, name="public-support-notification-attachment-download"),
     path("verify-email", views.verify_email, name="verify-email"),
+    path("my-tickets", views.public_requester_tickets, name="public-requester-tickets"),
     path("admin/login", views.admin_login, name="admin-login"),
     path("admin/microsoft/login", views.admin_microsoft_login, name="admin-microsoft-login"),
     path("admin/microsoft/callback", views.admin_microsoft_callback, name="admin-microsoft-callback"),

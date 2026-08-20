@@ -12,6 +12,7 @@ import ChatSupport from "./pages/support/ChatSupport.tsx";
 import EmbeddedBooking from "./pages/support/EmbeddedBooking.tsx";
 import BookingConfirmed from "./pages/support/BookingConfirmed.tsx";
 import TicketStatus from "./pages/support/TicketStatus.tsx";
+import MyTickets from "./pages/support/MyTickets.tsx";
 import Documentation from "./pages/support/Documentation.tsx";
 import AgentDashboard from "./pages/support/AgentDashboard.tsx";
 import AdminLogin from "./pages/support/AdminLogin.tsx";
@@ -38,6 +39,7 @@ const App = () => (
             <Route path="/support/booking" element={<EmbeddedBooking />} />
             <Route path="/support/booking-confirmed" element={<BookingConfirmed />} />
             <Route path="/support/status" element={<TicketStatus />} />
+            <Route path="/support/my-tickets" element={<MyTickets />} />
             <Route path="/support/docs" element={<Documentation />} />
             <Route path="/admin/login" element={<AdminLogin />} />
             <Route path="/admin" element={<RequireAdmin allowedRoles={supportDashboardRoles}><AgentDashboard /></RequireAdmin>} />
