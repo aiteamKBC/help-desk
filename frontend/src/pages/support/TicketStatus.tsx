@@ -17,6 +17,18 @@ import { canReturnToChat, getSupportResumePath, isAwaitingMeetingTicket, isAwait
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import { toast } from "sonner";
 
+const getDisplayedTicketStatus = (status: unknown, statusReason: unknown) => {
+  if (status === "Open" || status === "Pending" || status === "Closed") {
+    return status;
+  }
+
+  if (statusReason === quickTicketReason || status === quickTicketReason) {
+    return "Pending";
+  }
+
+  return "-";
+};
+
 const TicketStatus = () => {
   const navigate = useNavigate();
   const { ticket, bookingSummary, updateTicket, setBookingSummary, clearBookingSummary } = useSupport();
@@ -26,14 +38,12 @@ const TicketStatus = () => {
   const isReservationConfirmed = Boolean(bookingSummary?.reservationConfirmed);
   const hasStatusStep = shouldShowStatusStep(ticket, bookingSummary);
   const canCancelMeeting = hasBookingSummary || isAwaitingMeeting;
-  const displayedStatusReason = ticket.technicalSubcategory === "Coverage" && ticket.statusReason === quickTicketReason
-    ? "Coverage Ticket"
-    : (ticket.statusReason || ticket.status);
   const hasLocalChatTranscript = ticket.chatHistory.some((message) => message.source !== "intro");
   const [serverChatHistoryCount, setServerChatHistoryCount] = useState<number | null>(null);
   const hasServerChatTranscript = typeof serverChatHistoryCount === "number" && serverChatHistoryCount > 1;
   const showChatAction = canReturnToChat(ticket) || hasLocalChatTranscript || hasServerChatTranscript;
   const chatActionLabel = canReturnToChat(ticket) && ticket.status !== "Closed" ? "View Chat" : "View Chat Transcript";
+  const displayedTicketStatus = getDisplayedTicketStatus(ticket.status, ticket.statusReason);
   const [cancelMeetingOpen, setCancelMeetingOpen] = useState(false);
   const [isCancellingMeeting, setIsCancellingMeeting] = useState(false);
 
@@ -46,7 +56,7 @@ const TicketStatus = () => {
   }, [bookingSummary, hasStatusStep, navigate, ticket]);
 
   useEffect(() => {
-    if (bookingSummary || !ticket.id) {
+    if (!ticket.id) {
       return;
     }
 
@@ -106,7 +116,7 @@ const TicketStatus = () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bookingSummary, ticket.id]);
+  }, [ticket.id]);
 
   const title = hasBookingSummary
     ? (isReservationConfirmed ? "Teams Session Reserved" : "Support Session Request Submitted")
@@ -230,7 +240,7 @@ const TicketStatus = () => {
               <div className="rounded-2xl border border-primary/10 bg-muted/20 px-4 py-4">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary/80">Status</div>
                 <div className="mt-2 text-sm font-semibold text-foreground">
-                  {displayedStatusReason}
+                  {displayedTicketStatus}
                 </div>
               </div>
               <div className="rounded-2xl border border-primary/10 bg-muted/20 px-4 py-4">
