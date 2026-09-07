@@ -11,6 +11,7 @@ urlpatterns = [
     path("coverage/tutor-response", views.coverage_tutor_response, name="coverage-tutor-response"),
     path("coverage/tutor-response/result", views.coverage_tutor_response_result, name="coverage-tutor-response-result"),
     path("verify-email", views.verify_email, name="verify-email"),
+    path("support/chat/", views.support_chat, name="support-chat"),
     path("admin/login", views.admin_login, name="admin-login"),
     path("admin/microsoft/login", views.admin_microsoft_login, name="admin-microsoft-login"),
     path("admin/microsoft/callback", views.admin_microsoft_callback, name="admin-microsoft-callback"),

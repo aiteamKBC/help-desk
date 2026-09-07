@@ -155,6 +155,19 @@ describe("InquiryDetails", () => {
     expect(screen.getAllByText("Others").length).toBeGreaterThan(0);
   });
 
+  it("does not offer Aptem as a new inquiry category", () => {
+    render(
+      <MemoryRouter initialEntries={["/support/inquiry"]}>
+        <SupportProvider>
+          <InquiryDetails />
+        </SupportProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("combobox"));
+    expect(screen.queryByText("Aptem")).not.toBeInTheDocument();
+  });
+
   it("accepts PowerPoint files as supporting evidence", async () => {
     const { container } = render(
       <MemoryRouter initialEntries={["/support/inquiry"]}>

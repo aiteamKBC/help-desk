@@ -45,6 +45,7 @@ from .roles import (
     SUPPORT_ACCESS_GROUP_NAME,
     SUPPORT_PORTAL_ACCESS_ROLES,
 )
+from .ai.chatbot import handle_chat as handle_django_chatbot
 
 logger = logging.getLogger(__name__)
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -16205,34 +16206,44 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any], *, uploaded_fi
         if sanitize_text(entry.get("content")) or entry.get("attachments")
     ]
 
-    webhook_result = send_chatbot_webhook(
-        {
-            "event": "support_chat_message",
-            "source": "support_portal",
-            "message": webhook_message,
-            "clientTimeZone": client_time_zone or None,
+    chatbot_payload = {
+        "event": "support_chat_message",
+        "source": "support_portal",
+        "message": webhook_message,
+        "clientTimeZone": client_time_zone or None,
+        "category": ticket["category"],
+        "technicalSubcategory": ticket.get("technical_subcategory"),
+        "inquiry": ticket["inquiry"],
+        "learner": {
+            "id": int(ticket["learner_id"]),
+            "fullName": ticket.get("learner_full_name"),
+            "email": ticket["learner_email"],
+            "phone": ticket.get("learner_phone"),
+        },
+        "ticket": {
+            "id": ticket["public_id"],
             "category": ticket["category"],
             "technicalSubcategory": ticket.get("technical_subcategory"),
-            "inquiry": ticket["inquiry"],
-            "learner": {
-                "id": int(ticket["learner_id"]),
-                "fullName": ticket.get("learner_full_name"),
-                "email": ticket["learner_email"],
-                "phone": ticket.get("learner_phone"),
-            },
-            "ticket": {
-                "id": ticket["public_id"],
-                "category": ticket["category"],
-                "technicalSubcategory": ticket.get("technical_subcategory"),
             "inquiry": ticket["inquiry"],
             "status": ticket["status"],
             "statusReason": ticket.get("status_reason"),
             "priority": ticket["priority"],
             "assignedTeam": ticket["assigned_team"],
-            },
-            "messages": recent_messages,
+        },
+        "messages": recent_messages,
+    }
+    if getattr(settings, "SUPPORT_CHAT_PROVIDER", "n8n") == "django":
+        django_result = handle_django_chatbot(chatbot_payload)
+        webhook_result = {
+            "configured": True,
+            "delivered": bool(django_result.get("success")),
+            "status": 200 if django_result.get("success") else None,
+            "reply": django_result.get("reply") or "",
+            "route": django_result.get("route"),
+            "processingMs": django_result.get("processingMs"),
         }
-    )
+    else:
+        webhook_result = send_chatbot_webhook(chatbot_payload)
 
     if ticket.get("conversation_id"):
         persisted_at = datetime.now(timezone.utc)
@@ -16264,6 +16275,8 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any], *, uploaded_fi
         "webhookConfigured": webhook_result["configured"],
         "webhookDelivered": webhook_result["delivered"],
         "webhookStatus": webhook_result["status"],
+        "route": webhook_result.get("route"),
+        "processingMs": webhook_result.get("processingMs"),
     }
 
 

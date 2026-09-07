@@ -65,7 +65,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "Coverage", "Others"];
+const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Teams", "Coverage", "Others"];
 
 const getExtension = (name: string) => {
   const dotIndex = name.lastIndexOf(".");

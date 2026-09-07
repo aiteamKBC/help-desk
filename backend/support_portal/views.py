@@ -76,6 +76,7 @@ from .services import (
     update_agent_support_access,
     update_ticket,
 )
+from .ai.chatbot import handle_chat as handle_django_chatbot
 
 logger = logging.getLogger(__name__)
 DATABASE_UNAVAILABLE_MESSAGE = "The support data service is unavailable right now. Please try again in a moment."
@@ -491,6 +492,15 @@ def admin_login(request):
             "instanceId": instance_id,
         }
         return JsonResponse(response_payload)
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def support_chat(request):
+    try:
+        return JsonResponse(handle_django_chatbot(parse_json_body(request)))
     except Exception as error:
         return handle_api_error(error)
 

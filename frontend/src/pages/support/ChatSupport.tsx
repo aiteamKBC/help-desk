@@ -1681,6 +1681,166 @@ const ChatSupport = () => {
   );
 };
 
+const chatMessageUrlPattern = /(https?:\/\/[^\s<>"']+)/gi;
+const trailingUrlPunctuationPattern = /[),.?!;:]+$/;
+const inlineNumberedListPattern = /(?:^|\s)(\d+)\.\s+/g;
+const explicitNumberedLinePattern = /^\d+[.)]\s+/;
+const explicitBulletLinePattern = /^[-*•]\s+/;
+
+type OrganizedChatPart =
+  | { type: "paragraph"; text: string }
+  | { type: "ordered-list"; items: string[] }
+  | { type: "unordered-list"; items: string[] };
+
+function renderLinkedChatText(text: string) {
+  const nodes: Array<string | JSX.Element> = [];
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(chatMessageUrlPattern)) {
+    const rawUrl = match[0];
+    const matchIndex = match.index ?? 0;
+    const url = rawUrl.replace(trailingUrlPunctuationPattern, "");
+    const trailingText = rawUrl.slice(url.length);
+
+    if (matchIndex > lastIndex) {
+      nodes.push(text.slice(lastIndex, matchIndex));
+    }
+
+    nodes.push(
+      <a
+        key={`${url}-${matchIndex}`}
+        href={url}
+        target="_blank"
+        rel="noreferrer"
+        className="font-medium text-primary underline underline-offset-2 transition-colors hover:text-primary/80"
+      >
+        {url}
+      </a>,
+    );
+
+    if (trailingText) {
+      nodes.push(trailingText);
+    }
+
+    lastIndex = matchIndex + rawUrl.length;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes.length ? nodes : text;
+}
+
+function organizeChatText(text: string): OrganizedChatPart[] {
+  const trimmedText = text.trim();
+  if (!trimmedText) {
+    return [];
+  }
+
+  const lines = trimmedText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length > 1) {
+    const parts: OrganizedChatPart[] = [];
+    let pendingListType: "ordered-list" | "unordered-list" | null = null;
+    let pendingItems: string[] = [];
+
+    const flushList = () => {
+      if (pendingListType && pendingItems.length > 0) {
+        parts.push({ type: pendingListType, items: pendingItems });
+      }
+      pendingListType = null;
+      pendingItems = [];
+    };
+
+    for (const line of lines) {
+      if (explicitNumberedLinePattern.test(line)) {
+        if (pendingListType !== "ordered-list") {
+          flushList();
+          pendingListType = "ordered-list";
+        }
+        pendingItems.push(line.replace(explicitNumberedLinePattern, "").trim());
+        continue;
+      }
+
+      if (explicitBulletLinePattern.test(line)) {
+        if (pendingListType !== "unordered-list") {
+          flushList();
+          pendingListType = "unordered-list";
+        }
+        pendingItems.push(line.replace(explicitBulletLinePattern, "").trim());
+        continue;
+      }
+
+      flushList();
+      parts.push({ type: "paragraph", text: line });
+    }
+
+    flushList();
+    return parts;
+  }
+
+  const normalizedText = trimmedText.replace(/\s+/g, " ");
+  const matches = [...normalizedText.matchAll(inlineNumberedListPattern)];
+
+  if (matches.length < 2) {
+    return normalizedText ? [{ type: "paragraph", text: normalizedText }] : [];
+  }
+
+  const parts: OrganizedChatPart[] = [];
+  const firstMatchIndex = matches[0].index ?? 0;
+  const intro = normalizedText.slice(0, firstMatchIndex).trim();
+
+  if (intro) {
+    parts.push({ type: "paragraph", text: intro });
+  }
+
+  const items = matches.map((match, index) => {
+    const itemStart = (match.index ?? 0) + match[0].length;
+    const nextMatchIndex = matches[index + 1]?.index ?? normalizedText.length;
+    return normalizedText.slice(itemStart, nextMatchIndex).trim();
+  }).filter(Boolean);
+
+  if (items.length > 0) {
+    parts.push({ type: "ordered-list", items });
+  }
+
+  return parts;
+}
+
+function FormattedChatText({ text }: { text: string }) {
+  const parts = organizeChatText(text);
+
+  return (
+    <div className="space-y-3 break-words leading-7">
+      {parts.map((part, index) => (
+        part.type === "ordered-list" ? (
+          <ol key={`ordered-list-${index}`} className="list-decimal space-y-2 pl-5">
+            {part.items.map((item, itemIndex) => (
+              <li key={`${itemIndex}-${item.slice(0, 16)}`} className="pl-1">
+                {renderLinkedChatText(item)}
+              </li>
+            ))}
+          </ol>
+        ) : part.type === "unordered-list" ? (
+          <ul key={`unordered-list-${index}`} className="list-disc space-y-2 pl-5">
+            {part.items.map((item, itemIndex) => (
+              <li key={`${itemIndex}-${item.slice(0, 16)}`} className="pl-1">
+                {renderLinkedChatText(item)}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p key={`paragraph-${index}`}>{renderLinkedChatText(part.text)}</p>
+        )
+      ))}
+    </div>
+  );
+}
+
 export const MessageBubble = ({
   m,
   allowLiveAgentQueueActions = false,
@@ -1788,7 +1948,7 @@ export const MessageBubble = ({
             </>
           ) : (
             <div className="space-y-3">
-              {m.text ? <div>{m.text}</div> : null}
+              {m.text ? <FormattedChatText text={m.text} /> : null}
               {attachments.length > 0 ? (
                 <div className="flex flex-col gap-2">
                   {attachments.map((attachment) => (
