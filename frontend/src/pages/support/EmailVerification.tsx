@@ -133,6 +133,7 @@ const EmailVerification = () => {
   const [searchParams] = useSearchParams();
   const { ticket, setTicket, setBookingSummary, clearBookingSummary } = useSupport();
   const prefillEmail = searchParams.get("email")?.trim().toLowerCase() || "";
+  const ssoToken = searchParams.get("token")?.trim() || "";
   const [email, setEmail] = useState(ticket.email || prefillEmail);
   const autoSubmittedRef = useRef(false);
   const [errorTitle, setErrorTitle] = useState("Invalid Email");
@@ -150,12 +151,14 @@ const EmailVerification = () => {
     }
   }, []);
 
+  // A signed token from the LMS is the only thing that auto-enters the flow (the
+  // learner is already authenticated there). A raw ?email= is treated as a
+  // prefill only, never auto-submitted, so it cannot be used to impersonate.
   useEffect(() => {
-    if (!prefillEmail || autoSubmittedRef.current) return;
-    if (!isValidEmailFormat(prefillEmail)) return;
+    if (!ssoToken || autoSubmittedRef.current) return;
     autoSubmittedRef.current = true;
-    submitEmail(prefillEmail);
-  }, [prefillEmail]); // eslint-disable-line react-hooks/exhaustive-deps
+    submitSsoToken(ssoToken);
+  }, [ssoToken]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const restoreExistingRequest = (restoredTicket: Ticket, restoredBookingSummary: BookingSummary | null) => {
     setTicket(restoredTicket);
@@ -195,15 +198,11 @@ const EmailVerification = () => {
     navigate("/support/inquiry");
   };
 
-  const submitEmail = async (trimmedEmail: string) => {
+  const runVerification = async (request: () => Promise<Response>, emailFallback: string) => {
     setIsSubmitting(true);
 
     try {
-      const response = await fetch("/api/verify-email", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: trimmedEmail }),
-      });
+      const response = await request();
 
       const payload = (await response.json().catch(() => null)) as
         | {
@@ -240,6 +239,7 @@ const EmailVerification = () => {
         const learnerName = payload?.learner?.fullName || "";
         const requesterRole = payload?.requesterRole || restoredTicket?.requesterRole || "user";
         const requesterSource = payload?.requesterSource || restoredTicket?.requesterSource || "";
+        const resolvedEmail = (payload?.learner?.email || emailFallback).trim().toLowerCase();
 
         if (restoredTicket?.id) {
           setExistingRequestTicket(buildRestoredTicket(restoredTicket, learnerName));
@@ -248,7 +248,7 @@ const EmailVerification = () => {
           return;
         }
 
-        startNewTicket(trimmedEmail, learnerName, requesterRole, requesterSource);
+        startNewTicket(resolvedEmail, learnerName, requesterRole, requesterSource);
         return;
       }
 
@@ -265,6 +265,28 @@ const EmailVerification = () => {
       setIsSubmitting(false);
     }
   };
+
+  const submitEmail = (trimmedEmail: string) =>
+    runVerification(
+      () =>
+        fetch("/api/verify-email", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: trimmedEmail }),
+        }),
+      trimmedEmail,
+    );
+
+  const submitSsoToken = (token: string) =>
+    runVerification(
+      () =>
+        fetch("/api/support/sso", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        }),
+      "",
+    );
 
   const handleNext = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -303,7 +325,7 @@ const EmailVerification = () => {
             </h1>
           </div>
           <p className="mx-auto mb-6 max-w-[320px] text-center text-sm leading-6 text-muted-foreground sm:mb-7 sm:text-[15px] sm:leading-7">
-            {isSubmitting && prefillEmail
+            {isSubmitting && ssoToken
               ? "Verifying your account, please wait..."
               : "Enter your registered email address to continue. For learners, this is usually your Aptem email."}
           </p>

@@ -55,6 +55,7 @@ from .services import (
     get_ticket_chat_history_response,
     get_ticket_chat_context_response,
     get_verify_email_response,
+    get_support_sso_verify_response,
     add_entra_agent,
     list_admin_tickets,
     list_agents,
@@ -470,6 +471,26 @@ def migration_status(_request):
 def verify_email(request):
     try:
         return JsonResponse(get_verify_email_response(parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def support_sso_verify(request):
+    try:
+        return JsonResponse(get_support_sso_verify_response(parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def support_assistant(request):
+    try:
+        from .chatbot import get_support_assistant_response
+
+        return JsonResponse(get_support_assistant_response(parse_json_body(request)))
     except Exception as error:
         return handle_api_error(error)
 

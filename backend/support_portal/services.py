@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -215,6 +217,7 @@ MICROSOFT_GRAPH_STAFF_ROLE_PRIORITY = {
 }
 MANAGED_PUBLIC_REQUESTER_SOURCE = "support_portal_requester"
 KBC_USERS_DATA_REQUESTER_SOURCE = "kbc_users_data"
+LMS_LEARNERS_REQUESTER_SOURCE = "lms_learners"
 MICROSOFT_ENTRA_REQUESTER_SOURCE = "microsoft_entra"
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 CHAT_MESSAGE_ID_METADATA_KEY = "client_message_id"
@@ -2614,6 +2617,70 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
         "email": normalized_email,
         "phone": phone,
     }
+
+
+def fetch_lms_learner_by_email(email: str) -> dict[str, Any] | None:
+    if not settings.LMS_DATABASE_URL:
+        return None
+
+    try:
+        with psycopg.connect(settings.LMS_DATABASE_URL) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                      NULLIF(TRIM(id::text), '') AS external_learner_id,
+                      NULLIF(TRIM(full_name), '') AS full_name,
+                      LOWER(TRIM(COALESCE(NULLIF(TRIM(email_normalized), ''), email))) AS email,
+                      NULLIF(TRIM(phone_number), '') AS phone,
+                      NULLIF(TRIM(lifecycle_status::text), '') AS lifecycle_status,
+                      NULLIF(TRIM(aptem_id::text), '') AS aptem_id
+                    FROM "Learner".learners
+                    WHERE LOWER(TRIM(COALESCE(NULLIF(TRIM(email_normalized), ''), email))) = %s
+                       OR LOWER(TRIM(secondary_email)) = %s
+                    LIMIT 1
+                    """,
+                    [email, email],
+                )
+                row = cursor.fetchone()
+    except Exception:
+        logger.warning("LMS database lookup failed for email verification; skipping Learner.learners check.")
+        return None
+
+    if not row:
+        return None
+
+    external_learner_id, full_name, normalized_email, phone, lifecycle_status, aptem_id = row
+    return {
+        "external_learner_id": external_learner_id,
+        "full_name": full_name,
+        "email": normalized_email,
+        "phone": phone,
+        "lifecycle_status": lifecycle_status,
+        "aptem_id": aptem_id,
+    }
+
+
+def find_lms_learner_by_email(email: str) -> dict[str, Any] | None:
+    lms_learner = fetch_lms_learner_by_email(email)
+    if not lms_learner:
+        return None
+
+    return upsert_learner_record(
+        {
+            "external_learner_id": lms_learner.get("external_learner_id"),
+            "full_name": lms_learner.get("full_name"),
+            "email": lms_learner["email"],
+            "phone": lms_learner.get("phone"),
+        },
+        source=LMS_LEARNERS_REQUESTER_SOURCE,
+        metadata={
+            "lms_source": "Learner.learners",
+            "lms_lifecycle_status": lms_learner.get("lifecycle_status") or "",
+            "lms_aptem_id": lms_learner.get("aptem_id") or "",
+            "synced_on_demand": True,
+        },
+    )
 
 
 def run_communication_centre_query(
@@ -9050,7 +9117,14 @@ def fetch_public_requester_account_by_email(email: str) -> dict[str, Any] | None
 
 
 def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
-    local_learner = find_kbc_learner_by_email(email)
+    # The LMS "Learner".learners table is the most comprehensive roster, so it is
+    # checked first; the legacy kbc_users_data database remains a fallback for any
+    # learner that has not been migrated across yet.
+    local_learner = find_lms_learner_by_email(email)
+    learner_source = LMS_LEARNERS_REQUESTER_SOURCE
+    if not local_learner:
+        local_learner = find_kbc_learner_by_email(email)
+        learner_source = KBC_USERS_DATA_REQUESTER_SOURCE
 
     if local_learner:
         managed_account = fetch_public_requester_account_by_email(email)
@@ -9075,7 +9149,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
             "account": None,
             "learner": local_learner,
             "display_name": sanitize_text(local_learner.get("full_name")) or email,
-            "source": "kbc_users_data",
+            "source": learner_source,
         }
 
     entra_user = fetch_microsoft_entra_user_by_email(email)
@@ -10227,6 +10301,78 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
             for row in session_requests
         ],
     }
+
+
+def _decode_sso_token_segment(segment: str) -> bytes:
+    padding = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def verify_support_sso_token(token: Any) -> str:
+    """Verify an HMAC-signed single sign-on token and return the learner email.
+
+    The token is a compact ``<base64url(payload)>.<base64url(signature)>`` string
+    where ``payload`` is JSON ``{"email": str, "exp": <unix seconds>}`` and the
+    signature is ``HMAC-SHA256(secret, base64url(payload))``. The LMS mints the
+    token for its logged-in learner so the support portal can trust the email
+    without exposing a spoofable ``?email=`` link.
+    """
+    secret = sanitize_text(getattr(settings, "SUPPORT_SSO_SECRET", ""))
+    if not secret:
+        raise ApiError(503, "Single sign-on is not configured on the server.")
+
+    raw_token = sanitize_text(token)
+    if not raw_token or raw_token.count(".") != 1:
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    payload_segment, signature_segment = raw_token.split(".", 1)
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        payload_segment.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    try:
+        provided_signature = _decode_sso_token_segment(signature_segment)
+    except Exception as error:
+        raise ApiError(401, "This sign-in link is invalid.") from error
+
+    if not hmac.compare_digest(expected_signature, provided_signature):
+        raise ApiError(401, "This sign-in link could not be verified.")
+
+    try:
+        token_payload = json.loads(_decode_sso_token_segment(payload_segment))
+    except Exception as error:
+        raise ApiError(401, "This sign-in link is invalid.") from error
+
+    if not isinstance(token_payload, dict):
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    expires_at = token_payload.get("exp")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    max_age = int(getattr(settings, "SUPPORT_SSO_TOKEN_MAX_AGE_SECONDS", 300) or 300)
+    issued_at = token_payload.get("iat")
+    now = time.time()
+    if now > float(expires_at):
+        raise ApiError(401, "This sign-in link has expired. Please reopen support from your learner portal.")
+    # Reject tokens whose lifetime is longer than we allow, even if not yet expired.
+    if isinstance(issued_at, (int, float)) and not isinstance(issued_at, bool):
+        if float(expires_at) - float(issued_at) > max_age + 5:
+            raise ApiError(401, "This sign-in link is invalid.")
+
+    email = normalize_email(token_payload.get("email"))
+    if not is_valid_email(email):
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    return email
+
+
+def get_support_sso_verify_response(payload: dict[str, Any]) -> dict[str, Any]:
+    email = verify_support_sso_token(payload.get("token") if isinstance(payload, dict) else None)
+    # Reuse the exact same lookup/flow as the manual email step; nothing downstream changes.
+    return get_verify_email_response({"email": email})
 
 
 def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -13588,38 +13734,11 @@ def send_admin_ai_agent_message(public_id: str, payload: dict[str, Any]) -> dict
         if sanitize_text(entry.get("text"))
     ]
 
-    webhook_result = send_admin_ai_webhook(
-        {
-            "event": "admin_console_ai_message",
-            "source": "support_portal_admin_console",
-            "message": message,
-            "admin": {
-                "username": actor_username or None,
-                "fullName": admin_actor.get("full_name") if admin_actor else None,
-                "role": admin_actor.get("role") if admin_actor else None,
-            },
-            "learner": {
-                "id": int(ticket["learner_id"]),
-                "fullName": ticket.get("learner_full_name"),
-                "email": ticket["learner_email"],
-                "phone": ticket.get("learner_phone"),
-            },
-            "ticket": {
-                "id": ticket["public_id"],
-                "chatId": build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
-                "category": ticket["category"],
-                "technicalSubcategory": ticket.get("technical_subcategory"),
-                "inquiry": ticket["inquiry"],
-                "status": ticket["status"],
-                "statusReason": ticket.get("status_reason"),
-                "priority": ticket["priority"],
-                "assignedTeam": ticket["assigned_team"],
-                "documentation": documentation,
-            },
-            "conversationHistory": conversation_history[-20:],
-            "messages": recent_messages,
-        }
-    )
+    # The agent-console AI now runs natively in the backend (staff mode); n8n is kept
+    # only for email workflows.
+    from .chatbot import generate_admin_ai_reply
+
+    webhook_result = generate_admin_ai_reply(ticket, message, recent_messages)
 
     return {
         "ok": True,
@@ -16205,34 +16324,10 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any], *, uploaded_fi
         if sanitize_text(entry.get("content")) or entry.get("attachments")
     ]
 
-    webhook_result = send_chatbot_webhook(
-        {
-            "event": "support_chat_message",
-            "source": "support_portal",
-            "message": webhook_message,
-            "clientTimeZone": client_time_zone or None,
-            "category": ticket["category"],
-            "technicalSubcategory": ticket.get("technical_subcategory"),
-            "inquiry": ticket["inquiry"],
-            "learner": {
-                "id": int(ticket["learner_id"]),
-                "fullName": ticket.get("learner_full_name"),
-                "email": ticket["learner_email"],
-                "phone": ticket.get("learner_phone"),
-            },
-            "ticket": {
-                "id": ticket["public_id"],
-                "category": ticket["category"],
-                "technicalSubcategory": ticket.get("technical_subcategory"),
-            "inquiry": ticket["inquiry"],
-            "status": ticket["status"],
-            "statusReason": ticket.get("status_reason"),
-            "priority": ticket["priority"],
-            "assignedTeam": ticket["assigned_team"],
-            },
-            "messages": recent_messages,
-        }
-    )
+    # The chatbot now runs natively in the backend (n8n is kept for emails only).
+    from .chatbot import generate_ticket_chat_reply
+
+    webhook_result = generate_ticket_chat_reply(ticket, webhook_message, recent_messages)
 
     if ticket.get("conversation_id"):
         persisted_at = datetime.now(timezone.utc)
