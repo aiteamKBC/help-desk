@@ -93,17 +93,27 @@ def _learner_system_prompt(route: str, learner_name: str) -> str:
     greeting_name = f" The learner's name is {learner_name}." if learner_name else ""
     return f"""You are the Kent Business College support assistant, talking directly to a learner (a student).{greeting_name}
 
-Your job is to help the learner solve their problem themselves with clear, friendly steps. You help with: the learning portal (LMS), Aptem, Microsoft Teams, logging in, courses, assignments, OTJ hours, bookings and general college questions.
+Your job is to SOLVE the learner's problem yourself. Escalating to a human is the last resort, not the second step. You help with: the learning portal (LMS), Aptem, Microsoft Teams, logging in, courses, assignments, OTJ hours, bookings and general college questions.
+
+"The LMS" is KBC LearningOS, the college's own learner portal — the site the learner is using right now. It is where they find My Learning, Monthly Submission, Monthly Logs, OTJ Hours, KSBs, Evidence, Attendance, the Calendar, coaching meetings and rewards. Almost every problem a learner reports comes from somewhere in it, so work out WHICH page or button they are on before advising anything. The guide below gives the real page paths and the exact on-screen labels: use those names, not invented ones.
 
 {LMS_CONTEXT}
 
+Language:
+- Always reply in British English, no matter which language the learner writes in. If they write in Arabic or any other language, understand it and answer in British English anyway. Never reply in another language and never mix languages.
+- Use British spelling: organise, personalise, apologise, programme, enrolment, timetable.
+
+Manner:
+- Be genuinely courteous. Open by acknowledging the learner briefly ("Thanks for flagging that", "Sorry you're stuck with this") before the substance, and stay warm and respectful however frustrated they become.
+- Never be curt, never lecture, never blame the learner for the problem.
+
 Rules:
-- Reply in the SAME language the learner writes in. If they write in Arabic, answer in clear Arabic; if in English, answer in warm, simple British English. Never mix languages in one reply.
 - Speak directly to the learner ("you", "your account"). Never say you are talking to staff.
 - Base your answer on the supplied guide. If it does not cover the issue, state that limitation and suggest the programme team, coach or administrator. Do not invent product-specific troubleshooting steps.
-- BE BRIEF. Two to four sentences is the normal answer. Use numbered steps only for a real multi-step procedure, and never more than four steps. Do not pad with pleasantries, summaries or "let me know if you need anything else".
+- BE BRIEF. Two to four sentences is the normal answer. Use numbered steps only for a real multi-step procedure, and never more than four steps. Do not pad with summaries or "let me know if you need anything else".
 - Read the conversation before replying. Never repeat advice the learner has already been given.
-- If the learner only names a topic ("I have a problem with the LMS"), ask one short question to find out what is actually wrong. Do not guess, do not list steps, and do not treat it as something you failed to solve.
+- TRY FIRST. Work the problem with the learner: ask what they are seeing, name the page they should be on, and give them something concrete to check. Only once you have genuinely tried and run out of things to suggest should you say the support team is needed.
+- If the learner only names a topic ("I have a problem with attendance"), ask one short question to find out what is actually wrong. Do not guess, do not list steps, and do not treat it as something you failed to solve.
 - If the learner says your suggestion did not work, or that the problem is still there, do NOT offer the same steps again and do not invent new ones. Say plainly that this needs the support team.
 - Never announce that you have opened, raised or created a ticket, and never say you are about to. The learner decides, and the options are presented to them separately.
 - Do not ask "would you like me to escalate this?" or offer choices of your own. End with the plain fact that the support team needs to look at it; the options follow your reply automatically.
@@ -251,7 +261,9 @@ def is_clarifying_question(reply: str) -> bool:
     has not tried and failed yet, so offering to escalate contradicts itself.
     """
     text = (reply or "").strip()
-    if not text.endswith("?"):
+    # "?" plus the Arabic question mark, in case a reply comes back in Arabic
+    # despite the prompt — the two look alike but are different characters.
+    if not text.endswith(("?", "؟")):
         return False
     # Numbered steps mean guidance was given, not a question asked.
     if re.search(r"^\s*\d+[\.\)]\s", text, re.MULTILINE):
@@ -259,7 +271,7 @@ def is_clarifying_question(reply: str) -> bool:
     # Scoping is one short question, at most prefaced by a line of acknowledgement
     # ("Yes, I can help with that. What are you trying to do?"). An answer that
     # merely closes with "does that help?" runs longer than that.
-    sentences = [part for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    sentences = [part for part in re.split(r"(?<=[.!?؟])\s+", text) if part.strip()]
     return len(sentences) <= 2 and len(text.split()) <= 30
 
 
@@ -398,6 +410,12 @@ def search_knowledge_base(route: str, query: str, *, top_k: int = 4) -> list[dic
 # model which starts listing every possibility gets cut off rather than making
 # the learner wait.
 ASSISTANT_REPLY_TOKEN_CAP = 400
+
+# How many messages the learner must have sent before escalation is offered. The
+# assistant is meant to solve the problem, so it gets this many turns to scope it
+# and try something before a ticket is put on the table. A direct request for a
+# human bypasses this entirely.
+ASSISTANT_MIN_TURNS_BEFORE_ESCALATION = 3
 
 
 def _chat_completion(messages: list[dict[str, str]]) -> str:
@@ -545,7 +563,14 @@ def generate_assistant_reply(
     # fell short. A vague opener, or a reply that asks the learner what they
     # meant, is the conversation still getting started.
     still_scoping = is_vague_problem_statement(message) or is_clarifying_question(reply)
-    escalate = wants_human(message) or ((low_confidence or not evidence) and not still_scoping)
+    # One unmatched question is not a dead end — the learner has barely described
+    # the problem yet. Give the assistant a couple of exchanges to work it out
+    # before putting escalation on the table, unless they ask for a human outright.
+    learner_turns = sum(1 for entry in (history or []) if entry.get("sender") == "user") + 1
+    too_early = learner_turns < ASSISTANT_MIN_TURNS_BEFORE_ESCALATION
+    escalate = wants_human(message) or (
+        (low_confidence or not evidence) and not still_scoping and not too_early
+    )
 
     return {
         "reply": reply,

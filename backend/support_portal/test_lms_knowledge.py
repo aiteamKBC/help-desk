@@ -145,12 +145,34 @@ class LmsRetrievalTests(SimpleTestCase):
                 self.assertIn("Messages is disabled", messages[-1]["content"])
 
     def test_guardrails_alone_do_not_claim_a_matching_answer(self):
+        # Past the opening turns, so the escalation gate is not what is under test.
+        history = [
+            {"sender": "user", "text": "The portal is misbehaving"},
+            {"sender": "bot", "text": "Which page are you on?"},
+            {"sender": "user", "text": "My Learning"},
+        ]
+        with patch.object(chatbot, "search_knowledge_base", return_value=[
+            {"text": "Not live yet", "distance": None, "guardrail": True},
+        ]), patch.object(chatbot, "_chat_completion", return_value="Please contact your programme team."):
+            response = chatbot.generate_assistant_reply("An undocumented LMS problem", history=history)
+        self.assertTrue(response["escalate"])
+        self.assertIsNone(response["kbDistance"])
+
+    def test_opening_turns_try_before_offering_escalation(self):
+        """An unmatched first message means scope it, not hand it to a human."""
         with patch.object(chatbot, "search_knowledge_base", return_value=[
             {"text": "Not live yet", "distance": None, "guardrail": True},
         ]), patch.object(chatbot, "_chat_completion", return_value="Please contact your programme team."):
             response = chatbot.generate_assistant_reply("An undocumented LMS problem")
+        self.assertFalse(response["escalate"])
+
+    def test_asking_for_a_human_escalates_on_the_first_message(self):
+        """The gate holds back guesswork, never a learner who asked outright."""
+        with patch.object(chatbot, "search_knowledge_base", return_value=[
+            {"text": "Not live yet", "distance": None, "guardrail": True},
+        ]), patch.object(chatbot, "_chat_completion", return_value="I'll get someone to help."):
+            response = chatbot.generate_assistant_reply("I want to speak to a human")
         self.assertTrue(response["escalate"])
-        self.assertIsNone(response["kbDistance"])
 
     def test_follow_up_keeps_self_described_role_and_allows_switch(self):
         with patch.object(chatbot, "search_knowledge_base", return_value=[
