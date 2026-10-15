@@ -68,15 +68,10 @@ ROUTE_TO_TICKET: dict[str, tuple[str, str]] = {
 
 ALLOWED_KB_TABLES = {t for tables in KB_TABLES.values() for t in tables}
 
-GREETING_REPLY = (
-    "Hello! I'm the Kent Business College support assistant. "
-    "Tell me what you need help with — for example Aptem, Microsoft Teams, "
-    "the learning portal, logging in, or your course — and I'll do my best to help."
-)
-CLOSING_REPLY = (
-    "You're welcome! If anything else comes up, just open support again. "
-    "Have a great day."
-)
+# Short on purpose. The learner has already been greeted when the chat opened,
+# and listing what we cover reads as a menu nobody asked for.
+GREETING_REPLY = "Hello! What can I help you with?"
+CLOSING_REPLY = "You're welcome. Open support again any time."
 
 LMS_CONTEXT = """The current college LMS is KBC LearningOS. Its help reference is
 LMS_KNOWLEDGE_BASE.md, covering learners, coaches, tutors and other workspaces.
