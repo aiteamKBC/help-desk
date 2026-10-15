@@ -185,3 +185,29 @@ Sections not touched this pass: the Super Admin and Audit subsections' own claim
 not independently re-verified against source — spot-checked adjacent code in the same
 files but did not trace every listed feature. If a reported issue ever traces to one of
 those, verify it the same way before trusting the existing text.
+
+## Home page has no sidebar — found live, same day
+
+A learner on Home asked about Progress Review; the assistant correctly said
+"Open My Progress in the menu" — but Home (`pages/learner/home/page.tsx`) does
+not import `WorkspaceShell` at all, unlike every other learner page. It has no
+sidebar, so "the menu" the reply referred to is not on screen. The real Home
+page shows exactly four quick-action cards (Monthly Submission, Dashboard,
+Attend or Report Absence, Book for Monthly Coaching Session) plus a read-only
+"My Progress" OTJH widget that is not the My Progress menu item — easy to
+conflate since the widget shares its name with the destination.
+
+This matters specifically for the LMS-embedded widget, since it is itself
+only mounted on Home: every question asked through it is asked by a learner
+who, by definition, cannot see the sidebar unless they have already clicked
+through to another page. Documented in 3.2, with explicit guidance not to
+recommend a specific card as if it were relevant to the destination — an
+early version suggested "use the Book for Monthly Coaching Session card" to a
+learner asking about Progress Review, which reads as a wrong answer rather
+than a workaround. Re-tested after the fix: the assistant now says to click
+any of the four cards, unlinked to the specific destination.
+
+Also added: `SupportChatWidget.tsx` only kept its conversation in React state,
+so navigating away and back — which, given the point above, a learner using
+it necessarily does constantly — silently wiped the chat. Persisted it to
+`localStorage`, keyed per learner email, capped at the last 60 messages.

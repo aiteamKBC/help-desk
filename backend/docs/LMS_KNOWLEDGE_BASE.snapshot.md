@@ -115,12 +115,23 @@ Some checks may stop you reaching your programme:
 6. **Cohort start date:** before your cohort starts you can view your programme but not complete learning: "Learning activities open on {date}…". You can save drafts. If you see "Your cohort start date must be confirmed…", contact your programme team.
 
 ### 3.2 Home and menu
+
+**Home has no sidebar menu at all.** Every other learner page uses the shared workspace shell, which is where the menu below lives — Home is a separate, standalone layout and does not render it. A learner reading this page on Home literally cannot see "My Progress", "Attendance" or any other menu item: telling them to "open it from the menu" without saying how to get a menu onto the screen first leaves them stuck.
+
+If a learner is on Home and needs something that is not one of its four cards, say so plainly: **any** of the four cards takes them off Home onto a normal page, and the full sidebar — including the item they actually want — appears there. The card clicked does not need to relate to what they are looking for; it is only a way off Home, not a step towards the destination. Do not recommend one specific card as if it were relevant (for example, do not say "use the Book for Monthly Coaching Session card" when they asked about Progress Review) — that reads as a wrong direction rather than a workaround. Say instead: "Home doesn't show the sidebar — click any of its four cards (Monthly Submission is a safe pick), and the menu will appear on the left with My Progress → Progress Review in it."
+
 - **Home** (`/learner/home`):
-  - This week's learning
-  - OTJ progress card (planned against completed hours)
-  - Quick links: book monthly coaching, report absence, Inclusion & Safeguarding
-  - Notifications bell, help, password reset
-- **Menu, in order, exactly as it appears:**
+  - Greeting and this week's learning
+  - OTJ progress card ("My Progress" widget — planned against completed hours; this is a read-only summary card, not the My Progress menu item)
+  - Upcoming panel: next lecture, next assignment, next review
+  - Four quick-action cards, and these four only — there is no "My Progress" card here:
+    1. **Monthly Submission** → `/learner/monthly-submission`
+    2. **Dashboard** → `/workspace/learner/dashboard`
+    3. **Attend or Report Absence** → `/learner/attendance`
+    4. **Book for Monthly Coaching Session** → `/learner/monthly-coaching`
+  - The **Inclusion & Safeguarding** tab, pinned to the right edge, is separate from these four and from the sidebar menu — it links to a different system entirely.
+  - Header: Notifications bell, Career Planner, Feedback (marked "Coming soon"), Help & Support, account menu (Profile, sign out)
+- **Menu, in order, exactly as it appears on every page *except* Home:**
   1. **Home** (`/learner/home`)
   2. **Dashboard** (`/learner/dashboard`) — see 3.15a for the tools reached from here, not from the main menu
   3. **My Learning** (`/learner/my-learning`) — the **Learning Plan** (`/learner/learning-plan`) is reached from inside My Learning, not its own menu item
