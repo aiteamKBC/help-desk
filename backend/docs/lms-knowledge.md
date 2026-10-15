@@ -144,3 +144,44 @@ Re-imported chunk count: 48 → 52 (new: 3.9a, 3.10a, 3.15a, 3.15b, plus expansi
 on apply. 24 offline tests passed (`test_lms_knowledge`, `test_support_hardening`).
 No commit, push or deployment was performed for the frontend findings above — they are
 documentation only; nothing in the LMS frontend itself was changed.
+
+## Full-site verification pass, same day
+
+Extended the same code-first method across every remaining section of the document —
+Calendar, Evidence, Quizzes, My Learning, Video, the onboarding flow, working-hours
+rule, Coach, Curriculum, Tutor, Enrolment, Employer, Admin and Engagement — checking
+each specific claim (button labels, routes, thresholds, file-format lists) against the
+current frontend source rather than rewriting from scratch. Most of the existing
+document held up: exact matches confirmed include the quiz question-type list, the
+`07:00–19:00` Monday–Friday working-hours window, the four onboarding review names,
+"Book my first session" and its tomorrow-earliest rule, the evidence file-size/type
+limits, "Signing opens after the month ends" for Monthly Logs (literal string in
+`features/monthly-logs/page.tsx`), and the engagement risk thresholds "critical <55,
+high <70" (literal string in `pages/engagement/attendance-risk/page.tsx`).
+
+Two factual errors found and corrected:
+
+- **"Unlock monthly log" is admin-only**, not a coach action as the document stated —
+  the button is gated `auth.account?.role === 'admin'` in `features/monthly-logs/page.tsx`.
+  A coach now gets told to escalate to an admin rather than look for a button they do
+  not have.
+- **"My Teaching" is the sidebar label for the tutor dashboard, not text on the page
+  itself** — the page's actual heading is "Good morning, {name}". Previously stated as
+  if it were the page title.
+
+Also expanded Calendar (3.11), previously four lines for a 2,192-line page: added the
+Month/Week/Day view switcher, the per-event Join Meeting and Export .ics buttons
+(confirming there is no single whole-calendar export), and the real event-type colours
+(Live Session, Coaching, Review).
+
+Chunk count unchanged at 52 (the Calendar edit lands inside an existing chunk; the two
+corrections are line-level fixes, not new sections). Re-imported and re-tested after
+each edit; `unrelated_knowledge_records_preserved: 64` held at every apply. Retrieval
+confidence checked directly against both corrections post-import (`0.370` and `0.395`
+respectively, well inside the `0.55` threshold).
+
+Sections not touched this pass: the Super Admin and Audit subsections' own claims
+(Access Logs, Audit Trail, Platform Report, Monthly Learning Sign-Off Report PDF) were
+not independently re-verified against source — spot-checked adjacent code in the same
+files but did not trace every listed feature. If a reported issue ever traces to one of
+those, verify it the same way before trusting the existing text.

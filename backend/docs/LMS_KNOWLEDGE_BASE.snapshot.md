@@ -264,7 +264,9 @@ Three separate menu items sound alike. Use the right one:
 A learner who was never told which of these contains what is the most common source of confusion — when in doubt, ask whether they mean the monthly 1:1, the formal review with their employer present, or something from before this platform was introduced.
 
 ### 3.11 Calendar (`/learner/calendar`)
-- Shows all your sessions, coaching, reviews and events.
+- Shows all your sessions, coaching, reviews and events. Event types include Live Session, Coaching and Review, each shown in its own colour.
+- **Views:** switch between **Month**, **Week** and **Day** using the buttons at the top.
+- **Click any event** to open its details. For a live session this shows a **Join Meeting** button (opens the meeting link directly) and an **Export .ics** button to add that one event to your own calendar app — there is no single button that exports everything at once.
 - **Book a Coach Session:** Catch-up, Student Support, PR, MCM, Gateway or Other.
 - **Catch-ups:** you can change or cancel them up to **12 hours** before the start.
 - "No coach has been assigned to you yet" means contact your programme team.
@@ -495,7 +497,7 @@ A book shared by two programmes is stored once and linked to both.
 - **Marking** (`/coach/marking-queue`):
   - Review the submission. **Generate AI draft** is optional and only a draft.
   - Then **Accept** or **Refer back**. Feedback is mandatory.
-- **Monthly Logs:** sign after month-end. **Unlock monthly log** reopens a log and keeps its signatures.
+- **Monthly Logs:** sign after month-end. **Unlock monthly log** reopens a locked log and keeps its existing signatures — but this button is **admin-only**; a coach cannot unlock one themselves and should escalate to an admin if a learner needs their log reopened.
 
 ### Viewing as an admin
 When an admin views a coach's workspace, it is read-only.
@@ -505,7 +507,7 @@ When an admin views a coach's workspace, it is read-only.
 ## 6. Other staff roles
 
 ### Tutor (`/workspace/tutor`)
-Shows "My Teaching": your modules and next live session.
+Reached via the **My Teaching** sidebar item. The page itself greets you by name ("Good morning, {name}") and shows your modules and next scheduled session — "My Teaching" is the menu label, not text on the page.
 
 ### Enrolment (`/users`)
 **Users directory:** search, filter, export.
