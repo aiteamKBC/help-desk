@@ -73,3 +73,74 @@ test settings; never point an integration test runner at production to create ta
   The threshold was not changed; no endpoint that creates tickets/logs was invoked.
 - No commit, push or deployment was performed. Live use requires deployment of
   the updated backend; the Neon import itself is already applied.
+
+## Rebuild on 2026-10-15 — code-verified learner sections
+
+The source has no repository of its own (`C:\Users\DELL\Desktop\LMS_V2\LMS_KNOWLEDGE_BASE.md`
+is a loose file, not under version control). A snapshot as of this rebuild is kept at
+`backend/docs/LMS_KNOWLEDGE_BASE.snapshot.md` in this repo so the content survives even
+if that file is lost; it is a copy for reference, not the live import source.
+
+This rebuild was triggered by two observed failures: the assistant gave a different
+menu location for Progress Review on consecutive turns, and separately named "KBC
+LearningOS" in nearly every reply. Both traced back to the same cause — every chunk's
+embedding included the document banner and full heading path, which pulled all 51
+vectors within 0.02 of each other, so no LMS question ever cleared the 0.55 confidence
+threshold and the model filled the gap by guessing. Fixed in `lms_knowledge.py` by
+embedding the heading trail and body only, keeping the banner for display
+(`embed_text` vs `text`; see `embed_hash` in chunk metadata so a changed embedding
+forces a re-embed even when the stored text is unchanged).
+
+Every new learner-facing claim below was checked against the current frontend source
+at `E:\Projects\lms_updates\LMS_v2\frontend\src`, not against `mocks/user-guide-data.ts`
+— that file backs the in-app `/user-guide` page and reads as confident, detailed
+documentation, but it describes screens already flagged live as sample-data-only
+(Support, Gateway, Knowledge Base) with the same confidence as working ones, and at
+least one quoted label ("Flag for Review" on the quiz page) does not exist in the
+component it is attributed to. Treat it as an index of topics to verify, never as a
+source of fact for this document.
+
+Findings from that verification:
+
+- The real learner menu (`mocks/navigation.ts`) groups Monthly Submission, Monthly
+  Logs, Monthly Coaching Meeting, Progress Review and Reviews under one "My Progress"
+  entry — confirmed correct already; the chatbot's inconsistency was a retrieval gap
+  before the embedding fix, not a wrong document (3.2, 3.10a).
+- The Catch-Up Learning Hub (`/learner/catchup`) is demo-only in a way the existing
+  "Not live yet" list had not caught: its evidence form sets local state and calls no
+  endpoint, so "Submit" shows a fake success screen and saves nothing. The real,
+  backend-connected catch-up booking and absence report both live inside the
+  Attendance page itself (`fetch('/learner_api/session-catchup/...')` in
+  `pages/learner/attendance/page.tsx`, and `AbsenceReportForm` posting to
+  `api/absenceReports`). Added to "Not live yet" and to 3.12.
+- Messages is confirmed still off (`CHAT_ENABLED = false` in `lib/featureFlags.ts`);
+  opening `/learner/messages` redirects to `/`. Unchanged from the existing entry.
+- `/learner/otjh` and `/learner/ksbs` are not separate pages — both routes render
+  `ProgressPage` (`router/config.tsx`), the same component as `/learner/progress`.
+- Clubs, Events, Rewards and Flash cards are reached from the Dashboard
+  (`learnerDashboardLinks` in `mocks/navigation.ts`), not from the main sidebar;
+  Profile is not in either list. Both were previously undocumented (3.15a, 3.15b).
+- Monthly Cycle (`/learner/monthly-cycle`) and Learning Plan (`/learner/learning-plan`)
+  are real, API-backed views reached as alternate addresses for Monthly Logs and My
+  Learning respectively (`matchPaths` in `mocks/navigation.ts`), not separate menu
+  items. Previously undocumented; added as 3.9a and a note under 3.3.
+- Monthly Coaching Meeting and Progress Review were already accurately documented.
+  Added 3.10a to state plainly how they differ from the third, previously-undocumented
+  "Reviews" page (`/learner/reviews`, booked/held review history including anything
+  imported from the college's previous system).
+
+Prompt changes in `chatbot.py` alongside this: told the assistant LearningOS and the
+support service are separate (so a feature switched off in one says nothing about the
+other), to stop repeating the product name every reply, to try at least one real
+suggestion before saying the support team is needed, and gated escalation so a vague
+opening message or a clarifying question from the assistant itself no longer counts as
+a failed attempt. Also: the per-model token-cap parameter is chosen per attempt now
+(`max_completion_tokens` vs `max_tokens`) rather than silently dropping the cap on the
+first rejection, which had been quietly undoing the brevity instructions for gpt-5-era
+models.
+
+Re-imported chunk count: 48 → 52 (new: 3.9a, 3.10a, 3.15a, 3.15b, plus expansions to
+3.2, 3.3, 3.12, 3.13). `unrelated_knowledge_records_preserved: 64` confirmed unchanged
+on apply. 24 offline tests passed (`test_lms_knowledge`, `test_support_hardening`).
+No commit, push or deployment was performed for the frontend findings above — they are
+documentation only; nothing in the LMS frontend itself was changed.
