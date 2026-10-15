@@ -87,10 +87,19 @@ def build_chunks(markdown: str, source_name: str) -> list[dict[str, Any]]:
         guardrail = bool(titles and titles[-1] in {
             "Not live yet", "How to use this document (instructions for the assistant)",
         })
+        # The document title heads every section path, and the banner and audience
+        # line are near-identical across chunks. Embedding that boilerplate pulls
+        # every vector towards the same point: distances for unrelated sections
+        # ended up within 0.02 of each other, so nothing ever scored as a good
+        # match. Embed the heading trail and body only; keep the full text for
+        # display and for the model to read.
+        embed_section = " > ".join(titles[1:] or titles) or source_name
         for part_number, part in enumerate(parts, 1):
             text = f"KBC LearningOS help\nSection: {section}\nAudience: {', '.join(audiences)}\n\n{part}"
+            embed_text = f"{embed_section}\n\n{part}"
             chunks.append({
                 "text": text,
+                "embed_text": embed_text,
                 "metadata": {
                     "source_key": SOURCE_KEY,
                     "source": source_name,
@@ -105,6 +114,9 @@ def build_chunks(markdown: str, source_name: str) -> list[dict[str, Any]]:
                     "part": part_number,
                     "parts": len(parts),
                     "chunk_hash": digest(text),
+                    # Changing what we embed must force a re-embed, even when the
+                    # stored text is identical.
+                    "embed_hash": digest(embed_text),
                 },
             })
     if not chunks:
@@ -131,7 +143,11 @@ def embed_chunks(chunks: list[dict[str, Any]], model: str) -> list[list[float]]:
     vectors = []
     for offset in range(0, len(chunks), 24):
         batch = chunks[offset:offset + 24]
-        response = client.embeddings.create(model=model, input=[item["text"] for item in batch])
+        response = client.embeddings.create(
+            model=model,
+            # Falls back to the stored text for callers that build chunks by hand.
+            input=[item.get("embed_text") or item["text"] for item in batch],
+        )
         items = sorted(response.data, key=lambda item: item.index)
         if [item.index for item in items] != list(range(len(batch))):
             raise ValueError("Embedding response indexes are incomplete or duplicated.")

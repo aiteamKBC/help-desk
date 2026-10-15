@@ -24,6 +24,13 @@ from django.db import connection, transaction
 
 from .lms_knowledge import SOURCE_KEY
 
+# LMS learner knowledge arrives from more than one document. The main help guide
+# is re-imported wholesale, which archives everything carrying its key, so other
+# LMS material is tagged separately to survive those imports — and every key here
+# is searched for learner questions and withheld from support-portal ones.
+UI_GROUNDING_KEY = "kbc-lms-ui-grounding"
+LMS_SOURCE_KEYS = [SOURCE_KEY, UI_GROUNDING_KEY]
+
 from .services import (
     ApiError,
     is_valid_email,
@@ -256,6 +263,27 @@ def is_vague_problem_statement(text: str) -> bool:
     return bool(_VAGUE_OPENER_RE.match(stripped))
 
 
+# "tick\w{0,4}" rather than "ticket": learners type this in a hurry and the real
+# message that prompted this rule said "tickect".
+_DECLINES_ESCALATION_RE = re.compile(
+    r"\b(?:no|not|don'?t|dont|do\s+not|without)\b[^.?!]{0,24}"
+    r"\b(?:tick\w{0,4}|escalat\w*|agent|support\s+team)\b"
+    r"|\b(?:tick\w{0,4}|escalat\w*)\b[^.?!]{0,16}\bno(?:t|pe)?\b"
+    r"|\bjust\s+(?:tell|show|help)\s+me\b"
+    r"|\bmyself\b",
+    re.IGNORECASE,
+)
+
+
+def declines_escalation(text: str) -> bool:
+    """True when the learner has said they do not want to be handed off.
+
+    They asked for help using the LMS, so continuing to push a ticket at them is
+    both deaf and faintly insulting.
+    """
+    return bool(_DECLINES_ESCALATION_RE.search(text or ""))
+
+
 def is_clarifying_question(reply: str) -> bool:
     """True when the assistant asked the learner something instead of answering.
 
@@ -373,9 +401,12 @@ def search_knowledge_base(route: str, query: str, *, top_k: int = 4) -> list[dic
                 if table == "new_lms_knowledge_base":
                     # The same table also contains support-desk documentation.
                     # Those email-first flows are not the new LMS login flow.
-                    source_filter = ("AND metadata->>'source_key' IS DISTINCT FROM %s "
-                                     if route == "support" else "AND metadata->>'source_key'=%s ")
-                    source_params = [SOURCE_KEY]
+                    source_filter = (
+                        "AND COALESCE(metadata->>'source_key','') <> ALL(%s) "
+                        if route == "support"
+                        else "AND metadata->>'source_key' = ANY(%s) "
+                    )
+                    source_params = [LMS_SOURCE_KEYS]
                 cursor.execute(
                     f'SELECT text, (embedding <=> %s::vector) AS distance, metadata '
                     f'FROM public."{table}" '
@@ -393,6 +424,7 @@ def search_knowledge_base(route: str, query: str, *, top_k: int = 4) -> list[dic
                                     "metadata": metadata or {}})
 
             guardrails = []
+            navigation: list[dict[str, Any]] = []
             if "new_lms_knowledge_base" in tables and route != "support":
                 cursor.execute(
                     """SELECT text,metadata FROM public.new_lms_knowledge_base
@@ -405,8 +437,29 @@ def search_knowledge_base(route: str, query: str, *, top_k: int = 4) -> list[dic
                                "distance": None, "table": "new_lms_knowledge_base"}
                               for text, metadata in cursor.fetchall()]
 
+                # Where a page lives is the single most-asked thing, and the
+                # assistant was inventing menu locations whenever retrieval
+                # happened not to surface the menu — placing Progress Review
+                # under My Learning one turn after correctly saying My Progress.
+                # The menu section is small, so pin it to every LMS answer.
+                cursor.execute(
+                    """SELECT text,metadata FROM public.new_lms_knowledge_base
+                       WHERE metadata->>'source_key'=%s
+                         AND metadata->>'title' ILIKE %s
+                         AND COALESCE(metadata->>'archived','false')!='true'
+                         AND COALESCE(metadata->>'status','active')!='archived'
+                       ORDER BY id LIMIT 1""",
+                    [SOURCE_KEY, "%Home and menu%"],
+                )
+                navigation = [{"text": text, "metadata": metadata, "navigation": True,
+                               "distance": None, "table": "new_lms_knowledge_base"}
+                              for text, metadata in cursor.fetchall()]
+
     results.sort(key=lambda row: row["distance"])
-    return results[:top_k] + guardrails
+    # Drop any copy retrieval already found, so the menu is not sent twice.
+    pinned_texts = {row["text"] for row in navigation}
+    ranked = [row for row in results[:top_k] if row["text"] not in pinned_texts]
+    return ranked + navigation + guardrails
 
 
 # Roughly 300 words — enough for a complete short answer, short enough that a
@@ -572,7 +625,10 @@ def generate_assistant_reply(
     learner_turns = sum(1 for entry in (history or []) if entry.get("sender") == "user") + 1
     too_early = learner_turns < ASSISTANT_MIN_TURNS_BEFORE_ESCALATION
     escalate = wants_human(message) or (
-        (low_confidence or not evidence) and not still_scoping and not too_early
+        (low_confidence or not evidence)
+        and not still_scoping
+        and not too_early
+        and not declines_escalation(message)
     )
 
     return {

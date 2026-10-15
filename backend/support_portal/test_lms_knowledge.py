@@ -108,6 +108,8 @@ class LmsRetrievalTests(SimpleTestCase):
         cursor.fetchall.side_effect = [
             [("Current help", .2, {"source_key": SOURCE_KEY})],
             [("Messages is disabled", {"guardrail": True})],
+            # The menu section, pinned to every LMS answer.
+            [("Menu: Home, My Progress", {"title": "3.2 Home and menu"})],
         ]
         with patch.object(chatbot, "connection", conn), patch.object(
             chatbot.transaction, "atomic", return_value=nullcontext()
@@ -119,17 +121,23 @@ class LmsRetrievalTests(SimpleTestCase):
         results, calls = self.run_search("moodle")
         sql = "\n".join(c.args[0] for c in calls)
         self.assertNotIn("moodle_knowledge_base", sql)
-        self.assertIn("metadata->>'source_key'=%s", sql)
+        self.assertIn("metadata->>'source_key' = ANY(%s)", sql)
         self.assertIn("metadata->>'archived'", sql)
         self.assertIn("metadata->>'status'", sql)
-        self.assertEqual(len(results), 2)  # guardrails survive top_k
+        self.assertEqual(len(results), 3)  # ranked hit + pinned menu + guardrail
         self.assertTrue(results[-1]["guardrail"])
         self.assertIsNone(results[-1]["distance"])
+        # Navigation always travels with an LMS answer, whatever retrieval ranked.
+        self.assertTrue(any(row.get("navigation") for row in results))
 
     def test_support_search_does_not_use_lms_document(self):
         results, calls = self.run_search("support")
         self.assertEqual(len(results), 1)
-        self.assertIn("IS DISTINCT FROM %s", "\n".join(c.args[0] for c in calls))
+        # Every LMS key is excluded, not just the main help guide.
+        self.assertIn("<> ALL(%s)", "\n".join(c.args[0] for c in calls))
+        keys = next(c.args[1][1] for c in calls if len(c.args) > 1 and "source_key" in c.args[0])
+        self.assertIn(chatbot.SOURCE_KEY, keys)
+        self.assertIn(chatbot.UI_GROUNDING_KEY, keys)
 
     def test_coach_and_tutor_get_direct_role_help(self):
         for role in ("coach", "tutor"):

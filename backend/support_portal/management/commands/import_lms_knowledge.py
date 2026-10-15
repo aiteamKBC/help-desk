@@ -32,8 +32,10 @@ def matches_version(rows, markdown, chunks, model):
             or documents[0][1] != markdown or documents[0][2].get('status') != 'active'
             or len(stored) != len(chunks)):
         return False
-    expected = {(c["metadata"]["chunk_index"], c["text"]) for c in chunks}
-    actual = {(r[2].get("chunk_index"), r[1]) for r in stored}
+    # embed_hash is part of the identity: the same stored text embedded a
+    # different way is a different record and has to be re-embedded.
+    expected = {(c["metadata"]["chunk_index"], c["text"], c["metadata"]["embed_hash"]) for c in chunks}
+    actual = {(r[2].get("chunk_index"), r[1], r[2].get("embed_hash")) for r in stored}
     return actual == expected and all(
         r[2].get("source_hash") == digest(markdown)
         and r[2].get("embedding_model") == model
