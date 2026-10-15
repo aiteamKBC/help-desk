@@ -243,6 +243,26 @@ def is_vague_problem_statement(text: str) -> bool:
     return bool(_VAGUE_OPENER_RE.match(stripped))
 
 
+def is_clarifying_question(reply: str) -> bool:
+    """True when the assistant asked the learner something instead of answering.
+
+    Looking at our own reply catches far more than pattern-matching the learner's
+    wording: whatever they wrote, if the assistant came back with a question it
+    has not tried and failed yet, so offering to escalate contradicts itself.
+    """
+    text = (reply or "").strip()
+    if not text.endswith("?"):
+        return False
+    # Numbered steps mean guidance was given, not a question asked.
+    if re.search(r"^\s*\d+[\.\)]\s", text, re.MULTILINE):
+        return False
+    # Scoping is one short question, at most prefaced by a line of acknowledgement
+    # ("Yes, I can help with that. What are you trying to do?"). An answer that
+    # merely closes with "does that help?" runs longer than that.
+    sentences = [part for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+    return len(sentences) <= 2 and len(text.split()) <= 30
+
+
 _CLOSING_PHRASE_RE = re.compile(
     r"\b(that'?s all|that is all|nothing else|i'?m done|im done|all good|no thanks?|"
     r"that helps|that helped)\b",
@@ -374,21 +394,36 @@ def search_knowledge_base(route: str, query: str, *, top_k: int = 4) -> list[dic
     return results[:top_k] + guardrails
 
 
+# Roughly 300 words — enough for a complete short answer, short enough that a
+# model which starts listing every possibility gets cut off rather than making
+# the learner wait.
+ASSISTANT_REPLY_TOKEN_CAP = 400
+
+
 def _chat_completion(messages: list[dict[str, str]]) -> str:
     client = _openai_client()
     model = sanitize_text(getattr(settings, "OPENAI_CHAT_MODEL", "")) or "gpt-4o-mini"
-    try:
-        # Capped so the learner gets a short answer quickly; the prompt already
-        # asks for brevity, so this only catches a model that rambles.
-        completion = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=400,
-        )
-    except Exception:
-        # Some newer models reject temperature or max_tokens; retry with defaults.
-        completion = client.chat.completions.create(model=model, messages=messages)
+    # The reply is capped so learners get a short answer quickly. Which parameter
+    # carries that cap depends on the model generation: gpt-5 era models take
+    # max_completion_tokens and reject max_tokens, older ones are the reverse.
+    # Try each in turn rather than silently falling back to an uncapped call.
+    attempts = (
+        {"temperature": 0.3, "max_completion_tokens": ASSISTANT_REPLY_TOKEN_CAP},
+        {"temperature": 0.3, "max_tokens": ASSISTANT_REPLY_TOKEN_CAP},
+        {"max_completion_tokens": ASSISTANT_REPLY_TOKEN_CAP},
+        {},
+    )
+    last_error: Exception | None = None
+    for options in attempts:
+        try:
+            completion = client.chat.completions.create(
+                model=model, messages=messages, **options
+            )
+            break
+        except Exception as error:  # noqa: PERF203 - each retry drops one parameter
+            last_error = error
+    else:
+        raise last_error  # type: ignore[misc]
     return sanitize_text(completion.choices[0].message.content)
 
 
@@ -506,11 +541,11 @@ def generate_assistant_reply(
 
     threshold = float(getattr(settings, "ASSISTANT_ESCALATION_DISTANCE", 0.55) or 0.55)
     low_confidence = best_distance is not None and best_distance > threshold
-    # A vague opener reads as low confidence because there is nothing to match on
-    # yet. Asking what is wrong is the right move there, not escalating.
-    escalate = wants_human(message) or (
-        (low_confidence or not evidence) and not is_vague_problem_statement(message)
-    )
+    # Low confidence only means escalate when the assistant actually tried and
+    # fell short. A vague opener, or a reply that asks the learner what they
+    # meant, is the conversation still getting started.
+    still_scoping = is_vague_problem_statement(message) or is_clarifying_question(reply)
+    escalate = wants_human(message) or ((low_confidence or not evidence) and not still_scoping)
 
     return {
         "reply": reply,
