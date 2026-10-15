@@ -13723,6 +13723,18 @@ def create_follow_up_ticket_from_source_ticket(
         },
     )
 
+    # A follow-up is a new ticket for the team to pick up, so it is announced
+    # like any other. Best effort: the follow-up itself is already committed.
+    try:
+        queue_ticket_created_notification({
+            **new_ticket_row,
+            "public_id": new_public_id,
+            "learner_email": sanitize_text(ticket.get("learner_email")),
+            "learner_name": sanitize_text(ticket.get("learner_name")),
+        })
+    except Exception as error:  # pragma: no cover - notification is best effort
+        logger.warning("Could not queue the follow-up ticket notification: %s", error)
+
     return new_public_id
 
 
