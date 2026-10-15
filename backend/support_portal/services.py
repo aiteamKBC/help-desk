@@ -15507,6 +15507,10 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
     try:
         queue_ticket_created_notification({
             **ticket_row,
+            # ticket_row predates the public id, which is written in a follow-up
+            # update once the row has an id. Without this the webhook went out
+            # with an empty ticketId and was rejected.
+            "public_id": public_id,
             "learner_email": learner.get("email", ""),
             "learner_name": requester.get("display_name") or learner.get("full_name") or "",
         })
