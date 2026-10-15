@@ -6254,6 +6254,10 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           ON c.id = t.conversation_id
         WHERE t.learner_id = %s
           AND t.status <> 'Closed'
+          -- An archived ticket is out of the live queue, so staff no longer see
+          -- it. Reusing one would silently attach new learner activity to
+          -- something nobody is working: open a fresh ticket instead.
+          AND NOT COALESCE(t.is_archived, FALSE)
           AND (
             t.status <> 'Open'
             OR LOWER(COALESCE(c.status, 'open')) <> 'closed'
