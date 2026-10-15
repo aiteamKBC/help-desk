@@ -40,12 +40,14 @@ from .roles import (
     ROLE_ADMIN,
     ROLE_AGENT,
     ROLE_COACH,
+    ROLE_TUTOR,
     derive_account_scope_from_role,
     ROLE_EMPLOYER,
     ROLE_SUPERADMIN,
     ROLE_USER,
     SUPPORT_ACCESS_GROUP_NAME,
     SUPPORT_PORTAL_ACCESS_ROLES,
+    TUTOR_ACCESS_GROUP_NAME,
 )
 
 logger = logging.getLogger(__name__)
@@ -170,6 +172,8 @@ SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
+SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+SUPPORT_NOTIFICATION_MAX_ATTEMPTS = 2
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
         "quick_ticket_confirmation_email_sent",
@@ -4602,16 +4606,38 @@ def build_support_notification_webhook_payload(
 
 
 def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, response_payload = post_json_webhook(
-        get_support_notification_webhook_url(),
-        payload,
-        timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
+    # Retry only explicit transient HTTP failures. Retrying a timeout could duplicate
+    # an email if n8n completed the request but its response was lost.
+    delivery_key = ":".join(
+        part for part in (
+            sanitize_text(payload.get("event")),
+            sanitize_text(payload.get("ticketId")),
+            sanitize_text(payload.get("recipientType")),
+        ) if part
     )
+    request_headers = {"X-Support-Delivery-Key": delivery_key} if delivery_key else None
+    attempts = 0
+    configured = delivered = False
+    status = None
+    response_payload: Any = None
+    for attempts in range(1, SUPPORT_NOTIFICATION_MAX_ATTEMPTS + 1):
+        configured, delivered, status, response_payload = post_json_webhook(
+            get_support_notification_webhook_url(),
+            payload,
+            headers=request_headers,
+            timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
+        )
+        if delivered or status not in SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES:
+            break
+        if attempts < SUPPORT_NOTIFICATION_MAX_ATTEMPTS:
+            time.sleep(0.25)
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
         "response": response_payload,
+        "attempts": attempts,
+        "deliveryKey": delivery_key,
     }
 
 
@@ -4663,6 +4689,8 @@ def queue_support_notification_delivery(
                     "webhookConfigured": bool(result.get("configured")),
                     "webhookDelivered": delivered,
                     "webhookStatus": result.get("status"),
+                    "webhookAttempts": result.get("attempts", 1),
+                    "webhookDeliveryKey": result.get("deliveryKey", ""),
                     "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
                 },
             )
@@ -5717,10 +5745,17 @@ def has_public_requester_coach_access(email: Any) -> bool:
     return legacy_auth_user_has_group_by_email(email, COACH_ACCESS_GROUP_NAME)
 
 
+def has_public_requester_tutor_access(email: Any) -> bool:
+    return legacy_auth_user_has_group_by_email(email, TUTOR_ACCESS_GROUP_NAME)
+
+
 def apply_public_requester_role_overrides(email: Any, requester_role: Any) -> str:
     normalized_role = normalize_public_requester_role(requester_role)
-    if normalized_role == ROLE_USER and has_public_requester_coach_access(email):
-        return ROLE_COACH
+    if normalized_role == ROLE_USER:
+        if has_public_requester_coach_access(email):
+            return ROLE_COACH
+        if has_public_requester_tutor_access(email):
+            return ROLE_TUTOR
     return normalized_role
 
 
@@ -6109,7 +6144,7 @@ def promote_ticket_requester_role_if_needed(
     normalized_default_role = normalize_public_requester_role(default_role, default=current_role)
     if current_role == ROLE_USER and normalized_default_role != ROLE_USER:
         effective_role = normalized_default_role
-    if effective_role != ROLE_COACH or current_role == ROLE_COACH:
+    if effective_role not in {ROLE_COACH, ROLE_TUTOR} or current_role == effective_role:
         return ticket, effective_role
 
     ticket_id = parse_int(ticket.get("id"), 0)
@@ -6117,7 +6152,7 @@ def promote_ticket_requester_role_if_needed(
         return ticket, effective_role
 
     updated_metadata = dict(ticket_metadata)
-    updated_metadata["requester_role"] = ROLE_COACH
+    updated_metadata["requester_role"] = effective_role
 
     with connection.cursor() as cursor:
         cursor.execute(

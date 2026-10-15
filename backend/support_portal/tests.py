@@ -1470,6 +1470,7 @@ class AdminSessionViewTests(SimpleTestCase):
                 "actorUsername": "fatma",
                 "instanceId": "current-instance",
             },
+            uploaded_files=[],
         )
 
     def test_admin_ticket_chat_history_uses_server_session_actor(self):
@@ -2866,6 +2867,7 @@ class SupportSessionValidationTests(SimpleTestCase):
                 "get_coverage_ticket_operations_webhook_url",
                 return_value="https://n8n.example/coverage-ticket",
             ),
+            patch.object(services, "get_coverage_ticket_operations_webhook_secret", return_value=""),
             patch.object(
                 services,
                 "post_json_webhook",
@@ -2920,6 +2922,7 @@ class SupportSessionValidationTests(SimpleTestCase):
                 "get_coverage_ticket_operations_webhook_url",
                 return_value="https://n8n.example/coverage-ticket",
             ),
+            patch.object(services, "get_coverage_ticket_operations_webhook_secret", return_value=""),
             patch.object(
                 services,
                 "post_json_webhook",

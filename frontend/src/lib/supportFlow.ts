@@ -2,6 +2,9 @@ import { type BookingSummary, type RequesterRole, type Ticket } from "@/context/
 
 export const awaitingMeetingReason = "Awaiting support meeting";
 export const quickTicketReason = "Quick Ticket";
+export const chatbotClosingReason = "Closed via Chatbot";
+export const requesterClosingReason = "Closed by Requester";
+export const liveAgentQueueWaitingMessage = "No support admins are available right now. You're in queue and we'll connect you as soon as one becomes available. If you'd prefer another option, you can still continue this inquiry through booking session or submit ticket directly.";
 export const awaitingSupportReviewReason = quickTicketReason;
 export const coverageTutorRequestedReason = "Tutor Requested";
 export const coverageTutorAcceptedReason = "Tutor Accepted";
@@ -26,6 +29,9 @@ type TicketFlowState = Pick<Ticket, "id" | "status" | "statusReason" | "requeste
 
 export const isCoachRequesterRole = (role: RequesterRole | string | null | undefined) =>
   (role || "").trim().toLowerCase() === "coach";
+
+export const getRequesterChatClosingReason = (liveChatRequested: boolean) =>
+  liveChatRequested ? requesterClosingReason : chatbotClosingReason;
 
 export const isAwaitingMeetingTicket = (ticket: TicketFlowState) =>
   ticket.status === "Pending" && ticket.statusReason === awaitingMeetingReason;

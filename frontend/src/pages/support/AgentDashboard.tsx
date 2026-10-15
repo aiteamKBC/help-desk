@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Archive,
@@ -503,6 +503,7 @@ interface PermanentDeleteResponse {
 interface MigrationStatusResponse {
   adminAiWebhookConfigured?: boolean;
   chatbotWebhookConfigured?: boolean;
+  nativeAssistantConfigured?: boolean;
 }
 
 interface NotificationLogResponse {
@@ -2411,7 +2412,11 @@ const AgentDashboard = () => {
         }
 
         setChatbotWorkflowConfigured(
-          Boolean(migrationStatusPayload?.adminAiWebhookConfigured ?? migrationStatusPayload?.chatbotWebhookConfigured),
+          Boolean(
+            migrationStatusPayload?.nativeAssistantConfigured
+            ?? migrationStatusPayload?.adminAiWebhookConfigured
+            ?? migrationStatusPayload?.chatbotWebhookConfigured,
+          ),
         );
       });
 
@@ -8273,11 +8278,16 @@ const CoverageTicketWorkspace = ({
   const hasSavedCoverageSnapshot = Boolean(ticket.documentation?.coverageCards?.length || ticket.documentation?.coverageNotes?.trim());
   const previewAttachmentKind = getCoverageAttachmentPreviewKind(previewAttachment);
   const previewAttachmentSource = getCoverageAttachmentSource(previewAttachment);
-  const parsedCoverageInquiry = parseCoverageInquiry(draft.inquiry);
+  const parsedCoverageInquiry = useMemo(
+    () => parseCoverageInquiry(draft.inquiry),
+    [draft.inquiry],
+  );
   const coverageInquiryModule = parsedCoverageInquiry?.module?.trim() || "";
   const coverageInquiryTime = parsedCoverageInquiry?.time?.trim() || "";
-  const coverageInquirySessionDates = parsedCoverageInquiry?.sessionDates || [];
-  const coverageInquirySessionDateKey = coverageInquirySessionDates.join("|");
+  const coverageInquirySessionDates = useMemo(
+    () => parsedCoverageInquiry?.sessionDates || [],
+    [parsedCoverageInquiry],
+  );
   const tutorAvailabilityByKey = new Map(
     tutorAvailabilityItems.map((item) => [normalizeCoverageTutorOptionKey(item.tutor), item]),
   );
@@ -8297,7 +8307,6 @@ const CoverageTicketWorkspace = ({
         .flat()
         .forEach(revokeCoverageAttachmentObjectUrl);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Revoke only the current pending object URLs when the panel unmounts.
   ), []);
 
   useEffect(() => {
@@ -8384,7 +8393,7 @@ const CoverageTicketWorkspace = ({
     return () => {
       cancelled = true;
     };
-  }, [coverageInquiryTime, coverageInquirySessionDateKey, ticket.id]);
+  }, [coverageInquiryTime, coverageInquirySessionDates, ticket.id]);
 
   const expandCoverageHistoryCards = () => {
     setCollapsedCoverageCardIds(new Set());
