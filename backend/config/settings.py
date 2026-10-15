@@ -174,6 +174,9 @@ SUPPORT_SESSION_SLOT_INTERVAL_MINUTES = max(int(get_env("SUPPORT_SESSION_SLOT_IN
 SUPPORT_SESSION_BUFFER_MINUTES = max(int(get_env("SUPPORT_SESSION_BUFFER_MINUTES", "0") or "0"), 0)
 SUPPORT_TEAMS_CALL_URL = get_env("SUPPORT_TEAMS_CALL_URL")
 SUPPORT_TEAMS_CALL_TARGETS = get_env_list("SUPPORT_TEAMS_CALL_TARGETS", "")
+# Who the support team's own notifications reach. Sent in the webhook payload so
+# n8n addresses the mail from here rather than from its own copy of the rota.
+SUPPORT_OPERATIONS_NOTIFICATION_EMAILS = get_env_list("SUPPORT_OPERATIONS_NOTIFICATION_EMAILS", "")
 SUPPORT_TEAMS_CALL_LABEL = get_env("SUPPORT_TEAMS_CALL_LABEL", "")
 SUPPORT_BOOKING_URL = get_env(
     "SUPPORT_BOOKING_URL",

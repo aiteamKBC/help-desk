@@ -170,6 +170,8 @@ LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailab
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
+SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED = "ticket_created"
+TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "ticket_created_operations_notified_at"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
 SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -186,6 +188,10 @@ SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE: (
         "live_agent_unavailable_operations_notified",
         "live_agent_unavailable_operations_notification_failed",
+    ),
+    SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED: (
+        "ticket_created_operations_notified",
+        "ticket_created_operations_notification_failed",
     ),
 }
 MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -4543,6 +4549,30 @@ def notify_learning_plan_ticket_transfer(ticket_id: int, payload: dict[str, Any]
     return webhook_result
 
 
+def get_support_operations_notification_emails() -> list[str]:
+    """Addresses the support team's own notifications are sent to.
+
+    Falls back to the Teams-call targets so a deployment that has only ever
+    configured those still reaches a person, rather than sending operations mail
+    to nobody.
+    """
+    configured = settings.SUPPORT_OPERATIONS_NOTIFICATION_EMAILS
+    raw = [configured] if isinstance(configured, str) else list(configured or [])
+    emails: list[str] = []
+    for item in raw:
+        address = normalize_email(item)
+        if address and address not in emails:
+            emails.append(address)
+    if emails:
+        return emails
+
+    for item in get_support_teams_call_targets(include_booking_fallback=False):
+        address = normalize_email(item)
+        if address and address not in emails:
+            emails.append(address)
+    return emails
+
+
 def build_support_notification_webhook_payload(
     event: str,
     ticket: dict[str, Any],
@@ -4554,7 +4584,14 @@ def build_support_notification_webhook_payload(
 ) -> dict[str, Any]:
     public_base_url = get_support_portal_public_base_url("")
     dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
-    recipient_type = "operations" if event == SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE else "requester"
+    recipient_type = (
+        "operations"
+        if event in {
+            SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE,
+            SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+        }
+        else "requester"
+    )
     ticket_metadata = normalize_json_object(ticket.get("metadata"))
     requester_role = get_ticket_requester_role(ticket_metadata)
     requester_source = get_ticket_requester_source(
@@ -4571,10 +4608,20 @@ def build_support_notification_webhook_payload(
     notification_status = status or sanitize_text(ticket.get("status"))
     notification_status_reason = status_reason if status_reason is not None else sanitize_text(ticket.get("status_reason"))
 
+    # Operations mail is addressed from here, so a change of rota is a settings
+    # change rather than an edit inside n8n. The learner's own notifications
+    # still go to the learner, so they carry no operations addresses.
+    recipients = (
+        get_support_operations_notification_emails()
+        if recipient_type == "operations"
+        else [requester_email] if requester_email else []
+    )
+
     return {
         "event": event,
         "source": "support_portal",
         "recipientType": recipient_type,
+        "recipients": recipients,
         "ticket": {
             "id": ticket.get("public_id"),
             "status": notification_status,
@@ -4792,6 +4839,25 @@ def should_notify_live_agent_unavailable(ticket: dict[str, Any], *, assigned_age
         return False
 
     return True
+
+
+def queue_ticket_created_notification(ticket: dict[str, Any]) -> None:
+    """Tell the support team a ticket has just been opened.
+
+    Keyed on its own metadata flag so a retry or a second save cannot send the
+    same opening mail twice.
+    """
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+        ticket,
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+        payload=payload,
+        sent_metadata_key=TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
 
 
 def queue_live_agent_unavailable_notification(ticket: dict[str, Any], *, requested_at: Any) -> None:
@@ -15423,6 +15489,17 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 attachment_rows=attachment_rows,
             ),
         )
+
+    # Outside the write above: a webhook that is slow or down must not roll back
+    # a ticket the learner has already been told was opened.
+    try:
+        queue_ticket_created_notification({
+            **ticket_row,
+            "learner_email": learner.get("email", ""),
+            "learner_name": requester.get("display_name") or learner.get("full_name") or "",
+        })
+    except Exception as error:  # pragma: no cover - notification is best effort
+        logger.warning("Could not queue the ticket-created notification: %s", error)
 
     return {
         "ticket": {
