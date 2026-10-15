@@ -166,6 +166,40 @@ class LmsRetrievalTests(SimpleTestCase):
             response = chatbot.generate_assistant_reply("An undocumented LMS problem")
         self.assertFalse(response["escalate"])
 
+    def test_chosen_action_never_reaches_retrieval_or_the_model(self):
+        """A pressed button is an instruction. Answering it from the knowledge
+        base is what had the assistant explaining the LMS's own coach booking
+        when the learner asked to book a session with support."""
+        requester = {"learner": {"id": "1"}, "display_name": "Aya"}
+        with patch.object(chatbot, "search_knowledge_base") as search, \
+             patch.object(chatbot, "_chat_completion") as completion, \
+             patch.object(chatbot, "_escalate_to_ticket",
+                          return_value={"id": "KBC-1", "status": "Open", "created": True}):
+            response = chatbot.perform_escalation_action("book_meeting", requester, "a@b.com", [])
+
+        search.assert_not_called()
+        completion.assert_not_called()
+        self.assertEqual(response["ticket"]["id"], "KBC-1")
+        self.assertIn("/support/booking", response["actionUrl"])
+        # It must not send them into LearningOS's own calendar for this.
+        self.assertNotIn("/learner/calendar", response["reply"])
+
+    def test_live_chat_action_joins_the_queue(self):
+        requester = {"learner": {"id": "1"}, "display_name": "Aya"}
+        with patch.object(chatbot, "_escalate_to_ticket",
+                          return_value={"id": "KBC-2", "status": "Open", "created": False}), \
+             patch("support_portal.services.request_live_chat",
+                   return_value={"ticket": {"liveChatRequested": True}}) as queue:
+            response = chatbot.perform_escalation_action("live_chat", requester, "a@b.com", [])
+
+        queue.assert_called_once_with("KBC-2")
+        self.assertIn("queue", response["reply"].lower())
+
+    def test_action_without_a_known_learner_does_not_claim_a_ticket(self):
+        response = chatbot.perform_escalation_action("ticket", None, "", [])
+        self.assertEqual(response["assistantAction"], "escalate_needs_identity")
+        self.assertNotIn("ticket", response)
+
     def test_asking_for_a_human_escalates_on_the_first_message(self):
         """The gate holds back guesswork, never a learner who asked outright."""
         with patch.object(chatbot, "search_knowledge_base", return_value=[

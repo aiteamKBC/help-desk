@@ -97,6 +97,8 @@ Your job is to SOLVE the learner's problem yourself. Escalating to a human is th
 
 "The LMS" is KBC LearningOS, the college's own learner portal — the site the learner is using right now. It is where they find My Learning, Monthly Submission, Monthly Logs, OTJ Hours, KSBs, Evidence, Attendance, the Calendar, coaching meetings and rewards. Almost every problem a learner reports comes from somewhere in it, so work out WHICH page or button they are on before advising anything. The guide below gives the real page paths and the exact on-screen labels: use those names, not invented ones.
 
+Keep two things apart. KBC LearningOS is the learning site; the support service you belong to is separate. Features switched off inside LearningOS — its internal messaging, for instance — say nothing about what support can do. Support can always raise a ticket, connect the learner to a live agent, and book a session with the team. Never tell a learner that a live agent or a booking is unavailable, and never describe LearningOS's own coach-booking or messaging screens as if they were the way to reach support. If they want support, the options appear under your reply and they choose from there.
+
 {LMS_CONTEXT}
 
 Language:
@@ -104,8 +106,8 @@ Language:
 - Use British spelling: organise, personalise, apologise, programme, enrolment, timetable.
 
 Manner:
-- Be genuinely courteous. Open by acknowledging the learner briefly ("Thanks for flagging that", "Sorry you're stuck with this") before the substance, and stay warm and respectful however frustrated they become.
-- Never be curt, never lecture, never blame the learner for the problem.
+- Be genuinely courteous and stay warm and respectful however frustrated the learner becomes. Never be curt, never lecture, never blame them for the problem.
+- Vary how you open. Do NOT start reply after reply with "Thanks" — repeating the same opener makes you sound automated. Often the best opening is simply the answer itself.
 
 Rules:
 - Speak directly to the learner ("you", "your account"). Never say you are talking to staff.
@@ -113,7 +115,8 @@ Rules:
 - BE BRIEF. Two to four sentences is the normal answer. Use numbered steps only for a real multi-step procedure, and never more than four steps. Do not pad with summaries or "let me know if you need anything else".
 - Read the conversation before replying. Never repeat advice the learner has already been given.
 - TRY FIRST. Work the problem with the learner: ask what they are seeing, name the page they should be on, and give them something concrete to check. Only once you have genuinely tried and run out of things to suggest should you say the support team is needed.
-- If the learner only names a topic ("I have a problem with attendance"), ask one short question to find out what is actually wrong. Do not guess, do not list steps, and do not treat it as something you failed to solve.
+- Never say the support team is needed in the same reply as the learner's first clear description of the problem. Give them at least one real thing to try or check first — the page to look at, the person who can amend it, the setting to confirm. "I can't fix this" is not an answer until you have attempted one.
+- If the learner only names a topic ("I have a problem with attendance"), ask one short question to find out what is actually wrong. Do not guess, do not walk them through a procedure you are not yet sure they need, and do not treat it as something you failed to solve.
 - If the learner says your suggestion did not work, or that the problem is still there, do NOT offer the same steps again and do not invent new ones. Say plainly that this needs the support team.
 - Never announce that you have opened, raised or created a ticket, and never say you are about to. The learner decides, and the options are presented to them separately.
 - Do not ask "would you like me to escalate this?" or offer choices of your own. End with the plain fact that the support team needs to look at it; the options follow your reply automatically.
@@ -833,6 +836,110 @@ def _escalate_to_ticket(
     }
 
 
+# The three choices offered when the assistant cannot resolve something. Pressing
+# one is an instruction, not a question, so these never reach the knowledge base
+# or the model — that is what had the assistant explaining how to book a coach
+# session when the learner asked it to book a support session.
+ESCALATION_ACTIONS = {"ticket", "live_chat", "book_meeting"}
+
+
+def _portal_url(path: str) -> str:
+    base = sanitize_text(getattr(settings, "SUPPORT_PORTAL_PUBLIC_BASE_URL", "")).rstrip("/")
+    return f"{base}{path}" if base else ""
+
+
+def perform_escalation_action(
+    action: str,
+    requester: dict[str, Any] | None,
+    email: str,
+    history: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Carry out a support action the learner chose, and say plainly what happened.
+
+    Deterministic on purpose: no retrieval, no generation. The learner pressed a
+    button, so the only correct reply is what we actually did.
+    """
+    response: dict[str, Any] = {
+        "ok": True,
+        "route": "support",
+        "escalate": True,
+        "links": [],
+        "canCreateTicket": bool(requester),
+    }
+
+    if not requester:
+        response["assistantAction"] = "escalate_needs_identity"
+        response["escalate"] = False
+        response["reply"] = (
+            "I can't match your sign-in to a learner record, so I'm not able to open a "
+            "ticket for you from here. Please contact your coach or the programme team "
+            "and they will raise this for you."
+        )
+        return response
+
+    last_message = next(
+        (entry["text"] for entry in reversed(history or []) if entry.get("sender") == "user"),
+        "",
+    )
+    try:
+        ticket = _escalate_to_ticket(requester, email, "lms", history, last_message)
+    except ApiError as error:
+        logger.warning("Assistant escalation action failed: %s", error.message)
+        response["assistantAction"] = "escalate_failed"
+        response["ticketError"] = error.message
+        response["reply"] = (
+            "I wasn't able to open a ticket just now. Please try again in a moment, or "
+            "contact your coach if it keeps failing."
+        )
+        return response
+
+    ticket_id = ticket["id"]
+    opened = "I've opened" if ticket.get("created") else "I've added this to"
+    response["ticket"] = {"id": ticket_id, "status": ticket.get("status")}
+    response["assistantAction"] = "ticket_created" if ticket.get("created") else "ticket_linked"
+
+    if action == "live_chat":
+        # Actually join the queue rather than describing how to.
+        queued = False
+        try:
+            from .services import request_live_chat
+
+            result = request_live_chat(ticket_id)
+            queued = bool(isinstance(result, dict) and result.get("ticket"))
+        except Exception as error:  # pragma: no cover - queue stays available via the portal
+            logger.warning("Live chat request failed for %s: %s", ticket_id, error)
+
+        response["reply"] = (
+            f"{opened} ticket {ticket_id} and asked for a live agent. "
+            + (
+                "You're in the queue now — a member of the support team will pick this up, "
+                "and you can follow it here:"
+                if queued
+                else "The support team will pick this up, and you can follow it here:"
+            )
+        )
+        response["actionUrl"] = _portal_url("/support/status")
+        response["actionLabel"] = "Open your ticket"
+        return response
+
+    if action == "book_meeting":
+        response["reply"] = (
+            f"{opened} ticket {ticket_id} so you can book a session with the support team. "
+            "Pick a time here and we'll confirm it by email:"
+        )
+        response["actionUrl"] = _portal_url("/support/booking")
+        response["actionLabel"] = "Choose a time"
+        return response
+
+    response["reply"] = (
+        f"{opened} ticket {ticket_id}. The support team will look into this and follow up "
+        "with you. You can check its progress here:"
+    )
+    response["actionUrl"] = _portal_url("/support/status")
+    response["actionLabel"] = "Track your ticket"
+    return response
+
+
 def generate_admin_ai_reply(
     ticket: dict[str, Any],
     message: str,
@@ -904,6 +1011,24 @@ def get_support_assistant_response(payload: dict[str, Any]) -> dict[str, Any]:
             "canCreateTicket": bool(requester),
             "assistantAction": "greeting",
         }
+
+    # The learner pressed one of the offered options. Do it, and report what was
+    # done — no retrieval, no model, so there is nothing to get wrong.
+    if action in ESCALATION_ACTIONS:
+        chosen_history = _normalize_history(payload.get("messages"))
+        response = perform_escalation_action(action, requester, email, chosen_history)
+        log_assistant_turn(
+            session_id=session_id,
+            email=email,
+            mode=mode,
+            route="support",
+            user_message=f"[action] {action}",
+            assistant_reply=response.get("reply", ""),
+            escalated=bool(response.get("escalate")),
+            kb_distance=None,
+            ticket_id=(response.get("ticket") or {}).get("id"),
+        )
+        return response
 
     if not message:
         raise ApiError(400, "Message is required.")
