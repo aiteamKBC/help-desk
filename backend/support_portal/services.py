@@ -175,7 +175,10 @@ TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "ticket_created_operations_no
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
 SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-SUPPORT_NOTIFICATION_MAX_ATTEMPTS = 2
+SUPPORT_NOTIFICATION_MAX_ATTEMPTS = 4
+# Waits between attempts. Spread out rather than immediate: the failures seen in
+# practice were short blips, and four rapid retries would all land inside one.
+SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
         "quick_ticket_confirmation_email_sent",
@@ -4652,9 +4655,36 @@ def build_support_notification_webhook_payload(
     }
 
 
+def _is_retryable_notification_failure(status: int | None, response_payload: Any) -> bool:
+    """Whether a failed delivery is safe to send again.
+
+    Retrying must not risk a second email, so the question is not "did it fail"
+    but "is it certain nobody received it".
+
+    - An explicit transient status (503, 429...) is a refusal: nothing was sent.
+    - No status at all means the request never completed. A timeout is the one
+      ambiguous case — n8n may have done the work and lost the reply — and stays
+      un-retried, as it always has. Any other transport failure (refused, DNS,
+      TLS) never reached n8n, so sending again cannot duplicate anything.
+
+    That last case is what lost ticket KBC-000808: its single attempt failed at
+    the transport layer, which was not in the retryable set, so the first attempt
+    was also the last and the support team was never told the ticket existed.
+    """
+    if status in SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES:
+        return True
+    if status is not None:
+        return False
+    timed_out = isinstance(response_payload, dict) and "timed out" in str(
+        response_payload.get("message", "")
+    ).lower()
+    return not timed_out
+
+
 def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    # Retry only explicit transient HTTP failures. Retrying a timeout could duplicate
-    # an email if n8n completed the request but its response was lost.
+    # Every attempt carries the same X-Support-Delivery-Key, so a receiver that
+    # checks it can recognise a repeat. See _is_retryable_notification_failure
+    # for which failures are sent again and why a timeout is not one of them.
     delivery_key = ":".join(
         part for part in (
             sanitize_text(payload.get("event")),
@@ -4674,10 +4704,12 @@ def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]
             headers=request_headers,
             timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
         )
-        if delivered or status not in SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES:
+        if delivered or not configured or not _is_retryable_notification_failure(status, response_payload):
             break
         if attempts < SUPPORT_NOTIFICATION_MAX_ATTEMPTS:
-            time.sleep(0.25)
+            time.sleep(SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS[
+                min(attempts - 1, len(SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS) - 1)
+            ])
     return {
         "configured": configured,
         "delivered": delivered,
@@ -4841,12 +4873,27 @@ def should_notify_live_agent_unavailable(ticket: dict[str, Any], *, assigned_age
     return True
 
 
+def should_notify_ticket_created(ticket: dict[str, Any]) -> bool:
+    """False once this ticket's opening mail has already gone out.
+
+    The sibling live-agent event has always checked its own flag this way. This
+    one only wrote the flag and never read it, so the guarantee its docstring
+    claimed did not exist — a second call for the same ticket would have sent the
+    opening mail again.
+    """
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return not metadata.get(TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY)
+
+
 def queue_ticket_created_notification(ticket: dict[str, Any]) -> None:
     """Tell the support team a ticket has just been opened.
 
     Keyed on its own metadata flag so a retry or a second save cannot send the
     same opening mail twice.
     """
+    if not should_notify_ticket_created(ticket):
+        return
+
     payload = build_support_notification_webhook_payload(
         SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
         ticket,
@@ -10462,10 +10509,18 @@ def verify_support_sso_token(token: Any) -> str:
     now = time.time()
     if now > float(expires_at):
         raise ApiError(401, "This sign-in link has expired. Please reopen support from your learner portal.")
+
+    # The lifetime check below needs an issue time, so a token without one is
+    # refused rather than waved through. It used to be skipped when "iat" was
+    # absent, which meant a token claiming a year of life passed every check:
+    # the one guard against a long-lived token could be removed by leaving out
+    # the field it reads. The LMS has always sent "iat"; this makes it required
+    # instead of assumed.
+    if not isinstance(issued_at, (int, float)) or isinstance(issued_at, bool):
+        raise ApiError(401, "This sign-in link is invalid.")
     # Reject tokens whose lifetime is longer than we allow, even if not yet expired.
-    if isinstance(issued_at, (int, float)) and not isinstance(issued_at, bool):
-        if float(expires_at) - float(issued_at) > max_age + 5:
-            raise ApiError(401, "This sign-in link is invalid.")
+    if float(expires_at) - float(issued_at) > max_age + 5:
+        raise ApiError(401, "This sign-in link is invalid.")
 
     email = normalize_email(token_payload.get("email"))
     if not is_valid_email(email):

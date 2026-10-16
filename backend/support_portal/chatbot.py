@@ -70,8 +70,21 @@ ALLOWED_KB_TABLES = {t for tables in KB_TABLES.values() for t in tables}
 
 # Short on purpose. The learner has already been greeted when the chat opened,
 # and listing what we cover reads as a menu nobody asked for.
-GREETING_REPLY = "Hello! What can I help you with?"
+#
+# One wording, used both when the chat opens and when the learner types "hi".
+# There were two, and a learner who did both heard the assistant greet them in
+# two different voices a second apart.
+GREETING_REPLY = "Hi! How can I help?"
 CLOSING_REPLY = "You're welcome. Open support again any time."
+
+# Said when the problem needs a human but the chat cannot be tied to a learner
+# record. One self-contained sentence: there are no support options to offer in
+# this case, so nothing in it may suggest that any are coming.
+NO_IDENTITY_ESCALATION_REPLY = (
+    "This needs the support team, but I can't match your sign-in to a learner record, so "
+    "I'm not able to open a ticket for you from here. Please contact your coach or the "
+    "programme team and they will raise it for you."
+)
 
 LMS_CONTEXT = """The current college LMS is KBC LearningOS. Its help reference is
 LMS_KNOWLEDGE_BASE.md, covering learners, coaches, tutors and other workspaces.
@@ -95,6 +108,8 @@ def _learner_system_prompt(route: str, learner_name: str) -> str:
     greeting_name = f" The learner's name is {learner_name}." if learner_name else ""
     return f"""You are the Kent Business College support assistant, talking directly to a learner (a student).{greeting_name}
 
+BEFORE ANYTHING ELSE: write your reply in British English. This holds whatever language the learner writes in. If they write in Arabic, French or any other language, read it, understand it, and answer in British English. Do not answer in their language, do not translate your reply, do not mix languages, and do not apologise for replying in English. A reply in any other language is wrong even if everything in it is correct.
+
 Your job is to SOLVE the learner's problem yourself. Escalating to a human is the last resort, not the second step. You help with: the learning portal (LMS), Aptem, Microsoft Teams, logging in, courses, assignments, OTJ hours, bookings and general college questions.
 
 "The LMS" is KBC LearningOS, the college's own learner portal — the site the learner is using right now. It is where they find My Learning, Monthly Submission, Monthly Logs, OTJ Hours, KSBs, Evidence, Attendance, the Calendar, coaching meetings and rewards. Almost every problem a learner reports comes from somewhere in it, so work out WHICH page or button they are on before advising anything. The guide below gives the real page paths and the exact on-screen labels: use those names, not invented ones.
@@ -106,8 +121,9 @@ Keep the learning site and the support service apart. Features switched off insi
 {LMS_CONTEXT}
 
 Language:
-- Always reply in British English, no matter which language the learner writes in. If they write in Arabic or any other language, understand it and answer in British English anyway. Never reply in another language and never mix languages.
+- British English only, as stated at the top. A question asked in another language still gets an English answer.
 - Use British spelling: organise, personalise, apologise, programme, enrolment, timetable.
+- The page names and on-screen labels in the guide are in English. Keep them exactly as written — never translate a button or page name.
 
 Manner:
 - Be genuinely courteous and stay warm and respectful however frustrated the learner becomes. Never be curt, never lecture, never blame them for the problem.
@@ -137,7 +153,7 @@ use their own LearningOS workspace. Their name is {name or 'not supplied'}.
 
 {LMS_CONTEXT}
 
-Reply directly to this {role}, in the language they use, with short numbered steps.
+Reply in British English whatever language they write in, with short numbered steps.
 Use the sections for their role and shared account guidance. Do not describe them
 as a learner or assume they are a support agent writing a reply to somebody else.
 Use plain text, no markdown or code fences. Explain when the guide is incomplete.
@@ -713,6 +729,11 @@ _REQUESTER_CACHE_TTL = 120.0   # seconds
 _requester_lock = threading.Lock()
 _requester_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
+# One escalation at a time per learner, so a double-tapped button cannot open two
+# tickets. Keyed by learner id; see _escalation_lock_for.
+_escalation_locks_guard = threading.Lock()
+_escalation_locks: dict[int, threading.Lock] = {}
+
 
 def _cached_requester(email: str) -> tuple[bool, dict[str, Any] | None]:
     """Return (hit, requester). A cached ``None`` is still a hit."""
@@ -814,8 +835,13 @@ def log_assistant_turn(
 
 
 def build_assistant_greeting(learner_name: str = "") -> str:
+    """The opening greeting, with the learner's first name when we know it.
+
+    Falls back to GREETING_REPLY so the nameless greeting and the one the learner
+    gets for typing "hi" are the same sentence.
+    """
     name = sanitize_text(learner_name).split(" ")[0] if learner_name else ""
-    return f"Hi {name}! How can I help?" if name else "Hi! How can I help?"
+    return f"Hi {name}! How can I help?" if name else GREETING_REPLY
 
 
 def _resolve_assistant_requester(payload: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
@@ -853,16 +879,49 @@ def _escalate_to_ticket(
 
     Returns a dict describing what happened so the caller can tell the learner.
     """
-    from .services import create_ticket, find_latest_active_ticket_for_learner
-
     learner = requester.get("learner") if isinstance(requester.get("learner"), dict) else None
     learner_id = None
     if learner and str(learner.get("id") or "").isdigit():
         learner_id = int(learner["id"])
 
+    if learner_id is None:
+        return _find_or_create_ticket(None, email, route, history, message)
+
+    # Look-then-create is two steps, and a learner who double-taps the button
+    # sends two requests that both look first, both find nothing, and both
+    # create. Serialise per learner so the second request sees the first one's
+    # ticket and links to it instead.
+    with _escalation_lock_for(learner_id):
+        return _find_or_create_ticket(learner_id, email, route, history, message)
+
+
+def _escalation_lock_for(learner_id: int) -> threading.Lock:
+    """One lock per learner, created on first use.
+
+    In-process only, like the rate limiter above it: it closes the double-click
+    window inside a worker, which is where the duplicates actually came from. Two
+    workers racing would still need a database constraint to stop them.
+    """
+    with _escalation_locks_guard:
+        lock = _escalation_locks.get(learner_id)
+        if lock is None:
+            lock = threading.Lock()
+            _escalation_locks[learner_id] = lock
+        return lock
+
+
+def _find_or_create_ticket(
+    learner_id: int | None,
+    email: str,
+    route: str,
+    history: list[dict[str, str]],
+    message: str,
+) -> dict[str, Any]:
+    from .services import create_ticket, find_latest_active_ticket_for_learner
+
     # Avoid spawning duplicate tickets: if the learner already has an active one,
     # route the conversation to it instead of opening another.
-    if learner_id:
+    if learner_id is not None:
         existing = find_latest_active_ticket_for_learner(learner_id)
         if existing:
             return {
@@ -894,6 +953,10 @@ def _escalate_to_ticket(
 # or the model — that is what had the assistant explaining how to book a coach
 # session when the learner asked it to book a support session.
 ESCALATION_ACTIONS = {"ticket", "live_chat", "book_meeting"}
+# Every action the endpoint accepts. "start" opens the chat; the rest are the
+# buttons offered under an escalation. Anything else is a client bug, and is
+# refused rather than quietly handled as an empty request.
+ASSISTANT_ACTIONS = {"start"} | ESCALATION_ACTIONS
 
 
 def _portal_url(path: str) -> str:
@@ -923,11 +986,7 @@ def perform_escalation_action(
     if not requester:
         response["assistantAction"] = "escalate_needs_identity"
         response["escalate"] = False
-        response["reply"] = (
-            "I can't match your sign-in to a learner record, so I'm not able to open a "
-            "ticket for you from here. Please contact your coach or the programme team "
-            "and they will raise this for you."
-        )
+        response["reply"] = NO_IDENTITY_ESCALATION_REPLY
         return response
 
     last_message = next(
@@ -1040,6 +1099,16 @@ def get_support_assistant_response(payload: dict[str, Any]) -> dict[str, Any]:
     message = sanitize_text(payload.get("message"))
     session_id = sanitize_text(payload.get("sessionId"))
 
+    # Say no to a malformed body rather than greeting it. sanitize_text turns a
+    # number, a list or null into "", which used to look exactly like a chat that
+    # had just opened — so a client sending the wrong shape got a cheerful hello
+    # and no hint that its request was broken.
+    raw_message = payload.get("message")
+    if raw_message is not None and not isinstance(raw_message, str):
+        raise ApiError(400, "Message must be text.")
+    if action and action not in ASSISTANT_ACTIONS:
+        raise ApiError(400, "Unknown action.")
+
     if len(message) > MAX_ASSISTANT_MESSAGE_CHARS:
         raise ApiError(400, f"Please keep your message under {MAX_ASSISTANT_MESSAGE_CHARS} characters.")
 
@@ -1146,13 +1215,13 @@ def get_support_assistant_response(payload: dict[str, Any]) -> dict[str, Any]:
         # The assistant can open tickets, but only against a learner it can
         # identify. Say that plainly instead of sending them to the portal they
         # may well already be sitting in.
+        #
+        # The model's own reply is dropped rather than kept as a preamble. It is
+        # told that the support options follow every escalation, so it announces
+        # them — and here there are none to show. Appending the refusal to that
+        # promise told the learner to pick from buttons that were never sent.
         response["assistantAction"] = "escalate_needs_identity"
-        response["reply"] = (
-            result["reply"].rstrip()
-            + "\n\nI can't match your sign-in to a learner record, so I'm not able to open a "
-            "ticket for you from here. Please contact your coach or the programme team and "
-            "they will raise this for you."
-        )
+        response["reply"] = NO_IDENTITY_ESCALATION_REPLY
         return _finish(response, None)
 
     if not auto_create:

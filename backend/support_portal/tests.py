@@ -4819,7 +4819,42 @@ class SupportAssistantTests(SimpleTestCase):
 
         self.assertEqual(response["assistantAction"], "greeting")
         self.assertFalse(response["escalate"])
-        self.assertIn("support assistant", response["reply"].lower())
+        # Asserted against the constant rather than a phrase: the greeting has
+        # been shortened once already, and this test went on passing a stale
+        # wording until the next run caught it.
+        self.assertEqual(response["reply"], chatbot.GREETING_REPLY)
+
+    def test_typed_greeting_matches_the_opening_greeting(self):
+        """One wording, whether the chat opens or the learner types "hi"."""
+        from support_portal import chatbot
+
+        self.assertEqual(chatbot.build_assistant_greeting(), chatbot.GREETING_REPLY)
+        self.assertEqual(chatbot.build_assistant_greeting("Aya Khater"), "Hi Aya! How can I help?")
+
+    def test_malformed_payloads_are_refused_rather_than_greeted(self):
+        from support_portal import chatbot
+        from support_portal.services import ApiError
+
+        for payload in (
+            {"message": 12345},
+            {"message": ["hi"]},
+            {"message": "hi", "action": "delete_everything"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ApiError) as caught:
+                    chatbot.get_support_assistant_response(payload)
+                self.assertEqual(caught.exception.args[0], 400)
+
+    def test_escalation_without_identity_promises_no_options(self):
+        """The reply must not mention options when none are being offered."""
+        from support_portal import chatbot
+
+        response = chatbot.perform_escalation_action("ticket", None, "", [])
+
+        self.assertEqual(response["assistantAction"], "escalate_needs_identity")
+        self.assertNotIn("offerActions", response)
+        self.assertNotIn("option", response["reply"].lower())
+        self.assertNotIn("choose", response["reply"].lower())
 
     def test_escalation_creates_ticket_for_identified_learner(self):
         from support_portal import chatbot
