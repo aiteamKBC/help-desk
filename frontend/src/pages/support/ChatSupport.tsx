@@ -50,6 +50,8 @@ import {
 import {
   isAwaitingMeetingTicket,
   isAwaitingSupportReviewTicket,
+  getRequesterChatClosingReason,
+  liveAgentQueueWaitingMessage,
   quickTicketReason,
   type SupportChatEntryAction,
   type SupportBookingLocationState,
@@ -65,18 +67,11 @@ const ukSupportSessionEndMinutes = 16 * 60;
 const supportSessionSlotIntervalMinutes = 30;
 const supportSessionLeadTimeMs = 24 * 60 * 60 * 1000;
 const learnerChatPollIntervalMs = 2500;
-const chatbotClosingReason = "Closed via Chatbot";
-export const requesterClosingReason = "Closed by Requester";
 const awaitingMeetingReason = "Awaiting support meeting";
 const inactivityClosingReason = "Closed due to inactivity";
 const closedChatDescription = "If you still need help, you can start a new chat and continue with a fresh support request.";
 const legacyLiveAgentQueueWaitingMessage = "No support admins are available right now. You're in queue and we'll connect you as soon as one becomes available.";
 const previousLiveAgentQueueWaitingMessage = `${legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through booking session or quick ticket.`;
-export const liveAgentQueueWaitingMessage = `${legacyLiveAgentQueueWaitingMessage} If you'd prefer another option, you can still continue this inquiry through booking session or submit ticket directly.`;
-
-export function getRequesterChatClosingReason(liveChatRequested: boolean) {
-  return liveChatRequested ? requesterClosingReason : chatbotClosingReason;
-}
 
 function getIssueLabel(category: string, technicalSubcategory: string) {
   return technicalSubcategory.trim() || category.trim() || "your request";
@@ -1895,7 +1890,7 @@ const SupportActionButton = ({
     aria-label={`${title}. ${desc}`}
     aria-disabled={disabled}
     className={cn(
-      "group/button pointer-events-auto flex h-11 min-w-[152px] items-center gap-2.5 rounded-2xl border border-border/80 bg-card/95 px-3.5 text-left shadow-lg backdrop-blur-sm transition-all duration-300 ease-out focus:outline-none focus:ring-2 focus:ring-primary/20 sm:h-12 sm:w-12 sm:min-w-0 sm:gap-3 sm:overflow-hidden sm:rounded-full sm:px-3 sm:transition-[width,transform,box-shadow,border-color,background-color] sm:duration-[1000ms]",
+      "group/button pointer-events-auto flex h-11 min-w-[152px] items-center gap-2.5 rounded-2xl border border-border/80 bg-card/95 px-3.5 text-left shadow-lg backdrop-blur-sm transition-all duration-300 ease-out focus:outline-none focus:ring-2 focus:ring-primary/20 sm:h-12 sm:w-12 sm:min-w-0 sm:gap-3 sm:overflow-hidden sm:rounded-full sm:px-3 sm:transition-[width,transform,box-shadow,border-color,background-color] sm:duration-1000",
       active
         ? "border-success/30 bg-success/10 shadow-card sm:w-60"
         : disabled
@@ -1917,7 +1912,7 @@ const SupportActionButton = ({
     </span>
     <span
       className={cn(
-        "min-w-0 flex-1 sm:max-w-0 sm:flex-none sm:overflow-hidden sm:opacity-0 sm:transition-[max-width,opacity] sm:duration-[1000ms] sm:ease-out sm:group-hover/rail:max-w-[11rem] sm:group-hover/rail:opacity-100 sm:group-focus-within/rail:max-w-[11rem] sm:group-focus-within/rail:opacity-100",
+        "min-w-0 flex-1 sm:max-w-0 sm:flex-none sm:overflow-hidden sm:opacity-0 sm:transition-[max-width,opacity] sm:duration-1000 sm:ease-out sm:group-hover/rail:max-w-[11rem] sm:group-hover/rail:opacity-100 sm:group-focus-within/rail:max-w-[11rem] sm:group-focus-within/rail:opacity-100",
         active && "sm:max-w-[11rem] sm:opacity-100",
       )}
     >

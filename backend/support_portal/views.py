@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from psycopg import OperationalError as PsycopgOperationalError
 from django.conf import settings
+from django.db import connection
 from django.db.utils import OperationalError as DjangoOperationalError
 from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils.html import escape
@@ -55,6 +56,7 @@ from .services import (
     get_ticket_chat_history_response,
     get_ticket_chat_context_response,
     get_verify_email_response,
+    get_support_sso_verify_response,
     add_entra_agent,
     list_admin_tickets,
     list_agents,
@@ -445,8 +447,14 @@ def handle_api_error(error: Exception) -> JsonResponse:
 
 @require_GET
 def health(_request):
-    database_name = settings.DATABASES.get("default", {}).get("NAME", "")
-    return JsonResponse({"ok": True, "databaseConfigured": bool(database_name)})
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except Exception:
+        logger.warning("Health check could not reach the configured database.", exc_info=True)
+        return JsonResponse({"ok": False, "databaseReachable": False}, status=503)
+    return JsonResponse({"ok": True, "databaseReachable": True})
 
 
 @require_GET
@@ -459,6 +467,7 @@ def migration_status(_request):
             "bookingWebhookConfigured": bool(settings.BOOKING_WEBHOOK_URL),
             "adminAiWebhookConfigured": bool(settings.ADMIN_AI_WEBHOOK_URL or settings.CHATBOT_WEBHOOK_URL),
             "chatbotWebhookConfigured": bool(settings.CHATBOT_WEBHOOK_URL),
+            "nativeAssistantConfigured": bool(settings.OPENAI_API_KEY),
             "supportPortalPasswordConfigured": bool(settings.SUPPORT_PORTAL_PASSWORD),
             "nextRoutesToPort": LEGACY_ENDPOINTS,
         }
@@ -470,6 +479,26 @@ def migration_status(_request):
 def verify_email(request):
     try:
         return JsonResponse(get_verify_email_response(parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def support_sso_verify(request):
+    try:
+        return JsonResponse(get_support_sso_verify_response(parse_json_body(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def support_assistant(request):
+    try:
+        from .chatbot import get_support_assistant_response
+
+        return JsonResponse(get_support_assistant_response(parse_json_body(request)))
     except Exception as error:
         return handle_api_error(error)
 

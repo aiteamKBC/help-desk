@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import {
+  MessageBubble,
+} from "@/pages/support/ChatSupport";
+import {
   getRequesterChatClosingReason,
   requesterClosingReason,
-  MessageBubble,
   liveAgentQueueWaitingMessage,
-} from "@/pages/support/ChatSupport";
+} from "@/lib/supportFlow";
 
 describe("MessageBubble live agent queue actions", () => {
   afterEach(() => {

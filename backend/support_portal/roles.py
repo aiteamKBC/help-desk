@@ -1,5 +1,6 @@
 ROLE_USER = "user"
 ROLE_COACH = "coach"
+ROLE_TUTOR = "tutor"
 ROLE_EMPLOYER = "employer"
 ROLE_ADMIN = "admin"
 ROLE_SUPERADMIN = "superadmin"
@@ -10,10 +11,12 @@ SUPPORT_ACCESS_GROUP_NAME = "support access"
 ADMIN_ACCESS_GROUP_NAME = "admin access"
 OPERATIONS_ACCESS_GROUP_NAME = "operations access"
 COACH_ACCESS_GROUP_NAME = "coach access"
+TUTOR_ACCESS_GROUP_NAME = "tutor access"
 
 ACCOUNT_ROLES = (
     ROLE_USER,
     ROLE_COACH,
+    ROLE_TUTOR,
     ROLE_EMPLOYER,
     ROLE_ADMIN,
     ROLE_SUPERADMIN,
@@ -23,6 +26,7 @@ ACCOUNT_ROLES = (
 PUBLIC_SUPPORT_ACCOUNT_ROLES = (
     ROLE_USER,
     ROLE_COACH,
+    ROLE_TUTOR,
     ROLE_EMPLOYER,
 )
 
@@ -45,6 +49,7 @@ DEFAULT_ACCOUNT_ROLE = ROLE_AGENT
 ACCOUNT_ROLE_LABELS = {
     ROLE_USER: "User",
     ROLE_COACH: "Coach",
+    ROLE_TUTOR: "Tutor",
     ROLE_EMPLOYER: "Employer",
     ROLE_ADMIN: "Admin",
     ROLE_SUPERADMIN: "Super Admin",

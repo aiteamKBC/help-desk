@@ -32,11 +32,13 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "corsheaders",
     "support_portal",
     "knowledge_base",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -98,6 +100,20 @@ SUPPORT_PORTAL_PASSWORD = get_env("SUPPORT_PORTAL_PASSWORD")
 BOOKING_WEBHOOK_URL = get_env("N8N_BOOKING_WEBHOOK_URL")
 CHATBOT_WEBHOOK_URL = get_env("N8N_CHATBOT_WEBHOOK_URL")
 ADMIN_AI_WEBHOOK_URL = get_env("N8N_ADMIN_AI_WEBHOOK_URL")
+# Native (in-backend) assistant. The chatbot now runs here instead of n8n;
+# n8n stays only for email workflows. Reuses the PGVector knowledge-base tables
+# that already live in the support database.
+OPENAI_API_KEY = get_env("OPENAI_API_KEY")
+OPENAI_CHAT_MODEL = get_env("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_EMBEDDING_MODEL = get_env("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+# A KB hit further than this cosine distance is treated as "no good answer" and
+# nudges the assistant to escalate to a human ticket.
+ASSISTANT_ESCALATION_DISTANCE = float(get_env("ASSISTANT_ESCALATION_DISTANCE", "0.55") or "0.55")
+# Cross-origin access for the LMS to call the public support endpoints directly from
+# the browser. Scoped to /api/support/* only (admin endpoints stay same-origin).
+CORS_ALLOWED_ORIGINS = get_env_list("CORS_ALLOWED_ORIGINS", "")
+CORS_URLS_REGEX = r"^/api/support/.*$"
+CORS_ALLOW_CREDENTIALS = False
 MAIL_WEBHOOK_URL = get_env("N8N_MAIL_WEBHOOK_URL")
 SUPPORT_NOTIFICATION_WEBHOOK_URL = get_env(
     "N8N_SUPPORT_NOTIFICATION_WEBHOOK_URL",
@@ -125,6 +141,11 @@ COVERAGE_TUTOR_ATTACHMENT_REPLY_WEBHOOK_URL = get_env(
 )
 SUPPORT_PORTAL_PUBLIC_BASE_URL = get_env("SUPPORT_PORTAL_PUBLIC_BASE_URL", "https://technicalsupport.kentbusinesscollege.net")
 LEGACY_DATABASE_URL = get_env("LEGACY_DATABASE_URL")
+LMS_DATABASE_URL = get_env("LMS_DATABASE_URL")
+# Shared secret used to verify signed single sign-on tokens minted by the LMS so a
+# logged-in learner can open the support portal without re-entering their email.
+SUPPORT_SSO_SECRET = get_env("SUPPORT_SSO_SECRET")
+SUPPORT_SSO_TOKEN_MAX_AGE_SECONDS = max(int(get_env("SUPPORT_SSO_TOKEN_MAX_AGE_SECONDS", "300") or "300"), 30)
 KBC_AUTH_DATABASE_URL = get_env("KBC_AUTH_DATABASE_URL")
 COMMUNICATION_CENTRE_DATABASE_URL = get_env("COMMUNICATION_CENTRE_DATABASE_URL")
 APTEM_AUTO_EXTRACTING_DATABASE_URL = (
@@ -153,6 +174,9 @@ SUPPORT_SESSION_SLOT_INTERVAL_MINUTES = max(int(get_env("SUPPORT_SESSION_SLOT_IN
 SUPPORT_SESSION_BUFFER_MINUTES = max(int(get_env("SUPPORT_SESSION_BUFFER_MINUTES", "0") or "0"), 0)
 SUPPORT_TEAMS_CALL_URL = get_env("SUPPORT_TEAMS_CALL_URL")
 SUPPORT_TEAMS_CALL_TARGETS = get_env_list("SUPPORT_TEAMS_CALL_TARGETS", "")
+# Who the support team's own notifications reach. Sent in the webhook payload so
+# n8n addresses the mail from here rather than from its own copy of the rota.
+SUPPORT_OPERATIONS_NOTIFICATION_EMAILS = get_env_list("SUPPORT_OPERATIONS_NOTIFICATION_EMAILS", "")
 SUPPORT_TEAMS_CALL_LABEL = get_env("SUPPORT_TEAMS_CALL_LABEL", "")
 SUPPORT_BOOKING_URL = get_env(
     "SUPPORT_BOOKING_URL",

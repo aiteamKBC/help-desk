@@ -16,6 +16,7 @@ import Documentation from "./pages/support/Documentation.tsx";
 import AgentDashboard from "./pages/support/AgentDashboard.tsx";
 import AdminLogin from "./pages/support/AdminLogin.tsx";
 import { RequireAdmin } from "./components/support/RequireAdmin.tsx";
+import LmsChat from "./pages/support/LmsChat.tsx";
 import KnowledgeBaseWorkspace from "./pages/knowledge-base/KnowledgeBaseWorkspace.tsx";
 import KnowledgeBaseArticle from "./pages/knowledge-base/KnowledgeBaseArticle.tsx";
 
@@ -28,9 +29,10 @@ const App = () => (
       <Toaster />
       <Sonner />
       <SupportProvider>
-        <BrowserRouter>
+        <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <Routes>
             <Route path="/" element={<EmailVerification />} />
+            <Route path="/lms" element={<LmsChat />} />
             <Route path="/support" element={<Navigate to="/" replace />} />
             <Route path="/support/inquiry" element={<InquiryDetails />} />
             <Route path="/support/options" element={<SupportOptions />} />

@@ -1470,6 +1470,7 @@ class AdminSessionViewTests(SimpleTestCase):
                 "actorUsername": "fatma",
                 "instanceId": "current-instance",
             },
+            uploaded_files=[],
         )
 
     def test_admin_ticket_chat_history_uses_server_session_actor(self):
@@ -2559,18 +2560,17 @@ class SupportSessionValidationTests(SimpleTestCase):
             patch.object(services, "sync_open_ticket_inactivity"),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "mark_conversation_as_active"),
-            patch.object(
-                services,
-                "send_chatbot_webhook",
-                return_value={"configured": True, "delivered": True, "status": 200, "reply": "Thanks"},
-            ) as send_chatbot_webhook,
+            patch(
+                "support_portal.chatbot.generate_ticket_chat_reply",
+                return_value={"configured": True, "delivered": True, "status": 200, "reply": "Thanks", "escalate": False},
+            ) as generate_ticket_chat_reply,
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "sync_conversation_messages", return_value=[]),
         ):
             response = services.send_chatbot_message("KBC-000077", {"message": "hello"})
 
         self.assertTrue(response["ok"])
-        self.assertEqual(send_chatbot_webhook.call_args.args[0]["message"], "hello")
+        self.assertEqual(generate_ticket_chat_reply.call_args.args[1], "hello")
 
     def test_send_chatbot_webhook_uses_dedicated_timeout_and_suppresses_failed_reply(self):
         with patch.object(
@@ -2613,7 +2613,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             patch.object(services, "sync_open_ticket_inactivity"),
             patch.object(services, "run_query_one", return_value=ticket),
             patch.object(services, "mark_conversation_as_active"),
-            patch.object(services, "send_chatbot_webhook", return_value={"configured": True, "delivered": True, "status": 200, "reply": "Thanks"}) as send_chatbot_webhook,
+            patch("support_portal.chatbot.generate_ticket_chat_reply", return_value={"configured": True, "delivered": True, "status": 200, "reply": "Thanks", "escalate": False}) as generate_ticket_chat_reply,
             patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "sync_conversation_messages", return_value=[] ) as sync_conversation_messages,
         ):
@@ -2636,7 +2636,7 @@ class SupportSessionValidationTests(SimpleTestCase):
             )
 
         self.assertTrue(response["ok"])
-        self.assertEqual(send_chatbot_webhook.call_args.args[0]["message"], "Shared attachment: chat-proof.png.")
+        self.assertEqual(generate_ticket_chat_reply.call_args.args[1], "Shared attachment: chat-proof.png.")
         self.assertEqual(sync_conversation_messages.call_args.kwargs["ticket_public_id"], "KBC-000077")
         self.assertEqual(sync_conversation_messages.call_args.kwargs["uploaded_files"], [uploaded_file])
 
@@ -2867,6 +2867,7 @@ class SupportSessionValidationTests(SimpleTestCase):
                 "get_coverage_ticket_operations_webhook_url",
                 return_value="https://n8n.example/coverage-ticket",
             ),
+            patch.object(services, "get_coverage_ticket_operations_webhook_secret", return_value=""),
             patch.object(
                 services,
                 "post_json_webhook",
@@ -2921,6 +2922,7 @@ class SupportSessionValidationTests(SimpleTestCase):
                 "get_coverage_ticket_operations_webhook_url",
                 return_value="https://n8n.example/coverage-ticket",
             ),
+            patch.object(services, "get_coverage_ticket_operations_webhook_secret", return_value=""),
             patch.object(
                 services,
                 "post_json_webhook",
@@ -4809,7 +4811,136 @@ class ChatInactivitySyncCommandTests(SimpleTestCase):
         sync_open_ticket_inactivity.assert_called_once_with(public_id=None)
 
 
+class SupportAssistantTests(SimpleTestCase):
+    def test_start_action_returns_greeting_without_llm(self):
+        from support_portal import chatbot
+
+        response = chatbot.get_support_assistant_response({"action": "start"})
+
+        self.assertEqual(response["assistantAction"], "greeting")
+        self.assertFalse(response["escalate"])
+        # Asserted against the constant rather than a phrase: the greeting has
+        # been shortened once already, and this test went on passing a stale
+        # wording until the next run caught it.
+        self.assertEqual(response["reply"], chatbot.GREETING_REPLY)
+
+    def test_typed_greeting_matches_the_opening_greeting(self):
+        """One wording, whether the chat opens or the learner types "hi"."""
+        from support_portal import chatbot
+
+        self.assertEqual(chatbot.build_assistant_greeting(), chatbot.GREETING_REPLY)
+        self.assertEqual(chatbot.build_assistant_greeting("Aya Khater"), "Hi Aya! How can I help?")
+
+    def test_malformed_payloads_are_refused_rather_than_greeted(self):
+        from support_portal import chatbot
+        from support_portal.services import ApiError
+
+        for payload in (
+            {"message": 12345},
+            {"message": ["hi"]},
+            {"message": "hi", "action": "delete_everything"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ApiError) as caught:
+                    chatbot.get_support_assistant_response(payload)
+                self.assertEqual(caught.exception.args[0], 400)
+
+    def test_escalation_without_identity_promises_no_options(self):
+        """The reply must not mention options when none are being offered."""
+        from support_portal import chatbot
+
+        response = chatbot.perform_escalation_action("ticket", None, "", [])
+
+        self.assertEqual(response["assistantAction"], "escalate_needs_identity")
+        self.assertNotIn("offerActions", response)
+        self.assertNotIn("option", response["reply"].lower())
+        self.assertNotIn("choose", response["reply"].lower())
+
+    def test_escalation_creates_ticket_for_identified_learner(self):
+        from support_portal import chatbot
+
+        requester = {"display_name": "Aya Khater", "learner": {"id": 9}}
+        with (
+            patch.object(chatbot, "_resolve_assistant_requester", return_value=("aya@example.com", requester)),
+            patch.object(
+                chatbot,
+                "generate_assistant_reply",
+                return_value={"reply": "Try these steps.", "route": "aptem", "escalate": True, "links": [], "kbDistance": 0.9},
+            ),
+            patch("support_portal.services.find_latest_active_ticket_for_learner", return_value=None),
+            patch(
+                "support_portal.services.create_ticket",
+                return_value={"ticket": {"id": "KBC-000999", "status": "Open"}},
+            ) as create_ticket,
+        ):
+            response = chatbot.get_support_assistant_response({"message": "help me", "email": "aya@example.com"})
+
+        create_ticket.assert_called_once()
+        self.assertEqual(response["assistantAction"], "ticket_created")
+        self.assertEqual(response["ticket"]["id"], "KBC-000999")
+        self.assertIn("KBC-000999", response["reply"])
+
+    def test_escalation_links_existing_active_ticket_without_duplicate(self):
+        from support_portal import chatbot
+
+        requester = {"display_name": "Aya Khater", "learner": {"id": 9}}
+        with (
+            patch.object(chatbot, "_resolve_assistant_requester", return_value=("aya@example.com", requester)),
+            patch.object(
+                chatbot,
+                "generate_assistant_reply",
+                return_value={"reply": "Looking into it.", "route": "teams", "escalate": True, "links": [], "kbDistance": 0.9},
+            ),
+            patch(
+                "support_portal.services.find_latest_active_ticket_for_learner",
+                return_value={"public_id": "KBC-000500", "status": "Open"},
+            ),
+            patch("support_portal.services.create_ticket") as create_ticket,
+        ):
+            response = chatbot.get_support_assistant_response({"message": "still broken", "email": "aya@example.com"})
+
+        create_ticket.assert_not_called()
+        self.assertEqual(response["assistantAction"], "ticket_linked")
+        self.assertEqual(response["ticket"]["id"], "KBC-000500")
+
+    def test_escalation_without_identity_asks_to_sign_in(self):
+        from support_portal import chatbot
+
+        with (
+            patch.object(chatbot, "_resolve_assistant_requester", return_value=("", None)),
+            patch.object(
+                chatbot,
+                "generate_assistant_reply",
+                return_value={"reply": "I could not find that.", "route": "general", "escalate": True, "links": [], "kbDistance": 0.9},
+            ),
+        ):
+            response = chatbot.get_support_assistant_response({"message": "I want a human"})
+
+        self.assertEqual(response["assistantAction"], "escalate_needs_identity")
+        self.assertNotIn("ticket", response)
+        self.assertFalse(response["canCreateTicket"])
+
+
 class AdminTicketUpdateTests(SimpleTestCase):
+    def setUp(self):
+        # Most tests here target status / reason / chat-state logic, not the actor
+        # access gate (which has dedicated coverage elsewhere), and supply no actor.
+        # Grant access only in that no-actor case so those tests reach the behaviour
+        # they are written for, while tests that pass a real actor (e.g. the
+        # support-only coverage rejection) still exercise the real gate.
+        real_actor_can_access = services.actor_can_access_admin_ticket
+
+        def allow_when_no_actor(actor, ticket):
+            if actor is None:
+                return True
+            return real_actor_can_access(actor, ticket)
+
+        actor_access_patcher = patch.object(
+            services, "actor_can_access_admin_ticket", side_effect=allow_when_no_actor
+        )
+        actor_access_patcher.start()
+        self.addCleanup(actor_access_patcher.stop)
+
     def test_update_admin_ticket_requires_note_when_status_changes(self):
         ticket = {
             "id": 17,

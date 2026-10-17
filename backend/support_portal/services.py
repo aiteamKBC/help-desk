@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -38,12 +40,14 @@ from .roles import (
     ROLE_ADMIN,
     ROLE_AGENT,
     ROLE_COACH,
+    ROLE_TUTOR,
     derive_account_scope_from_role,
     ROLE_EMPLOYER,
     ROLE_SUPERADMIN,
     ROLE_USER,
     SUPPORT_ACCESS_GROUP_NAME,
     SUPPORT_PORTAL_ACCESS_ROLES,
+    TUTOR_ACCESS_GROUP_NAME,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,8 +170,15 @@ LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailab
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
+SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED = "ticket_created"
+TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "ticket_created_operations_notified_at"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
+SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+SUPPORT_NOTIFICATION_MAX_ATTEMPTS = 4
+# Waits between attempts. Spread out rather than immediate: the failures seen in
+# practice were short blips, and four rapid retries would all land inside one.
+SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
         "quick_ticket_confirmation_email_sent",
@@ -180,6 +191,10 @@ SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE: (
         "live_agent_unavailable_operations_notified",
         "live_agent_unavailable_operations_notification_failed",
+    ),
+    SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED: (
+        "ticket_created_operations_notified",
+        "ticket_created_operations_notification_failed",
     ),
 }
 MICROSOFT_GRAPH_V1_BASE_URL = "https://graph.microsoft.com/v1.0"
@@ -215,6 +230,7 @@ MICROSOFT_GRAPH_STAFF_ROLE_PRIORITY = {
 }
 MANAGED_PUBLIC_REQUESTER_SOURCE = "support_portal_requester"
 KBC_USERS_DATA_REQUESTER_SOURCE = "kbc_users_data"
+LMS_LEARNERS_REQUESTER_SOURCE = "lms_learners"
 MICROSOFT_ENTRA_REQUESTER_SOURCE = "microsoft_entra"
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 CHAT_MESSAGE_ID_METADATA_KEY = "client_message_id"
@@ -2616,6 +2632,70 @@ def fetch_legacy_learner_by_email(email: str) -> dict[str, Any] | None:
     }
 
 
+def fetch_lms_learner_by_email(email: str) -> dict[str, Any] | None:
+    if not settings.LMS_DATABASE_URL:
+        return None
+
+    try:
+        with psycopg.connect(settings.LMS_DATABASE_URL) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                      NULLIF(TRIM(id::text), '') AS external_learner_id,
+                      NULLIF(TRIM(full_name), '') AS full_name,
+                      LOWER(TRIM(COALESCE(NULLIF(TRIM(email_normalized), ''), email))) AS email,
+                      NULLIF(TRIM(phone_number), '') AS phone,
+                      NULLIF(TRIM(lifecycle_status::text), '') AS lifecycle_status,
+                      NULLIF(TRIM(aptem_id::text), '') AS aptem_id
+                    FROM "Learner".learners
+                    WHERE LOWER(TRIM(COALESCE(NULLIF(TRIM(email_normalized), ''), email))) = %s
+                       OR LOWER(TRIM(secondary_email)) = %s
+                    LIMIT 1
+                    """,
+                    [email, email],
+                )
+                row = cursor.fetchone()
+    except Exception:
+        logger.warning("LMS database lookup failed for email verification; skipping Learner.learners check.")
+        return None
+
+    if not row:
+        return None
+
+    external_learner_id, full_name, normalized_email, phone, lifecycle_status, aptem_id = row
+    return {
+        "external_learner_id": external_learner_id,
+        "full_name": full_name,
+        "email": normalized_email,
+        "phone": phone,
+        "lifecycle_status": lifecycle_status,
+        "aptem_id": aptem_id,
+    }
+
+
+def find_lms_learner_by_email(email: str) -> dict[str, Any] | None:
+    lms_learner = fetch_lms_learner_by_email(email)
+    if not lms_learner:
+        return None
+
+    return upsert_learner_record(
+        {
+            "external_learner_id": lms_learner.get("external_learner_id"),
+            "full_name": lms_learner.get("full_name"),
+            "email": lms_learner["email"],
+            "phone": lms_learner.get("phone"),
+        },
+        source=LMS_LEARNERS_REQUESTER_SOURCE,
+        metadata={
+            "lms_source": "Learner.learners",
+            "lms_lifecycle_status": lms_learner.get("lifecycle_status") or "",
+            "lms_aptem_id": lms_learner.get("aptem_id") or "",
+            "synced_on_demand": True,
+        },
+    )
+
+
 def run_communication_centre_query(
     sql: str,
     params: list[Any] | tuple[Any, ...] | None = None,
@@ -4472,6 +4552,30 @@ def notify_learning_plan_ticket_transfer(ticket_id: int, payload: dict[str, Any]
     return webhook_result
 
 
+def get_support_operations_notification_emails() -> list[str]:
+    """Addresses the support team's own notifications are sent to.
+
+    Falls back to the Teams-call targets so a deployment that has only ever
+    configured those still reaches a person, rather than sending operations mail
+    to nobody.
+    """
+    configured = settings.SUPPORT_OPERATIONS_NOTIFICATION_EMAILS
+    raw = [configured] if isinstance(configured, str) else list(configured or [])
+    emails: list[str] = []
+    for item in raw:
+        address = normalize_email(item)
+        if address and address not in emails:
+            emails.append(address)
+    if emails:
+        return emails
+
+    for item in get_support_teams_call_targets(include_booking_fallback=False):
+        address = normalize_email(item)
+        if address and address not in emails:
+            emails.append(address)
+    return emails
+
+
 def build_support_notification_webhook_payload(
     event: str,
     ticket: dict[str, Any],
@@ -4483,7 +4587,14 @@ def build_support_notification_webhook_payload(
 ) -> dict[str, Any]:
     public_base_url = get_support_portal_public_base_url("")
     dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
-    recipient_type = "operations" if event == SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE else "requester"
+    recipient_type = (
+        "operations"
+        if event in {
+            SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE,
+            SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+        }
+        else "requester"
+    )
     ticket_metadata = normalize_json_object(ticket.get("metadata"))
     requester_role = get_ticket_requester_role(ticket_metadata)
     requester_source = get_ticket_requester_source(
@@ -4500,10 +4611,20 @@ def build_support_notification_webhook_payload(
     notification_status = status or sanitize_text(ticket.get("status"))
     notification_status_reason = status_reason if status_reason is not None else sanitize_text(ticket.get("status_reason"))
 
+    # Operations mail is addressed from here, so a change of rota is a settings
+    # change rather than an edit inside n8n. The learner's own notifications
+    # still go to the learner, so they carry no operations addresses.
+    recipients = (
+        get_support_operations_notification_emails()
+        if recipient_type == "operations"
+        else [requester_email] if requester_email else []
+    )
+
     return {
         "event": event,
         "source": "support_portal",
         "recipientType": recipient_type,
+        "recipients": recipients,
         "ticket": {
             "id": ticket.get("public_id"),
             "status": notification_status,
@@ -4534,17 +4655,68 @@ def build_support_notification_webhook_payload(
     }
 
 
+def _is_retryable_notification_failure(status: int | None, response_payload: Any) -> bool:
+    """Whether a failed delivery is safe to send again.
+
+    Retrying must not risk a second email, so the question is not "did it fail"
+    but "is it certain nobody received it".
+
+    - An explicit transient status (503, 429...) is a refusal: nothing was sent.
+    - No status at all means the request never completed. A timeout is the one
+      ambiguous case — n8n may have done the work and lost the reply — and stays
+      un-retried, as it always has. Any other transport failure (refused, DNS,
+      TLS) never reached n8n, so sending again cannot duplicate anything.
+
+    That last case is what lost ticket KBC-000808: its single attempt failed at
+    the transport layer, which was not in the retryable set, so the first attempt
+    was also the last and the support team was never told the ticket existed.
+    """
+    if status in SUPPORT_NOTIFICATION_RETRYABLE_STATUS_CODES:
+        return True
+    if status is not None:
+        return False
+    timed_out = isinstance(response_payload, dict) and "timed out" in str(
+        response_payload.get("message", "")
+    ).lower()
+    return not timed_out
+
+
 def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
-    configured, delivered, status, response_payload = post_json_webhook(
-        get_support_notification_webhook_url(),
-        payload,
-        timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
+    # Every attempt carries the same X-Support-Delivery-Key, so a receiver that
+    # checks it can recognise a repeat. See _is_retryable_notification_failure
+    # for which failures are sent again and why a timeout is not one of them.
+    delivery_key = ":".join(
+        part for part in (
+            sanitize_text(payload.get("event")),
+            sanitize_text(payload.get("ticketId")),
+            sanitize_text(payload.get("recipientType")),
+        ) if part
     )
+    request_headers = {"X-Support-Delivery-Key": delivery_key} if delivery_key else None
+    attempts = 0
+    configured = delivered = False
+    status = None
+    response_payload: Any = None
+    for attempts in range(1, SUPPORT_NOTIFICATION_MAX_ATTEMPTS + 1):
+        configured, delivered, status, response_payload = post_json_webhook(
+            get_support_notification_webhook_url(),
+            payload,
+            headers=request_headers,
+            timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
+        )
+        if delivered or not configured or not _is_retryable_notification_failure(status, response_payload):
+            break
+        if attempts < SUPPORT_NOTIFICATION_MAX_ATTEMPTS:
+            time.sleep(SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS[
+                min(attempts - 1, len(SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS) - 1)
+            ])
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
         "response": response_payload,
+        "attempts": attempts,
+        "deliveryKey": delivery_key,
     }
 
 
@@ -4596,6 +4768,8 @@ def queue_support_notification_delivery(
                     "webhookConfigured": bool(result.get("configured")),
                     "webhookDelivered": delivered,
                     "webhookStatus": result.get("status"),
+                    "webhookAttempts": result.get("attempts", 1),
+                    "webhookDeliveryKey": result.get("deliveryKey", ""),
                     "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
                 },
             )
@@ -4697,6 +4871,40 @@ def should_notify_live_agent_unavailable(ticket: dict[str, Any], *, assigned_age
         return False
 
     return True
+
+
+def should_notify_ticket_created(ticket: dict[str, Any]) -> bool:
+    """False once this ticket's opening mail has already gone out.
+
+    The sibling live-agent event has always checked its own flag this way. This
+    one only wrote the flag and never read it, so the guarantee its docstring
+    claimed did not exist — a second call for the same ticket would have sent the
+    opening mail again.
+    """
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return not metadata.get(TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY)
+
+
+def queue_ticket_created_notification(ticket: dict[str, Any]) -> None:
+    """Tell the support team a ticket has just been opened.
+
+    Keyed on its own metadata flag so a retry or a second save cannot send the
+    same opening mail twice.
+    """
+    if not should_notify_ticket_created(ticket):
+        return
+
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+        ticket,
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+        payload=payload,
+        sent_metadata_key=TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
 
 
 def queue_live_agent_unavailable_notification(ticket: dict[str, Any], *, requested_at: Any) -> None:
@@ -5650,10 +5858,17 @@ def has_public_requester_coach_access(email: Any) -> bool:
     return legacy_auth_user_has_group_by_email(email, COACH_ACCESS_GROUP_NAME)
 
 
+def has_public_requester_tutor_access(email: Any) -> bool:
+    return legacy_auth_user_has_group_by_email(email, TUTOR_ACCESS_GROUP_NAME)
+
+
 def apply_public_requester_role_overrides(email: Any, requester_role: Any) -> str:
     normalized_role = normalize_public_requester_role(requester_role)
-    if normalized_role == ROLE_USER and has_public_requester_coach_access(email):
-        return ROLE_COACH
+    if normalized_role == ROLE_USER:
+        if has_public_requester_coach_access(email):
+            return ROLE_COACH
+        if has_public_requester_tutor_access(email):
+            return ROLE_TUTOR
     return normalized_role
 
 
@@ -6042,7 +6257,7 @@ def promote_ticket_requester_role_if_needed(
     normalized_default_role = normalize_public_requester_role(default_role, default=current_role)
     if current_role == ROLE_USER and normalized_default_role != ROLE_USER:
         effective_role = normalized_default_role
-    if effective_role != ROLE_COACH or current_role == ROLE_COACH:
+    if effective_role not in {ROLE_COACH, ROLE_TUTOR} or current_role == effective_role:
         return ticket, effective_role
 
     ticket_id = parse_int(ticket.get("id"), 0)
@@ -6050,7 +6265,7 @@ def promote_ticket_requester_role_if_needed(
         return ticket, effective_role
 
     updated_metadata = dict(ticket_metadata)
-    updated_metadata["requester_role"] = ROLE_COACH
+    updated_metadata["requester_role"] = effective_role
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -6152,6 +6367,10 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           ON c.id = t.conversation_id
         WHERE t.learner_id = %s
           AND t.status <> 'Closed'
+          -- An archived ticket is out of the live queue, so staff no longer see
+          -- it. Reusing one would silently attach new learner activity to
+          -- something nobody is working: open a fresh ticket instead.
+          AND NOT COALESCE(t.is_archived, FALSE)
           AND (
             t.status <> 'Open'
             OR LOWER(COALESCE(c.status, 'open')) <> 'closed'
@@ -9050,7 +9269,14 @@ def fetch_public_requester_account_by_email(email: str) -> dict[str, Any] | None
 
 
 def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
-    local_learner = find_kbc_learner_by_email(email)
+    # The LMS "Learner".learners table is the most comprehensive roster, so it is
+    # checked first; the legacy kbc_users_data database remains a fallback for any
+    # learner that has not been migrated across yet.
+    local_learner = find_lms_learner_by_email(email)
+    learner_source = LMS_LEARNERS_REQUESTER_SOURCE
+    if not local_learner:
+        local_learner = find_kbc_learner_by_email(email)
+        learner_source = KBC_USERS_DATA_REQUESTER_SOURCE
 
     if local_learner:
         managed_account = fetch_public_requester_account_by_email(email)
@@ -9075,7 +9301,7 @@ def resolve_public_support_requester(email: str) -> dict[str, Any] | None:
             "account": None,
             "learner": local_learner,
             "display_name": sanitize_text(local_learner.get("full_name")) or email,
-            "source": "kbc_users_data",
+            "source": learner_source,
         }
 
     entra_user = fetch_microsoft_entra_user_by_email(email)
@@ -10227,6 +10453,86 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
             for row in session_requests
         ],
     }
+
+
+def _decode_sso_token_segment(segment: str) -> bytes:
+    padding = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def verify_support_sso_token(token: Any) -> str:
+    """Verify an HMAC-signed single sign-on token and return the learner email.
+
+    The token is a compact ``<base64url(payload)>.<base64url(signature)>`` string
+    where ``payload`` is JSON ``{"email": str, "exp": <unix seconds>}`` and the
+    signature is ``HMAC-SHA256(secret, base64url(payload))``. The LMS mints the
+    token for its logged-in learner so the support portal can trust the email
+    without exposing a spoofable ``?email=`` link.
+    """
+    secret = sanitize_text(getattr(settings, "SUPPORT_SSO_SECRET", ""))
+    if not secret:
+        raise ApiError(503, "Single sign-on is not configured on the server.")
+
+    raw_token = sanitize_text(token)
+    if not raw_token or raw_token.count(".") != 1:
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    payload_segment, signature_segment = raw_token.split(".", 1)
+    expected_signature = hmac.new(
+        secret.encode("utf-8"),
+        payload_segment.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    try:
+        provided_signature = _decode_sso_token_segment(signature_segment)
+    except Exception as error:
+        raise ApiError(401, "This sign-in link is invalid.") from error
+
+    if not hmac.compare_digest(expected_signature, provided_signature):
+        raise ApiError(401, "This sign-in link could not be verified.")
+
+    try:
+        token_payload = json.loads(_decode_sso_token_segment(payload_segment))
+    except Exception as error:
+        raise ApiError(401, "This sign-in link is invalid.") from error
+
+    if not isinstance(token_payload, dict):
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    expires_at = token_payload.get("exp")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    max_age = int(getattr(settings, "SUPPORT_SSO_TOKEN_MAX_AGE_SECONDS", 300) or 300)
+    issued_at = token_payload.get("iat")
+    now = time.time()
+    if now > float(expires_at):
+        raise ApiError(401, "This sign-in link has expired. Please reopen support from your learner portal.")
+
+    # The lifetime check below needs an issue time, so a token without one is
+    # refused rather than waved through. It used to be skipped when "iat" was
+    # absent, which meant a token claiming a year of life passed every check:
+    # the one guard against a long-lived token could be removed by leaving out
+    # the field it reads. The LMS has always sent "iat"; this makes it required
+    # instead of assumed.
+    if not isinstance(issued_at, (int, float)) or isinstance(issued_at, bool):
+        raise ApiError(401, "This sign-in link is invalid.")
+    # Reject tokens whose lifetime is longer than we allow, even if not yet expired.
+    if float(expires_at) - float(issued_at) > max_age + 5:
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    email = normalize_email(token_payload.get("email"))
+    if not is_valid_email(email):
+        raise ApiError(401, "This sign-in link is invalid.")
+
+    return email
+
+
+def get_support_sso_verify_response(payload: dict[str, Any]) -> dict[str, Any]:
+    email = verify_support_sso_token(payload.get("token") if isinstance(payload, dict) else None)
+    # Reuse the exact same lookup/flow as the manual email step; nothing downstream changes.
+    return get_verify_email_response({"email": email})
 
 
 def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -13472,6 +13778,18 @@ def create_follow_up_ticket_from_source_ticket(
         },
     )
 
+    # A follow-up is a new ticket for the team to pick up, so it is announced
+    # like any other. Best effort: the follow-up itself is already committed.
+    try:
+        queue_ticket_created_notification({
+            **new_ticket_row,
+            "public_id": new_public_id,
+            "learner_email": sanitize_text(ticket.get("learner_email")),
+            "learner_name": sanitize_text(ticket.get("learner_name")),
+        })
+    except Exception as error:  # pragma: no cover - notification is best effort
+        logger.warning("Could not queue the follow-up ticket notification: %s", error)
+
     return new_public_id
 
 
@@ -13588,38 +13906,11 @@ def send_admin_ai_agent_message(public_id: str, payload: dict[str, Any]) -> dict
         if sanitize_text(entry.get("text"))
     ]
 
-    webhook_result = send_admin_ai_webhook(
-        {
-            "event": "admin_console_ai_message",
-            "source": "support_portal_admin_console",
-            "message": message,
-            "admin": {
-                "username": actor_username or None,
-                "fullName": admin_actor.get("full_name") if admin_actor else None,
-                "role": admin_actor.get("role") if admin_actor else None,
-            },
-            "learner": {
-                "id": int(ticket["learner_id"]),
-                "fullName": ticket.get("learner_full_name"),
-                "email": ticket["learner_email"],
-                "phone": ticket.get("learner_phone"),
-            },
-            "ticket": {
-                "id": ticket["public_id"],
-                "chatId": build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), ticket.get("conversation_metadata")),
-                "category": ticket["category"],
-                "technicalSubcategory": ticket.get("technical_subcategory"),
-                "inquiry": ticket["inquiry"],
-                "status": ticket["status"],
-                "statusReason": ticket.get("status_reason"),
-                "priority": ticket["priority"],
-                "assignedTeam": ticket["assigned_team"],
-                "documentation": documentation,
-            },
-            "conversationHistory": conversation_history[-20:],
-            "messages": recent_messages,
-        }
-    )
+    # The agent-console AI now runs natively in the backend (staff mode); n8n is kept
+    # only for email workflows.
+    from .chatbot import generate_admin_ai_reply
+
+    webhook_result = generate_admin_ai_reply(ticket, message, recent_messages)
 
     return {
         "ok": True,
@@ -15266,6 +15557,21 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             ),
         )
 
+    # Outside the write above: a webhook that is slow or down must not roll back
+    # a ticket the learner has already been told was opened.
+    try:
+        queue_ticket_created_notification({
+            **ticket_row,
+            # ticket_row predates the public id, which is written in a follow-up
+            # update once the row has an id. Without this the webhook went out
+            # with an empty ticketId and was rejected.
+            "public_id": public_id,
+            "learner_email": learner.get("email", ""),
+            "learner_name": requester.get("display_name") or learner.get("full_name") or "",
+        })
+    except Exception as error:  # pragma: no cover - notification is best effort
+        logger.warning("Could not queue the ticket-created notification: %s", error)
+
     return {
         "ticket": {
             "id": public_id,
@@ -16205,34 +16511,10 @@ def send_chatbot_message(public_id: str, payload: dict[str, Any], *, uploaded_fi
         if sanitize_text(entry.get("content")) or entry.get("attachments")
     ]
 
-    webhook_result = send_chatbot_webhook(
-        {
-            "event": "support_chat_message",
-            "source": "support_portal",
-            "message": webhook_message,
-            "clientTimeZone": client_time_zone or None,
-            "category": ticket["category"],
-            "technicalSubcategory": ticket.get("technical_subcategory"),
-            "inquiry": ticket["inquiry"],
-            "learner": {
-                "id": int(ticket["learner_id"]),
-                "fullName": ticket.get("learner_full_name"),
-                "email": ticket["learner_email"],
-                "phone": ticket.get("learner_phone"),
-            },
-            "ticket": {
-                "id": ticket["public_id"],
-                "category": ticket["category"],
-                "technicalSubcategory": ticket.get("technical_subcategory"),
-            "inquiry": ticket["inquiry"],
-            "status": ticket["status"],
-            "statusReason": ticket.get("status_reason"),
-            "priority": ticket["priority"],
-            "assignedTeam": ticket["assigned_team"],
-            },
-            "messages": recent_messages,
-        }
-    )
+    # The chatbot now runs natively in the backend (n8n is kept for emails only).
+    from .chatbot import generate_ticket_chat_reply
+
+    webhook_result = generate_ticket_chat_reply(ticket, webhook_message, recent_messages)
 
     if ticket.get("conversation_id"):
         persisted_at = datetime.now(timezone.utc)
