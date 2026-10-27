@@ -17,6 +17,18 @@ import { canReturnToChat, getSupportResumePath, isAwaitingMeetingTicket, isAwait
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
 import { toast } from "sonner";
 
+const getDisplayedTicketStatus = (status: unknown, statusReason: unknown) => {
+  if (status === "Open" || status === "Pending" || status === "Closed") {
+    return status;
+  }
+
+  if (statusReason === quickTicketReason || status === quickTicketReason) {
+    return "Pending";
+  }
+
+  return "-";
+};
+
 const TicketStatus = () => {
   const navigate = useNavigate();
   const { ticket, bookingSummary, updateTicket, setBookingSummary, clearBookingSummary } = useSupport();
@@ -25,11 +37,13 @@ const TicketStatus = () => {
   const hasBookingSummary = Boolean(bookingSummary);
   const isReservationConfirmed = Boolean(bookingSummary?.reservationConfirmed);
   const hasStatusStep = shouldShowStatusStep(ticket, bookingSummary);
-  const showChatAction = canReturnToChat(ticket);
   const canCancelMeeting = hasBookingSummary || isAwaitingMeeting;
-  const displayedStatusReason = ticket.technicalSubcategory === "Coverage" && ticket.statusReason === quickTicketReason
-    ? "Coverage Ticket"
-    : (ticket.statusReason || ticket.status);
+  const hasLocalChatTranscript = ticket.chatHistory.some((message) => message.source !== "intro");
+  const [serverChatHistoryCount, setServerChatHistoryCount] = useState<number | null>(null);
+  const hasServerChatTranscript = typeof serverChatHistoryCount === "number" && serverChatHistoryCount > 1;
+  const showChatAction = canReturnToChat(ticket) || hasLocalChatTranscript || hasServerChatTranscript;
+  const chatActionLabel = canReturnToChat(ticket) && ticket.status !== "Closed" ? "View Chat" : "View Chat Transcript";
+  const displayedTicketStatus = getDisplayedTicketStatus(ticket.status, ticket.statusReason);
   const [cancelMeetingOpen, setCancelMeetingOpen] = useState(false);
   const [isCancellingMeeting, setIsCancellingMeeting] = useState(false);
 
@@ -42,7 +56,7 @@ const TicketStatus = () => {
   }, [bookingSummary, hasStatusStep, navigate, ticket]);
 
   useEffect(() => {
-    if (bookingSummary || !ticket.id) {
+    if (!ticket.id) {
       return;
     }
 
@@ -64,6 +78,7 @@ const TicketStatus = () => {
                 liveChatRequested?: boolean;
               };
               bookingSummary?: ApiBookingSummary | null;
+              historyCount?: number;
             }
           | null;
 
@@ -87,6 +102,9 @@ const TicketStatus = () => {
         if ("bookingSummary" in (payload || {})) {
           setBookingSummary(toBookingSummary(payload?.bookingSummary));
         }
+        if (typeof payload?.historyCount === "number") {
+          setServerChatHistoryCount(payload.historyCount);
+        }
       } catch {
         // The status page can still show the saved ticket state even if the refresh fetch fails.
       }
@@ -98,7 +116,7 @@ const TicketStatus = () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bookingSummary, ticket.id]);
+  }, [ticket.id]);
 
   const title = hasBookingSummary
     ? (isReservationConfirmed ? "Teams Session Reserved" : "Support Session Request Submitted")
@@ -222,7 +240,7 @@ const TicketStatus = () => {
               <div className="rounded-2xl border border-primary/10 bg-muted/20 px-4 py-4">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary/80">Status</div>
                 <div className="mt-2 text-sm font-semibold text-foreground">
-                  {displayedStatusReason}
+                  {displayedTicketStatus}
                 </div>
               </div>
               <div className="rounded-2xl border border-primary/10 bg-muted/20 px-4 py-4">
@@ -232,6 +250,19 @@ const TicketStatus = () => {
                 </div>
               </div>
             </div>
+          ) : null}
+          {ticket.id ? (
+            <p className="mt-5 text-sm text-muted-foreground">
+              Need to review what you submitted? Click{" "}
+              <button
+                type="button"
+                onClick={() => navigate("/support/inquiry")}
+                className="font-semibold text-primary underline-offset-4 transition hover:underline"
+              >
+                Step 2 (Inquiry)
+              </button>{" "}
+              above.
+            </p>
           ) : null}
         </div>
 
@@ -253,7 +284,7 @@ const TicketStatus = () => {
           ) : null}
           {showChatAction ? (
             <Button onClick={() => navigate("/support/chat")} className="gradient-primary border-0">
-              <MessageSquare className="h-4 w-4 mr-2" /> View Chat
+              <MessageSquare className="h-4 w-4 mr-2" /> {chatActionLabel}
             </Button>
           ) : null}
         </div>

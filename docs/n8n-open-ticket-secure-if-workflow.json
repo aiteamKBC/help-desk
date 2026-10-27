@@ -1,0 +1,290 @@
+  {
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "open/ticket",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          176,
+          96
+        ],
+        "id": "3b3faec3-244c-4aaa-b2e0-36957fde1bb9",
+        "name": "Webhook",
+        "webhookId": "694cf7c4-6304-4967-b3a7-bfd74e82f417"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "id": "9869bcee-e89a-4378-b797-b87fe221984b",
+                "leftValue": "={{ (($json.headers?.['x-support-webhook-secret'] ?? $json.headers?.['X-Support-Webhook-Secret'] ?? '') === 'REPLACE_WITH_YOUR_SECRET') }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          416,
+          96
+        ],
+        "id": "c53fea3f-9028-4f9d-86cf-b1379d8527ee",
+        "name": "If Secret Valid"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "id": "ef428019-91e5-4ee8-88ea-b807dc3c99b1",
+                "leftValue": "={{ (($json.body?.event ?? $json.event ?? '') === 'coverage_ticket_created') }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          656,
+          32
+        ],
+        "id": "f2f95695-8547-4175-8e90-8568ed6a7d81",
+        "name": "If Coverage Event"
+      },
+      {
+        "parameters": {
+          "jsCode": "const inputJson = $input.first().json || {};\nconst body = inputJson.body ?? inputJson;\n\nconst ticket = body.ticket || {};\nconst coverage = body.coverage || {};\nconst requester = body.requester || {};\n\nconst ticketId = ticket.id || 'N/A';\nconst status = ticket.status || 'N/A';\nconst priority = ticket.priority || 'N/A';\nconst slaStatus = ticket.slaStatus || 'N/A';\nconst createdAt = ticket.createdAt\n  ? new Date(ticket.createdAt).toLocaleString('en-GB', { timeZone: 'UTC' })\n  : 'N/A';\nconst dashboardUrl = ticket.dashboardUrl || '#';\n\nconst tutorName = coverage.tutor || 'N/A';\nconst moduleName = coverage.module || 'N/A';\nconst preferredTime = coverage.preferredTime || 'N/A';\nconst sessions = Array.isArray(coverage.sessions) ? coverage.sessions : [];\n\nconst requesterName = requester.name || 'N/A';\nconst requesterEmail = requester.email || 'N/A';\n\nfunction escapeHtml(value) {\n  return String(value ?? 'N/A')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\\\"/g, '&quot;')\n    .replace(/'/g, '&#039;');\n}\n\nfunction infoRow(label, value) {\n  return `\n    <tr>\n      <td style=\"width:170px;padding:4px 10px 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#222;vertical-align:top;\">\n        ${escapeHtml(label)}\n      </td>\n      <td style=\"padding:4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#444;vertical-align:top;word-break:break-word;\">\n        ${escapeHtml(value)}\n      </td>\n    </tr>\n  `;\n}\n\nfunction sectionTitle(title) {\n  return `\n    <tr>\n      <td style=\"padding:22px 0 10px 0;\">\n        <div style=\"font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:16px;font-weight:bold;color:#777;text-transform:uppercase;letter-spacing:0.5px;\">\n          ${escapeHtml(title)}\n        </div>\n      </td>\n    </tr>\n  `;\n}\n\nfunction infoBox(rowsHtml, accentColor = '#1a1a2e') {\n  return `\n    <tr>\n      <td style=\"background:#f8f9fb;border-left:4px solid ${accentColor};border-radius:0 4px 4px 0;padding:14px 18px;\">\n        <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n          ${rowsHtml}\n        </table>\n      </td>\n    </tr>\n  `;\n}\n\nconst sessionCards = sessions.map((s) => `\n  <tr>\n    <td style=\"background:#f8f9fb;border-left:4px solid #4a6fa5;border-radius:0 4px 4px 0;padding:14px 18px;\">\n      <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n        ${infoRow('Date', s.date || 'N/A')}\n        ${infoRow('Session No.', s.sessionNumber || s.index || 'N/A')}\n        ${infoRow('Subject', s.subject || 'N/A')}\n      </table>\n    </td>\n  </tr>\n  <tr>\n    <td style=\"height:12px;line-height:12px;font-size:12px;\">&nbsp;</td>\n  </tr>\n`).join('');\n\nconst emailHtml = `\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>New Coverage Ticket</title>\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;\">\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"background:#f4f4f4;\">\n    <tr>\n      <td align=\"center\" style=\"padding:24px 12px;\">\n        <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"max-width:620px;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;\">\n          <tr>\n            <td style=\"background:#1a1a2e;padding:26px 30px;\">\n              <div style=\"font-family:Arial,Helvetica,sans-serif;color:#aac4f0;font-size:13px;line-height:18px;font-weight:bold;letter-spacing:1px;\">\n                KENT BUSINESS COLLEGE\n              </div>\n              <div style=\"font-family:Arial,Helvetica,sans-serif;color:#ffffff;font-size:20px;line-height:26px;font-weight:bold;margin-top:8px;\">\n                New Coverage Ticket Opened\n              </div>\n            </td>\n          </tr>\n          <tr>\n            <td style=\"padding:28px 30px;\">\n              <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n                <tr>\n                  <td style=\"font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#555;padding:0 0 4px 0;\">\n                    A new coverage ticket has been submitted and requires your attention.\n                  </td>\n                </tr>\n\n                ${sectionTitle('Ticket Info')}\n                ${infoBox(\n                  infoRow('Ticket ID', ticketId) +\n                  infoRow('Status', status) +\n                  infoRow('Priority', priority) +\n                  infoRow('SLA Status', slaStatus) +\n                  infoRow('Created At', createdAt) +\n                  infoRow('Requested By', `${requesterName} (${requesterEmail})`)\n                )}\n\n                ${sectionTitle('Coverage Details')}\n                ${infoBox(\n                  infoRow('Tutor', tutorName) +\n                  infoRow('Module', moduleName) +\n                  infoRow('Preferred Time', preferredTime)\n                )}\n\n                ${sectionTitle('Sessions')}\n                ${sessionCards || infoBox(infoRow('Details', 'No session details were provided.'), '#4a6fa5')}\n\n                <tr>\n                  <td style=\"padding-top:20px;\">\n                    <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n                      <tr>\n                        <td bgcolor=\"#1a1a2e\" style=\"border-radius:6px;\">\n                          <a href=\"${escapeHtml(dashboardUrl)}\" style=\"display:inline-block;padding:14px 34px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:18px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;\">\n                            View Dashboard\n                          </a>\n                        </td>\n                      </tr>\n                    </table>\n                  </td>\n                </tr>\n              </table>\n            </td>\n          </tr>\n        </table>\n      </td>\n    </tr>\n  </table>\n</body>\n</html>\n`;\n\nreturn [{\n  json: {\n    emailHtml,\n    emailSubject: `New Coverage Ticket - ${ticketId}`,\n    ticketId\n  }\n}];"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          896,
+          -64
+        ],
+        "id": "b3bc4f2a-e03c-4b89-9fbc-842a62ba922c",
+        "name": "Prepare Coverage Email"
+      },
+      {
+        "parameters": {
+          "sendTo": "LearningPlan.Team@kentbusinesscollege.com",
+          "subject": "={{ $json.emailSubject }}",
+          "message": "={{ $json.emailHtml }}",
+          "options": {
+            "appendAttribution": false
+          }
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          1120,
+          -64
+        ],
+        "id": "d5970648-2e3f-451b-850a-1d578bdc780e",
+        "name": "Send Coverage Email",
+        "webhookId": "536e9b71-4e54-49d9-b2fc-cc122f16013a",
+        "credentials": {
+          "gmailOAuth2": {
+            "id": "DZ8VIkkppghFEoGg",
+            "name": "Charly Account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "id": "6229c233-7fc8-4116-9c03-82ce28259678",
+                "leftValue": "={{ (($json.body?.event ?? $json.event ?? '') === 'learning_plan_ticket_transferred') }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          896,
+          240
+        ],
+        "id": "7d22180c-1f55-4b32-ac4f-0e257bfe176a",
+        "name": "If Learning Plan Transfer Event"
+      },
+      {
+        "parameters": {
+          "jsCode": "const inputJson = $input.first().json || {};\nconst body = inputJson.body ?? inputJson;\n\nconst ticket = body.ticket || {};\nconst requester = body.requester || {};\nconst transfer = body.transfer || {};\n\nconst ticketId = ticket.id || 'N/A';\nconst status = ticket.status || 'N/A';\nconst statusReason = ticket.statusReason || 'N/A';\nconst priority = ticket.priority || 'N/A';\nconst slaStatus = ticket.slaStatus || 'N/A';\nconst assignedTeam = ticket.assignedTeam || 'N/A';\nconst createdAt = ticket.createdAt\n  ? new Date(ticket.createdAt).toLocaleString('en-GB', { timeZone: 'UTC' })\n  : 'N/A';\nconst dashboardUrl = ticket.dashboardUrl || '#';\n\nconst requesterName = requester.name || 'N/A';\nconst requesterEmail = requester.email || 'N/A';\nconst requesterRole = requester.role || 'N/A';\n\nconst fromTeam = transfer.fromTeam || 'N/A';\nconst toTeam = transfer.toTeam || 'N/A';\nconst transferredAt = transfer.transferredAt\n  ? new Date(transfer.transferredAt).toLocaleString('en-GB', { timeZone: 'UTC' })\n  : 'N/A';\nconst transferNote = transfer.note || 'No internal note was provided.';\n\nconst transferredBy = transfer.transferredBy || {};\nconst assignedAgent = transfer.assignedAgent || {};\n\nconst transferredByName = transferredBy.name || transferredBy.username || 'N/A';\nconst assignedAgentName = assignedAgent.name || assignedAgent.username || 'Unassigned';\n\nfunction escapeHtml(value) {\n  return String(value ?? 'N/A')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\\\"/g, '&quot;')\n    .replace(/'/g, '&#039;');\n}\n\nfunction infoRow(label, value) {\n  return `\n    <tr>\n      <td style=\"width:170px;padding:4px 10px 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#222;vertical-align:top;\">\n        ${escapeHtml(label)}\n      </td>\n      <td style=\"padding:4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#444;vertical-align:top;word-break:break-word;\">\n        ${escapeHtml(value)}\n      </td>\n    </tr>\n  `;\n}\n\nfunction sectionTitle(title) {\n  return `\n    <tr>\n      <td style=\"padding:22px 0 10px 0;\">\n        <div style=\"font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:16px;font-weight:bold;color:#777;text-transform:uppercase;letter-spacing:0.5px;\">\n          ${escapeHtml(title)}\n        </div>\n      </td>\n    </tr>\n  `;\n}\n\nfunction infoBox(rowsHtml, accentColor = '#0f766e') {\n  return `\n    <tr>\n      <td style=\"background:#f8f9fb;border-left:4px solid ${accentColor};border-radius:0 4px 4px 0;padding:14px 18px;\">\n        <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n          ${rowsHtml}\n        </table>\n      </td>\n    </tr>\n  `;\n}\n\nconst emailHtml = `\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>Learning Plan Ticket Transfer</title>\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;\">\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"background:#f4f4f4;\">\n    <tr>\n      <td align=\"center\" style=\"padding:24px 12px;\">\n        <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"max-width:620px;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;\">\n          <tr>\n            <td style=\"background:#1a1a2e;padding:26px 30px;\">\n              <div style=\"font-family:Arial,Helvetica,sans-serif;color:#99f6e4;font-size:13px;line-height:18px;font-weight:bold;letter-spacing:1px;\">\n                KENT BUSINESS COLLEGE\n              </div>\n              <div style=\"font-family:Arial,Helvetica,sans-serif;color:#ffffff;font-size:20px;line-height:26px;font-weight:bold;margin-top:8px;\">\n                Ticket Transferred To Learning Plan Team\n              </div>\n            </td>\n          </tr>\n          <tr>\n            <td style=\"padding:28px 30px;\">\n              <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n                <tr>\n                  <td style=\"font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#555;padding:0 0 4px 0;\">\n                    A support ticket has been transferred to the Learning Plan Team queue and is ready for review.\n                  </td>\n                </tr>\n\n                ${sectionTitle('Ticket Info')}\n                ${infoBox(\n                  infoRow('Ticket ID', ticketId) +\n                  infoRow('Status', status) +\n                  infoRow('Status Reason', statusReason) +\n                  infoRow('Priority', priority) +\n                  infoRow('SLA Status', slaStatus) +\n                  infoRow('Assigned Team', assignedTeam) +\n                  infoRow('Created At', createdAt)\n                )}\n\n                ${sectionTitle('Requester')}\n                ${infoBox(\n                  infoRow('Name', requesterName) +\n                  infoRow('Email', requesterEmail) +\n                  infoRow('Role', requesterRole)\n                )}\n\n                ${sectionTitle('Transfer Details')}\n                ${infoBox(\n                  infoRow('From Team', fromTeam) +\n                  infoRow('To Team', toTeam) +\n                  infoRow('Transferred By', transferredByName) +\n                  infoRow('Assigned Agent', assignedAgentName) +\n                  infoRow('Transferred At', transferredAt) +\n                  infoRow('Internal Note', transferNote)\n                )}\n\n                <tr>\n                  <td style=\"padding-top:20px;\">\n                    <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n                      <tr>\n                        <td bgcolor=\"#0f172a\" style=\"border-radius:6px;\">\n                          <a href=\"${escapeHtml(dashboardUrl)}\" style=\"display:inline-block;padding:14px 34px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:18px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;\">\n                            View Dashboard\n                          </a>\n                        </td>\n                      </tr>\n                    </table>\n                  </td>\n                </tr>\n              </table>\n            </td>\n          </tr>\n        </table>\n      </td>\n    </tr>\n  </table>\n</body>\n</html>\n`;\n\nreturn [{\n  json: {\n    emailHtml,\n    emailSubject: `Learning Plan Ticket Transfer - ${ticketId}`,\n    ticketId\n  }\n}];"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          1120,
+          208
+        ],
+        "id": "be4e6e35-29ae-4ed7-9e4e-ee7b59e527f7",
+        "name": "Prepare Learning Plan Transfer Email"
+      },
+      {
+        "parameters": {
+          "sendTo": "LearningPlan.Team@kentbusinesscollege.com",
+          "subject": "={{ $json.emailSubject }}",
+          "message": "={{ $json.emailHtml }}",
+          "options": {
+            "appendAttribution": false
+          }
+        },
+        "type": "n8n-nodes-base.gmail",
+        "typeVersion": 2.2,
+        "position": [
+          1344,
+          208
+        ],
+        "id": "4da79761-eb27-4fae-977c-163489d49aba",
+        "name": "Send Learning Plan Transfer Email",
+        "webhookId": "536e9b71-4e54-49d9-b2fc-cc122f16013a",
+        "credentials": {
+          "gmailOAuth2": {
+            "id": "DZ8VIkkppghFEoGg",
+            "name": "Charly Account"
+          }
+        }
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "If Secret Valid",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If Secret Valid": {
+        "main": [
+          [
+            {
+              "node": "If Coverage Event",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          []
+        ]
+      },
+      "If Coverage Event": {
+        "main": [
+          [
+            {
+              "node": "Prepare Coverage Email",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "If Learning Plan Transfer Event",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Prepare Coverage Email": {
+        "main": [
+          [
+            {
+              "node": "Send Coverage Email",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "If Learning Plan Transfer Event": {
+        "main": [
+          [
+            {
+              "node": "Prepare Learning Plan Transfer Email",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          []
+        ]
+      },
+      "Prepare Learning Plan Transfer Email": {
+        "main": [
+          [
+            {
+              "node": "Send Learning Plan Transfer Email",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Send Coverage Email": {
+        "main": [
+          []
+        ]
+      },
+      "Send Learning Plan Transfer Email": {
+        "main": [
+          []
+        ]
+      }
+    },
+    "pinData": {},
+    "meta": {
+      "templateCredsSetupCompleted": true,
+      "instanceId": "1df6b8eb7cad6964c4019ffc034ca93b67e15d54f1ef0b486646f0918cb85bc3"
+    }
+  }

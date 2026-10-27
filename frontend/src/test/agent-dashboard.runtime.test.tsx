@@ -333,6 +333,22 @@ const dashboardPayload = {
         consoleStatus: "Off",
         selectedConsoleStatus: "Off",
       },
+      {
+        id: 41,
+        username: "test.test",
+        fullName: "Test Test",
+        email: "test.test@kentbusinesscollege.com",
+        accountScope: "staff",
+        role: "agent",
+        isActive: true,
+        sessionActive: false,
+        legacySupportAccess: false,
+        legacyOperationsAccess: false,
+        legacyAdminAccess: false,
+        entraDirectoryAdmin: false,
+        consoleStatus: "Off",
+        selectedConsoleStatus: "Off",
+      },
     ],
     agents: [
       {
@@ -351,29 +367,85 @@ const dashboardPayload = {
         consoleStatus: "Off",
         selectedConsoleStatus: "Off",
       },
+      {
+        id: 41,
+        username: "test.test",
+        fullName: "Test Test",
+        email: "test.test@kentbusinesscollege.com",
+        accountScope: "staff",
+        role: "agent",
+        isActive: true,
+        sessionActive: false,
+        legacySupportAccess: false,
+        legacyOperationsAccess: false,
+        legacyAdminAccess: false,
+        entraDirectoryAdmin: false,
+        consoleStatus: "Off",
+        selectedConsoleStatus: "Off",
+      },
     ],
   },
 };
 
+type RuntimeDashboardTicket = (typeof dashboardPayload.tickets.tickets)[number] & {
+  ticketState?: {
+    dashboardBucket?: string;
+    ticketType?: string;
+  };
+};
+
+function isRuntimeCoverageTicket(ticket: RuntimeDashboardTicket) {
+  return ticket.ticketState?.ticketType === "coverage" || ticket.technicalSubcategory === "Coverage";
+}
+
+function isRuntimeQuickTicket(ticket: RuntimeDashboardTicket) {
+  return (
+    ticket.ticketState?.ticketType === "quick"
+    || ticket.statusReason === "Quick Ticket"
+    || ticket.statusReason === "Quick Resolution"
+  ) && !isRuntimeCoverageTicket(ticket);
+}
+
+function buildDashboardMetricsPayload(tickets: RuntimeDashboardTicket[] = dashboardPayload.tickets.tickets) {
+  const activeTickets = tickets.filter((ticket) => !ticket.isArchived);
+  return {
+    metrics: {
+      total: activeTickets.length,
+      open: activeTickets.filter((ticket) => ticket.status === "Open" && ticket.chatState !== "closed").length,
+      pending: activeTickets.filter((ticket) => ticket.status === "Pending" || ticket.ticketState?.dashboardBucket === "pending").length,
+      escalation: activeTickets.filter((ticket) => ticket.status === "Pending" && ticket.statusReason === "Escalation").length,
+      closed: activeTickets.filter((ticket) => ticket.status === "Closed" || ticket.ticketState?.dashboardBucket === "closed").length,
+      slaBreached: activeTickets.filter((ticket) => ticket.slaStatus === "Breached").length,
+      coverage: activeTickets.filter(isRuntimeCoverageTicket).length,
+      quickResolution: activeTickets.filter(isRuntimeQuickTicket).length,
+      sections: {
+        coverage: activeTickets.filter(isRuntimeCoverageTicket).length,
+        learningPlanOther: activeTickets.filter((ticket) => ticket.assignedTeam === "Learning Plan Team" && !isRuntimeCoverageTicket(ticket)).length,
+      },
+    },
+  };
+}
+
 function buildDashboardAccountsPayload() {
+  const applyRuntimeSessionToSignedInAccount = (account: (typeof dashboardPayload.accounts.accounts)[number]) => {
+    if (account.id !== runtimeAdminSession.id && account.username !== runtimeAdminSession.username) {
+      return account;
+    }
+
+    return {
+      ...account,
+      role: runtimeAdminSession.role,
+      legacySupportAccess: runtimeAdminSession.legacySupportAccess,
+      legacyOperationsAccess: runtimeAdminSession.legacyOperationsAccess,
+      legacyAdminAccess: runtimeAdminSession.legacyAdminAccess,
+      entraDirectoryAdmin: runtimeAdminSession.entraDirectoryAdmin,
+    };
+  };
+
   return {
     accounts: {
-      accounts: dashboardPayload.accounts.accounts.map((account) => ({
-        ...account,
-        role: runtimeAdminSession.role,
-        legacySupportAccess: runtimeAdminSession.legacySupportAccess,
-        legacyOperationsAccess: runtimeAdminSession.legacyOperationsAccess,
-        legacyAdminAccess: runtimeAdminSession.legacyAdminAccess,
-        entraDirectoryAdmin: runtimeAdminSession.entraDirectoryAdmin,
-      })),
-      agents: dashboardPayload.accounts.agents.map((agent) => ({
-        ...agent,
-        role: runtimeAdminSession.role,
-        legacySupportAccess: runtimeAdminSession.legacySupportAccess,
-        legacyOperationsAccess: runtimeAdminSession.legacyOperationsAccess,
-        legacyAdminAccess: runtimeAdminSession.legacyAdminAccess,
-        entraDirectoryAdmin: runtimeAdminSession.entraDirectoryAdmin,
-      })),
+      accounts: dashboardPayload.accounts.accounts.map(applyRuntimeSessionToSignedInAccount),
+      agents: dashboardPayload.accounts.agents.map(applyRuntimeSessionToSignedInAccount),
     },
   };
 }
@@ -433,7 +505,7 @@ describe("AgentDashboard runtime", () => {
       },
     });
 
-    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
 
       if (url.includes("/api/admin/session-heartbeat")) {
@@ -445,6 +517,13 @@ describe("AgentDashboard runtime", () => {
 
       if (url.includes("/api/admin/session")) {
         return new Response(JSON.stringify({ admin: runtimeAdminSession }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload()), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
@@ -501,7 +580,12 @@ describe("AgentDashboard runtime", () => {
     ];
     const defaultFetch = globalThis.fetch;
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input) === "/api/admin/tickets") {
+      if (String(input).startsWith("/api/admin/tickets/metrics")) {
+        // Exercise local counts alongside the unpaginated cached-list fallback.
+        return new Response(JSON.stringify({ metrics: null }), { status: 200 });
+      }
+      if (String(input).startsWith("/api/admin/tickets") && !String(input).includes("/metrics")) {
+        // No pagination metadata: exercise the cached-list fallback.
         return new Response(JSON.stringify({ tickets }), { status: 200 });
       }
       return defaultFetch(input, init);
@@ -516,48 +600,96 @@ describe("AgentDashboard runtime", () => {
     const expectOpenCount = (count: string) => {
       expect(within(screen.getByRole("button", { name: /Open Tickets/ })).getByText(count, { exact: true })).toBeInTheDocument();
     };
-    expectOpenCount("4");
+    await waitFor(() => expectOpenCount("4"));
 
     await selectPeriod("Today");
-    expect(screen.getByText("KBC-000101")).toBeInTheDocument();
+    expect(await screen.findByText("KBC-000101")).toBeInTheDocument();
     for (const id of ["KBC-000102", "KBC-000103", "KBC-000104", "KBC-000105"]) {
       expect(screen.queryByText(id)).not.toBeInTheDocument();
     }
     expectOpenCount("1");
 
     fireEvent.click(screen.getByRole("button", { name: /Pending Tickets/ }));
-    expect(screen.getByText("No tickets match the current filters for today.")).toBeInTheDocument();
+    expect(await screen.findByText("No tickets match the current filters for today.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Pending Tickets/ }));
 
     await selectPeriod("Last 7 Days");
-    expect(screen.getByText("KBC-000101")).toBeInTheDocument();
-    expect(screen.getByText("KBC-000102")).toBeInTheDocument();
+    expect(await screen.findByText("KBC-000101")).toBeInTheDocument();
+    expect(await screen.findByText("KBC-000102")).toBeInTheDocument();
     expect(screen.queryByText("KBC-000103")).not.toBeInTheDocument();
     expect(screen.queryByText("KBC-000104")).not.toBeInTheDocument();
     expectOpenCount("2");
 
     fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "KBC-000102" } });
-    expect(screen.getByText("KBC-000102")).toBeInTheDocument();
+    expect(await screen.findByText("KBC-000102")).toBeInTheDocument();
     expect(screen.queryByText("KBC-000101")).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "KBC-000103" } });
-    expect(screen.getByText("No matching tickets found for this search.")).toBeInTheDocument();
+    expect(await screen.findByText("No matching tickets found for this search.")).toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
     expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
-    expect(screen.getByText("KBC-000103")).toBeInTheDocument();
+    expect(await screen.findByText("KBC-000103")).toBeInTheDocument();
     expect(screen.getByText("KBC-000104")).toBeInTheDocument();
-    expectOpenCount("4");
+    await waitFor(() => expectOpenCount("4"));
 
     await selectPeriod("Today");
     fireEvent.click(screen.getByRole("button", { name: "Archived" }));
-    expect(screen.getByText("KBC-000105")).toBeInTheDocument();
+    expect(await screen.findByText("KBC-000105")).toBeInTheDocument();
     expect(screen.queryByText("KBC-000101")).not.toBeInTheDocument();
     expect(screen.queryByText("KBC-000106")).not.toBeInTheDocument();
     expectOpenCount("1");
     fireEvent.click(screen.getByRole("button", { name: "Back to Active" }));
     expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
-    expectOpenCount("4");
+    await waitFor(() => expectOpenCount("4"));
+  });
+
+  it("requests the same date range for pages and metrics and returns to the first page", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 5, 14, 12));
+    const defaultFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/admin/tickets" && url.searchParams.has("page")) {
+        const page = Number(url.searchParams.get("page"));
+        const filtered = url.searchParams.has("createdFrom");
+        return new Response(JSON.stringify({
+          tickets: filtered ? [] : [dashboardPayload.tickets.tickets[0]],
+          pagination: {
+            page, pageSize: 25, total: filtered ? 0 : 26, totalPages: filtered ? 0 : 2,
+            hasNext: !filtered && page === 1, hasPrevious: page > 1, isPaginated: true,
+          },
+        }), { status: 200 });
+      }
+      if (url.pathname === "/api/admin/tickets/metrics" && url.searchParams.has("createdFrom")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload([])), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+    await screen.findByText("Page 2 of 2");
+
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Filter tickets by creation date" }), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "Today" }));
+    await screen.findByText("No tickets match the current filters for today.");
+    const expectedFrom = new Date(2026, 5, 14).toISOString();
+    const expectedBefore = new Date(2026, 5, 15).toISOString();
+    await waitFor(() => {
+      const requests = vi.mocked(globalThis.fetch).mock.calls.map(([input]) => new URL(String(input), "http://localhost"));
+      for (const path of ["/api/admin/tickets", "/api/admin/tickets/metrics"]) {
+        expect(requests.some((url) => url.pathname === path
+          && url.searchParams.get("createdFrom") === expectedFrom
+          && url.searchParams.get("createdBefore") === expectedBefore
+          && (path.endsWith("metrics") || url.searchParams.get("page") === "1"))).toBe(true);
+      }
+      expect(screen.getByRole("button", { name: /Open Tickets/ })).toHaveTextContent("0");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
+    await screen.findByText("Page 1 of 2");
+    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
   });
 
   it("renders the admin dashboard with live payload data", async () => {
@@ -585,7 +717,7 @@ describe("AgentDashboard runtime", () => {
       "Support Dashboard",
       "Learning Plan Team",
       "Chat Console",
-      "Manage Agents",
+      "Team Management",
     ]);
     expect(screen.getByRole("tab", { name: /Admin Dashboard/i })).toHaveAttribute("data-state", "inactive");
     expect(screen.getByRole("tab", { name: /Support Dashboard/i })).toHaveAttribute("data-state", "active");
@@ -617,13 +749,282 @@ describe("AgentDashboard runtime", () => {
       "Support Dashboard",
       "Learning Plan Team",
       "Chat Console",
-      "Manage Agents",
+      "Team Management",
     ]);
     expect(screen.getByRole("tab", { name: /Admin Dashboard/i })).toHaveAttribute("data-state", "active");
     expect(screen.getByRole("tab", { name: /Support Dashboard/i })).toHaveAttribute("data-state", "inactive");
     expect(screen.getByRole("tab", { name: /Learning Plan Team/i })).toHaveAttribute("data-state", "inactive");
     expect(screen.getByRole("tab", { name: /Chat Console/i })).toHaveAttribute("data-state", "inactive");
     expect(within(adminPanel).getByRole("heading", { name: "All Tickets" })).toBeInTheDocument();
+  });
+
+  it("keeps no-access staff visible in Team Management so access can be restored", async () => {
+    render(
+      <MemoryRouter initialEntries={["/admin?view=management"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Team Management" })).toBeInTheDocument();
+    expect(screen.getByText("Test Test")).toBeInTheDocument();
+    expect(screen.getByText(/No support access/i)).toBeInTheDocument();
+  });
+
+  it("loads dynamic teams into the transfer menu", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/teams")) {
+        return new Response(JSON.stringify({
+          teams: [
+            {
+              id: 7,
+              key: "curriculum",
+              name: "Curriculum Team",
+              assignedTeam: "Curriculum Team",
+              label: "Curriculum Team",
+              description: "Route this ticket to the curriculum queue.",
+              receiverAccessMetadataKey: "team_access:curriculum",
+              isActive: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("Overview");
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalledWith("/api/admin/teams", { cache: "no-store" });
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: /Transfer ticket KBC-000001 to another team/i }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(await screen.findByRole("menuitem", { name: /Curriculum Team/i })).toBeInTheDocument();
+  });
+
+  it("shows dynamic teams as isolated dashboard tabs", async () => {
+    const originalFetch = globalThis.fetch;
+    const curriculumTicket = {
+      ...dashboardPayload.tickets.tickets[0],
+      id: "KBC-000006",
+      learnerName: "Curriculum Learner",
+      requesterName: "Curriculum Learner",
+      email: "curriculum.learner@kentbusinesscollege.com",
+      inquiryPreview: "Curriculum team request",
+      assignedTeam: "Curriculum Team",
+      chatId: "CHAT-000006",
+      createdAt: "2026-06-14T13:00:00.000Z",
+      updatedAt: "2026-06-14T13:00:00.000Z",
+    };
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/teams")) {
+        return new Response(JSON.stringify({
+          teams: [
+            {
+              id: 7,
+              key: "curriculum",
+              name: "Curriculum Team",
+              assignedTeam: "Curriculum Team",
+              label: "Curriculum Team",
+              description: "Route this ticket to the curriculum queue.",
+              receiverAccessMetadataKey: "team_access:curriculum",
+              isActive: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload([...dashboardPayload.tickets.tickets, curriculumTicket])), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/api/admin/tickets")) {
+        return new Response(JSON.stringify({
+          tickets: [...dashboardPayload.tickets.tickets, curriculumTicket],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    const curriculumTab = await screen.findByRole("tab", { name: /^Curriculum Team$/i });
+    fireEvent.mouseDown(curriculumTab, {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.mouseUp(curriculumTab);
+    fireEvent.click(curriculumTab);
+
+    expect(await screen.findByRole("heading", { name: "Curriculum Team Tickets" })).toBeInTheDocument();
+    const curriculumPanel = screen.getByRole("tabpanel", { name: /^Curriculum Team$/i });
+    expect(within(curriculumPanel).getByText("KBC-000006")).toBeInTheDocument();
+    expect(within(curriculumPanel).queryByText("KBC-000001")).not.toBeInTheDocument();
+  });
+
+  it("toggles dynamic team receiver access through the team-access endpoint", async () => {
+    const originalFetch = globalThis.fetch;
+    const teamAccessRequests: Array<Record<string, unknown>> = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/teams")) {
+        return new Response(JSON.stringify({
+          teams: [
+            {
+              id: 7,
+              key: "curriculum",
+              name: "Curriculum Team",
+              assignedTeam: "Curriculum Team",
+              label: "Curriculum Team",
+              description: "Route this ticket to the curriculum queue.",
+              receiverAccessMetadataKey: "team_access:curriculum",
+              isActive: true,
+            },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.endsWith("/api/admin/accounts/41/team-access") && init?.method === "PATCH") {
+        const parsedBody = JSON.parse(String(init.body || "{}")) as Record<string, unknown>;
+        teamAccessRequests.push(parsedBody);
+        return new Response(JSON.stringify({
+          agent: {
+            ...dashboardPayload.accounts.accounts[1],
+            teamAccess: [
+              {
+                key: "curriculum",
+                name: "Curriculum Team",
+                assignedTeam: "Curriculum Team",
+                label: "Curriculum Team",
+                canReceiveTickets: true,
+              },
+            ],
+            teamAccessKeys: ["curriculum"],
+          },
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=management"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("tab", { name: /Curriculum Team0/i })).toBeInTheDocument();
+    const curriculumTab = screen.getByRole("tab", { name: /Curriculum Team0/i });
+    fireEvent.mouseDown(curriculumTab, {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.mouseUp(curriculumTab);
+    fireEvent.click(curriculumTab);
+    await waitFor(() => {
+      expect(curriculumTab).toHaveAttribute("data-state", "active");
+    });
+    fireEvent.click(screen.getByRole("switch", { name: /Toggle Curriculum Team access for Test Test/i }));
+
+    await waitFor(() => {
+      expect(teamAccessRequests).toEqual([{ teamKey: "curriculum", receiveTickets: true }]);
+    });
+  });
+
+  it("surfaces live handoffs from ticketState even before chatIsActive is set", async () => {
+    const originalFetch = globalThis.fetch;
+    const waitingLiveTicket = {
+      ...dashboardPayload.tickets.tickets[0],
+      id: "KBC-000005",
+      learnerName: "Waiting Learner",
+      requesterName: "Waiting Learner",
+      email: "waiting.learner@kentbusinesscollege.com",
+      inquiryPreview: "Waiting for an available support agent",
+      chatId: "CHAT-000005",
+      chatIsActive: false,
+      liveChatRequested: true,
+      liveChatRequestedAt: "2026-06-14T10:05:00.000Z",
+      chatState: "open",
+      ticketState: {
+        ticketType: "live_chat",
+        workflowStage: "awaiting_agent",
+        queueScope: "support",
+        dashboardBucket: "live_chat",
+        canShowConversation: true,
+        canReceiveChat: true,
+        resolutionReason: "",
+      },
+    };
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.includes("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload([...dashboardPayload.tickets.tickets, waitingLiveTicket])), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/api/admin/tickets")) {
+        return new Response(JSON.stringify({
+          tickets: [...dashboardPayload.tickets.tickets, waitingLiveTicket],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=console"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Waiting Learner")).toBeInTheDocument();
+    expect(screen.getByText("CHAT-000005")).toBeInTheDocument();
   });
 
   it("opens the Admin Dashboard overview from the admin view deep link", async () => {
@@ -653,7 +1054,7 @@ describe("AgentDashboard runtime", () => {
 
     await screen.findByRole("tabpanel");
 
-    const notificationButton = screen.getAllByRole("button", { name: /transfer requests/i }).at(-1);
+    const notificationButton = screen.getAllByRole("button", { name: /transfer requests/i }).slice(-1)[0];
     expect(notificationButton).toBeTruthy();
     expect(within(notificationButton as HTMLElement).getByText("1")).toBeInTheDocument();
 
@@ -769,10 +1170,10 @@ describe("AgentDashboard runtime", () => {
   });
 
   it("closes a coverage ticket from the close dialog when a note is provided", async () => {
-    const originalFetch = global.fetch;
+    const originalFetch = globalThis.fetch;
     const patchRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
 
-    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
 
       if (url.endsWith("/api/admin/tickets/KBC-000002") && (!init?.method || init.method === "GET")) {

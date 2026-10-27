@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS support_accounts (
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT support_accounts_role_check CHECK (role IN ('agent', 'user', 'coach', 'employer', 'admin', 'superadmin')),
+  CONSTRAINT support_accounts_role_check CHECK (role IN ('agent', 'user', 'coach', 'tutor', 'employer', 'admin', 'superadmin')),
   CONSTRAINT support_accounts_account_scope_check CHECK (account_scope IN ('staff', 'requester'))
 );
 
@@ -87,7 +87,7 @@ ADD COLUMN IF NOT EXISTS account_scope TEXT NOT NULL DEFAULT 'staff';
 
 UPDATE support_accounts
 SET account_scope = CASE
-  WHEN role IN ('user', 'coach', 'employer') THEN 'requester'
+  WHEN role IN ('user', 'coach', 'tutor', 'employer') THEN 'requester'
   ELSE 'staff'
 END;
 
@@ -99,7 +99,7 @@ DROP CONSTRAINT IF EXISTS support_accounts_role_check;
 
 ALTER TABLE support_accounts
 ADD CONSTRAINT support_accounts_role_check
-CHECK (role IN ('agent', 'user', 'coach', 'employer', 'admin', 'superadmin'));
+CHECK (role IN ('agent', 'user', 'coach', 'tutor', 'employer', 'admin', 'superadmin'));
 
 ALTER TABLE support_accounts
 DROP CONSTRAINT IF EXISTS agents_account_scope_check;
@@ -110,6 +110,121 @@ DROP CONSTRAINT IF EXISTS support_accounts_account_scope_check;
 ALTER TABLE support_accounts
 ADD CONSTRAINT support_accounts_account_scope_check
 CHECK (account_scope IN ('staff', 'requester'));
+
+CREATE TABLE IF NOT EXISTS support_teams (
+  id BIGSERIAL PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  receiver_access_metadata_key TEXT NOT NULL DEFAULT '',
+  receiver_error_ticket_label TEXT NOT NULL DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS receiver_access_metadata_key TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS receiver_error_ticket_label TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE support_teams
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE TABLE IF NOT EXISTS support_account_team_access (
+  id BIGSERIAL PRIMARY KEY,
+  account_id BIGINT NOT NULL REFERENCES support_accounts(id) ON DELETE CASCADE,
+  team_id BIGINT NOT NULL REFERENCES support_teams(id) ON DELETE CASCADE,
+  can_receive_tickets BOOLEAN NOT NULL DEFAULT TRUE,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT support_account_team_access_account_team_key UNIQUE (account_id, team_id)
+);
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS can_receive_tickets BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE support_account_team_access
+ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+INSERT INTO support_teams (
+  key,
+  name,
+  description,
+  receiver_access_metadata_key,
+  receiver_error_ticket_label,
+  metadata
+)
+VALUES
+  (
+    'support',
+    'Support Desk',
+    'Default support desk queue for technical support tickets.',
+    'legacy_support_access',
+    'support',
+    '{"seeded": true, "legacyTeam": true}'::jsonb
+  ),
+  (
+    'operations',
+    'Learning Plan Team',
+    'Operations queue for Learning Plan and Coverage tickets.',
+    'legacy_operations_access',
+    'Learning Plan',
+    '{"seeded": true, "legacyTeam": true}'::jsonb
+  )
+ON CONFLICT (key) DO UPDATE
+SET name = EXCLUDED.name,
+    description = EXCLUDED.description,
+    receiver_access_metadata_key = EXCLUDED.receiver_access_metadata_key,
+    receiver_error_ticket_label = EXCLUDED.receiver_error_ticket_label,
+    is_active = TRUE,
+    metadata = COALESCE(support_teams.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+    updated_at = NOW();
+
+INSERT INTO support_account_team_access (account_id, team_id, can_receive_tickets, metadata)
+SELECT sa.id, st.id, TRUE, '{"source": "legacy_support_access"}'::jsonb
+FROM support_accounts sa
+JOIN support_teams st
+  ON st.key = 'support'
+WHERE sa.account_scope = 'staff'
+  AND LOWER(COALESCE(sa.metadata->>'legacy_support_access', 'false')) = 'true'
+ON CONFLICT (account_id, team_id) DO UPDATE
+SET can_receive_tickets = TRUE,
+    metadata = support_account_team_access.metadata || EXCLUDED.metadata,
+    updated_at = NOW();
+
+INSERT INTO support_account_team_access (account_id, team_id, can_receive_tickets, metadata)
+SELECT sa.id, st.id, TRUE, '{"source": "legacy_operations_access"}'::jsonb
+FROM support_accounts sa
+JOIN support_teams st
+  ON st.key = 'operations'
+WHERE sa.account_scope = 'staff'
+  AND LOWER(COALESCE(sa.metadata->>'legacy_operations_access', 'false')) = 'true'
+ON CONFLICT (account_id, team_id) DO UPDATE
+SET can_receive_tickets = TRUE,
+    metadata = support_account_team_access.metadata || EXCLUDED.metadata,
+    updated_at = NOW();
 
 ALTER TABLE learners
 ADD COLUMN IF NOT EXISTS support_account_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
@@ -135,11 +250,20 @@ CREATE TABLE IF NOT EXISTS tickets (
   conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
   category TEXT NOT NULL,
   technical_subcategory TEXT,
+  subject TEXT NOT NULL DEFAULT '',
   inquiry TEXT NOT NULL,
+  submitted_for_learner_id BIGINT REFERENCES learners(id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'Open',
   status_reason TEXT NOT NULL DEFAULT '',
   assigned_agent_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL,
   assigned_team TEXT NOT NULL DEFAULT 'Unassigned',
+  ticket_type TEXT,
+  workflow_stage TEXT,
+  queue_scope TEXT,
+  dashboard_bucket TEXT,
+  can_show_conversation BOOLEAN,
+  can_receive_chat BOOLEAN,
+  resolution_reason TEXT,
   sla_status TEXT NOT NULL DEFAULT 'Pending Review',
   priority TEXT NOT NULL DEFAULT 'Normal',
   evidence_count INTEGER NOT NULL DEFAULT 0,
@@ -155,6 +279,12 @@ ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS technical_subcategory TEXT;
 
 ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS subject TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS submitted_for_learner_id BIGINT REFERENCES learners(id) ON DELETE SET NULL;
+
+ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS status_reason TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE tickets
@@ -165,6 +295,51 @@ ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 
 ALTER TABLE tickets
 ADD COLUMN IF NOT EXISTS archived_by_id BIGINT REFERENCES support_accounts(id) ON DELETE SET NULL;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS ticket_type TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS workflow_stage TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS queue_scope TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS dashboard_bucket TEXT;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS can_show_conversation BOOLEAN;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS can_receive_chat BOOLEAN;
+
+ALTER TABLE tickets
+ADD COLUMN IF NOT EXISTS resolution_reason TEXT;
+
+UPDATE tickets
+SET ticket_type = COALESCE(NULLIF(ticket_type, ''), NULLIF(metadata #>> '{ticket_state,ticketType}', '')),
+    workflow_stage = COALESCE(NULLIF(workflow_stage, ''), NULLIF(metadata #>> '{ticket_state,workflowStage}', '')),
+    queue_scope = COALESCE(NULLIF(queue_scope, ''), NULLIF(metadata #>> '{ticket_state,queueScope}', '')),
+    dashboard_bucket = COALESCE(NULLIF(dashboard_bucket, ''), NULLIF(metadata #>> '{ticket_state,dashboardBucket}', '')),
+    can_show_conversation = COALESCE(
+      can_show_conversation,
+      CASE
+        WHEN LOWER(COALESCE(metadata #>> '{ticket_state,canShowConversation}', '')) IN ('true', 'false')
+          THEN (metadata #>> '{ticket_state,canShowConversation}')::boolean
+        ELSE NULL
+      END
+    ),
+    can_receive_chat = COALESCE(
+      can_receive_chat,
+      CASE
+        WHEN LOWER(COALESCE(metadata #>> '{ticket_state,canReceiveChat}', '')) IN ('true', 'false')
+          THEN (metadata #>> '{ticket_state,canReceiveChat}')::boolean
+        ELSE NULL
+      END
+    ),
+    resolution_reason = COALESCE(NULLIF(resolution_reason, ''), NULLIF(metadata #>> '{ticket_state,resolutionReason}', ''))
+WHERE metadata ? 'ticket_state';
 
 ALTER TABLE tickets
 DROP CONSTRAINT IF EXISTS tickets_conversation_id_key;
@@ -253,10 +428,17 @@ CREATE TABLE IF NOT EXISTS support_session_requests (
 CREATE INDEX IF NOT EXISTS idx_learners_source ON learners(source);
 CREATE INDEX IF NOT EXISTS idx_learners_support_account_id ON learners(support_account_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_learner_id ON tickets(learner_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_submitted_for_learner_id ON tickets(submitted_for_learner_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_agent_id ON tickets(assigned_agent_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_is_archived ON tickets(is_archived);
 CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_active_created_at ON tickets(is_archived, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_active_status_created_at ON tickets(is_archived, status, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_active_team_created_at ON tickets(is_archived, LOWER(TRIM(COALESCE(assigned_team, ''))), created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_active_dashboard_bucket ON tickets(is_archived, dashboard_bucket);
+CREATE INDEX IF NOT EXISTS idx_tickets_sla_status ON tickets(sla_status);
+CREATE INDEX IF NOT EXISTS idx_tickets_technical_subcategory ON tickets(LOWER(TRIM(COALESCE(technical_subcategory, ''))));
 CREATE INDEX IF NOT EXISTS idx_ticket_attachments_ticket_id ON ticket_attachments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_ticket_history_ticket_id ON ticket_history(ticket_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_support_session_requests_ticket_id ON support_session_requests(ticket_id, created_at DESC);

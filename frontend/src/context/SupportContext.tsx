@@ -5,9 +5,9 @@ import { SupportContext } from "@/context/support-context-value";
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
-export type TechnicalSubcategory = "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
-export type RequesterRole = "user" | "coach" | "employer";
-export type RequesterSource = "kbc_users_data" | "microsoft_entra" | "support_portal_requester" | "";
+export type TechnicalSubcategory = "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
+export type RequesterRole = "user" | "coach" | "tutor" | "employer";
+export type RequesterSource = "kbc_users_data" | "lms_learners" | "microsoft_entra" | "support_portal_requester" | "";
 
 export interface ChatMessage {
   id: string;
@@ -28,6 +28,22 @@ export interface EvidenceFile {
   file?: File;
 }
 
+export interface SubmittedForLearner {
+  id: number;
+  externalLearnerId?: string;
+  fullName: string;
+  email: string;
+  notificationEmail?: string;
+}
+
+export interface CoverageSessionPlanItem {
+  id: string;
+  label: string;
+  date: string;
+  number: string;
+  subject: string;
+}
+
 export interface Ticket {
   id: string;
   learnerName: string;
@@ -36,7 +52,13 @@ export interface Ticket {
   requesterSource: RequesterSource;
   category: Category;
   technicalSubcategory: TechnicalSubcategory;
+  subject: string;
   inquiry: string;
+  aiTeamPersonName: string;
+  aiTeamPersonEmail: string;
+  coverageSessions: CoverageSessionPlanItem[];
+  submittedForLearner: SubmittedForLearner | null;
+  notifySubmittedForLearner: boolean;
   evidence: EvidenceFile[];
   status: TicketStatus;
   statusReason: string;
@@ -69,7 +91,13 @@ const defaultTicket: Ticket = {
   requesterSource: "",
   category: "",
   technicalSubcategory: "",
+  subject: "",
   inquiry: "",
+  aiTeamPersonName: "",
+  aiTeamPersonEmail: "",
+  coverageSessions: [],
+  submittedForLearner: null,
+  notifySubmittedForLearner: false,
   evidence: [],
   status: "Open",
   statusReason: "",
@@ -99,6 +127,7 @@ function normalizeTechnicalSubcategory(
 ): TechnicalSubcategory {
   if (
     value === "Aptem"
+    || value === "AI Team"
     || value === "Coverage"
     || value === "LMS"
     || value === "Teams"
@@ -141,7 +170,7 @@ function normalizeRequesterRole(value: unknown, fallback: RequesterRole = defaul
   }
 
   const normalizedValue = value.trim().toLowerCase();
-  if (normalizedValue === "user" || normalizedValue === "coach" || normalizedValue === "employer") {
+  if (normalizedValue === "user" || normalizedValue === "coach" || normalizedValue === "tutor" || normalizedValue === "employer") {
     return normalizedValue;
   }
 
@@ -166,11 +195,66 @@ function normalizeRequesterSource(
   if (normalizedValue === "microsoft_entra") {
     return "microsoft_entra";
   }
+  if (normalizedValue === "lms_learners") {
+    return "lms_learners";
+  }
   if (normalizedValue === "support_portal_requester") {
     return "support_portal_requester";
   }
 
   return fallback;
+}
+
+function normalizeSubmittedForLearner(value: unknown): SubmittedForLearner | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const learner = value as Partial<SubmittedForLearner>;
+  const id = typeof learner.id === "number" && Number.isFinite(learner.id) ? learner.id : 0;
+  const email = normalizeString(learner.email);
+  const fullName = normalizeString(learner.fullName, email);
+
+  if (!id || !email) {
+    return null;
+  }
+
+  return {
+    id,
+    externalLearnerId: normalizeString(learner.externalLearnerId),
+    fullName,
+    email,
+    notificationEmail: normalizeString(learner.notificationEmail),
+  };
+}
+
+function normalizeCoverageSessionPlanItem(item: unknown, index: number): CoverageSessionPlanItem | null {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const payload = item as Partial<Record<keyof CoverageSessionPlanItem, unknown>>;
+  const id = normalizeString(payload.id) || `session-${index + 1}`;
+  const label = normalizeString(payload.label) || `Session ${index + 1}`;
+  const date = normalizeString(payload.date);
+  const number = normalizeString(payload.number);
+  const subject = normalizeString(payload.subject);
+  if (!id && !date && !number && !subject) {
+    return null;
+  }
+
+  return { id, label, date, number, subject };
+}
+
+function normalizeCoverageSessionPlan(value: unknown): CoverageSessionPlanItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item, index) => {
+    const normalizedItem = normalizeCoverageSessionPlanItem(item, index);
+    return normalizedItem ? [normalizedItem] : [];
+  });
 }
 
 function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
@@ -184,7 +268,13 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
     email: normalizeString(nextTicket.email),
     category: normalizeCategory(nextTicket.category),
     technicalSubcategory: normalizeTechnicalSubcategory(nextTicket.technicalSubcategory),
+    subject: normalizeString(nextTicket.subject),
     inquiry: normalizeString(nextTicket.inquiry),
+    aiTeamPersonName: normalizeString(nextTicket.aiTeamPersonName),
+    aiTeamPersonEmail: normalizeString(nextTicket.aiTeamPersonEmail),
+    coverageSessions: normalizeCoverageSessionPlan(nextTicket.coverageSessions),
+    submittedForLearner: normalizeSubmittedForLearner(nextTicket.submittedForLearner),
+    notifySubmittedForLearner: Boolean(nextTicket.notifySubmittedForLearner),
     evidence: Array.isArray(nextTicket.evidence) ? nextTicket.evidence : [],
     status: normalizeTicketStatus(nextTicket.status),
     statusReason: normalizeString(nextTicket.statusReason),
@@ -204,7 +294,9 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     || ticket.learnerName
     || ticket.category
     || ticket.technicalSubcategory
-    || ticket.inquiry,
+    || ticket.subject
+    || ticket.inquiry
+    || ticket.submittedForLearner,
   );
 
   if (!ticket.id && !hasDraftDetails) {
@@ -219,7 +311,13 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     requesterSource: ticket.requesterSource,
     category: ticket.category,
     technicalSubcategory: ticket.technicalSubcategory,
+    subject: ticket.subject,
     inquiry: ticket.inquiry,
+    aiTeamPersonName: ticket.aiTeamPersonName,
+    aiTeamPersonEmail: ticket.aiTeamPersonEmail,
+    coverageSessions: ticket.coverageSessions,
+    submittedForLearner: ticket.submittedForLearner,
+    notifySubmittedForLearner: ticket.notifySubmittedForLearner,
     status: ticket.status,
     statusReason: ticket.statusReason,
     assignedAgentId: ticket.assignedAgentId,

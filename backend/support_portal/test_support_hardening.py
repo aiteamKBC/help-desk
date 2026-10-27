@@ -2,7 +2,7 @@
 from unittest.mock import MagicMock, patch
 
 from django.db.utils import OperationalError as DjangoOperationalError
-from django.test import RequestFactory, SimpleTestCase
+from django.test import RequestFactory, SimpleTestCase, override_settings
 
 from support_portal import chatbot, services, views
 from support_portal.roles import ROLE_TUTOR
@@ -199,6 +199,7 @@ class TicketCreatedNotificationGuardTests(SimpleTestCase):
         queue.assert_not_called()
 
 
+@override_settings(SUPPORT_SSO_SECRET="test-sso-secret", SUPPORT_SSO_TOKEN_MAX_AGE_SECONDS=300)
 class SsoTokenLifetimeTests(SimpleTestCase):
     """A token must not be able to disable the check on its own lifetime."""
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, ArrowRight, ChevronDown, FileText, Paperclip, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChevronDown, FileText, Paperclip, Search, UserRound, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -11,6 +11,8 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -28,10 +30,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
-  type Category,
   type EvidenceFile,
-  type RequesterSource,
+  type SubmittedForLearner,
   type TechnicalSubcategory,
+  type Ticket,
 } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
 import {
@@ -42,7 +44,8 @@ import {
   parseCoverageInquiry,
   type CoverageTimeOption,
 } from "@/lib/coverageSupport";
-import { quickTicketReason } from "@/lib/supportFlow";
+import { isSubmittedSupportFlowLocked } from "@/lib/supportFlow";
+import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/supportTicketDraft";
 import { toast } from "sonner";
 
 const textExtensions = new Set([
@@ -65,7 +68,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "Coverage", "Others"];
+const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "AI Team", "Coverage", "Others"];
 
 const getExtension = (name: string) => {
   const dotIndex = name.lastIndexOf(".");
@@ -147,14 +150,31 @@ const getDefaultCoverageSessionNumber = (sessionDate: string, sessionDateOptions
   return sessionIndex >= 0 ? String(sessionIndex + 1) : "";
 };
 
+type RequestForMode = "self" | "learner";
+const SUBJECT_MAX_LENGTH = 120;
+const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+
 const InquiryDetails = () => {
   const navigate = useNavigate();
-  const { ticket, updateTicket, clearBookingSummary } = useSupport();
+  const { ticket, updateTicket, clearBookingSummary, bookingSummary } = useSupport();
   const initialCoverageDetails = parseCoverageInquiry(ticket.inquiry);
   const [technicalSubcategory, setTechnicalSubcategory] = useState<TechnicalSubcategory>(ticket.technicalSubcategory);
+  const [subject, setSubject] = useState(ticket.subject);
   const [inquiry, setInquiry] = useState(
     isCoverageSubcategory(ticket.technicalSubcategory) && initialCoverageDetails ? "" : ticket.inquiry,
   );
+  const [aiTeamPersonName, setAiTeamPersonName] = useState(ticket.aiTeamPersonName);
+  const [aiTeamPersonEmail, setAiTeamPersonEmail] = useState(ticket.aiTeamPersonEmail);
+  const [requestFor, setRequestFor] = useState<RequestForMode>(ticket.submittedForLearner ? "learner" : "self");
+  const [learnerSearch, setLearnerSearch] = useState("");
+  const [learnerResults, setLearnerResults] = useState<SubmittedForLearner[]>([]);
+  const [selectedSubmittedForLearner, setSelectedSubmittedForLearner] = useState<SubmittedForLearner | null>(ticket.submittedForLearner);
+  const [submittedForNotificationEmail, setSubmittedForNotificationEmail] = useState(
+    ticket.submittedForLearner?.notificationEmail || ticket.submittedForLearner?.email || "",
+  );
+  const [notifySubmittedForLearner, setNotifySubmittedForLearner] = useState(ticket.notifySubmittedForLearner);
+  const [isSearchingLearners, setIsSearchingLearners] = useState(false);
+  const [learnerSearchError, setLearnerSearchError] = useState("");
   const [coverageTutor, setCoverageTutor] = useState(initialCoverageDetails?.tutor || "");
   const [coverageModule, setCoverageModule] = useState(initialCoverageDetails?.module || "");
   const [coverageTime, setCoverageTime] = useState(initialCoverageDetails?.time || "");
@@ -183,10 +203,13 @@ const InquiryDetails = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const coverageSessionDateRequestRef = useRef(0);
-  const canUseCoverage = ticket.requesterSource !== "kbc_users_data";
-  const availableInquiryPlatforms = canUseCoverage
-    ? inquiryPlatforms
-    : inquiryPlatforms.filter((item) => item !== "Coverage");
+  const isLearnerSource = ticket.requesterSource === "kbc_users_data" || ticket.requesterSource === "lms_learners";
+  const canUseCoverage = !isLearnerSource;
+  const canSubmitForLearner = !isLearnerSource || ticket.requesterRole === "coach" || ticket.requesterRole === "tutor" || ticket.requesterRole === "employer";
+  const availableInquiryPlatforms = inquiryPlatforms.filter((item) => (
+    !isLearnerSource
+    || (item !== "Coverage" && item !== "AI Team")
+  ));
   const selectedCoverageSessionNumbers = coverageSessionDates.map(
     (sessionDate) => (coverageSessionNumberByDate[sessionDate] || getDefaultCoverageSessionNumber(sessionDate, coverageSessionDateOptions)).trim(),
   );
@@ -194,17 +217,39 @@ const InquiryDetails = () => {
     (sessionDate) => (coverageSessionSubjectByDate[sessionDate] || "").trim(),
   );
   const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
+  const isReadOnlyReview = isSubmittedSupportFlowLocked(ticket, bookingSummary);
 
+  const isAiTeamFlow = technicalSubcategory === "AI Team";
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
-  const canSubmit = isCoverageFlow
+  const hasSubmittedForLearner = requestFor !== "learner" || Boolean(selectedSubmittedForLearner);
+  const trimmedSubmittedForNotificationEmail = submittedForNotificationEmail.trim();
+  const hasValidSubmittedForNotificationEmail = !notifySubmittedForLearner
+    || (Boolean(selectedSubmittedForLearner) && isValidEmailFormat(trimmedSubmittedForNotificationEmail));
+  const trimmedAiTeamPersonName = aiTeamPersonName.trim();
+  const trimmedAiTeamPersonEmail = aiTeamPersonEmail.trim();
+  const hasValidAiTeamContact = !isAiTeamFlow
+    || (Boolean(trimmedAiTeamPersonName) && isValidEmailFormat(trimmedAiTeamPersonEmail));
+  const hasSubject = subject.trim().length > 0;
+  const canSubmit = !isReadOnlyReview && (isCoverageFlow
     ? Boolean(
-      coverageTutor
+      hasSubject
+      && hasSubmittedForLearner
+      && hasValidSubmittedForNotificationEmail
+      && technicalSubcategory
+      && coverageTutor
       && coverageModule
       && coverageTime
       && coverageSessionDates.length > 0
       && selectedCoverageSessionSubjects.every((value) => value.length > 0),
     )
-    : Boolean(technicalSubcategory && inquiry.trim().length > 0);
+    : Boolean(
+      hasSubject
+      && hasSubmittedForLearner
+      && hasValidSubmittedForNotificationEmail
+      && hasValidAiTeamContact
+      && technicalSubcategory
+      && inquiry.trim().length > 0,
+    ));
 
   const loadCoverageSessionDateOptions = (tutorValue: string, moduleValue: string, timeValue: string) => {
     if (!isCoverageFlow || !tutorValue || !moduleValue || !timeValue) {
@@ -260,10 +305,97 @@ const InquiryDetails = () => {
   }, [navigate, ticket.email, ticket.id]);
 
   useEffect(() => {
+    if (isReadOnlyReview) {
+      return;
+    }
+
     if (!canUseCoverage && technicalSubcategory === "Coverage") {
       setTechnicalSubcategory("");
     }
-  }, [canUseCoverage, technicalSubcategory]);
+  }, [canUseCoverage, isReadOnlyReview, technicalSubcategory]);
+
+  useEffect(() => {
+    if (isReadOnlyReview) {
+      return;
+    }
+
+    if (!canSubmitForLearner) {
+      setRequestFor("self");
+      setSelectedSubmittedForLearner(null);
+      setSubmittedForNotificationEmail("");
+      setNotifySubmittedForLearner(false);
+      setLearnerSearch("");
+      setLearnerResults([]);
+      setLearnerSearchError("");
+    }
+  }, [canSubmitForLearner, isReadOnlyReview]);
+
+  useEffect(() => {
+    if (!canSubmitForLearner || requestFor !== "learner") {
+      setLearnerResults([]);
+      setLearnerSearchError("");
+      setIsSearchingLearners(false);
+      return;
+    }
+
+    const normalizedQuery = learnerSearch.trim();
+    if (normalizedQuery.length < 2) {
+      setLearnerResults([]);
+      setLearnerSearchError("");
+      setIsSearchingLearners(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setIsSearchingLearners(true);
+      setLearnerSearchError("");
+
+      const searchParams = new URLSearchParams({
+        q: normalizedQuery,
+        limit: "12",
+        requesterEmail: ticket.email,
+      });
+
+      void fetch(`/api/learners/search?${searchParams.toString()}`)
+        .then(async (response) => {
+          const payload = (await response.json().catch(() => null)) as
+            | {
+                message?: string;
+                learners?: SubmittedForLearner[];
+              }
+            | null;
+
+          if (cancelled) {
+            return;
+          }
+
+          if (!response.ok) {
+            setLearnerResults([]);
+            setLearnerSearchError(payload?.message || "We could not search learners right now.");
+            return;
+          }
+
+          setLearnerResults(Array.isArray(payload?.learners) ? payload.learners : []);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLearnerResults([]);
+            setLearnerSearchError("We could not connect to the learner search service.");
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setIsSearchingLearners(false);
+          }
+        });
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [canSubmitForLearner, learnerSearch, requestFor, ticket.email]);
 
   useEffect(() => {
     if (!isCoverageFlow) {
@@ -469,6 +601,7 @@ const InquiryDetails = () => {
   }, [coverageSessionDates, isCoverageFlow]);
 
   const onFiles = async (files: FileList | null) => {
+    if (isReadOnlyReview) return;
     if (!files) return;
 
     const selectedFiles = Array.from(files);
@@ -483,6 +616,8 @@ const InquiryDetails = () => {
   };
 
   const removeFile = (index: number) => {
+    if (isReadOnlyReview) return;
+
     setEvidence((prev) => {
       const fileToRemove = prev[index];
 
@@ -499,12 +634,12 @@ const InquiryDetails = () => {
   };
 
   const handleNext = async () => {
+    if (isReadOnlyReview) return;
     if (!canSubmit) return;
 
     setIsSubmitting(true);
 
     try {
-      const hasExistingTicket = Boolean(ticket.id);
       const submittedInquiry = isCoverageFlow
         ? buildCoverageInquiry({
             tutor: coverageTutor,
@@ -516,160 +651,70 @@ const InquiryDetails = () => {
             sessionSubject: selectedCoverageSessionSubjects.join("; "),
           })
         : inquiry.trim();
-
-      if (!isCoverageFlow && !hasExistingTicket) {
-        clearBookingSummary();
-        updateTicket({
-          id: "",
-          learnerName: ticket.learnerName,
-          email: ticket.email,
-          requesterRole: ticket.requesterRole,
-          requesterSource: ticket.requesterSource,
-          category: "Technical",
-          technicalSubcategory,
-          inquiry: submittedInquiry,
-          evidence,
-          status: "Open",
-          statusReason: "",
-          assignedAgentId: null,
-          assignedTeam: "Unassigned",
-          slaStatus: "Pending Review",
-          createdAt: "",
-          chatState: "open",
-          liveChatRequested: false,
-          chatHistory: [],
-        });
-        navigate("/support/options");
-        return;
-      }
-
-      const formData = new FormData();
-      if (!hasExistingTicket) {
-        formData.set("email", ticket.email);
-      }
-      formData.set("requesterRole", ticket.requesterRole);
-      formData.set("category", "Technical");
-      formData.set("technicalSubcategory", technicalSubcategory);
-      formData.set("inquiry", submittedInquiry);
-      evidence.forEach((file) => {
-        if (file.file) {
-          formData.append("evidenceFiles", file.file, file.name);
-        }
-      });
-
-      const response = await fetch(hasExistingTicket ? `/api/tickets/${encodeURIComponent(ticket.id)}` : "/api/tickets", {
-        method: "POST",
-        body: formData,
-      });
-
-      const payload = (await response.json().catch(() => null)) as
-        | {
-            message?: string;
-            ticket?: {
-              id: string;
-              learnerName?: string;
-              email: string;
-              requesterRole?: "user" | "coach" | "employer";
-              requesterSource?: RequesterSource;
-              category: Category;
-              technicalSubcategory: TechnicalSubcategory;
-              inquiry: string;
-              status: "Open" | "Pending" | "Closed";
-              statusReason?: string;
-              assignedAgentId?: number | null;
-              assignedTeam: string;
-              slaStatus: string;
-              createdAt: string;
-              chatState?: "open" | "closed";
-              liveChatRequested?: boolean;
-            };
-          }
-        | null;
-
-      if (!response.ok || !payload?.ticket) {
-        toast.error(payload?.message || `We could not ${hasExistingTicket ? "update" : "create"} the ticket right now.`);
-        return;
-      }
-
-      const nextRequesterRole = payload.ticket.requesterRole || ticket.requesterRole;
-      const nextRequesterSource = payload.ticket.requesterSource || ticket.requesterSource;
-      const nextTicketState = {
-        id: payload.ticket.id,
-        learnerName: payload.ticket.learnerName || ticket.learnerName,
-        email: payload.ticket.email,
-        requesterRole: nextRequesterRole,
-        requesterSource: nextRequesterSource,
-        category: payload.ticket.category,
-        technicalSubcategory: payload.ticket.technicalSubcategory,
-        inquiry: payload.ticket.inquiry || submittedInquiry,
-        evidence,
-        statusReason: payload.ticket.statusReason || ticket.statusReason,
-        assignedAgentId: payload.ticket.assignedAgentId ?? (hasExistingTicket ? ticket.assignedAgentId : null),
-        createdAt: payload.ticket.createdAt,
-        status: payload.ticket.status,
-        assignedTeam: payload.ticket.assignedTeam,
-        slaStatus: payload.ticket.slaStatus,
-        liveChatRequested: payload.ticket.liveChatRequested ?? (hasExistingTicket ? ticket.liveChatRequested : false),
-        chatState: payload.ticket.chatState ?? (hasExistingTicket ? ticket.chatState : "open"),
-        chatHistory: hasExistingTicket ? ticket.chatHistory : [],
-      } as const;
-
-      updateTicket(nextTicketState);
-
-      if (isCoverageFlow) {
-        const directSubmitResponse = await fetch(`/api/tickets/${encodeURIComponent(payload.ticket.id)}/chat-history`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            status: "Pending",
-            statusReason: quickTicketReason,
-            messages: nextTicketState.chatHistory.map((message) => ({
-              sender: message.sender,
-              text: message.text,
-              timestamp: message.timestamp,
-            })),
-          }),
-        });
-
-        const directSubmitPayload = (await directSubmitResponse.json().catch(() => null)) as
-          | {
-              message?: string;
-              ticket?: {
-                status?: "Open" | "Pending" | "Closed";
-                statusReason?: string;
-                assignedTeam?: string;
-                slaStatus?: string;
-                createdAt?: string;
-                chatState?: "open" | "closed";
-              };
+      const submittedForLearner = canSubmitForLearner && requestFor === "learner"
+        ? selectedSubmittedForLearner
+          ? {
+              ...selectedSubmittedForLearner,
+              notificationEmail: trimmedSubmittedForNotificationEmail || selectedSubmittedForLearner.email,
             }
-          | null;
+          : null
+        : null;
+      const coverageSessions = isCoverageFlow
+        ? coverageSessionDates.map((sessionDate, index) => ({
+            id: `session-${index + 1}`,
+            label: `Session ${index + 1}`,
+            date: sessionDate,
+            number: selectedCoverageSessionNumbers[index] || "",
+            subject: selectedCoverageSessionSubjects[index] || "",
+          }))
+        : [];
 
-        if (!directSubmitResponse.ok || !directSubmitPayload?.ticket) {
-          toast.error(directSubmitPayload?.message || "We could not submit the ticket right now.");
-          return;
-        }
+      const nextTicket: Ticket = {
+        ...ticket,
+        id: ticket.id || "",
+        learnerName: ticket.learnerName,
+        email: ticket.email,
+        requesterRole: ticket.requesterRole,
+        requesterSource: ticket.requesterSource,
+        category: "Technical",
+        technicalSubcategory,
+        subject: subject.trim(),
+        inquiry: submittedInquiry,
+        aiTeamPersonName: isAiTeamFlow ? trimmedAiTeamPersonName : "",
+        aiTeamPersonEmail: isAiTeamFlow ? trimmedAiTeamPersonEmail.toLowerCase() : "",
+        coverageSessions,
+        submittedForLearner,
+        notifySubmittedForLearner: Boolean(submittedForLearner && notifySubmittedForLearner && isValidEmailFormat(submittedForLearner.notificationEmail || "")),
+        evidence,
+        status: ticket.id ? ticket.status : "Open",
+        statusReason: ticket.id ? ticket.statusReason : "",
+        assignedAgentId: ticket.id ? ticket.assignedAgentId : null,
+        assignedTeam: ticket.id ? ticket.assignedTeam : "Unassigned",
+        slaStatus: ticket.id ? ticket.slaStatus : "Pending Review",
+        createdAt: ticket.id ? ticket.createdAt : "",
+        chatState: ticket.id ? ticket.chatState : "open",
+        liveChatRequested: ticket.id ? ticket.liveChatRequested : false,
+        chatHistory: ticket.id ? ticket.chatHistory : [],
+      };
+
+      if (isCoverageFlow || isAiTeamFlow) {
+        const persistedTicket = await persistTicketDraft(nextTicket);
+        const submittedTicket = await submitTicketDirectlyForReview(persistedTicket);
 
         clearBookingSummary();
-        updateTicket({
-          ...nextTicketState,
-          status: directSubmitPayload.ticket.status || "Pending",
-          statusReason: directSubmitPayload.ticket.statusReason || quickTicketReason,
-          assignedTeam: directSubmitPayload.ticket.assignedTeam || nextTicketState.assignedTeam,
-          slaStatus: directSubmitPayload.ticket.slaStatus || nextTicketState.slaStatus,
-          createdAt: directSubmitPayload.ticket.createdAt || nextTicketState.createdAt,
-          chatState: directSubmitPayload.ticket.chatState || nextTicketState.chatState,
-        });
-        toast.success("Your ticket has been submitted directly for team review.");
+        updateTicket(submittedTicket);
+        toast.success(isAiTeamFlow
+          ? "Your AI Team ticket has been submitted."
+          : "Your coverage ticket has been submitted to the Learning Plan team.");
         navigate("/support/status");
         return;
       }
 
+      clearBookingSummary();
+      updateTicket(nextTicket);
       navigate("/support/options");
-    } catch {
-      toast.error("We could not connect to the server. Please try again.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "We could not save these inquiry details. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -677,10 +722,12 @@ const InquiryDetails = () => {
 
   const previewKind = previewFile ? getPreviewKind(previewFile) : null;
   const pageDescription = isCoverageFlow
-    ? "Choose the inquiry category, then select the tutor, module, time, session date, and session details."
-    : "Choose the inquiry category and describe your issue.";
+    ? "Add a subject, then select the tutor, module, time, session date, and session details."
+    : "Choose the inquiry category, add a subject, and describe the issue.";
 
   const handleCoverageTutorChange = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageTutor(value);
     setCoverageModule("");
     setCoverageTime("");
@@ -691,6 +738,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageModuleChange = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageModule(value);
     setCoverageTime("");
     setCoverageSessionDates([]);
@@ -700,6 +749,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageTimeChange = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageTime(value);
     setCoverageSessionDates([]);
     setCoverageSessionNumberByDate({});
@@ -707,6 +758,8 @@ const InquiryDetails = () => {
   };
 
   const toggleCoverageSessionDate = (value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageSessionDates((currentDates) => {
       if (currentDates.includes(value)) {
         return currentDates.filter((currentDate) => currentDate !== value);
@@ -717,6 +770,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageSessionNumberChange = (sessionDate: string, value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageSessionNumberByDate((currentSessionNumberByDate) => ({
       ...currentSessionNumberByDate,
       [sessionDate]: value.replace(/[^\d]/g, ""),
@@ -724,6 +779,8 @@ const InquiryDetails = () => {
   };
 
   const handleCoverageSessionSubjectChange = (sessionDate: string, value: string) => {
+    if (isReadOnlyReview) return;
+
     setCoverageSessionSubjectByDate((currentSessionSubjectByDate) => ({
       ...currentSessionSubjectByDate,
       [sessionDate]: value,
@@ -745,17 +802,258 @@ const InquiryDetails = () => {
       <StepIndicator current={2} />
       <div className="mx-auto max-w-4xl">
         <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8">
-          <h1 className="mb-1 text-2xl font-bold text-primary">Create Support Inquiry</h1>
+          <div className="mb-1 flex flex-wrap items-center gap-3">
+            <h1 className="text-2xl font-bold text-primary">
+              {isReadOnlyReview ? "Review Support Inquiry" : "Create Support Inquiry"}
+            </h1>
+            {isReadOnlyReview ? (
+              <span className="rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-primary">
+                Submitted - read only
+              </span>
+            ) : null}
+          </div>
           <p className="mb-6 text-sm text-muted-foreground">
-            {pageDescription}
+            {isReadOnlyReview
+              ? "This ticket has already been submitted. You can review the saved details, but they cannot be edited here."
+              : pageDescription}
           </p>
 
           <div className="space-y-5">
+            {canSubmitForLearner && (
+              <div className="space-y-3 rounded-2xl border border-primary/10 bg-white/70 p-4 shadow-sm">
+                <div>
+                  <Label>Who is this request for?</Label>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    Keep yourself as the requester, or attach the ticket to a learner who asked you for help.
+                  </p>
+                </div>
+
+                <RadioGroup
+                  value={requestFor}
+                  onValueChange={(value) => {
+                    if (isReadOnlyReview) return;
+
+                    const nextRequestFor = value as RequestForMode;
+                    setRequestFor(nextRequestFor);
+                    if (nextRequestFor === "self") {
+                      setSelectedSubmittedForLearner(null);
+                      setSubmittedForNotificationEmail("");
+                      setNotifySubmittedForLearner(false);
+                      setLearnerSearch("");
+                      setLearnerResults([]);
+                    }
+                  }}
+                  disabled={isReadOnlyReview}
+                  className="grid gap-3 sm:grid-cols-2"
+                >
+                  <Label
+                    htmlFor="request-for-self"
+                    className={`flex items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                      isReadOnlyReview ? "cursor-default opacity-80" : "cursor-pointer"
+                    } ${
+                      requestFor === "self"
+                        ? "border-primary bg-primary/[0.06] text-primary shadow-soft"
+                        : "border-primary/10 bg-white hover:border-primary/25"
+                    }`}
+                  >
+                    <RadioGroupItem id="request-for-self" value="self" className="mt-1" />
+                    <span>
+                      <span className="block font-semibold">For myself</span>
+                      <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                        The ticket is about the signed-in requester.
+                      </span>
+                    </span>
+                  </Label>
+
+                  <Label
+                    htmlFor="request-for-learner"
+                    className={`flex items-start gap-3 rounded-2xl border px-4 py-3 text-left transition-all ${
+                      isReadOnlyReview ? "cursor-default opacity-80" : "cursor-pointer"
+                    } ${
+                      requestFor === "learner"
+                        ? "border-primary bg-primary/[0.06] text-primary shadow-soft"
+                        : "border-primary/10 bg-white hover:border-primary/25"
+                    }`}
+                  >
+                    <RadioGroupItem id="request-for-learner" value="learner" className="mt-1" />
+                    <span>
+                      <span className="block font-semibold">For a learner</span>
+                      <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                        Search KBC learners and keep the requester linked as the submitter.
+                      </span>
+                    </span>
+                  </Label>
+                </RadioGroup>
+
+                {requestFor === "learner" && (
+                  <div className="space-y-3 rounded-2xl border border-primary/10 bg-background/80 p-4">
+                    {selectedSubmittedForLearner ? (
+                      <div className="rounded-2xl border border-primary/15 bg-white p-4">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="flex min-w-0 items-start gap-3">
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/[0.08] text-primary">
+                              <UserRound className="h-5 w-5" />
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-semibold text-foreground">
+                                {selectedSubmittedForLearner.fullName}
+                              </div>
+                              <div className="mt-1 break-all text-sm text-muted-foreground">
+                                Official email: {selectedSubmittedForLearner.email}
+                              </div>
+                              {selectedSubmittedForLearner.externalLearnerId && (
+                                <div className="mt-1 text-xs text-muted-foreground">
+                                  Learner ID: {selectedSubmittedForLearner.externalLearnerId}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="rounded-full"
+                            onClick={() => {
+                              if (isReadOnlyReview) return;
+
+                              setSelectedSubmittedForLearner(null);
+                              setSubmittedForNotificationEmail("");
+                              setNotifySubmittedForLearner(false);
+                              setLearnerSearch("");
+                            }}
+                            disabled={isReadOnlyReview}
+                          >
+                            Change
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <Label htmlFor="learner-search">Search learner</Label>
+                        <div className="relative">
+                          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                          <Input
+                            id="learner-search"
+                            value={learnerSearch}
+                            onChange={(event) => {
+                              if (!isReadOnlyReview) {
+                                setLearnerSearch(event.target.value);
+                              }
+                            }}
+                            placeholder="Type learner name, email, or learner ID..."
+                            readOnly={isReadOnlyReview}
+                            className="h-11 rounded-xl pl-10"
+                          />
+                        </div>
+
+                        {learnerSearch.trim().length > 0 && learnerSearch.trim().length < 2 && (
+                          <p className="text-xs text-muted-foreground">Type at least 2 characters to search.</p>
+                        )}
+                        {isSearchingLearners && (
+                          <p className="text-xs text-muted-foreground">Searching learners...</p>
+                        )}
+                        {learnerSearchError && (
+                          <p className="text-xs text-destructive">{learnerSearchError}</p>
+                        )}
+                        {!isSearchingLearners && learnerSearch.trim().length >= 2 && !learnerSearchError && learnerResults.length === 0 && (
+                          <p className="text-xs text-muted-foreground">No matching learners found.</p>
+                        )}
+
+                        {learnerResults.length > 0 && (
+                          <div className="overflow-hidden rounded-2xl border border-primary/10 bg-white shadow-soft">
+                            {learnerResults.map((learner) => (
+                              <button
+                                key={learner.id}
+                                type="button"
+                                onClick={() => {
+                                  if (isReadOnlyReview) return;
+
+                                  setSelectedSubmittedForLearner(learner);
+                                  setSubmittedForNotificationEmail(learner.notificationEmail || learner.email);
+                                  setLearnerResults([]);
+                                  setLearnerSearch("");
+                                }}
+                                disabled={isReadOnlyReview}
+                                className="flex w-full flex-col gap-1 border-b border-primary/8 px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-primary/[0.05]"
+                              >
+                                <span className="font-semibold text-foreground">{learner.fullName}</span>
+                                <span className="break-all text-xs text-muted-foreground">
+                                  {learner.email}
+                                  {learner.externalLearnerId ? ` • ID: ${learner.externalLearnerId}` : ""}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {selectedSubmittedForLearner ? (
+                      <div className="space-y-2 rounded-2xl border border-primary/10 bg-white px-4 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <Label htmlFor="submitted-for-notification-email">Notification email</Label>
+                          <span className="rounded-full border border-primary/10 bg-primary/[0.05] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-primary">
+                            Ticket only
+                          </span>
+                        </div>
+                        <Input
+                          id="submitted-for-notification-email"
+                          type="email"
+                          value={submittedForNotificationEmail}
+                          onChange={(event) => {
+                            if (!isReadOnlyReview) {
+                              setSubmittedForNotificationEmail(event.target.value);
+                            }
+                          }}
+                          placeholder={selectedSubmittedForLearner.email}
+                          readOnly={isReadOnlyReview}
+                          className="h-11 rounded-xl"
+                        />
+                        <p className="text-xs leading-5 text-muted-foreground">
+                          This does not update the learner official record. It is used only if learner notification is enabled for this ticket.
+                        </p>
+                        {notifySubmittedForLearner && !hasValidSubmittedForNotificationEmail ? (
+                          <p className="text-xs font-medium text-destructive">
+                            Please enter a valid notification email before continuing.
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    <label className="flex cursor-not-allowed items-start gap-3 rounded-2xl border border-primary/10 bg-white px-4 py-3 text-sm opacity-75"
+                    >
+                      <Checkbox
+                        checked={notifySubmittedForLearner}
+                        disabled
+                        onCheckedChange={(checked) => setNotifySubmittedForLearner(Boolean(checked))}
+                        className="mt-1"
+                      />
+                      <span>
+                        <span className="flex flex-wrap items-center gap-2 font-semibold text-foreground">
+                          Notify learner by email
+                          <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700">
+                            Coming soon
+                          </span>
+                        </span>
+                        <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                          Off by default. If selected, the learner receives an email after the ticket is submitted.
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="space-y-2">
               <Label>Inquiry Category</Label>
               <Select
                 value={technicalSubcategory}
-                onValueChange={(value) => setTechnicalSubcategory(value as TechnicalSubcategory)}
+                onValueChange={(value) => {
+                  if (!isReadOnlyReview) {
+                    setTechnicalSubcategory(value as TechnicalSubcategory);
+                  }
+                }}
+                disabled={isReadOnlyReview}
               >
                 <SelectTrigger className="h-11">
                   <SelectValue placeholder="Select a category" />
@@ -768,12 +1066,74 @@ const InquiryDetails = () => {
               </Select>
             </div>
 
+            {isAiTeamFlow ? (
+              <div className="grid gap-4 rounded-2xl border border-primary/10 bg-primary/[0.03] p-4 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="ai-team-person-name">Person name</Label>
+                  <Input
+                    id="ai-team-person-name"
+                    value={aiTeamPersonName}
+                    onChange={(event) => {
+                      if (!isReadOnlyReview) {
+                        setAiTeamPersonName(event.target.value);
+                      }
+                    }}
+                    placeholder="Enter the person's name"
+                    readOnly={isReadOnlyReview}
+                    className="h-11 rounded-xl"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ai-team-person-email">Person email</Label>
+                  <Input
+                    id="ai-team-person-email"
+                    type="email"
+                    value={aiTeamPersonEmail}
+                    onChange={(event) => {
+                      if (!isReadOnlyReview) {
+                        setAiTeamPersonEmail(event.target.value);
+                      }
+                    }}
+                    placeholder="Enter the person's email"
+                    readOnly={isReadOnlyReview}
+                    className="h-11 rounded-xl"
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            <div className="space-y-2">
+              <div className="flex items-end justify-between gap-3">
+                <Label htmlFor="ticket-subject">Subject</Label>
+                <span className="text-xs text-muted-foreground">
+                  {subject.length}/{SUBJECT_MAX_LENGTH}
+                </span>
+              </div>
+              <Input
+                id="ticket-subject"
+                required
+                maxLength={SUBJECT_MAX_LENGTH}
+                value={subject}
+                onChange={(event) => {
+                  if (!isReadOnlyReview) {
+                    setSubject(event.target.value);
+                  }
+                }}
+                placeholder="Write a short title for this issue..."
+                readOnly={isReadOnlyReview}
+                className="h-11 rounded-xl"
+              />
+              <p className="text-xs leading-5 text-muted-foreground">
+                Keep this as a short title. Add the full explanation in Issue Details below.
+              </p>
+            </div>
+
             {isCoverageFlow ? (
               <div className="space-y-5 rounded-2xl border border-primary/10 bg-primary/[0.03] p-4">
                 <div className="grid gap-5 md:grid-cols-2">
                   <div className="space-y-2">
                     <Label>Tutor</Label>
-                    <Select value={coverageTutor} onValueChange={handleCoverageTutorChange} disabled={isLoadingCoverageTutors}>
+                    <Select value={coverageTutor} onValueChange={handleCoverageTutorChange} disabled={isReadOnlyReview || isLoadingCoverageTutors}>
                       <SelectTrigger className="h-11">
                         <SelectValue placeholder={isLoadingCoverageTutors ? "Loading tutors..." : "Choose tutor"} />
                       </SelectTrigger>
@@ -796,7 +1156,7 @@ const InquiryDetails = () => {
                     <Select
                       value={coverageModule}
                       onValueChange={handleCoverageModuleChange}
-                      disabled={!coverageTutor || isLoadingCoverageModules}
+                      disabled={isReadOnlyReview || !coverageTutor || isLoadingCoverageModules}
                     >
                       <SelectTrigger className="h-11">
                         <SelectValue
@@ -834,7 +1194,7 @@ const InquiryDetails = () => {
                     <Select
                       value={coverageTime}
                       onValueChange={handleCoverageTimeChange}
-                      disabled={!coverageModule || isLoadingCoverageTimes}
+                      disabled={isReadOnlyReview || !coverageModule || isLoadingCoverageTimes}
                     >
                       <SelectTrigger className="h-11">
                         <SelectValue
@@ -889,7 +1249,7 @@ const InquiryDetails = () => {
                         <Button
                           type="button"
                           variant="outline"
-                          disabled={!coverageTime || isLoadingCoverageSessionDates}
+                          disabled={isReadOnlyReview || !coverageTime || isLoadingCoverageSessionDates}
                           className="h-11 w-full justify-between rounded-xl border-primary/12 bg-white px-3 font-normal text-foreground shadow-sm hover:bg-white"
                         >
                           <span className="truncate text-left">
@@ -966,6 +1326,7 @@ const InquiryDetails = () => {
                                 placeholder="Write the session subject"
                                 value={coverageSessionSubjectByDate[sessionDate] || ""}
                                 onChange={(event) => handleCoverageSessionSubjectChange(sessionDate, event.target.value)}
+                                readOnly={isReadOnlyReview}
                                 className="h-11 rounded-xl border-primary/12 bg-white shadow-none"
                               />
                             </div>
@@ -984,6 +1345,7 @@ const InquiryDetails = () => {
                                 placeholder="No."
                                 value={coverageSessionNumberByDate[sessionDate] || ""}
                                 onChange={(event) => handleCoverageSessionNumberChange(sessionDate, event.target.value)}
+                                readOnly={isReadOnlyReview}
                                 className="h-11 rounded-xl border-primary/12 bg-white text-center font-semibold shadow-none"
                               />
                             </div>
@@ -1007,12 +1369,17 @@ const InquiryDetails = () => {
               </div>
             ) : (
               <div className="space-y-2">
-                <Label>Inquiry</Label>
+                <Label>Issue Details</Label>
                 <Textarea
                   rows={6}
                   placeholder="Please describe your issue in detail..."
                   value={inquiry}
-                  onChange={(event) => setInquiry(event.target.value)}
+                  onChange={(event) => {
+                    if (!isReadOnlyReview) {
+                      setInquiry(event.target.value);
+                    }
+                  }}
+                  readOnly={isReadOnlyReview}
                   className="resize-none"
                 />
               </div>
@@ -1020,22 +1387,35 @@ const InquiryDetails = () => {
 
             <div className="space-y-2">
               <Label className="flex items-center gap-2">
-                <Paperclip className="w-4 h-4" /> Upload supporting evidence
+                <Paperclip className="w-4 h-4" /> Supporting evidence
               </Label>
               <div
-                onClick={() => fileRef.current?.click()}
-                className="p-6 text-center transition-colors border-2 border-dashed rounded-xl cursor-pointer border-border hover:border-primary hover:bg-primary/5"
+                onClick={() => {
+                  if (!isReadOnlyReview) {
+                    fileRef.current?.click();
+                  }
+                }}
+                className={`p-6 text-center transition-colors border-2 border-dashed rounded-xl ${
+                  isReadOnlyReview
+                    ? "cursor-default border-border bg-secondary/20"
+                    : "cursor-pointer border-border hover:border-primary hover:bg-primary/5"
+                }`}
               >
                 <Paperclip className="w-6 h-6 mx-auto mb-2 text-muted-foreground" />
-                <p className="text-sm font-medium">Click to upload files</p>
+                <p className="text-sm font-medium">
+                  {isReadOnlyReview ? "Submitted files are shown below" : "Click to upload files"}
+                </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  You can upload any file type. Multiple files are supported.
+                  {isReadOnlyReview
+                    ? "Evidence is read-only after the ticket has been submitted."
+                    : "You can upload any file type. Multiple files are supported."}
                 </p>
                 <input
                   ref={fileRef}
                   type="file"
                   multiple
                   className="hidden"
+                  disabled={isReadOnlyReview}
                   onChange={(event) => void onFiles(event.target.files)}
                 />
               </div>
@@ -1049,38 +1429,57 @@ const InquiryDetails = () => {
                       <button
                         type="button"
                         onClick={() => setPreviewFile(file)}
+                        disabled={!file.previewUrl && !file.textContent}
                         className="flex flex-1 min-w-0 items-center gap-2 text-left transition-colors hover:text-primary"
                       >
                         <FileText className="w-4 h-4 shrink-0 text-muted-foreground" />
                         <span className="truncate">{file.name}</span>
-                        <span className="shrink-0 text-xs text-primary">View</span>
+                        {file.previewUrl || file.textContent ? (
+                          <span className="shrink-0 text-xs text-primary">View</span>
+                        ) : null}
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => removeFile(index)}
-                        className="ml-3 shrink-0 text-muted-foreground hover:text-destructive"
-                        aria-label="Remove"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
+                      {!isReadOnlyReview ? (
+                        <button
+                          type="button"
+                          onClick={() => removeFile(index)}
+                          className="ml-3 shrink-0 text-muted-foreground hover:text-destructive"
+                          aria-label="Remove"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      ) : null}
                     </li>
                   ))}
                 </ul>
               )}
+              {isReadOnlyReview && evidence.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No supporting evidence was uploaded for this ticket.</p>
+              ) : null}
             </div>
 
             <div className="flex flex-col-reverse gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
-              <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/support")}>
-                <ArrowLeft className="w-4 h-4 mr-2" /> Back
-              </Button>
-              <Button
-                disabled={!canSubmit || isSubmitting}
-                onClick={() => void handleNext()}
-                className="w-full border-0 gradient-primary sm:w-auto"
-              >
-                {isSubmitting ? (isCoverageFlow && !ticket.id ? "Creating..." : "Saving...") : "Next"}
-                {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
-              </Button>
+              {isReadOnlyReview ? (
+                <Button
+                  onClick={() => navigate("/support/status")}
+                  className="mx-auto w-full border-0 gradient-primary sm:w-auto"
+                >
+                  Return to Ticket Status
+                </Button>
+              ) : (
+                <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/support")}>
+                  <ArrowLeft className="w-4 h-4 mr-2" /> Back
+                </Button>
+              )}
+              {!isReadOnlyReview ? (
+                <Button
+                  disabled={!canSubmit || isSubmitting}
+                  onClick={() => void handleNext()}
+                  className="w-full border-0 gradient-primary sm:w-auto"
+                >
+                  {isSubmitting ? "Saving..." : isAiTeamFlow ? "Submit ticket" : "Next"}
+                  {!isSubmitting && <ArrowRight className="w-4 h-4 ml-2" />}
+                </Button>
+              ) : null}
             </div>
           </div>
         </div>

@@ -1,0 +1,242 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "Coverege/Requesting/Tutor",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -976,
+        272
+      ],
+      "id": "414c1e03-414b-4c70-b55b-0136ef346cf2",
+      "name": "Webhook",
+      "webhookId": "298f8672-af63-4675-bf1b-60f3293f3196"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"queued\": true, \"message\": \"Tutor request received\" }",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -400,
+        272
+      ],
+      "id": "5b4c3296-c7bd-47e3-a1fe-b343c6904fab",
+      "name": "Respond to Caller"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============== Resolve the body across all webhook shapes ===============\nconst input = $input.first();\nconst inputJson = input.json || {};\nconst inputBinary = input.binary || {};\n\nlet body;\n\n// Case A: multipart/form-data - JSON body comes as a binary file under $binary.body\nif (inputBinary.body) {\n  const buffer = await this.helpers.getBinaryDataBuffer(0, 'body');\n  body = JSON.parse(buffer.toString('utf8'));\n}\n// Case B: webhook exposes body as a stringified JSON\nelse if (typeof inputJson.body === 'string') {\n  body = JSON.parse(inputJson.body);\n}\n// Case C: webhook exposes body as a nested object\nelse if (inputJson.body && typeof inputJson.body === 'object') {\n  body = inputJson.body;\n}\n// Case D: payload is at the top level\nelse {\n  body = inputJson;\n}\n\n// =============== Extract fields ===============\nconst request = body.request || {};\nconst sessionDetails = request.sessionDetails || '';\n\nconst moduleMatch = sessionDetails.match(/Module:\\s*(.+?)(?:\\n|$)/);\nconst timeMatch = sessionDetails.match(/Preferred Time:\\s*(.+?)(?:\\n|$)/);\nconst module_ = moduleMatch ? moduleMatch[1].trim() : 'N/A';\nconst preferredTime = timeMatch ? timeMatch[1].trim() : 'N/A';\n\nconst ticketId = body.ticketId || '';\nconst cardId = body.cardId || '';\nconst responseToken = body.responseToken || '';\nconst tutorEmail = (body.tutor && body.tutor.email) ? body.tutor.email : '';\nconst tutorName = (body.tutor && body.tutor.name) ? body.tutor.name : 'Tutor';\nconst learnerName = (body.learner && body.learner.name) ? body.learner.name : 'N/A';\n\nconst acceptUrl = body.callback?.acceptUrl || body.acceptUrl || '';\nconst refuseUrl = body.callback?.refuseUrl || body.refuseUrl || '';\n\n// =============== HTML helpers ===============\nfunction escapeHtml(value) {\n  return String(value ?? 'N/A')\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;')\n    .replace(/'/g, '&#039;');\n}\n\nfunction formatBytes(value) {\n  const size = Number(value || 0);\n  if (!Number.isFinite(size) || size <= 0) return '';\n  if (size < 1024) return `${size} B`;\n  if (size < 1024 * 1024) return `${Math.round(size / 1024)} KB`;\n  return `${(size / 1024 / 1024).toFixed(1)} MB`;\n}\n\nfunction infoRow(label, value) {\n  return `\n    <tr>\n      <td style=\"width:150px;padding:4px 10px 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#222222;vertical-align:top;\">\n        ${escapeHtml(label)}\n      </td>\n      <td style=\"padding:4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#444444;vertical-align:top;word-break:break-word;\">\n        ${escapeHtml(value)}\n      </td>\n    </tr>\n  `;\n}\n\nfunction sectionTitle(title) {\n  return `\n    <tr>\n      <td style=\"padding:22px 0 10px 0;\">\n        <div style=\"font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:16px;font-weight:bold;color:#777777;text-transform:uppercase;letter-spacing:0.5px;\">\n          ${escapeHtml(title)}\n        </div>\n      </td>\n    </tr>\n  `;\n}\n\nfunction infoBox(rowsHtml, accentColor) {\n  return `\n    <tr>\n      <td style=\"background:#f8f9fb;border-left:4px solid ${accentColor};border-radius:0 4px 4px 0;padding:14px 18px;\">\n        <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n          ${rowsHtml}\n        </table>\n      </td>\n    </tr>\n  `;\n}\n\nfunction normalizeFiles(files) {\n  return Array.isArray(files)\n    ? files.filter(Boolean).map((file) => ({\n        name: file.name || 'attachment',\n        mimeType: file.mimeType || 'application/octet-stream',\n        size: Number(file.size || 0),\n        dataUrl: file.dataUrl || '',\n        downloadUrl: file.downloadUrl || '',\n        deliveryMode: file.deliveryMode || '',\n        deliveryReason: file.deliveryReason || '',\n      }))\n    : [];\n}\n\nfunction parseSessionsFromText(text) {\n  const sessions = [];\n  const sessionsMatch = text.match(/Sessions:\\n([\\s\\S]+)/);\n\n  if (sessionsMatch) {\n    const lines = sessionsMatch[1].trim().split('\\n').filter((line) => line.trim());\n    lines.forEach((line, index) => {\n      const clean = line.replace(/^\\d+\\.\\s*/, '').trim();\n      const parts = clean.split('|').map((part) => part.trim());\n      sessions.push({\n        label: `Session ${index + 1}`,\n        date: parts[0] || 'N/A',\n        number: parts[1] ? parts[1].replace('No.', '').trim() : 'N/A',\n        subject: parts[2] || 'N/A',\n        files: [],\n      });\n    });\n    return sessions;\n  }\n\n  const subjectMatch = text.match(/Session Subject:\\s*(.+?)(?:\\n|$)/);\n  if (subjectMatch) {\n    sessions.push({\n      label: 'Session 1',\n      date: 'N/A',\n      number: 'N/A',\n      subject: subjectMatch[1].trim(),\n      files: [],\n    });\n  }\n\n  return sessions;\n}\n\nfunction fileListHtml(files) {\n  if (!files.length) {\n    return `\n      <tr>\n        <td colspan=\"2\" style=\"padding:8px 0 0 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#777777;\">\n          No files attached specifically to this session.\n        </td>\n      </tr>\n    `;\n  }\n\n  return `\n    <tr>\n      <td style=\"width:150px;padding:8px 10px 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#222222;vertical-align:top;\">\n        Attachments\n      </td>\n      <td style=\"padding:8px 0 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:20px;color:#444444;vertical-align:top;word-break:break-word;\">\n        ${files.map((file) => {\n          const sizeLabel = formatBytes(file.size);\n          const fileLabel = `${file.name}${sizeLabel ? ` (${sizeLabel})` : ''}`;\n          const linkBadge = file.deliveryMode === 'link'\n            ? ' <span style=\"color:#777777;\">secure download link</span>'\n            : '';\n          if (file.downloadUrl) {\n            return `<div style=\"margin:0 0 6px 0;\"><a href=\"${escapeHtml(file.downloadUrl)}\" style=\"color:#4f46e5;text-decoration:underline;\">${escapeHtml(fileLabel)}</a>${linkBadge}</div>`;\n          }\n          return `<div style=\"margin:0 0 3px 0;\">${escapeHtml(fileLabel)}</div>`;\n        }).join('')}\n      </td>\n    </tr>\n  `;\n}\n\n// =============== Build sessions array ===============\nconst parsedSessions = parseSessionsFromText(sessionDetails);\nconst structuredSessionFiles = Array.isArray(request.sessionFiles) ? request.sessionFiles : [];\nconst sessions = structuredSessionFiles.length > 0\n  ? structuredSessionFiles.map((group, index) => {\n      const parsed = parsedSessions[index] || {};\n      return {\n        label: group.label || parsed.label || `Session ${index + 1}`,\n        date: group.date || parsed.date || 'N/A',\n        number: group.number || parsed.number || 'N/A',\n        subject: group.subject || parsed.subject || 'N/A',\n        files: normalizeFiles(group.attachments),\n      };\n    })\n  : parsedSessions;\n\nconst generalFiles = normalizeFiles(request.presentationFiles);\nconst allStructuredFiles = [\n  ...generalFiles,\n  ...sessions.flatMap((session) => session.files),\n];\n\nconst sessionCards = sessions.map((session) => `\n  <tr>\n    <td style=\"background:#f8f9fb;border-left:4px solid #4a6fa5;border-radius:0 4px 4px 0;padding:14px 18px;\">\n      <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n        ${infoRow('Date', session.date)}\n        ${infoRow('Session No. in Module', session.number)}\n        ${infoRow('Subject', session.subject)}\n        ${fileListHtml(session.files)}\n      </table>\n    </td>\n  </tr>\n  <tr>\n    <td style=\"height:12px;line-height:12px;font-size:12px;\">&nbsp;</td>\n  </tr>\n`).join('');\n\nconst generalAttachmentsHtml = generalFiles.length > 0\n  ? `\n    ${sectionTitle('General Attachments')}\n    ${infoBox(\n      fileListHtml(generalFiles),\n      '#6d5dfc'\n    )}\n  `\n  : '';\n\n// =============== Compose the email ===============\nconst emailHtml = `\n<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>Coverage Session Request</title>\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;\">\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"background:#f4f4f4;margin:0;padding:0;\">\n    <tr>\n      <td align=\"center\" style=\"padding:24px 12px;\">\n        <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\" style=\"max-width:620px;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;\">\n          <tr>\n            <td style=\"background:#1a1a2e;padding:26px 30px;\">\n              <div style=\"font-family:Arial,Helvetica,sans-serif;color:#aac4f0;font-size:13px;line-height:18px;font-weight:bold;letter-spacing:1px;\">\n                KENT BUSINESS COLLEGE\n              </div>\n              <div style=\"font-family:Arial,Helvetica,sans-serif;color:#ffffff;font-size:20px;line-height:26px;font-weight:bold;margin-top:8px;\">\n                Coverage Session Request\n              </div>\n            </td>\n          </tr>\n          <tr>\n            <td style=\"padding:28px 30px;\">\n              <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n                <tr>\n                  <td style=\"font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#555555;padding:0 0 4px 0;\">\n                    Dear <strong>${escapeHtml(tutorName)}</strong>, you have received a coverage session request. Please review the details below and confirm your availability.\n                  </td>\n                </tr>\n\n                ${sectionTitle('Request Info')}\n                ${infoBox(\n                  infoRow('Requested By', learnerName) +\n                  infoRow('Module', module_) +\n                  infoRow('Session Details', preferredTime),\n                  '#1a1a2e'\n                )}\n\n                ${generalAttachmentsHtml}\n\n                ${sectionTitle('Sessions That Need To Be Covered')}\n                ${sessionCards || `\n                  <tr>\n                    <td style=\"background:#f8f9fb;border-left:4px solid #4a6fa5;border-radius:0 4px 4px 0;padding:14px 18px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#444444;\">\n                      No sessions were provided.\n                    </td>\n                  </tr>\n                `}\n\n                <tr>\n                  <td style=\"padding-top:20px;\">\n                    <table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\">\n                      <tr>\n                        <td bgcolor=\"#2e7d32\" style=\"border-radius:6px;\">\n                          <a href=\"${escapeHtml(acceptUrl)}\" style=\"display:inline-block;padding:14px 34px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:18px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;\">\n                            &#10003; Accept\n                          </a>\n                        </td>\n                        <td style=\"width:12px;\">&nbsp;</td>\n                        <td bgcolor=\"#c62828\" style=\"border-radius:6px;\">\n                          <a href=\"${escapeHtml(refuseUrl)}\" style=\"display:inline-block;padding:14px 34px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:18px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;\">\n                            &#10007; Refuse\n                          </a>\n                        </td>\n                      </tr>\n                    </table>\n                  </td>\n                </tr>\n              </table>\n            </td>\n          </tr>\n        </table>\n      </td>\n    </tr>\n  </table>\n</body>\n</html>\n`;\n\n// =============== Build CC list (coach + fixed emails) ===============\nconst FIXED_CC = [\n  'Mohamed.Elmasry@kentbusinesscollege.com',\n  'Yousef.Sultan@kentbusinesscollege.com',\n  'Ayman.Badewi@kentbusinesscollege.com'\n];\n\nconst coachEmail = (body.coach && body.coach.email) ? body.coach.email : null;\nconst ccList = [coachEmail, ...FIXED_CC].filter(Boolean).join(',');\n\n// =============== Attachments ===============\n// Two paths:\n//   A) Multipart: files come as binary items already (file_0, file_1, ...)\n//   B) JSON: files come as base64 dataUrls in body.request.presentationFiles/sessionFiles\nconst binaryData = {};\n\n// Path A - pass through binary items, skip the \"body\" item itself\nfor (const key of Object.keys(inputBinary)) {\n  if (key === 'body') continue;\n  binaryData[key] = inputBinary[key];\n}\n\n// Path B - fallback: build from base64 dataUrls if Path A produced nothing\nif (Object.keys(binaryData).length === 0) {\n  for (let i = 0; i < allStructuredFiles.length; i++) {\n    const file = allStructuredFiles[i];\n    if (file && file.dataUrl) {\n      binaryData['attachment_' + i] = {\n        data: file.dataUrl.split(',')[1],\n        mimeType: file.mimeType,\n        fileName: file.name,\n        fileExtension: (file.name || '').split('.').pop(),\n      };\n    }\n  }\n}\n\nconst hasAttachments = Object.keys(binaryData).length > 0;\n\n// =============== Output ===============\nconst result = {\n  json: {\n    tutorEmail,\n    tutorName,\n    ticketId,\n    cardId,\n    responseToken,\n    ccList,\n    emailSubject: 'Coverage Session Request',\n    emailHtml,\n    hasAttachments,\n  },\n};\n\nif (hasAttachments) {\n  result.binary = binaryData;\n}\n\nreturn [result];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        480
+      ],
+      "id": "443bc139-2a91-44db-a1a3-f1deb6c061c9",
+      "name": "Prepare Email Data"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "06c8e6bd-d35a-4a79-a74d-39958cdba793",
+              "leftValue": "={{ $json.hasAttachments }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -432,
+        480
+      ],
+      "id": "5c5e331e-326f-41a9-83ba-efdd940a3e6c",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.tutorEmail }}",
+        "subject": "={{ $json.emailSubject }}",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "={{ Object.keys($binary).join(',') }}"
+              }
+            ]
+          },
+          "ccList": "={{ $json.ccList }}"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -96,
+        400
+      ],
+      "id": "bfe17ead-f7f6-4f37-9f41-3c3078e5f0e7",
+      "name": "Send Email to Tutor (Att)",
+      "webhookId": "fca26f01-0b01-4cbf-a951-7ba01c78c76f",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "DZ8VIkkppghFEoGg",
+          "name": "Charly Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.tutorEmail }}",
+        "subject": "={{ $json.emailSubject }}",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": []
+          },
+          "ccList": "={{ $json.ccList }}"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -96,
+        624
+      ],
+      "id": "33238000-d469-4f0c-9445-ab7175fce73f",
+      "name": "Send Email to Tutor (No Att)",
+      "webhookId": "fca26f01-0b01-4cbf-a951-7ba01c78c76f",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "DZ8VIkkppghFEoGg",
+          "name": "Charly Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET tutor_emails = jsonb_set(\n  COALESCE(tutor_emails, '{}'::jsonb),\n  ARRAY[$2::text],\n  jsonb_build_object(\n    'gmail_message_id', $3::text,\n    'gmail_thread_id',  $4::text,\n    'sent_at',          to_jsonb(now())\n  ),\n  true\n)\nWHERE public_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $('Prepare Email Data').item.json.ticketId }},{{ $('Prepare Email Data').item.json.tutorEmail }},{{ $json.id }},{{ $json.threadId }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        256,
+        480
+      ],
+      "id": "c5708b6e-4e63-47a9-b4f1-a7bd5583a8f4",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "IYCZ2viNqvKxmIau",
+          "name": "Ticketing System"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond to Caller",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Data": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Send Email to Tutor (Att)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Email to Tutor (No Att)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email to Tutor (Att)": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email to Tutor (No Att)": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1df6b8eb7cad6964c4019ffc034ca93b67e15d54f1ef0b486646f0918cb85bc3"
+  }
+}

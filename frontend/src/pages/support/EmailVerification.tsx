@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Mail, AlertTriangle, ArrowRight, CalendarClock, MessageSquarePlus } from "lucide-react";
+import { Mail, AlertTriangle, ArrowRight, ListChecks, MessageSquarePlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -15,14 +15,12 @@ import { SupportLayout } from "@/components/support/SupportLayout";
 import { KentCrestMark } from "@/components/support/KentCrestMark";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
-  type BookingSummary,
   type RequesterRole,
   type RequesterSource,
   type Ticket,
 } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
-import { getSupportResumePath, isAwaitingSupportReviewTicket } from "@/lib/supportFlow";
-import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
+import { type ApiBookingSummary } from "@/lib/supportBooking";
 import { adminPortalReturnQueryParam, clearAdminPortalReturnFlag } from "@/lib/adminSession";
 
 const isValidEmailFormat = (email: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
@@ -83,55 +81,10 @@ const getVerificationRequestFailureMessage = () =>
     ? "We could not reach the support API. Make sure the Django backend is running on 127.0.0.1:3001, then try again."
     : "We could not verify your email right now. Please try again.";
 
-interface RestoredTicketPayload {
-  id: string;
-  learnerName?: string;
-  email: string;
-  requesterRole?: RequesterRole;
-  requesterSource?: RequesterSource;
-  category: "" | "Learning" | "Technical" | "Others";
-  technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
-  inquiry: string;
-  status: "Open" | "Pending" | "Closed";
-  statusReason?: string;
-  assignedAgentId?: number | null;
-  assignedTeam: string;
-  slaStatus: string;
-  createdAt: string;
-  chatState?: "open" | "closed";
-  liveChatRequested?: boolean;
-}
-
-function buildRestoredTicket(
-  restoredTicket: RestoredTicketPayload,
-  learnerNameFallback: string,
-): Ticket {
-  return {
-    id: restoredTicket.id,
-    learnerName: restoredTicket.learnerName || learnerNameFallback,
-    email: restoredTicket.email,
-    requesterRole: restoredTicket.requesterRole || "user",
-    requesterSource: restoredTicket.requesterSource || "",
-    category: restoredTicket.category,
-    technicalSubcategory: restoredTicket.technicalSubcategory,
-    inquiry: restoredTicket.inquiry,
-    evidence: [],
-    status: restoredTicket.status,
-    statusReason: restoredTicket.statusReason || "",
-    assignedAgentId: restoredTicket.assignedAgentId ?? null,
-    assignedTeam: restoredTicket.assignedTeam,
-    slaStatus: restoredTicket.slaStatus,
-    createdAt: restoredTicket.createdAt,
-    chatState: restoredTicket.chatState || "open",
-    liveChatRequested: restoredTicket.liveChatRequested ?? false,
-    chatHistory: [],
-  };
-}
-
 const EmailVerification = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const { ticket, setTicket, setBookingSummary, clearBookingSummary } = useSupport();
+  const { ticket, setTicket, clearBookingSummary } = useSupport();
   const prefillEmail = searchParams.get("email")?.trim().toLowerCase() || "";
   const ssoToken = searchParams.get("token")?.trim() || "";
   const [email, setEmail] = useState(ticket.email || prefillEmail);
@@ -141,8 +94,11 @@ const EmailVerification = () => {
   const [errorOpen, setErrorOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [existingRequestOpen, setExistingRequestOpen] = useState(false);
-  const [existingRequestTicket, setExistingRequestTicket] = useState<Ticket | null>(null);
-  const [existingRequestBookingSummary, setExistingRequestBookingSummary] = useState<BookingSummary | null>(null);
+  const [requesterProfile, setRequesterProfile] = useState<{
+    learnerName: string;
+    requesterRole: RequesterRole;
+    requesterSource: RequesterSource;
+  } | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -160,13 +116,6 @@ const EmailVerification = () => {
     submitSsoToken(ssoToken);
   }, [ssoToken]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const restoreExistingRequest = (restoredTicket: Ticket, restoredBookingSummary: BookingSummary | null) => {
-    setTicket(restoredTicket);
-    setBookingSummary(restoredBookingSummary);
-    setExistingRequestOpen(false);
-    navigate(getSupportResumePath(restoredTicket, restoredBookingSummary));
-  };
-
   const startNewTicket = (
     trimmedEmail: string,
     learnerName: string,
@@ -181,7 +130,13 @@ const EmailVerification = () => {
       requesterSource,
       category: "",
       technicalSubcategory: "",
+      subject: "",
       inquiry: "",
+      aiTeamPersonName: "",
+      aiTeamPersonEmail: "",
+      coverageSessions: [],
+      submittedForLearner: null,
+      notifySubmittedForLearner: false,
       evidence: [],
       status: "Open",
       statusReason: "",
@@ -196,6 +151,44 @@ const EmailVerification = () => {
     clearBookingSummary();
     setExistingRequestOpen(false);
     navigate("/support/inquiry");
+  };
+
+  const showRequesterDashboard = async (
+    trimmedEmail: string,
+    learnerName: string,
+    requesterRole: RequesterRole,
+    requesterSource: RequesterSource,
+  ) => {
+    setEmail(trimmedEmail);
+    setRequesterProfile({ learnerName, requesterRole, requesterSource });
+    setTicket({
+      id: "",
+      learnerName,
+      email: trimmedEmail,
+      requesterRole,
+      requesterSource,
+      category: "",
+      technicalSubcategory: "",
+      subject: "",
+      inquiry: "",
+      aiTeamPersonName: "",
+      aiTeamPersonEmail: "",
+      coverageSessions: [],
+      submittedForLearner: null,
+      notifySubmittedForLearner: false,
+      evidence: [],
+      status: "Open",
+      statusReason: "",
+      assignedAgentId: null,
+      assignedTeam: "Unassigned",
+      slaStatus: "Pending Review",
+      createdAt: "",
+      chatState: "open",
+      liveChatRequested: false,
+      chatHistory: [],
+    });
+    clearBookingSummary();
+    setExistingRequestOpen(true);
   };
 
   const runVerification = async (request: () => Promise<Response>, emailFallback: string) => {
@@ -218,8 +211,13 @@ const EmailVerification = () => {
               requesterRole?: RequesterRole;
               requesterSource?: RequesterSource;
               category: "" | "Learning" | "Technical" | "Others";
-              technicalSubcategory: "" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+              technicalSubcategory: "" | "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+              subject?: string;
               inquiry: string;
+              aiTeamPersonName?: string;
+              aiTeamPersonEmail?: string;
+              submittedForLearner?: Ticket["submittedForLearner"];
+              notifySubmittedForLearner?: boolean;
               status: "Open" | "Pending" | "Closed";
               statusReason?: string;
               assignedAgentId?: number | null;
@@ -234,21 +232,18 @@ const EmailVerification = () => {
         | null;
 
       if (response.ok && payload?.exists) {
-        const restoredBookingSummary = toBookingSummary(payload.bookingSummary);
         const restoredTicket = payload.ticket;
         const learnerName = payload?.learner?.fullName || "";
         const requesterRole = payload?.requesterRole || restoredTicket?.requesterRole || "user";
         const requesterSource = payload?.requesterSource || restoredTicket?.requesterSource || "";
         const resolvedEmail = (payload?.learner?.email || emailFallback).trim().toLowerCase();
 
-        if (restoredTicket?.id) {
-          setExistingRequestTicket(buildRestoredTicket(restoredTicket, learnerName));
-          setExistingRequestBookingSummary(restoredBookingSummary);
-          setExistingRequestOpen(true);
-          return;
-        }
-
-        startNewTicket(resolvedEmail, learnerName, requesterRole, requesterSource);
+        await showRequesterDashboard(
+          resolvedEmail,
+          learnerName,
+          requesterRole,
+          requesterSource,
+        );
         return;
       }
 
@@ -382,58 +377,35 @@ const EmailVerification = () => {
       <Dialog open={existingRequestOpen} onOpenChange={setExistingRequestOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle className="text-center">Existing Support Request Found</DialogTitle>
+            <DialogTitle className="text-center">Support Dashboard</DialogTitle>
             <DialogDescription className="text-center">
-              We found an active support request for this email. You can continue to the existing request to access your meeting or updates, or start a new ticket.
+              Choose what you want to do for this email.
             </DialogDescription>
           </DialogHeader>
-
-          <div className="space-y-3">
-            {existingRequestTicket ? (
-              <div className="rounded-2xl border border-primary/15 bg-primary/5 px-4 py-4 text-center">
-                <div className="text-xs font-semibold uppercase tracking-[0.16em] text-primary/80">Current Request</div>
-                <div className="mt-2 text-sm text-muted-foreground">
-                  {existingRequestTicket.category}
-                  {existingRequestTicket.technicalSubcategory ? ` - ${existingRequestTicket.technicalSubcategory}` : ""}
-                </div>
-                <div className="mt-1 text-sm text-muted-foreground">
-                  {existingRequestBookingSummary?.reservationConfirmed
-                    ? "Meeting reserved and ready to open."
-                    : isAwaitingSupportReviewTicket(existingRequestTicket)
-                      ? "Quick ticket submitted and waiting for team review."
-                      : existingRequestTicket.status === "Pending"
-                        ? "Request is saved and waiting for the next support update."
-                        : "Progress saved and available to continue."}
-                </div>
-              </div>
-            ) : null}
-          </div>
 
           <DialogFooter className="flex-col gap-2 sm:flex-col">
             <Button
               className="w-full border-0 gradient-primary"
-              onClick={() => {
-                if (!existingRequestTicket) {
-                  return;
-                }
-                restoreExistingRequest(existingRequestTicket, existingRequestBookingSummary);
-              }}
-            >
-              <CalendarClock className="mr-2 h-4 w-4" />
-              Review Existing Request
-            </Button>
-            <Button
-              variant="outline"
-              className="w-full"
               onClick={() => startNewTicket(
                 email.trim().toLowerCase(),
-                existingRequestTicket?.learnerName || "",
-                existingRequestTicket?.requesterRole || "user",
-                existingRequestTicket?.requesterSource || "",
+                requesterProfile?.learnerName || "",
+                requesterProfile?.requesterRole || "user",
+                requesterProfile?.requesterSource || "",
               )}
             >
               <MessageSquarePlus className="mr-2 h-4 w-4" />
               Start New Ticket
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => {
+                setExistingRequestOpen(false);
+                navigate("/support/my-tickets");
+              }}
+            >
+              <ListChecks className="mr-2 h-4 w-4" />
+              My Tickets
             </Button>
           </DialogFooter>
         </DialogContent>

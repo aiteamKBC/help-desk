@@ -1,0 +1,367 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "Coverege/Requesting/Tutor",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -960,
+        1488
+      ],
+      "id": "0479999a-fdf9-4467-95a9-5dc0e4589074",
+      "name": "Webhook",
+      "webhookId": "298f8672-af63-4675-bf1b-60f3293f3196"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"ok\", \"queued\": true, \"message\": \"Tutor request received\" }",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -384,
+        1488
+      ],
+      "id": "93aa1530-ed53-4cfb-9322-a5e60aec41b8",
+      "name": "Respond to Caller"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input=$input.first();const inputJson=input.json||{};const inputBinary=input.binary||{};let body;if(inputBinary.body){const buffer=await this.helpers.getBinaryDataBuffer(0,'body');body=JSON.parse(buffer.toString('utf8'));}else if(typeof inputJson.body==='string'){body=JSON.parse(inputJson.body);}else if(inputJson.body&&typeof inputJson.body==='object'){body=inputJson.body;}else{body=inputJson;}const request=body.request||{};const sessionDetails=request.sessionDetails||'';const moduleMatch=sessionDetails.match(/Module:\\s*(.+?)(?:\\n|$)/);const timeMatch=sessionDetails.match(/Preferred Time:\\s*(.+?)(?:\\n|$)/);const module_=moduleMatch?moduleMatch[1].trim():'N/A';const preferredTime=timeMatch?timeMatch[1].trim():'N/A';const ticketId=body.ticketId||'';const cardId=body.cardId||'';const responseToken=body.responseToken||'';const tutorEmail=body.tutor&&body.tutor.email?String(body.tutor.email).trim():'';const tutorName=body.tutor&&body.tutor.name?body.tutor.name:'Tutor';const learnerName=body.learner&&body.learner.name?body.learner.name:'N/A';const acceptUrl=body.callback?.acceptUrl||body.acceptUrl||'';const refuseUrl=body.callback?.refuseUrl||body.refuseUrl||'';const emailDeliveryCallback=body.emailDeliveryCallback||{};const dashboardUrl=body.dashboardUrl||body.ticket?.dashboardUrl||'https://technicalsupport.kentbusinesscollege.net/admin';function esc(value){return String(value??'N/A').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#039;');}function bytes(value){const size=Number(value||0);if(!Number.isFinite(size)||size<=0)return '';if(size<1024)return `${size} B`;if(size<1024*1024)return `${Math.round(size/1024)} KB`;return `${(size/1024/1024).toFixed(1)} MB`;}function row(label,value){return `<tr><td style='width:150px;padding:4px 10px 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#222222;vertical-align:top;'>${esc(label)}</td><td style='padding:4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#444444;vertical-align:top;word-break:break-word;'>${esc(value)}</td></tr>`;}function section(title){return `<tr><td style='padding:22px 0 10px 0;'><div style='font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:16px;font-weight:bold;color:#777777;text-transform:uppercase;letter-spacing:0.5px;'>${esc(title)}</div></td></tr>`;}function box(rows,color){return `<tr><td style='background:#f8f9fb;border-left:4px solid ${color};border-radius:0 4px 4px 0;padding:14px 18px;'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0'>${rows}</table></td></tr>`;}function normalizeFiles(files){return Array.isArray(files)?files.filter(Boolean).map(file=>({name:file.name||'attachment',mimeType:file.mimeType||'application/octet-stream',size:Number(file.size||0),dataUrl:file.dataUrl||'',downloadUrl:file.downloadUrl||'',deliveryMode:file.deliveryMode||'',deliveryReason:file.deliveryReason||''})):[];}function parseSessionsFromText(text){const sessions=[];const sessionsMatch=text.match(/Sessions:\\n([\\s\\S]+)/);if(sessionsMatch){const lines=sessionsMatch[1].trim().split('\\n').filter(line=>line.trim());lines.forEach((line,index)=>{const clean=line.replace(/^\\d+\\.\\s*/,'').trim();const parts=clean.split('|').map(part=>part.trim());sessions.push({label:`Session ${index+1}`,date:parts[0]||'N/A',number:parts[1]?parts[1].replace('No.','').trim():'N/A',subject:parts[2]||'N/A',files:[]});});return sessions;}const subjectMatch=text.match(/Session Subject:\\s*(.+?)(?:\\n|$)/);if(subjectMatch){sessions.push({label:'Session 1',date:'N/A',number:'N/A',subject:subjectMatch[1].trim(),files:[]});}return sessions;}function fileList(files){if(!files.length){return `<tr><td colspan='2' style='padding:8px 0 0 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#777777;'>No files attached specifically to this session.</td></tr>`;}return `<tr><td style='width:150px;padding:8px 10px 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;font-weight:bold;color:#222222;vertical-align:top;'>Attachments</td><td style='padding:8px 0 4px 0;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:20px;color:#444444;vertical-align:top;word-break:break-word;'>${files.map(file=>{const sizeLabel=bytes(file.size);const fileLabel=`${file.name}${sizeLabel?` (${sizeLabel})`:''}`;const linkBadge=file.deliveryMode==='link'?' <span style=\\'color:#777777;\\'>secure download link</span>':'';if(file.downloadUrl){return `<div style='margin:0 0 6px 0;'><a href='${esc(file.downloadUrl)}' style='color:#4f46e5;text-decoration:underline;'>${esc(fileLabel)}</a>${linkBadge}</div>`;}return `<div style='margin:0 0 3px 0;'>${esc(fileLabel)}</div>`;}).join('')}</td></tr>`;}const parsedSessions=parseSessionsFromText(sessionDetails);const structuredSessionFiles=Array.isArray(request.sessionFiles)?request.sessionFiles:[];const sessions=structuredSessionFiles.length>0?structuredSessionFiles.map((group,index)=>{const parsed=parsedSessions[index]||{};return {label:group.label||parsed.label||`Session ${index+1}`,date:group.date||parsed.date||'N/A',number:group.number||parsed.number||'N/A',subject:group.subject||parsed.subject||'N/A',files:normalizeFiles(group.attachments)};}):parsedSessions;const generalFiles=normalizeFiles(request.presentationFiles);const allStructuredFiles=[...generalFiles,...sessions.flatMap(session=>session.files)];const sessionCards=sessions.map(session=>`<tr><td style='background:#f8f9fb;border-left:4px solid #4a6fa5;border-radius:0 4px 4px 0;padding:14px 18px;'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0'>${row('Date',session.date)}${row('Session No. in Module',session.number)}${row('Subject',session.subject)}${fileList(session.files)}</table></td></tr><tr><td style='height:12px;line-height:12px;font-size:12px;'>&nbsp;</td></tr>`).join('');const generalAttachmentsHtml=generalFiles.length>0?`${section('General Attachments')}${box(fileList(generalFiles),'#6d5dfc')}`:'';const tutorButtons=`<tr><td style='padding-top:20px;'><table role='presentation' cellpadding='0' cellspacing='0' border='0'><tr><td bgcolor='#2e7d32' style='border-radius:6px;'><a href='${esc(acceptUrl)}' style='display:inline-block;padding:14px 34px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:18px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;'>&#10003; Accept</a></td><td style='width:12px;'>&nbsp;</td><td bgcolor='#c62828' style='border-radius:6px;'><a href='${esc(refuseUrl)}' style='display:inline-block;padding:14px 34px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:18px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:6px;'>&#10007; Refuse</a></td></tr></table></td></tr>`;function buildShell(title,intro,extraRows){return `<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'><title>${esc(title)}</title></head><body style='margin:0;padding:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0' style='background:#f4f4f4;margin:0;padding:0;'><tr><td align='center' style='padding:24px 12px;'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0' style='max-width:620px;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;'><tr><td style='background:#1a1a2e;padding:26px 30px;'><div style='font-family:Arial,Helvetica,sans-serif;color:#aac4f0;font-size:13px;line-height:18px;font-weight:bold;letter-spacing:1px;'>KENT BUSINESS COLLEGE</div><div style='font-family:Arial,Helvetica,sans-serif;color:#ffffff;font-size:20px;line-height:26px;font-weight:bold;margin-top:8px;'>${esc(title)}</div></td></tr><tr><td style='padding:28px 30px;'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' border='0'><tr><td style='font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;color:#555555;padding:0 0 4px 0;'>${intro}</td></tr>${section('Request Info')}${box(row('Ticket ID',ticketId)+row('Tutor',`${tutorName} <${tutorEmail}>`)+row('Requested By',learnerName)+row('Module',module_)+row('Session Details',preferredTime),'#1a1a2e')}${generalAttachmentsHtml}${section('Sessions That Need To Be Covered')}${sessionCards||`<tr><td style='background:#f8f9fb;border-left:4px solid #4a6fa5;border-radius:0 4px 4px 0;padding:14px 18px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:18px;color:#444444;'>No sessions were provided.</td></tr>`}${extraRows}</table></td></tr></table></td></tr></table></body></html>`;}const emailHtml=buildShell('Coverage Session Request',`Dear <strong>${esc(tutorName)}</strong>, you have received a coverage session request. Please review the details below and confirm your availability.`,tutorButtons);const internalEmailHtml=buildShell('Coverage Request Sent to Tutor','This is an internal notification. The tutor has received the action email separately.',`<tr><td style='padding-top:20px;'><a href='${esc(dashboardUrl)}' style='display:inline-block;padding:12px 28px;border-radius:6px;text-decoration:none;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:bold;background:#1a1a2e;color:#ffffff;'>Open Ticket in Dashboard</a></td></tr><tr><td style='padding-top:18px;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;color:#777777;'>Accept / Refuse buttons are only included in the tutor email, not in this internal copy.</td></tr>`);const FIXED_INTERNAL_RECIPIENTS=['Mohamed.Elmasry@kentbusinesscollege.com','Yousef.Sultan@kentbusinesscollege.com','Ayman.Badewi@kentbusinesscollege.com'];function uniqueEmailList(values){const seen=new Set();return values.map(value=>String(value||'').trim()).filter(Boolean).filter(email=>{const key=email.toLowerCase();if(key===tutorEmail.toLowerCase())return false;if(seen.has(key))return false;seen.add(key);return true;}).join(',');}const coachEmail=body.coach?.email||'';const requestedByEmail=body.requestedBy?.agentEmail||'';const ccList='';const internalRecipients=uniqueEmailList([coachEmail,requestedByEmail,...FIXED_INTERNAL_RECIPIENTS]);const binaryData={};for(const key of Object.keys(inputBinary)){if(key==='body')continue;binaryData[key]=inputBinary[key];}if(Object.keys(binaryData).length===0){for(let i=0;i<allStructuredFiles.length;i++){const file=allStructuredFiles[i];if(file&&file.dataUrl){binaryData['attachment_'+i]={data:file.dataUrl.split(',')[1],mimeType:file.mimeType,fileName:file.name,fileExtension:(file.name||'').split('.').pop()};}}}const hasAttachments=Object.keys(binaryData).length>0;const result={json:{tutorEmail,tutorName,ticketId,cardId,responseToken,ccList,internalRecipients,internalEmailSubject:`Coverage Request Sent - ${ticketId}`,internalEmailHtml,emailSubject:'Coverage Session Request',emailHtml,hasAttachments,emailDeliveryCallback}};if(hasAttachments){result.binary=binaryData;}return [result];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -624,
+        1696
+      ],
+      "id": "135bf730-ce41-4c56-a480-0d173faff8ed",
+      "name": "Prepare Email Data"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "06c8e6bd-d35a-4a79-a74d-39958cdba793",
+              "leftValue": "={{ $json.hasAttachments }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -416,
+        1696
+      ],
+      "id": "47c1bf69-59ee-4bb3-af0c-2492d1fb2592",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.tutorEmail }}",
+        "subject": "={{ $json.emailSubject }}",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": [
+              {
+                "property": "={{ Object.keys($binary).join(',') }}"
+              }
+            ]
+          },
+          "ccList": "={{ $json.ccList }}"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -80,
+        1616
+      ],
+      "id": "86bba265-3fb8-448b-993b-415a741ba3b4",
+      "name": "Send Email to Tutor (Att)",
+      "webhookId": "fca26f01-0b01-4cbf-a951-7ba01c78c76f",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "DZ8VIkkppghFEoGg",
+          "name": "Charly Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.tutorEmail }}",
+        "subject": "={{ $json.emailSubject }}",
+        "message": "={{ $json.emailHtml }}",
+        "options": {
+          "appendAttribution": false,
+          "attachmentsUi": {
+            "attachmentsBinary": []
+          },
+          "ccList": "={{ $json.ccList }}"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -80,
+        1840
+      ],
+      "id": "488c9115-b7f0-4309-a115-fb053d08999b",
+      "name": "Send Email to Tutor (No Att)",
+      "webhookId": "fca26f01-0b01-4cbf-a951-7ba01c78c76f",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "DZ8VIkkppghFEoGg",
+          "name": "Charly Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.internalRecipients }}",
+        "subject": "={{ $json.internalEmailSubject }}",
+        "message": "={{ $json.internalEmailHtml }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        -416,
+        1280
+      ],
+      "id": "7eacfc7a-8828-4d0f-a2de-d093e86a3a50",
+      "name": "Send Internal Notification",
+      "webhookId": "ed892655-5fd1-48cb-a1f0-7e9567cff783",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "DZ8VIkkppghFEoGg",
+          "name": "Charly Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const prepared=$('Prepare Email Data').item.json||{};const gmailResult=$input.first().json||{};const callback=prepared.emailDeliveryCallback||{};const messageId=gmailResult.id||gmailResult.messageId||gmailResult.gmailMessageId||'';const threadId=gmailResult.threadId||gmailResult.gmailThreadId||'';const rawError=gmailResult.error||gmailResult.message||gmailResult.errorMessage||'';const errorMessage=typeof rawError==='string'?rawError:(rawError.message||rawError.description||JSON.stringify(rawError));const failed=Boolean(gmailResult.error)||(!messageId&&!threadId);return [{json:{ticketId:prepared.ticketId||callback.ticketId||'',cardId:prepared.cardId||callback.cardId||'',responseToken:prepared.responseToken||callback.responseToken||'',tutorEmail:prepared.tutorEmail||'',tutorName:prepared.tutorName||'',status:failed?'failed':'sent',messageId,threadId,error:failed?(errorMessage||'Gmail delivery failed'):'',emailDeliveryCallback:callback}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        1744
+      ],
+      "id": "cd6771b6-4a2d-43ca-b95b-d586629e439b",
+      "name": "Prepare Email Delivery Result"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.emailDeliveryCallback.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { ticketId: $json.ticketId, cardId: $json.cardId, responseToken: $json.responseToken, status: $json.status, messageId: $json.messageId, threadId: $json.threadId, error: $json.error, token: $json.emailDeliveryCallback.token } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        656,
+        1552
+      ],
+      "id": "9777590a-119c-4f0d-9908-b7c76bff5bdd",
+      "name": "Report Email Delivery",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ee7d24ea-28fb-456e-a20f-f21e66a0e1ee",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "sent",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        464,
+        1744
+      ],
+      "id": "ef2b25e8-a153-4ad4-ae19-8ecb662a9b45",
+      "name": "Email Delivery Sent?"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tickets\nSET tutor_emails = jsonb_set(\n  COALESCE(tutor_emails, '{}'::jsonb),\n  ARRAY[$2::text],\n  jsonb_build_object(\n    'gmail_message_id', $3::text,\n    'gmail_thread_id',  $4::text,\n    'sent_at',          to_jsonb(now())\n  ),\n  true\n)\nWHERE public_id = $1;",
+        "options": {
+          "queryReplacement": "={{ $json.ticketId }},{{ $json.tutorEmail }},{{ $json.messageId }},{{ $json.threadId }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        656,
+        1744
+      ],
+      "id": "bcfcfb35-d706-4552-944a-4fa5792ef868",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "IYCZ2viNqvKxmIau",
+          "name": "Ticketing System"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond to Caller",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Data": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Internal Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Send Email to Tutor (Att)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Email to Tutor (No Att)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email to Tutor (Att)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Email Delivery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email to Tutor (No Att)": {
+      "main": [
+        [
+          {
+            "node": "Prepare Email Delivery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Delivery Result": {
+      "main": [
+        [
+          {
+            "node": "Report Email Delivery",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Delivery Sent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Delivery Sent?": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1df6b8eb7cad6964c4019ffc034ca93b67e15d54f1ef0b486646f0918cb85bc3"
+  }
+}

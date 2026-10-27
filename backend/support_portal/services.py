@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -22,7 +23,8 @@ from zoneinfo import ZoneInfo
 import psycopg
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
-from django.db import connection, transaction
+from django.core import signing
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone as django_timezone
 
 from .roles import (
@@ -55,24 +57,41 @@ EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
-ALLOWED_TECHNICAL_SUBCATEGORIES = {"Aptem", "Coverage", "LMS", "Teams", "Others"}
+TECHNICAL_SUBCATEGORY_AI_TEAM = "AI Team"
+ALLOWED_TECHNICAL_SUBCATEGORIES = {TECHNICAL_SUBCATEGORY_AI_TEAM, "Aptem", "Coverage", "LMS", "Teams", "Others"}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
 ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
 EMPLOYER_TICKET_PRIORITY = "High"
 COACH_TICKET_PRIORITY = "High"
+SUPPORT_TEAM_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 ASSIGNED_TEAM_UNASSIGNED = "Unassigned"
 ASSIGNED_TEAM_SUPPORT_DESK = "Support Desk"
 ASSIGNED_TEAM_LEARNING_PLAN = "Learning Plan Team"
-ALLOWED_ASSIGNED_TEAMS = {
-    ASSIGNED_TEAM_UNASSIGNED,
-    ASSIGNED_TEAM_SUPPORT_DESK,
-    ASSIGNED_TEAM_LEARNING_PLAN,
-}
+ASSIGNED_TEAM_AI_TEAM = "Ai Team"
 DEFAULT_ASSIGNED_TEAMS = {
     ASSIGNED_TEAM_UNASSIGNED,
     ASSIGNED_TEAM_SUPPORT_DESK,
 }
+TICKET_RECEIVER_SCOPE_SUPPORT = "support"
+TICKET_RECEIVER_SCOPE_OPERATIONS = "operations"
+TEAM_ROUTING_POLICIES = {
+    ASSIGNED_TEAM_SUPPORT_DESK: {
+        "key": TICKET_RECEIVER_SCOPE_SUPPORT,
+        "assigned_team": ASSIGNED_TEAM_SUPPORT_DESK,
+        "receiver_access_metadata_key": "legacy_support_access",
+        "receiver_error_ticket_label": "support",
+    },
+    ASSIGNED_TEAM_LEARNING_PLAN: {
+        "key": TICKET_RECEIVER_SCOPE_OPERATIONS,
+        "assigned_team": ASSIGNED_TEAM_LEARNING_PLAN,
+        "receiver_access_metadata_key": "legacy_operations_access",
+        "receiver_error_ticket_label": "Learning Plan",
+    },
+}
+LEGACY_TEAM_ROUTING_POLICY_KEYS = {policy["key"] for policy in TEAM_ROUTING_POLICIES.values()}
+SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY = "auth_group_name"
+ALLOWED_ASSIGNED_TEAMS = {ASSIGNED_TEAM_UNASSIGNED, *TEAM_ROUTING_POLICIES.keys()}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
     "High": 1,
@@ -95,6 +114,16 @@ STATUS_REASON_TUTOR_REFUSED = "Tutor Refused"
 STATUS_REASON_REREQUESTING = "Rerequesting"
 SUPPORT_FLOW_STAGE_METADATA_KEY = "support_flow_stage"
 SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS = "booking_in_progress"
+TICKET_STATE_METADATA_KEY = "ticket_state"
+TICKET_STATE_COLUMN_PAYLOAD_KEYS = {
+    "ticket_type": "ticketType",
+    "workflow_stage": "workflowStage",
+    "queue_scope": "queueScope",
+    "dashboard_bucket": "dashboardBucket",
+    "can_show_conversation": "canShowConversation",
+    "can_receive_chat": "canReceiveChat",
+    "resolution_reason": "resolutionReason",
+}
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION = "Awaiting Resolution"
 LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND = "Awaiting resolution"
 STATUS_REASON_AWAITING_RESOLUTION = LEGACY_STATUS_REASON_AWAITING_RESOLUTION_FRONTEND
@@ -134,7 +163,21 @@ ALLOWED_STATUS_REASONS_BY_STATUS = {
 }
 AUTO_MANAGED_SLA_STATUSES = {"Open", "Pending", "Closed"}
 PENDING_SLA_BREACH_AFTER = timedelta(days=3)
+MEETING_SLA_BREACH_AFTER = timedelta(days=3)
 SLA_ATTENTION_REASON_PENDING_OVERDUE = "pending_over_3_days"
+SLA_ATTENTION_REASON_MEETING_OVERDUE = "meeting_over_3_days"
+SLA_POLICY_KEY_METADATA_KEY = "sla_policy_key"
+SLA_STARTED_AT_METADATA_KEY = "sla_started_at"
+SLA_DUE_AT_METADATA_KEY = "sla_due_at"
+SLA_BREACHED_AT_METADATA_KEY = "sla_breached_at"
+SLA_RESOLVED_AT_METADATA_KEY = "sla_resolved_at"
+SLA_OUTCOME_STATUS_METADATA_KEY = "sla_outcome_status"
+SLA_POLICY_OPEN_REVIEW = "open_review"
+SLA_POLICY_PENDING_AGE = "pending_age"
+SLA_POLICY_AWAITING_SUPPORT_MEETING = "awaiting_support_meeting"
+SLA_POLICY_COVERAGE_SESSION_DEADLINE = "coverage_session_deadline"
+SLA_POLICY_CLOSED = "closed"
+SLA_POLICY_ARCHIVED = "archived"
 CHAT_INACTIVITY_REMINDER_AFTER = timedelta(minutes=2)
 CHAT_INACTIVITY_AUTO_CLOSE_AFTER = timedelta(minutes=3)
 OPEN_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS = 10
@@ -158,17 +201,23 @@ LATEST_TRANSFER_DECISION_METADATA_KEY = "latest_transfer_decision"
 PENDING_ESCALATION_NOTIFICATION_METADATA_KEY = "pending_escalation_notification"
 LATEST_ESCALATION_CLOSURE_METADATA_KEY = "latest_escalation_closure"
 PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY = "pending_teams_call_notification"
+PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY = "pending_support_queue_notification"
 PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY = "pending_coverage_ticket_notification"
 PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY = "pending_learning_plan_transfer_notification"
+AI_TEAM_REQUEST_METADATA_KEY = "ai_team_request"
 TEAMS_CALL_REQUESTED_METADATA_KEY = "teams_call_requested"
 LAST_QUICK_TICKET_ASSIGNED_AT_METADATA_KEY = "last_quick_ticket_assigned_at"
 QUICK_TICKET_ORIGIN_METADATA_KEY = "quick_ticket_origin"
 LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY = "latest_coverage_tutor_response"
 QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_confirmation_email_sent_at"
 QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY = "quick_ticket_closed_email_sent_at"
+AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "ai_team_ticket_submitted_email_sent_at"
 LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailable_operations_notified_at"
+SUBMITTED_FOR_LEARNER_METADATA_KEY = "submitted_for_learner"
+NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY = "notify_submitted_for_learner"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
+SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED = "ai_team_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
 SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED = "ticket_created"
 TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "ticket_created_operations_notified_at"
@@ -179,6 +228,8 @@ SUPPORT_NOTIFICATION_MAX_ATTEMPTS = 4
 # Waits between attempts. Spread out rather than immediate: the failures seen in
 # practice were short blips, and four rapid retries would all land inside one.
 SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
+SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
+SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES = 18 * 1024 * 1024
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
         "quick_ticket_confirmation_email_sent",
@@ -187,6 +238,10 @@ SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED: (
         "quick_ticket_closed_email_sent",
         "quick_ticket_closed_email_failed",
+    ),
+    SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED: (
+        "ai_team_ticket_submitted_email_sent",
+        "ai_team_ticket_submitted_email_failed",
     ),
     SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE: (
         "live_agent_unavailable_operations_notified",
@@ -231,12 +286,20 @@ MICROSOFT_GRAPH_STAFF_ROLE_PRIORITY = {
 MANAGED_PUBLIC_REQUESTER_SOURCE = "support_portal_requester"
 KBC_USERS_DATA_REQUESTER_SOURCE = "kbc_users_data"
 LMS_LEARNERS_REQUESTER_SOURCE = "lms_learners"
+LEARNER_REQUESTER_SOURCES = {KBC_USERS_DATA_REQUESTER_SOURCE, LMS_LEARNERS_REQUESTER_SOURCE}
 MICROSOFT_ENTRA_REQUESTER_SOURCE = "microsoft_entra"
 DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 CHAT_MESSAGE_ID_METADATA_KEY = "client_message_id"
 CHAT_ATTACHMENTS_METADATA_KEY = "attachments"
 CHAT_ATTACHMENT_STORAGE_SEGMENT = "chat"
 COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS = 30
+COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
+COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES = 18 * 1024 * 1024
+COVERAGE_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS = 60 * 24 * 60 * 60
+COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT = "support_portal.coverage_attachment_download"
+SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS = 60 * 24 * 60 * 60
+SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_DOWNLOAD_SALT = "support_portal.support_notification_attachment_download"
+COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT = "support_portal.coverage_tutor_email_delivery"
 COVERAGE_TICKET_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_SLA_WEBHOOK_TIMEOUT_SECONDS = 8
 COVERAGE_TUTOR_RESPONSE_WEBHOOK_TIMEOUT_SECONDS = 8
@@ -244,6 +307,7 @@ COVERAGE_SLA_STAGE_WARNING = "warning"
 COVERAGE_SLA_STAGE_ESCALATED = "escalated"
 COVERAGE_SLA_STAGES = {COVERAGE_SLA_STAGE_WARNING, COVERAGE_SLA_STAGE_ESCALATED}
 COVERAGE_SLA_STATE_METADATA_KEY = "coverage_sla_state"
+COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY = "coverage_original_sessions"
 COVERAGE_SLA_BREACH_LEAD_TIME = timedelta(days=3)
 COVERAGE_SLA_ESCALATION_AFTER = timedelta(days=1)
 SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE = "coverage_session_deadline"
@@ -252,6 +316,8 @@ _last_open_ticket_inactivity_sync_started_monotonic = 0.0
 _ticket_background_sync_lock = threading.Lock()
 _ticket_background_sync_in_progress = False
 _last_ticket_background_sync_started_monotonic = 0.0
+_ticket_detail_inactivity_sync_lock = threading.Lock()
+_ticket_detail_inactivity_sync_public_ids: set[str] = set()
 
 
 @dataclass
@@ -285,6 +351,65 @@ def get_support_attachment_max_file_bytes() -> int:
         normalized_value = DEFAULT_SUPPORT_ATTACHMENT_MAX_FILE_BYTES
 
     return max(normalized_value, 1024)
+
+
+def get_int_setting(name: str, default: int, *, minimum: int = 0) -> int:
+    configured_value = getattr(settings, name, default)
+
+    try:
+        normalized_value = int(configured_value)
+    except (TypeError, ValueError):
+        normalized_value = default
+
+    return max(normalized_value, minimum)
+
+
+def get_coverage_webhook_attachment_max_file_bytes() -> int:
+    return get_int_setting(
+        "COVERAGE_WEBHOOK_ATTACHMENT_MAX_FILE_BYTES",
+        COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_FILE_BYTES,
+        minimum=0,
+    )
+
+
+def get_coverage_webhook_attachment_max_total_bytes() -> int:
+    return get_int_setting(
+        "COVERAGE_WEBHOOK_ATTACHMENT_MAX_TOTAL_BYTES",
+        COVERAGE_WEBHOOK_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES,
+        minimum=0,
+    )
+
+
+def get_support_notification_attachment_max_file_bytes() -> int:
+    return get_int_setting(
+        "SUPPORT_NOTIFICATION_ATTACHMENT_MAX_FILE_BYTES",
+        SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_FILE_BYTES,
+        minimum=0,
+    )
+
+
+def get_support_notification_attachment_max_total_bytes() -> int:
+    return get_int_setting(
+        "SUPPORT_NOTIFICATION_ATTACHMENT_MAX_TOTAL_BYTES",
+        SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES,
+        minimum=0,
+    )
+
+
+def get_coverage_public_attachment_link_max_age_seconds() -> int:
+    return get_int_setting(
+        "COVERAGE_PUBLIC_ATTACHMENT_LINK_MAX_AGE_SECONDS",
+        COVERAGE_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS,
+        minimum=60,
+    )
+
+
+def get_support_notification_public_attachment_link_max_age_seconds() -> int:
+    return get_int_setting(
+        "SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_LINK_MAX_AGE_SECONDS",
+        SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_LINK_DEFAULT_MAX_AGE_SECONDS,
+        minimum=60,
+    )
 
 
 def get_open_ticket_inactivity_sync_min_interval_seconds() -> int:
@@ -370,6 +495,149 @@ def delete_support_attachment_file(storage_key: str) -> None:
 
 def build_admin_ticket_attachment_download_url(public_id: str, attachment_id: int) -> str:
     return f"/api/admin/tickets/{urllib_parse.quote(public_id)}/attachments/{attachment_id}/download"
+
+
+def build_public_coverage_attachment_token(public_id: str, attachment_id: int) -> str:
+    normalized_public_id = sanitize_text(public_id)
+    try:
+        normalized_attachment_id = int(attachment_id)
+    except (TypeError, ValueError):
+        normalized_attachment_id = 0
+
+    if not normalized_public_id or normalized_attachment_id <= 0:
+        return ""
+
+    return signing.dumps(
+        {
+            "ticketId": normalized_public_id,
+            "attachmentId": normalized_attachment_id,
+        },
+        salt=COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+        compress=True,
+    )
+
+
+def decode_public_coverage_attachment_token(token: Any) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        raise ApiError(403, "Attachment link is invalid.")
+
+    try:
+        payload = signing.loads(
+            normalized_token,
+            salt=COVERAGE_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+            max_age=get_coverage_public_attachment_link_max_age_seconds(),
+        )
+    except signing.SignatureExpired as error:
+        raise ApiError(410, "Attachment link has expired.") from error
+    except signing.BadSignature as error:
+        raise ApiError(403, "Attachment link is invalid.") from error
+
+    return normalize_json_object(payload)
+
+
+def build_public_coverage_attachment_download_url(public_id: str, attachment_id: int) -> str:
+    token = build_public_coverage_attachment_token(public_id, attachment_id)
+    public_base_url = get_support_portal_public_base_url("")
+    if not token or not public_base_url:
+        return ""
+
+    return (
+        f"{public_base_url}/api/public/coverage-attachments/"
+        f"{urllib_parse.quote(sanitize_text(public_id))}/{int(attachment_id)}/download?"
+        f"{urllib_parse.urlencode({'token': token})}"
+    )
+
+
+def build_public_support_notification_attachment_token(public_id: str, attachment_id: int) -> str:
+    normalized_public_id = sanitize_text(public_id)
+    try:
+        normalized_attachment_id = int(attachment_id)
+    except (TypeError, ValueError):
+        normalized_attachment_id = 0
+
+    if not normalized_public_id or normalized_attachment_id <= 0:
+        return ""
+
+    return signing.dumps(
+        {
+            "ticketId": normalized_public_id,
+            "attachmentId": normalized_attachment_id,
+            "purpose": "support_notification_attachment",
+        },
+        salt=SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+        compress=True,
+    )
+
+
+def decode_public_support_notification_attachment_token(token: Any) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        raise ApiError(403, "Attachment link is invalid.")
+
+    try:
+        payload = signing.loads(
+            normalized_token,
+            salt=SUPPORT_NOTIFICATION_PUBLIC_ATTACHMENT_DOWNLOAD_SALT,
+            max_age=get_support_notification_public_attachment_link_max_age_seconds(),
+        )
+    except signing.SignatureExpired as error:
+        raise ApiError(410, "Attachment link has expired.") from error
+    except signing.BadSignature as error:
+        raise ApiError(403, "Attachment link is invalid.") from error
+
+    return normalize_json_object(payload)
+
+
+def build_public_support_notification_attachment_download_url(public_id: str, attachment_id: int) -> str:
+    token = build_public_support_notification_attachment_token(public_id, attachment_id)
+    public_base_url = get_support_portal_public_base_url("")
+    if not token or not public_base_url:
+        return ""
+
+    return (
+        f"{public_base_url}/api/public/support-notification-attachments/"
+        f"{urllib_parse.quote(sanitize_text(public_id))}/{int(attachment_id)}/download?"
+        f"{urllib_parse.urlencode({'token': token})}"
+    )
+
+
+def build_coverage_tutor_email_delivery_callback_token(
+    ticket_public_id: Any,
+    card_id: Any,
+    response_token: Any,
+) -> str:
+    normalized_ticket_public_id = sanitize_text(ticket_public_id)
+    normalized_card_id = sanitize_text(card_id)
+    normalized_response_token = sanitize_text(response_token)
+    if not normalized_ticket_public_id or not normalized_card_id:
+        return ""
+
+    return signing.dumps(
+        {
+            "ticketId": normalized_ticket_public_id,
+            "cardId": normalized_card_id,
+            "responseToken": normalized_response_token,
+        },
+        salt=COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT,
+        compress=True,
+    )
+
+
+def decode_coverage_tutor_email_delivery_callback_token(token: Any) -> dict[str, Any]:
+    normalized_token = sanitize_text(token)
+    if not normalized_token:
+        raise ApiError(403, "Email delivery callback token is required.")
+
+    try:
+        return normalize_json_object(
+            signing.loads(
+                normalized_token,
+                salt=COVERAGE_TUTOR_EMAIL_DELIVERY_CALLBACK_SALT,
+            )
+        )
+    except signing.BadSignature as error:
+        raise ApiError(403, "Email delivery callback token is invalid.") from error
 
 
 def build_ticket_chat_attachment_download_url(public_id: str, client_attachment_id: str) -> str:
@@ -575,7 +843,9 @@ def get_admin_ticket_attachment_file(
           a.id,
           a.file_name,
           a.mime_type,
+          a.file_size,
           a.storage_url,
+          a.metadata AS attachment_metadata,
           t.public_id,
           t.technical_subcategory,
           t.assigned_team,
@@ -607,8 +877,73 @@ def get_admin_ticket_attachment_file(
     return {
         "fileName": sanitize_support_attachment_name(attachment.get("file_name")),
         "mimeType": sanitize_text(attachment.get("mime_type")) or None,
+        "fileSize": int(attachment.get("file_size") or 0),
+        "metadata": normalize_json_object(attachment.get("attachment_metadata")),
+        "technicalSubcategory": sanitize_text(attachment.get("technical_subcategory")),
+        "assignedTeam": get_effective_assigned_team(attachment.get("assigned_team")),
         "path": attachment_path,
     }
+
+
+def is_public_coverage_attachment_allowed(attachment: dict[str, Any]) -> bool:
+    if sanitize_text(attachment.get("technicalSubcategory")) == "Coverage":
+        return True
+
+    metadata = normalize_json_object(attachment.get("metadata"))
+    source = sanitize_text(metadata.get("source"))
+    return source.startswith("coverage_")
+
+
+def get_public_coverage_attachment_file(public_id: str, attachment_id: int, token: Any) -> dict[str, Any]:
+    token_payload = decode_public_coverage_attachment_token(token)
+
+    try:
+        normalized_token_attachment_id = int(token_payload.get("attachmentId") or 0)
+    except (TypeError, ValueError):
+        normalized_token_attachment_id = 0
+
+    if (
+        sanitize_text(token_payload.get("ticketId")) != sanitize_text(public_id)
+        or normalized_token_attachment_id != int(attachment_id)
+    ):
+        raise ApiError(403, "Attachment link is invalid.")
+
+    attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
+    if not is_public_coverage_attachment_allowed(attachment):
+        raise ApiError(404, "Attachment not found.")
+
+    return attachment
+
+
+def is_public_support_notification_attachment_allowed(attachment: dict[str, Any]) -> bool:
+    technical_subcategory = sanitize_text(attachment.get("technicalSubcategory"))
+    assigned_team = get_effective_assigned_team(attachment.get("assignedTeam"))
+    return (
+        technical_subcategory.casefold() == TECHNICAL_SUBCATEGORY_AI_TEAM.casefold()
+        or assigned_team.casefold() == ASSIGNED_TEAM_AI_TEAM.casefold()
+    )
+
+
+def get_public_support_notification_attachment_file(public_id: str, attachment_id: int, token: Any) -> dict[str, Any]:
+    token_payload = decode_public_support_notification_attachment_token(token)
+
+    try:
+        normalized_token_attachment_id = int(token_payload.get("attachmentId") or 0)
+    except (TypeError, ValueError):
+        normalized_token_attachment_id = 0
+
+    if (
+        sanitize_text(token_payload.get("ticketId")) != sanitize_text(public_id)
+        or normalized_token_attachment_id != int(attachment_id)
+        or sanitize_text(token_payload.get("purpose")) != "support_notification_attachment"
+    ):
+        raise ApiError(403, "Attachment link is invalid.")
+
+    attachment = get_admin_ticket_attachment_file(public_id, attachment_id)
+    if not is_public_support_notification_attachment_allowed(attachment):
+        raise ApiError(404, "Attachment not found.")
+
+    return attachment
 
 
 def get_ticket_chat_attachment_file(
@@ -859,6 +1194,60 @@ def get_pending_teams_call_notification(metadata: Any) -> dict[str, Any] | None:
     return normalize_pending_teams_call_notification(normalize_json_object(metadata).get(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY))
 
 
+def normalize_pending_support_queue_notification(value: Any) -> dict[str, Any] | None:
+    payload = normalize_json_object(value)
+    if not payload:
+        return None
+
+    ticket_id = sanitize_text(payload.get("ticketId")) or sanitize_text(payload.get("chatId"))
+    requester_name = sanitize_text(payload.get("requesterName"))
+    requester_email = sanitize_text(payload.get("requesterEmail"))
+    requester_role = normalize_public_requester_role(payload.get("requesterRole"))
+    reason = sanitize_text(payload.get("reason")) or "support_ticket_created"
+    queue = sanitize_text(payload.get("queue")) or ASSIGNED_TEAM_SUPPORT_DESK
+    created_at = serialize_datetime_value(coerce_datetime(payload.get("createdAt")))
+
+    if not ticket_id or not requester_email or not created_at:
+        return None
+
+    return {
+        "ticketId": ticket_id,
+        "requesterName": requester_name,
+        "requesterEmail": requester_email,
+        "requesterRole": requester_role,
+        "queue": queue,
+        "reason": reason,
+        "createdAt": created_at,
+    }
+
+
+def get_pending_support_queue_notification(metadata: Any) -> dict[str, Any] | None:
+    return normalize_pending_support_queue_notification(
+        normalize_json_object(metadata).get(PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY)
+    )
+
+
+def build_support_queue_notification_payload(
+    *,
+    ticket_id: str,
+    requester_name: Any,
+    requester_email: Any,
+    requester_role: Any,
+    reason: str,
+    created_at: Any,
+    queue: Any = ASSIGNED_TEAM_SUPPORT_DESK,
+) -> dict[str, Any]:
+    return {
+        "ticketId": ticket_id,
+        "requesterName": sanitize_text(requester_name),
+        "requesterEmail": normalize_email(requester_email),
+        "requesterRole": normalize_public_requester_role(requester_role),
+        "queue": sanitize_text(queue) or ASSIGNED_TEAM_SUPPORT_DESK,
+        "reason": sanitize_text(reason) or "support_ticket_created",
+        "createdAt": serialize_datetime_value(coerce_datetime(created_at)) or serialize_datetime_value(datetime.now(timezone.utc)),
+    }
+
+
 def normalize_pending_coverage_ticket_notification(value: Any) -> dict[str, Any] | None:
     payload = normalize_json_object(value)
     if not payload:
@@ -1105,6 +1494,7 @@ def normalize_latest_coverage_tutor_response(value: Any) -> dict[str, Any] | Non
         "requestedAt": request_submitted_at,
         "respondedAt": responded_at,
         "sessionDetails": session_details,
+        "selectedSessionIds": normalize_coverage_selected_session_ids(payload.get("selectedSessionIds")),
         "replyText": reply_text,
         "sessionStartAt": session_start_at,
         "sessionEndAt": session_end_at,
@@ -1268,7 +1658,7 @@ def get_ticket_requester_source(
     normalized_learner_source = normalize_public_requester_source(learner_source)
     normalized_learner_metadata = normalize_json_object(learner_metadata)
     learner_is_kbc = (
-        normalized_learner_source == KBC_USERS_DATA_REQUESTER_SOURCE
+        normalized_learner_source in LEARNER_REQUESTER_SOURCES
         or sanitize_text(normalized_learner_metadata.get("legacy_source")).lower() == KBC_USERS_DATA_REQUESTER_SOURCE
     )
     explicit_source = normalize_public_requester_source(metadata.get("requester_source"))
@@ -1280,7 +1670,7 @@ def get_ticket_requester_source(
             and requester_role == ROLE_USER
         )
     ):
-        return KBC_USERS_DATA_REQUESTER_SOURCE
+        return normalized_learner_source if normalized_learner_source in LEARNER_REQUESTER_SOURCES else KBC_USERS_DATA_REQUESTER_SOURCE
 
     if explicit_source:
         return explicit_source
@@ -1315,12 +1705,66 @@ def derive_requester_ticket_priority(requester_role: Any, current_priority: Any 
 
 
 def can_requester_submit_coverage_ticket(requester_source: Any) -> bool:
-    return normalize_public_requester_source(requester_source) != KBC_USERS_DATA_REQUESTER_SOURCE
+    return normalize_public_requester_source(requester_source) not in LEARNER_REQUESTER_SOURCES
 
 
 def ensure_requester_can_submit_coverage_ticket(requester_source: Any) -> None:
     if not can_requester_submit_coverage_ticket(requester_source):
         raise ApiError(403, "Coverage requests are not available for standard KBC learner accounts.")
+
+
+def can_requester_submit_ai_team_ticket(requester_source: Any) -> bool:
+    return normalize_public_requester_source(requester_source) not in LEARNER_REQUESTER_SOURCES
+
+
+def ensure_requester_can_submit_ai_team_ticket(requester_source: Any) -> None:
+    if not can_requester_submit_ai_team_ticket(requester_source):
+        raise ApiError(403, "AI Team requests are not available for standard KBC learner accounts.")
+
+
+def can_requester_submit_for_learner(requester_role: Any, requester_source: Any) -> bool:
+    if normalize_public_requester_source(requester_source) not in LEARNER_REQUESTER_SOURCES:
+        return True
+    return normalize_public_requester_role(requester_role) in {ROLE_COACH, ROLE_TUTOR, ROLE_EMPLOYER}
+
+
+def resolve_submitted_for_learner(
+    submitted_for_learner_id: Any,
+    *,
+    requester_role: Any,
+    requester_source: Any,
+) -> dict[str, Any] | None:
+    normalized_learner_id = parse_int(submitted_for_learner_id)
+    if normalized_learner_id <= 0:
+        return None
+
+    if not can_requester_submit_for_learner(requester_role, requester_source):
+        raise ApiError(403, "Standard learner accounts cannot submit tickets on behalf of another learner.")
+
+    learner = fetch_local_learner_by_id(normalized_learner_id)
+    if not learner or not is_kbc_learner_record(learner):
+        raise ApiError(400, "Please choose a valid learner from the KBC learner records.")
+
+    return learner
+
+
+def build_submitted_for_learner_payload(
+    learner: dict[str, Any] | None,
+    *,
+    notify_by_email: bool = False,
+    notification_email: Any = "",
+) -> dict[str, Any] | None:
+    if not learner:
+        return None
+
+    payload = {
+        **serialize_public_learner_search_result(learner),
+        "notifyByEmail": bool(notify_by_email),
+    }
+    normalized_notification_email = normalize_email(notification_email)
+    if normalized_notification_email:
+        payload["notificationEmail"] = normalized_notification_email
+    return payload
 
 
 def get_ticket_sort_timestamp(value: Any) -> float:
@@ -1410,12 +1854,114 @@ def normalize_coverage_card_attachment(value: Any, *, allow_pending_upload: bool
     }
 
 
+def normalize_coverage_session_file_groups(value: Any) -> list[dict[str, Any]]:
+    raw_groups = value if isinstance(value, list) else []
+    normalized_groups: list[dict[str, Any]] = []
+
+    for index, item in enumerate(raw_groups):
+        source = normalize_json_object(item)
+        if not source:
+            continue
+
+        raw_attachments = source.get("attachments") if isinstance(source.get("attachments"), list) else []
+        attachments = []
+        for attachment in raw_attachments:
+            normalized_attachment = normalize_coverage_card_attachment(attachment)
+            if normalized_attachment:
+                attachments.append(normalized_attachment)
+
+        normalized_groups.append(
+            {
+                "id": sanitize_text(source.get("id")) or f"session-{index + 1}",
+                "label": sanitize_text(source.get("label")) or f"Session {index + 1}",
+                "date": sanitize_text(source.get("date")),
+                "number": sanitize_text(source.get("number")),
+                "subject": sanitize_text(source.get("subject")),
+                "attachments": attachments,
+            }
+        )
+
+    return normalized_groups
+
+
+def merge_coverage_session_attachments(
+    groups: Any,
+    uploaded_by_session_id: dict[str, list[dict[str, Any]]],
+    metadata_by_session_id: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_groups = normalize_coverage_session_file_groups(groups)
+    metadata_by_session_id = metadata_by_session_id or {}
+    group_index_by_id = {
+        sanitize_text(group.get("id")): index
+        for index, group in enumerate(normalized_groups)
+        if sanitize_text(group.get("id"))
+    }
+
+    for session_id, attachments in uploaded_by_session_id.items():
+        normalized_session_id = sanitize_text(session_id)
+        if not normalized_session_id or not attachments:
+            continue
+
+        if normalized_session_id not in group_index_by_id:
+            metadata = metadata_by_session_id.get(normalized_session_id, {})
+            group_index_by_id[normalized_session_id] = len(normalized_groups)
+            normalized_groups.append(
+                {
+                    "id": normalized_session_id,
+                    "label": sanitize_text(metadata.get("label")) or f"Session {len(normalized_groups) + 1}",
+                    "date": sanitize_text(metadata.get("date")),
+                    "number": sanitize_text(metadata.get("number")),
+                    "subject": sanitize_text(metadata.get("subject")),
+                    "attachments": [],
+                }
+            )
+
+        group = normalized_groups[group_index_by_id[normalized_session_id]]
+        existing_keys = {
+            sanitize_text(attachment.get("id"))
+            or sanitize_text(attachment.get("attachmentId"))
+            or sanitize_text(attachment.get("storageKey"))
+            for attachment in group.get("attachments") or []
+        }
+        next_attachments = list(group.get("attachments") or [])
+        for attachment in attachments:
+            attachment_key = (
+                sanitize_text(attachment.get("id"))
+                or sanitize_text(attachment.get("attachmentId"))
+                or sanitize_text(attachment.get("storageKey"))
+            )
+            if attachment_key and attachment_key in existing_keys:
+                continue
+            next_attachments.append(attachment)
+            if attachment_key:
+                existing_keys.add(attachment_key)
+        group["attachments"] = next_attachments
+
+    return normalized_groups
+
+
+def normalize_coverage_selected_session_ids(value: Any) -> list[str]:
+    raw_values = value if isinstance(value, list) else []
+    normalized_values: list[str] = []
+    seen_values: set[str] = set()
+
+    for raw_value in raw_values:
+        session_id = sanitize_text(raw_value)
+        if not session_id or session_id in seen_values:
+            continue
+        seen_values.add(session_id)
+        normalized_values.append(session_id)
+
+    return normalized_values
+
+
 def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
     raw_cards = value if isinstance(value, list) else []
     normalized_cards: list[dict[str, Any]] = []
     allowed_types = {"tutor_choice", "tutor_reply", "note"}
     allowed_request_statuses = {"draft", "requested", "pending", "accepted", "refused"}
     allowed_reply_outcomes = {"accepted", "refused"}
+    allowed_email_delivery_statuses = {"", "pending", "sent", "failed"}
 
     for item in raw_cards:
         source = normalize_json_object(item)
@@ -1439,6 +1985,18 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
         reply_outcome = sanitize_text(source.get("replyOutcome")).lower()
         if reply_outcome not in allowed_reply_outcomes:
             reply_outcome = ""
+
+        email_delivery_status = sanitize_text(source.get("emailDeliveryStatus")).lower()
+        if email_delivery_status in {"delivered", "success", "succeeded"}:
+            email_delivery_status = "sent"
+        elif email_delivery_status in {"error", "failure"}:
+            email_delivery_status = "failed"
+        if email_delivery_status not in allowed_email_delivery_statuses:
+            email_delivery_status = ""
+        try:
+            email_delivery_retry_count = max(int(source.get("emailDeliveryRetryCount") or 0), 0)
+        except (TypeError, ValueError):
+            email_delivery_retry_count = 0
 
         normalized_cards.append(
             {
@@ -1470,6 +2028,12 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "requestSubmittedByAgentName": sanitize_text(source.get("requestSubmittedByAgentName")),
                 "requestSubmittedByAgentUsername": sanitize_text(source.get("requestSubmittedByAgentUsername")),
                 "responseToken": sanitize_text(source.get("responseToken")),
+                "emailDeliveryStatus": email_delivery_status,
+                "emailDeliveryUpdatedAt": serialize_datetime_value(coerce_datetime(source.get("emailDeliveryUpdatedAt"))),
+                "emailDeliveryMessageId": sanitize_text(source.get("emailDeliveryMessageId")),
+                "emailDeliveryThreadId": sanitize_text(source.get("emailDeliveryThreadId")),
+                "emailDeliveryError": sanitize_text(source.get("emailDeliveryError")),
+                "emailDeliveryRetryCount": email_delivery_retry_count,
                 "sessionStartAt": serialize_datetime_value(coerce_datetime(source.get("sessionStartAt"))),
                 "sessionEndAt": serialize_datetime_value(coerce_datetime(source.get("sessionEndAt"))),
                 "confirmedAt": serialize_datetime_value(coerce_datetime(source.get("confirmedAt"))),
@@ -1477,6 +2041,8 @@ def normalize_coverage_cards(value: Any) -> list[dict[str, Any]]:
                 "confirmedByAgentName": sanitize_text(source.get("confirmedByAgentName")),
                 "confirmedByAgentUsername": sanitize_text(source.get("confirmedByAgentUsername")),
                 "presentationFiles": attachments,
+                "selectedSessionIds": normalize_coverage_selected_session_ids(source.get("selectedSessionIds")),
+                "sessionFiles": normalize_coverage_session_file_groups(source.get("sessionFiles")),
             }
         )
 
@@ -1614,6 +2180,282 @@ def normalize_documentation_card_for_actor_comparison(card: Any) -> dict[str, An
     for field in COVERAGE_CARD_ACTOR_FIELDS:
         normalized_card.pop(field, None)
     return normalized_card
+
+
+def normalize_documentation_card_for_history_comparison(card: Any) -> dict[str, Any]:
+    normalized_card = normalize_documentation_card_for_actor_comparison(card)
+    for field in ("createdAt", "updatedAt"):
+        normalized_card.pop(field, None)
+    return normalized_card
+
+
+def normalize_card_content_for_history_comparison(card: Any, attachment_field: str) -> dict[str, Any]:
+    normalized_card = normalize_documentation_card_for_history_comparison(card)
+    normalized_card.pop(attachment_field, None)
+    return normalized_card
+
+
+CARD_HISTORY_ATTACHMENT_FIELDS = {
+    "attachmentId",
+    "id",
+    "mimeType",
+    "name",
+    "size",
+    "storageUrl",
+}
+CARD_HISTORY_EXCLUDED_FIELDS = {"dataUrl", "responseToken", "storageKey"}
+
+
+def has_history_payload_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def build_history_attachment_details(attachment: Any) -> dict[str, Any]:
+    source = normalize_json_object(attachment)
+    return {
+        field: source.get(field)
+        for field in CARD_HISTORY_ATTACHMENT_FIELDS
+        if has_history_payload_value(source.get(field))
+    }
+
+
+def build_card_history_details(card: Any, attachment_field: str) -> dict[str, Any]:
+    source = normalize_json_object(card)
+    details: dict[str, Any] = {}
+    for key, value in source.items():
+        if key in CARD_HISTORY_EXCLUDED_FIELDS:
+            continue
+        if key == attachment_field:
+            attachments = value if isinstance(value, list) else []
+            attachment_details = [
+                item
+                for attachment in attachments
+                if (item := build_history_attachment_details(attachment))
+            ]
+            if attachment_details:
+                details[key] = attachment_details
+            continue
+        if has_history_payload_value(value):
+            details[key] = value
+    return details
+
+
+def build_card_history_diff(previous_card: Any, next_card: Any, attachment_field: str) -> dict[str, Any]:
+    previous_details = normalize_card_content_for_history_comparison(previous_card, attachment_field)
+    next_details = normalize_card_content_for_history_comparison(next_card, attachment_field)
+    changed_fields = sorted(
+        field
+        for field in set(previous_details) | set(next_details)
+        if previous_details.get(field) != next_details.get(field)
+    )
+    return {
+        "changedFields": changed_fields,
+        "previousValues": {
+            field: previous_details.get(field)
+            for field in changed_fields
+            if has_history_payload_value(previous_details.get(field))
+        },
+        "currentValues": {
+            field: next_details.get(field)
+            for field in changed_fields
+            if has_history_payload_value(next_details.get(field))
+        },
+    }
+
+
+def get_card_attachment_identity(attachment: Any) -> str:
+    source = normalize_json_object(attachment)
+    for field in ("attachmentId", "id", "storageKey", "storageUrl"):
+        value = sanitize_text(source.get(field))
+        if value:
+            return f"{field}:{value}"
+    name = sanitize_text(source.get("name"))
+    size = sanitize_text(source.get("size"))
+    if name or size:
+        return f"name:{name}:size:{size}"
+    return ""
+
+
+def get_card_attachment_identities(card: Any, attachment_field: str) -> set[str]:
+    source = normalize_json_object(card)
+    attachments = source.get(attachment_field) if isinstance(source.get(attachment_field), list) else []
+    return {
+        identity
+        for attachment in attachments
+        if (identity := get_card_attachment_identity(attachment))
+    }
+
+
+def get_added_card_attachments(previous_card: Any, next_card: Any, attachment_field: str) -> list[dict[str, Any]]:
+    previous_identities = get_card_attachment_identities(previous_card, attachment_field)
+    source = normalize_json_object(next_card)
+    attachments = source.get(attachment_field) if isinstance(source.get(attachment_field), list) else []
+    added_attachments: list[dict[str, Any]] = []
+    for attachment in attachments:
+        identity = get_card_attachment_identity(attachment)
+        if identity and identity not in previous_identities:
+            added_attachments.append(normalize_json_object(attachment))
+    return added_attachments
+
+
+def build_card_history_payload(
+    card: Any,
+    *,
+    card_kind: str,
+    attachment_field: str,
+    previous_card: Any | None = None,
+    added_attachments: list[dict[str, Any]] | None = None,
+    include_diff: bool = False,
+) -> dict[str, Any]:
+    source = normalize_json_object(card)
+    attachments = source.get(attachment_field) if isinstance(source.get(attachment_field), list) else []
+    added_files = list(added_attachments or [])
+    card_type = sanitize_text(source.get("type")) or "documentation"
+    card_title = (
+        sanitize_text(source.get("title"))
+        or sanitize_text(source.get("inquiry"))
+        or sanitize_text(source.get("note"))
+        or card_type.replace("_", " ").title()
+    )
+    payload: dict[str, Any] = {
+        "cardId": sanitize_text(source.get("id")),
+        "cardKind": card_kind,
+        "cardType": card_type,
+        "cardTitle": card_title,
+        "attachmentCount": len(attachments),
+        "cardDetails": build_card_history_details(source, attachment_field),
+    }
+    if added_attachments is not None:
+        payload["addedAttachmentCount"] = len(added_files)
+        payload["fileCount"] = len(added_files)
+        payload["fileNames"] = [
+            sanitize_text(attachment.get("name"))
+            for attachment in added_files
+            if sanitize_text(attachment.get("name"))
+        ]
+        payload["addedAttachments"] = [
+            item
+            for attachment in added_files
+            if (item := build_history_attachment_details(attachment))
+        ]
+        payload["allAttachments"] = [
+            item
+            for attachment in attachments
+            if (item := build_history_attachment_details(attachment))
+        ]
+    if include_diff and previous_card is not None:
+        payload.update(build_card_history_diff(previous_card, source, attachment_field))
+    return payload
+
+
+def build_card_collection_history_events(
+    previous_cards: Any,
+    next_cards: Any,
+    *,
+    card_kind: str,
+    attachment_field: str,
+    create_event_type: str,
+    update_event_type: str,
+    attachment_event_type: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    previous_by_id: dict[str, dict[str, Any]] = {}
+    for card in previous_cards if isinstance(previous_cards, list) else []:
+        normalized_previous_card = normalize_json_object(card)
+        previous_card_id = sanitize_text(normalized_previous_card.get("id"))
+        if previous_card_id:
+            previous_by_id[previous_card_id] = normalized_previous_card
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    for card in next_cards if isinstance(next_cards, list) else []:
+        normalized_card = normalize_json_object(card)
+        card_id = sanitize_text(normalized_card.get("id"))
+        previous_card = previous_by_id.get(card_id)
+
+        if not previous_card:
+            events.append(
+                (
+                    create_event_type,
+                    build_card_history_payload(
+                        normalized_card,
+                        card_kind=card_kind,
+                        attachment_field=attachment_field,
+                    ),
+                )
+            )
+            continue
+
+        added_attachments = get_added_card_attachments(previous_card, normalized_card, attachment_field)
+        if added_attachments:
+            events.append(
+                (
+                    attachment_event_type,
+                    build_card_history_payload(
+                        normalized_card,
+                        card_kind=card_kind,
+                        attachment_field=attachment_field,
+                        previous_card=previous_card,
+                        added_attachments=added_attachments,
+                    ),
+                )
+            )
+
+        if (
+            normalize_card_content_for_history_comparison(normalized_card, attachment_field)
+            != normalize_card_content_for_history_comparison(previous_card, attachment_field)
+        ):
+            events.append(
+                (
+                    update_event_type,
+                    build_card_history_payload(
+                        normalized_card,
+                        card_kind=card_kind,
+                        attachment_field=attachment_field,
+                        previous_card=previous_card,
+                        include_diff=True,
+                    ),
+                )
+            )
+
+    return events
+
+
+def build_documentation_card_history_events(
+    previous_documentation: Any,
+    next_documentation: Any,
+) -> list[tuple[str, dict[str, Any]]]:
+    previous_payload = normalize_admin_documentation(previous_documentation)
+    next_payload = normalize_admin_documentation(next_documentation)
+    events: list[tuple[str, dict[str, Any]]] = []
+    events.extend(
+        build_card_collection_history_events(
+            previous_payload.get("documentationCards"),
+            next_payload.get("documentationCards"),
+            card_kind="Documentation",
+            attachment_field="attachments",
+            create_event_type="documentation_card_created",
+            update_event_type="documentation_card_updated",
+            attachment_event_type="documentation_attachment_added",
+        )
+    )
+    events.extend(
+        build_card_collection_history_events(
+            previous_payload.get("coverageCards"),
+            next_payload.get("coverageCards"),
+            card_kind="Coverage",
+            attachment_field="presentationFiles",
+            create_event_type="coverage_card_created",
+            update_event_type="coverage_card_updated",
+            attachment_event_type="coverage_attachment_added",
+        )
+    )
+    return events
 
 
 def stamp_documentation_card_actors(
@@ -1950,12 +2792,99 @@ def is_coverage_ticket_waiting_for_initial_action(row: dict[str, Any]) -> bool:
     return not has_submitted_coverage_tutor_request(coverage_cards)
 
 
-def derive_sla_state(status: Any, created_at: Any, current_sla_status: Any) -> tuple[str, bool, str | None]:
-    normalized_status = sanitize_text(status)
-    fallback_sla_status = sanitize_text(current_sla_status)
+def normalize_sla_status(value: Any, fallback: str = "Pending Review") -> str:
+    normalized_value = sanitize_text(value)
+    return normalized_value if normalized_value in ALLOWED_SLA_STATUSES else fallback
 
-    if fallback_sla_status not in ALLOWED_SLA_STATUSES:
-        fallback_sla_status = "Pending Review"
+
+def get_sla_comparison_now(reference_time: datetime | None = None, tzinfo: Any = timezone.utc) -> datetime:
+    comparison_now = reference_time or datetime.now(tzinfo or timezone.utc)
+    if comparison_now.tzinfo is None:
+        comparison_now = comparison_now.replace(tzinfo=timezone.utc)
+    return comparison_now
+
+
+def get_sla_started_at(metadata: Any, created_at: Any) -> datetime | None:
+    normalized_metadata = normalize_json_object(metadata)
+    return (
+        coerce_datetime(normalized_metadata.get(SLA_STARTED_AT_METADATA_KEY))
+        or coerce_datetime(normalized_metadata.get("queue_assigned_at"))
+        or coerce_datetime(normalized_metadata.get("quick_ticket_assigned_at"))
+        or coerce_datetime(created_at)
+    )
+
+
+def build_pending_age_due_at(started_at: datetime | None) -> datetime | None:
+    if not started_at:
+        return None
+    return started_at + PENDING_SLA_BREACH_AFTER
+
+
+def build_sla_metadata_patch(
+    attention_required: bool,
+    attention_reason: str | None,
+    *,
+    policy_key: str | None = None,
+    started_at: datetime | None = None,
+    due_at: datetime | None = None,
+    breached_at: datetime | None = None,
+    resolved_at: datetime | None = None,
+    outcome_status: str | None = None,
+) -> dict[str, Any]:
+    patch: dict[str, Any] = {
+        "sla_attention_required": attention_required,
+        "sla_attention_reason": attention_reason,
+        "sla_attention_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if policy_key is not None:
+        patch[SLA_POLICY_KEY_METADATA_KEY] = policy_key
+    if started_at is not None:
+        patch[SLA_STARTED_AT_METADATA_KEY] = serialize_datetime_value(started_at)
+    if due_at is not None:
+        patch[SLA_DUE_AT_METADATA_KEY] = serialize_datetime_value(due_at)
+    else:
+        patch[SLA_DUE_AT_METADATA_KEY] = None
+    if breached_at is not None:
+        patch[SLA_BREACHED_AT_METADATA_KEY] = serialize_datetime_value(breached_at)
+    elif not attention_required:
+        patch[SLA_BREACHED_AT_METADATA_KEY] = None
+    if resolved_at is not None:
+        patch[SLA_RESOLVED_AT_METADATA_KEY] = serialize_datetime_value(resolved_at)
+    elif policy_key != SLA_POLICY_CLOSED:
+        patch[SLA_RESOLVED_AT_METADATA_KEY] = None
+    if outcome_status is not None:
+        patch[SLA_OUTCOME_STATUS_METADATA_KEY] = normalize_sla_status(outcome_status)
+    elif policy_key != SLA_POLICY_CLOSED:
+        patch[SLA_OUTCOME_STATUS_METADATA_KEY] = None
+    return patch
+
+
+def derive_sla_policy_key(status: Any, status_reason: Any = None) -> str:
+    normalized_status = sanitize_text(status)
+    normalized_status_reason = sanitize_text(status_reason)
+
+    if normalized_status == "Open":
+        return SLA_POLICY_OPEN_REVIEW
+    if normalized_status == "Closed":
+        return SLA_POLICY_CLOSED
+    if normalized_status == "Pending" and normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        return SLA_POLICY_AWAITING_SUPPORT_MEETING
+    if normalized_status == "Pending":
+        return SLA_POLICY_PENDING_AGE
+    return SLA_POLICY_OPEN_REVIEW
+
+
+def derive_sla_state(
+    status: Any,
+    created_at: Any,
+    current_sla_status: Any,
+    *,
+    status_reason: Any = None,
+    metadata: Any = None,
+    reference_time: datetime | None = None,
+) -> tuple[str, bool, str | None]:
+    normalized_status = sanitize_text(status)
+    fallback_sla_status = normalize_sla_status(current_sla_status)
 
     if normalized_status == "Open":
         return "Pending Review", False, None
@@ -1964,10 +2893,26 @@ def derive_sla_state(status: Any, created_at: Any, current_sla_status: Any) -> t
         return "On Track", False, None
 
     if normalized_status == "Pending":
-        created_datetime = created_at if isinstance(created_at, datetime) else None
-        if created_datetime:
-            comparison_now = datetime.now(created_datetime.tzinfo or timezone.utc)
-            if (comparison_now - created_datetime) > PENDING_SLA_BREACH_AFTER:
+        if sanitize_text(status_reason) == STATUS_REASON_AWAITING_MEETING:
+            normalized_metadata = normalize_json_object(metadata)
+            meeting_due_at = (
+                coerce_datetime(normalized_metadata.get(SLA_DUE_AT_METADATA_KEY))
+                or coerce_datetime(normalized_metadata.get("support_session_requested_start_at"))
+                or coerce_datetime(normalized_metadata.get("requested_start_at"))
+                or coerce_datetime(normalized_metadata.get("scheduled_at"))
+            )
+            if meeting_due_at:
+                comparison_now = get_sla_comparison_now(reference_time, meeting_due_at.tzinfo)
+                if comparison_now > meeting_due_at + MEETING_SLA_BREACH_AFTER:
+                    return "Breached", True, SLA_ATTENTION_REASON_MEETING_OVERDUE
+
+            return "On Track", False, None
+
+        started_at = get_sla_started_at(metadata, created_at)
+        due_at = build_pending_age_due_at(started_at)
+        if due_at:
+            comparison_now = get_sla_comparison_now(reference_time, due_at.tzinfo)
+            if comparison_now > due_at:
                 return "Breached", True, SLA_ATTENTION_REASON_PENDING_OVERDUE
 
         return "On Track", False, None
@@ -1980,31 +2925,109 @@ def resolve_next_sla_state(
     created_at: Any,
     current_sla_status: Any,
     requested_sla_status: Any = None,
+    *,
+    status_reason: Any = None,
+    metadata: Any = None,
+    reference_time: datetime | None = None,
 ) -> tuple[str, bool, str | None]:
     normalized_status = sanitize_text(status)
     normalized_requested_sla_status = sanitize_text(requested_sla_status)
 
     if normalized_status in AUTO_MANAGED_SLA_STATUSES:
-        return derive_sla_state(normalized_status, created_at, current_sla_status)
+        return derive_sla_state(
+            normalized_status,
+            created_at,
+            current_sla_status,
+            status_reason=status_reason,
+            metadata=metadata,
+            reference_time=reference_time,
+        )
 
     if normalized_requested_sla_status in ALLOWED_SLA_STATUSES:
         return normalized_requested_sla_status, False, None
 
-    return derive_sla_state(normalized_status, created_at, current_sla_status)
+    return derive_sla_state(
+        normalized_status,
+        created_at,
+        current_sla_status,
+        status_reason=status_reason,
+        metadata=metadata,
+        reference_time=reference_time,
+    )
 
 
-def build_sla_metadata_patch(attention_required: bool, attention_reason: str | None) -> dict[str, Any]:
+def resolve_sla_policy_update(
+    ticket: dict[str, Any],
+    status: Any,
+    *,
+    status_reason: Any = None,
+    metadata: Any = None,
+    requested_sla_status: Any = None,
+    reference_time: datetime | None = None,
+) -> tuple[str, bool, str | None, dict[str, Any]]:
+    base_metadata = normalize_json_object(ticket.get("metadata") if metadata is None else metadata)
+    normalized_status = sanitize_text(status)
+    normalized_status_reason = sanitize_text(status_reason if status_reason is not None else ticket.get("status_reason"))
+    started_at = get_sla_started_at(base_metadata, ticket.get("created_at"))
+    if sanitize_text(ticket.get("status")) != normalized_status:
+        started_at = get_sla_comparison_now(reference_time)
+    if normalized_status == "Pending" and normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        due_at = (
+            coerce_datetime(base_metadata.get("support_session_requested_start_at"))
+            or coerce_datetime(base_metadata.get("requested_start_at"))
+            or coerce_datetime(base_metadata.get("scheduled_at"))
+        )
+    elif normalized_status == "Pending":
+        due_at = build_pending_age_due_at(started_at)
+    else:
+        due_at = None
+
+    next_sla_status, attention_required, attention_reason = resolve_next_sla_state(
+        normalized_status,
+        ticket.get("created_at"),
+        ticket.get("sla_status"),
+        requested_sla_status,
+        status_reason=normalized_status_reason,
+        metadata={
+            **base_metadata,
+            SLA_STARTED_AT_METADATA_KEY: serialize_datetime_value(started_at) if started_at else None,
+            SLA_DUE_AT_METADATA_KEY: serialize_datetime_value(due_at) if due_at else None,
+        },
+        reference_time=reference_time,
+    )
+    comparison_now = get_sla_comparison_now(reference_time)
+    policy_key = derive_sla_policy_key(normalized_status, normalized_status_reason)
+    metadata_patch = build_sla_metadata_patch(
+        attention_required,
+        attention_reason,
+        policy_key=policy_key,
+        started_at=started_at,
+        due_at=due_at,
+        breached_at=comparison_now if attention_required else None,
+        resolved_at=comparison_now if normalized_status == "Closed" else None,
+        outcome_status=normalize_sla_status(ticket.get("sla_status")) if normalized_status == "Closed" else None,
+    )
+    return next_sla_status, attention_required, attention_reason, {**base_metadata, **metadata_patch}
+
+
+def extract_sla_metadata_signature(metadata: Any) -> dict[str, Any]:
+    normalized_metadata = normalize_json_object(metadata)
     return {
-        "sla_attention_required": attention_required,
-        "sla_attention_reason": attention_reason,
-        "sla_attention_updated_at": datetime.now(timezone.utc).isoformat(),
+        "attentionRequired": normalize_bool(normalized_metadata.get("sla_attention_required")),
+        "attentionReason": sanitize_text(normalized_metadata.get("sla_attention_reason")) or None,
+        "policyKey": sanitize_text(normalized_metadata.get(SLA_POLICY_KEY_METADATA_KEY)),
+        "startedAt": sanitize_text(normalized_metadata.get(SLA_STARTED_AT_METADATA_KEY)),
+        "dueAt": sanitize_text(normalized_metadata.get(SLA_DUE_AT_METADATA_KEY)),
+        "breachedAt": sanitize_text(normalized_metadata.get(SLA_BREACHED_AT_METADATA_KEY)),
+        "resolvedAt": sanitize_text(normalized_metadata.get(SLA_RESOLVED_AT_METADATA_KEY)),
+        "outcomeStatus": sanitize_text(normalized_metadata.get(SLA_OUTCOME_STATUS_METADATA_KEY)),
     }
 
 
 def build_resolved_coverage_sla_metadata(metadata: Any) -> dict[str, Any]:
     next_metadata = {
         **normalize_json_object(metadata),
-        **build_sla_metadata_patch(False, None),
+        **build_sla_metadata_patch(False, None, policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE),
     }
     next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
     return next_metadata
@@ -2036,9 +3059,15 @@ def is_status_reason_allowed_for_status(status: str, status_reason: str) -> bool
 
 def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[str, Any]:
     metadata = normalize_json_object(row.get("metadata"))
-    current_sla_status = sanitize_text(row.get("sla_status")) or "Pending Review"
+    current_sla_status = normalize_sla_status(row.get("sla_status"))
     current_attention_required = normalize_bool(metadata.get("sla_attention_required"))
     current_attention_reason = sanitize_text(metadata.get("sla_attention_reason")) or None
+
+    if normalize_bool(row.get("is_archived")):
+        row["sla_status"] = current_sla_status
+        row["sla_attention_required"] = current_attention_required
+        row["metadata"] = metadata
+        return row
 
     if is_coverage_ticket_record(row):
         coverage_sla_state = get_coverage_sla_state(metadata)
@@ -2050,7 +3079,12 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
             )
         ):
             next_sla_status = "Breached"
-            metadata_patch = build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE)
+            metadata_patch = build_sla_metadata_patch(
+                True,
+                SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+                policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE,
+                breached_at=get_sla_comparison_now(),
+            )
             next_metadata = {**metadata, **metadata_patch}
             next_attention_required = True
             next_attention_reason = SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE
@@ -2085,19 +3119,19 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
                     WHERE id = %s
                     """,
                     [next_sla_status, json.dumps(next_metadata), row["id"]],
-                )
+        )
         return row
 
-    next_sla_status, attention_required, attention_reason = derive_sla_state(
+    next_sla_status, attention_required, attention_reason, next_metadata = resolve_sla_policy_update(
+        row,
         row.get("status"),
-        row.get("created_at"),
-        current_sla_status,
+        status_reason=row.get("status_reason"),
+        metadata=metadata,
     )
-    metadata_patch = build_sla_metadata_patch(attention_required, attention_reason)
 
     row["sla_status"] = next_sla_status
     row["sla_attention_required"] = attention_required
-    row["metadata"] = {**metadata, **metadata_patch}
+    row["metadata"] = next_metadata
 
     if (
         persist
@@ -2106,6 +3140,7 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
             next_sla_status != current_sla_status
             or attention_required != current_attention_required
             or attention_reason != current_attention_reason
+            or extract_sla_metadata_signature(next_metadata) != extract_sla_metadata_signature(metadata)
         )
     ):
         with connection.cursor() as cursor:
@@ -2113,11 +3148,11 @@ def apply_ticket_sla_policy(row: dict[str, Any], persist: bool = False) -> dict[
                 """
                 UPDATE tickets
                 SET sla_status = %s,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                    metadata = %s::jsonb,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                [next_sla_status, json.dumps(metadata_patch), row["id"]],
+                [next_sla_status, json.dumps(next_metadata), row["id"]],
             )
 
     return row
@@ -2127,50 +3162,46 @@ def resolve_ticket_sla_update(
     ticket: dict[str, Any],
     status: Any,
     *,
+    status_reason: Any = None,
     metadata: Any = None,
     requested_sla_status: Any = None,
 ) -> tuple[str, bool, str | None, dict[str, Any]]:
     base_metadata = normalize_json_object(ticket.get("metadata") if metadata is None else metadata)
+    normalized_status_reason = sanitize_text(status_reason if status_reason is not None else ticket.get("status_reason"))
 
     if is_coverage_ticket_record(ticket):
         coverage_row = {
             **ticket,
             "status": sanitize_text(status),
+            "status_reason": normalized_status_reason,
             "metadata": base_metadata,
-            "sla_status": sanitize_text(ticket.get("sla_status")) or "Pending Review",
+            "sla_status": normalize_sla_status(ticket.get("sla_status")),
         }
         apply_ticket_sla_policy(coverage_row)
         resolved_metadata = normalize_json_object(coverage_row.get("metadata"))
         return (
-            sanitize_text(coverage_row.get("sla_status")) or "On Track",
+            normalize_sla_status(coverage_row.get("sla_status"), "On Track"),
             normalize_bool(coverage_row.get("sla_attention_required")),
             sanitize_text(resolved_metadata.get("sla_attention_reason")) or None,
             resolved_metadata,
         )
 
-    next_sla_status, attention_required, attention_reason = resolve_next_sla_state(
+    return resolve_sla_policy_update(
+        ticket,
         status,
-        ticket.get("created_at"),
-        ticket.get("sla_status"),
-        requested_sla_status,
-    )
-    return (
-        next_sla_status,
-        attention_required,
-        attention_reason,
-        {
-            **base_metadata,
-            **build_sla_metadata_patch(attention_required, attention_reason),
-        },
+        status_reason=normalized_status_reason,
+        metadata=base_metadata,
+        requested_sla_status=requested_sla_status,
     )
 
 
 def sync_auto_managed_ticket_sla_statuses() -> dict[str, int]:
     tickets = run_query(
         """
-        SELECT id, public_id, category, technical_subcategory, inquiry, status, status_reason, sla_status, metadata, created_at
+        SELECT id, public_id, category, technical_subcategory, inquiry, status, status_reason, sla_status, metadata, created_at, is_archived
         FROM tickets
         WHERE status = ANY(%s)
+          AND COALESCE(is_archived, FALSE) = FALSE
         ORDER BY id ASC
         """,
         [list(AUTO_MANAGED_SLA_STATUSES)],
@@ -2349,7 +3380,7 @@ def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> di
         coverage_sla_state = get_coverage_sla_state(metadata)
 
         if not session_start_at:
-            next_metadata = {**metadata, **build_sla_metadata_patch(False, None)}
+            next_metadata = {**metadata, **build_sla_metadata_patch(False, None, policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE)}
             next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
             if (
                 sanitize_text(ticket.get("sla_status")) != "On Track"
@@ -2372,7 +3403,7 @@ def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> di
 
         breach_deadline_at = session_start_at - COVERAGE_SLA_BREACH_LEAD_TIME
         if comparison_now < breach_deadline_at:
-            next_metadata = {**metadata, **build_sla_metadata_patch(False, None)}
+            next_metadata = {**metadata, **build_sla_metadata_patch(False, None, policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE)}
             next_metadata.pop(COVERAGE_SLA_STATE_METADATA_KEY, None)
             if (
                 sanitize_text(ticket.get("sla_status")) != "On Track"
@@ -2424,7 +3455,13 @@ def sync_coverage_ticket_sla_alerts(reference_now: datetime | None = None) -> di
         )
         next_metadata = {
             **metadata,
-            **build_sla_metadata_patch(True, SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE),
+            **build_sla_metadata_patch(
+                True,
+                SLA_ATTENTION_REASON_COVERAGE_SESSION_DEADLINE,
+                policy_key=SLA_POLICY_COVERAGE_SESSION_DEADLINE,
+                due_at=breach_deadline_at,
+                breached_at=breached_at,
+            ),
             COVERAGE_SLA_STATE_METADATA_KEY: next_state,
         }
 
@@ -2512,6 +3549,52 @@ def normalize_technical_subcategory(value: Any) -> str:
     return ""
 
 
+def is_ai_team_technical_subcategory(value: Any) -> bool:
+    return sanitize_text(value).casefold() == TECHNICAL_SUBCATEGORY_AI_TEAM.casefold()
+
+
+def is_ai_team_ticket_record(ticket: dict[str, Any] | None) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    direct_value = get_ticket_scope_value(ticket, "technical_subcategory", "technicalSubcategory")
+    if is_ai_team_technical_subcategory(direct_value):
+        return True
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    return is_ai_team_technical_subcategory(metadata.get("technical_subcategory"))
+
+
+def normalize_ai_team_request_payload(payload: dict[str, Any], technical_subcategory: Any) -> dict[str, str] | None:
+    if not is_ai_team_technical_subcategory(technical_subcategory):
+        return None
+
+    person_name = sanitize_text(payload.get("aiTeamPersonName"))
+    person_email = normalize_email(payload.get("aiTeamPersonEmail"))
+    if not person_name:
+        raise ApiError(400, "Please enter the AI Team person's name.")
+    if not is_valid_email(person_email):
+        raise ApiError(400, "Please enter a valid AI Team person email.")
+
+    return {
+        "personName": person_name,
+        "personEmail": person_email,
+    }
+
+
+def get_ai_team_request(metadata: Any) -> dict[str, str] | None:
+    payload = normalize_json_object(normalize_json_object(metadata).get(AI_TEAM_REQUEST_METADATA_KEY))
+    person_name = sanitize_text(payload.get("personName"))
+    person_email = normalize_email(payload.get("personEmail"))
+    if not person_name and not person_email:
+        return None
+
+    return {
+        "personName": person_name,
+        "personEmail": person_email,
+    }
+
+
 def build_public_ticket_id(ticket_id: int) -> str:
     return f"KBC-{ticket_id:06d}"
 
@@ -2592,6 +3675,86 @@ def fetch_local_learner_by_email(email: str) -> dict[str, Any] | None:
         LIMIT 1
         """,
         [email],
+    )
+
+
+def fetch_local_learner_by_id(learner_id: Any) -> dict[str, Any] | None:
+    normalized_learner_id = parse_int(learner_id)
+    if normalized_learner_id <= 0:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, external_learner_id, support_account_id, full_name, email, phone, source, metadata
+        FROM learners
+        WHERE id = %s
+        LIMIT 1
+        """,
+        [normalized_learner_id],
+    )
+
+
+def is_kbc_learner_record(learner: dict[str, Any] | None) -> bool:
+    if not learner:
+        return False
+
+    metadata = normalize_json_object(learner.get("metadata"))
+    source = sanitize_text(learner.get("source")).lower()
+    legacy_source = sanitize_text(metadata.get("legacy_source")).lower()
+    return normalize_public_requester_source(source) in LEARNER_REQUESTER_SOURCES or legacy_source == "kbc_users_data"
+
+
+def serialize_public_learner_search_result(learner: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(learner["id"]),
+        "externalLearnerId": sanitize_text(learner.get("external_learner_id")),
+        "fullName": sanitize_text(learner.get("full_name")) or sanitize_text(learner.get("email")),
+        "email": sanitize_text(learner.get("email")),
+    }
+
+
+def search_local_kbc_learners(query: str, limit: int) -> list[dict[str, Any]]:
+    normalized_query = sanitize_text(query).lower()
+    if len(normalized_query) < 2:
+        return []
+
+    search_pattern = f"%{normalized_query}%"
+    starts_with_pattern = f"{normalized_query}%"
+    return run_query(
+        """
+        SELECT id, external_learner_id, support_account_id, full_name, email, phone, source, metadata
+        FROM learners
+        WHERE (
+            LOWER(COALESCE(full_name, '')) LIKE %s
+            OR LOWER(COALESCE(email, '')) LIKE %s
+            OR LOWER(COALESCE(external_learner_id, '')) LIKE %s
+          )
+          AND (
+            LOWER(COALESCE(source, '')) IN ('kbc_users_data', 'legacy_kbc_users_data', 'lms_learners')
+            OR LOWER(COALESCE(metadata ->> 'legacy_source', '')) = 'kbc_users_data'
+          )
+        ORDER BY
+          CASE
+            WHEN LOWER(COALESCE(full_name, '')) = %s THEN 0
+            WHEN LOWER(COALESCE(email, '')) = %s THEN 1
+            WHEN LOWER(COALESCE(full_name, '')) LIKE %s THEN 2
+            WHEN LOWER(COALESCE(email, '')) LIKE %s THEN 3
+            ELSE 4
+          END,
+          full_name NULLS LAST,
+          email
+        LIMIT %s
+        """,
+        [
+            search_pattern,
+            search_pattern,
+            search_pattern,
+            normalized_query,
+            normalized_query,
+            starts_with_pattern,
+            starts_with_pattern,
+            limit,
+        ],
     )
 
 
@@ -2694,6 +3857,98 @@ def find_lms_learner_by_email(email: str) -> dict[str, Any] | None:
             "synced_on_demand": True,
         },
     )
+
+
+def fetch_legacy_learners_by_search(query: str, limit: int) -> list[dict[str, Any]]:
+    normalized_query = sanitize_text(query).lower()
+    if len(normalized_query) < 2 or not settings.LEGACY_DATABASE_URL:
+        return []
+
+    search_pattern = f"%{normalized_query}%"
+
+    try:
+        with psycopg.connect(settings.LEGACY_DATABASE_URL) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT
+                      NULLIF(TRIM("ID"::text), '') AS external_learner_id,
+                      NULLIF(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName"))), '') AS full_name,
+                      LOWER(TRIM("Email")) AS email,
+                      NULLIF(TRIM(COALESCE("Learner_Phone", "learner-phone")), '') AS phone
+                    FROM kbc_users_data
+                    WHERE
+                      LOWER(TRIM(COALESCE("FullName", CONCAT_WS(' ', "FirstName", "LastName")))) LIKE %s
+                      OR LOWER(TRIM("Email")) LIKE %s
+                      OR LOWER(TRIM("ID"::text)) LIKE %s
+                    LIMIT %s
+                    """,
+                    [search_pattern, search_pattern, search_pattern, limit],
+                )
+                rows = cursor.fetchall()
+    except Exception:
+        logger.warning("Legacy learner search failed; returning local learner matches only.", exc_info=True)
+        return []
+
+    learners: list[dict[str, Any]] = []
+    for external_learner_id, full_name, normalized_email, phone in rows:
+        if not normalized_email:
+            continue
+        learners.append(
+            {
+                "external_learner_id": external_learner_id,
+                "full_name": full_name,
+                "email": normalized_email,
+                "phone": phone,
+            }
+        )
+    return learners
+
+
+def search_kbc_learners(query: str, limit: int = 12, requester_email: Any = "") -> dict[str, Any]:
+    normalized_query = sanitize_text(query)
+    normalized_limit = min(max(parse_int(limit, 12), 1), 25)
+    if len(normalized_query) < 2:
+        return {"learners": []}
+
+    normalized_requester_email = normalize_email(requester_email)
+    if not is_valid_email(normalized_requester_email):
+        raise ApiError(400, "Requester email is required before searching learners.")
+
+    requester = resolve_public_support_requester(normalized_requester_email)
+    if not requester:
+        raise ApiError(404, "This requester email is not registered in our records.")
+
+    requester_role = requester["role"]
+    requester_source = get_public_requester_source(requester)
+    if not can_requester_submit_for_learner(requester_role, requester_source):
+        raise ApiError(403, "This requester cannot submit tickets on behalf of another learner.")
+
+    matches = search_local_kbc_learners(normalized_query, normalized_limit)
+    seen_emails = {normalize_email(row.get("email")) for row in matches if normalize_email(row.get("email"))}
+
+    if len(matches) < normalized_limit:
+        for legacy_learner in fetch_legacy_learners_by_search(normalized_query, normalized_limit - len(matches)):
+            email = normalize_email(legacy_learner.get("email"))
+            if not email or email in seen_emails:
+                continue
+
+            synced_learner = upsert_learner_record(
+                legacy_learner,
+                source="legacy_kbc_users_data",
+                metadata={
+                    "legacy_source": "kbc_users_data",
+                    "synced_on_demand": True,
+                },
+            )
+            if synced_learner:
+                matches.append(synced_learner)
+                seen_emails.add(email)
+
+            if len(matches) >= normalized_limit:
+                break
+
+    return {"learners": [serialize_public_learner_search_result(learner) for learner in matches[:normalized_limit]]}
 
 
 def run_communication_centre_query(
@@ -3393,6 +4648,10 @@ def get_support_notification_webhook_url() -> str:
     return sanitize_text(getattr(settings, "SUPPORT_NOTIFICATION_WEBHOOK_URL", ""))
 
 
+def is_support_notification_delivery_enabled() -> bool:
+    return bool(getattr(settings, "SUPPORT_NOTIFICATION_DELIVERY_ENABLED", True))
+
+
 def get_coverage_ticket_operations_webhook_url() -> str:
     return sanitize_text(getattr(settings, "COVERAGE_TICKET_WEBHOOK_URL", ""))
 
@@ -3459,6 +4718,14 @@ def build_coverage_tutor_public_result_base_url(fallback_origin: Any = "") -> st
         return ""
 
     return f"{public_base_url}/coverage/tutor-response/result"
+
+
+def build_coverage_tutor_email_delivery_status_callback_url(fallback_origin: Any = "") -> str:
+    public_base_url = get_support_portal_public_base_url(fallback_origin)
+    if not public_base_url:
+        return ""
+
+    return f"{public_base_url}/api/integrations/coverage/tutor-request-email-status"
 
 
 def build_coverage_tutor_public_response_action_url(
@@ -3537,6 +4804,12 @@ def build_coverage_tutor_request_webhook_payload(
         result_base_url,
         action="refuse",
     )
+    email_delivery_callback_url = build_coverage_tutor_email_delivery_status_callback_url()
+    email_delivery_callback_token = build_coverage_tutor_email_delivery_callback_token(
+        ticket.get("public_id"),
+        card.get("id"),
+        card.get("responseToken"),
+    )
 
     return {
         "event": "coverage_tutor_requested",
@@ -3567,6 +4840,8 @@ def build_coverage_tutor_request_webhook_payload(
             "sessionDetails": card.get("sessionDetails"),
             "notes": documentation.get("coverageNotes") or "",
             "presentationFiles": card.get("presentationFiles") or [],
+            "selectedSessionIds": normalize_coverage_selected_session_ids(card.get("selectedSessionIds")),
+            "sessionFiles": card.get("sessionFiles") or [],
         },
         "requestedBy": {
             "agentId": int(actor_row["id"]),
@@ -3587,6 +4862,13 @@ def build_coverage_tutor_request_webhook_payload(
                 "acceptUrl": accept_result_url,
                 "refuseUrl": refuse_result_url,
             },
+        },
+        "emailDeliveryCallback": {
+            "url": email_delivery_callback_url,
+            "token": email_delivery_callback_token,
+            "ticketId": ticket["public_id"],
+            "cardId": card["id"],
+            "responseToken": card.get("responseToken"),
         },
     }
 
@@ -3682,6 +4964,7 @@ def build_coverage_tutor_follow_up_webhook_payload(
             "sessionDetails": card.get("sessionDetails"),
             "notes": documentation.get("coverageNotes") or "",
             "presentationFiles": card.get("presentationFiles") or [],
+            "sessionFiles": card.get("sessionFiles") or [],
         },
         "followUp": {
             "sentAt": sent_at,
@@ -3709,21 +4992,314 @@ def strip_webhook_attachment_binary_fields(value: Any) -> Any:
     return value
 
 
+def parse_attachment_file_size(value: Any) -> int:
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_attachment_id(value: Any) -> int | None:
+    try:
+        attachment_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return attachment_id if attachment_id > 0 else None
+
+
+def has_webhook_binary_source(file: dict[str, Any]) -> bool:
+    return bool(sanitize_text(file.get("dataUrl")) or sanitize_text(file.get("storageKey")))
+
+
+def build_coverage_file_public_download_url(ticket_public_id: str, file: dict[str, Any]) -> str:
+    attachment_id = parse_attachment_id(file.get("attachmentId"))
+    if not attachment_id:
+        return ""
+    return build_public_coverage_attachment_download_url(ticket_public_id, attachment_id)
+
+
+def build_support_notification_file_public_download_url(ticket_public_id: str, file: dict[str, Any]) -> str:
+    attachment_id = parse_attachment_id(file.get("attachmentId"))
+    if not attachment_id:
+        return ""
+    return build_public_support_notification_attachment_download_url(ticket_public_id, attachment_id)
+
+
+def prepare_coverage_webhook_file_delivery(
+    file: dict[str, Any],
+    *,
+    ticket_public_id: str,
+    current_total_bytes: int,
+) -> tuple[dict[str, Any], bool, int]:
+    prepared_file = normalize_json_object(file)
+    file_size = parse_attachment_file_size(prepared_file.get("size"))
+    max_file_bytes = get_coverage_webhook_attachment_max_file_bytes()
+    max_total_bytes = get_coverage_webhook_attachment_max_total_bytes()
+    download_url = build_coverage_file_public_download_url(ticket_public_id, prepared_file)
+    can_attach_binary = has_webhook_binary_source(prepared_file)
+    within_file_limit = max_file_bytes <= 0 or file_size <= max_file_bytes
+    within_total_limit = max_total_bytes <= 0 or (current_total_bytes + file_size) <= max_total_bytes
+
+    if download_url:
+        prepared_file["downloadUrl"] = download_url
+
+    if can_attach_binary and within_file_limit and within_total_limit:
+        prepared_file["deliveryMode"] = "attachment"
+        return prepared_file, True, file_size
+
+    if download_url:
+        prepared_file["deliveryMode"] = "link"
+        if not within_file_limit:
+            prepared_file["deliveryReason"] = "file_size_limit"
+        elif not within_total_limit:
+            prepared_file["deliveryReason"] = "total_size_limit"
+        elif not can_attach_binary:
+            prepared_file["deliveryReason"] = "download_link_only"
+        return prepared_file, False, 0
+
+    # Last-resort fallback for legacy unsaved dataUrl payloads. It may still fail externally,
+    # but it avoids silently dropping a file that cannot yet be linked.
+    if can_attach_binary:
+        prepared_file["deliveryMode"] = "attachment"
+        prepared_file["deliveryReason"] = "no_public_link_available"
+        return prepared_file, True, file_size
+
+    prepared_file["deliveryMode"] = "metadata_only"
+    return prepared_file, False, 0
+
+
+def prepare_coverage_webhook_attachment_list(
+    files: Any,
+    *,
+    ticket_public_id: str,
+    current_total_bytes: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    prepared_files: list[dict[str, Any]] = []
+    files_to_attach: list[dict[str, Any]] = []
+    running_total = current_total_bytes
+
+    if not isinstance(files, list):
+        return prepared_files, files_to_attach, running_total
+
+    for file in files:
+        prepared_file, should_attach, attached_size = prepare_coverage_webhook_file_delivery(
+            normalize_json_object(file),
+            ticket_public_id=ticket_public_id,
+            current_total_bytes=running_total,
+        )
+        prepared_files.append(prepared_file)
+        if should_attach:
+            files_to_attach.append(prepared_file)
+            running_total += attached_size
+
+    return prepared_files, files_to_attach, running_total
+
+
+def prepare_coverage_request_webhook_delivery_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prepared_payload = copy.deepcopy(payload)
+    if "request" not in prepared_payload:
+        return prepared_payload, []
+
+    ticket_public_id = sanitize_text(prepared_payload.get("ticketId"))
+    request_payload = normalize_json_object(prepared_payload.get("request"))
+    files_to_attach: list[dict[str, Any]] = []
+    running_total = 0
+
+    prepared_general_files, general_files_to_attach, running_total = prepare_coverage_webhook_attachment_list(
+        request_payload.get("presentationFiles"),
+        ticket_public_id=ticket_public_id,
+        current_total_bytes=running_total,
+    )
+    request_payload["presentationFiles"] = prepared_general_files
+    files_to_attach.extend(general_files_to_attach)
+
+    prepared_session_groups: list[dict[str, Any]] = []
+    session_file_groups = request_payload.get("sessionFiles")
+    if isinstance(session_file_groups, list):
+        for group in session_file_groups:
+            prepared_group = normalize_json_object(group)
+            prepared_session_files, session_files_to_attach, running_total = prepare_coverage_webhook_attachment_list(
+                prepared_group.get("attachments"),
+                ticket_public_id=ticket_public_id,
+                current_total_bytes=running_total,
+            )
+            prepared_group["attachments"] = prepared_session_files
+            prepared_session_groups.append(prepared_group)
+            files_to_attach.extend(session_files_to_attach)
+    request_payload["sessionFiles"] = prepared_session_groups
+    prepared_payload["request"] = request_payload
+
+    return prepared_payload, files_to_attach
+
+
+def prepare_coverage_follow_up_webhook_delivery_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prepared_payload = copy.deepcopy(payload)
+    ticket_public_id = sanitize_text(prepared_payload.get("ticketId"))
+    follow_up_payload = normalize_json_object(prepared_payload.get("followUp"))
+    prepared_files, files_to_attach, _running_total = prepare_coverage_webhook_attachment_list(
+        follow_up_payload.get("presentationFiles") or prepared_payload.get("attachments"),
+        ticket_public_id=ticket_public_id,
+        current_total_bytes=0,
+    )
+    follow_up_payload["presentationFiles"] = prepared_files
+    prepared_payload["followUp"] = follow_up_payload
+    prepared_payload["attachments"] = prepared_files
+
+    prepared_by_id = {
+        sanitize_text(file.get("id")): file
+        for file in prepared_files
+        if sanitize_text(file.get("id"))
+    }
+    request_payload = normalize_json_object(prepared_payload.get("request"))
+    request_files = request_payload.get("presentationFiles")
+    if isinstance(request_files, list) and prepared_by_id:
+        prepared_request_files = []
+        for file in request_files:
+            normalized_file = normalize_json_object(file)
+            prepared_request_files.append(
+                {
+                    **normalized_file,
+                    **prepared_by_id.get(sanitize_text(normalized_file.get("id")), {}),
+                }
+            )
+        request_payload["presentationFiles"] = prepared_request_files
+        prepared_payload["request"] = request_payload
+
+    return prepared_payload, files_to_attach
+
+
+def list_ticket_evidence_webhook_files(ticket_id: Any) -> list[dict[str, Any]]:
+    try:
+        normalized_ticket_id = int(ticket_id)
+    except (TypeError, ValueError):
+        normalized_ticket_id = 0
+    if normalized_ticket_id <= 0:
+        return []
+
+    rows = run_query(
+        """
+        SELECT id, file_name, mime_type, file_size, storage_url, created_at
+        FROM ticket_attachments
+        WHERE ticket_id = %s
+        ORDER BY created_at ASC, id ASC
+        """,
+        [normalized_ticket_id],
+    )
+    return [
+        {
+            "id": f"ticket-attachment-{int(row['id'])}",
+            "attachmentId": int(row["id"]),
+            "name": sanitize_support_attachment_name(row.get("file_name")),
+            "mimeType": sanitize_text(row.get("mime_type")) or "application/octet-stream",
+            "size": int(row.get("file_size") or 0),
+            "storageKey": sanitize_text(row.get("storage_url")),
+        }
+        for row in rows
+        if sanitize_text(row.get("storage_url"))
+    ]
+
+
+def can_attach_support_notification_file(file: dict[str, Any]) -> bool:
+    storage_key = sanitize_text(file.get("storageKey"))
+    if not storage_key:
+        return bool(sanitize_text(file.get("dataUrl")))
+    try:
+        attachment_path = resolve_support_attachment_path(storage_key)
+    except ApiError:
+        return False
+    return attachment_path.exists() and attachment_path.is_file()
+
+
+def prepare_support_notification_webhook_file_delivery(
+    file: dict[str, Any],
+    *,
+    ticket_public_id: str,
+    current_total_bytes: int,
+    multipart_index: int,
+) -> tuple[dict[str, Any], bool, int]:
+    prepared_file = normalize_json_object(file)
+    file_size = parse_attachment_file_size(prepared_file.get("size"))
+    max_file_bytes = get_support_notification_attachment_max_file_bytes()
+    max_total_bytes = get_support_notification_attachment_max_total_bytes()
+    download_url = build_support_notification_file_public_download_url(ticket_public_id, prepared_file)
+    can_attach_binary = can_attach_support_notification_file(prepared_file)
+    within_file_limit = max_file_bytes <= 0 or file_size <= max_file_bytes
+    within_total_limit = max_total_bytes <= 0 or (current_total_bytes + file_size) <= max_total_bytes
+
+    if download_url:
+        prepared_file["downloadUrl"] = download_url
+
+    if can_attach_binary and within_file_limit and within_total_limit:
+        prepared_file["deliveryMode"] = "attachment"
+        prepared_file["multipartField"] = f"file_{multipart_index}"
+        return prepared_file, True, file_size
+
+    if download_url:
+        prepared_file["deliveryMode"] = "link"
+        if not can_attach_binary:
+            prepared_file["deliveryReason"] = "download_link_only"
+        elif not within_file_limit:
+            prepared_file["deliveryReason"] = "file_size_limit"
+        elif not within_total_limit:
+            prepared_file["deliveryReason"] = "total_size_limit"
+        return prepared_file, False, 0
+
+    prepared_file["deliveryMode"] = "metadata_only"
+    if not can_attach_binary:
+        prepared_file["deliveryReason"] = "file_unavailable"
+    elif not within_file_limit:
+        prepared_file["deliveryReason"] = "file_size_limit"
+    elif not within_total_limit:
+        prepared_file["deliveryReason"] = "total_size_limit"
+    return prepared_file, False, 0
+
+
+def prepare_support_notification_webhook_delivery_payload(
+    payload: dict[str, Any],
+    files: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prepared_payload = copy.deepcopy(payload)
+    prepared_files: list[dict[str, Any]] = []
+    files_to_attach: list[dict[str, Any]] = []
+    running_total = 0
+    ticket_public_id = sanitize_text(normalize_json_object(prepared_payload.get("ticket")).get("id"))
+
+    for file in files:
+        prepared_file, should_attach, attached_size = prepare_support_notification_webhook_file_delivery(
+            normalize_json_object(file),
+            ticket_public_id=ticket_public_id,
+            current_total_bytes=running_total,
+            multipart_index=len(files_to_attach),
+        )
+        prepared_files.append(prepared_file)
+        if should_attach:
+            files_to_attach.append(prepared_file)
+            running_total += attached_size
+
+    if prepared_files:
+        prepared_payload["evidence"] = {
+            "count": len(prepared_files),
+            "files": prepared_files,
+        }
+
+    return prepared_payload, files_to_attach
+
+
 def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_request_webhook_url()
-    request_payload = normalize_json_object(payload.get("request"))
-    files = request_payload.get("presentationFiles") if isinstance(request_payload.get("presentationFiles"), list) else []
+    prepared_payload, files = prepare_coverage_request_webhook_delivery_payload(payload)
+    outbound_payload = strip_webhook_attachment_binary_fields(prepared_payload)
     if files:
         configured, delivered, status, response_payload = post_multipart_webhook(
             url,
-            strip_webhook_attachment_binary_fields(payload),
+            outbound_payload,
             files,
             timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
     else:
         configured, delivered, status, response_payload = post_json_webhook(
             url,
-            payload,
+            outbound_payload,
             timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
         )
     return {
@@ -3736,22 +5312,349 @@ def send_coverage_tutor_request_webhook(payload: dict[str, Any]) -> dict[str, An
 
 def send_coverage_tutor_follow_up_webhook(payload: dict[str, Any]) -> dict[str, Any]:
     url = get_coverage_tutor_attachment_reply_webhook_url()
-    follow_up_payload = normalize_json_object(payload.get("followUp"))
-    files = follow_up_payload.get("presentationFiles") if isinstance(follow_up_payload.get("presentationFiles"), list) else []
-    if not files and isinstance(payload.get("attachments"), list):
-        files = payload["attachments"]
-    configured, delivered, status, response_payload = post_multipart_webhook(
-        url,
-        strip_webhook_attachment_binary_fields(payload),
-        files,
-        timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
-    )
+    prepared_payload, files = prepare_coverage_follow_up_webhook_delivery_payload(payload)
+    outbound_payload = strip_webhook_attachment_binary_fields(prepared_payload)
+    if files:
+        configured, delivered, status, response_payload = post_multipart_webhook(
+            url,
+            outbound_payload,
+            files,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
+    else:
+        configured, delivered, status, response_payload = post_json_webhook(
+            url,
+            outbound_payload,
+            timeout_seconds=COVERAGE_TUTOR_WEBHOOK_TIMEOUT_SECONDS,
+        )
     return {
         "configured": configured,
         "delivered": delivered,
         "status": status,
         "response": response_payload,
     }
+
+
+def normalize_coverage_tutor_email_delivery_status_from_payload(payload: dict[str, Any]) -> str:
+    if isinstance(payload.get("success"), bool):
+        return "sent" if payload.get("success") else "failed"
+    if isinstance(payload.get("delivered"), bool):
+        return "sent" if payload.get("delivered") else "failed"
+
+    raw_status = sanitize_text(
+        payload.get("emailDeliveryStatus")
+        or payload.get("deliveryStatus")
+        or payload.get("status")
+        or payload.get("outcome")
+    ).lower()
+    if raw_status in {"sent", "delivered", "success", "succeeded", "ok"}:
+        return "sent"
+    if raw_status in {"failed", "failure", "error", "errored", "bounced"}:
+        return "failed"
+    if raw_status in {"pending", "queued"}:
+        return "pending"
+    return ""
+
+
+def build_coverage_tutor_email_delivery_history_payload(
+    *,
+    ticket_public_id: str,
+    card_id: str,
+    status: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ticketId": ticket_public_id,
+        "cardId": card_id,
+        "emailDeliveryStatus": status,
+        "emailDeliveryMessageId": sanitize_text(payload.get("messageId") or payload.get("gmailMessageId") or payload.get("id")),
+        "emailDeliveryThreadId": sanitize_text(payload.get("threadId") or payload.get("gmailThreadId")),
+        "emailDeliveryError": sanitize_text(payload.get("error") or payload.get("message")),
+        "webhookStatus": payload.get("webhookStatus"),
+        "webhookDelivered": payload.get("webhookDelivered"),
+    }
+
+
+def update_coverage_tutor_request_email_delivery_status(
+    *,
+    ticket_public_id: str,
+    card_id: str,
+    status: str,
+    payload: dict[str, Any] | None = None,
+    token_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_ticket_public_id = sanitize_text(ticket_public_id)
+    normalized_card_id = sanitize_text(card_id)
+    normalized_status = normalize_coverage_tutor_email_delivery_status_from_payload({"status": status})
+    payload = normalize_json_object(payload)
+    token_payload = normalize_json_object(token_payload)
+
+    if not normalized_ticket_public_id or not normalized_card_id:
+        raise ApiError(400, "Ticket id and coverage card id are required.")
+    if normalized_status not in {"pending", "sent", "failed"}:
+        raise ApiError(400, "Email delivery status must be pending, sent, or failed.")
+
+    timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT id, public_id, metadata
+            FROM tickets
+            WHERE public_id = %s
+            LIMIT 1
+            """,
+            [normalized_ticket_public_id],
+        )
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation = normalize_admin_documentation(ticket_metadata.get("admin_documentation"))
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=normalized_card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(target_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "Only tutor request cards can receive email delivery updates.")
+
+        expected_response_token = sanitize_text(token_payload.get("responseToken"))
+        if expected_response_token and expected_response_token != sanitize_text(target_card.get("responseToken")):
+            raise ApiError(403, "Email delivery callback token does not match this request.")
+
+        message_id = sanitize_text(payload.get("messageId") or payload.get("gmailMessageId") or payload.get("id"))
+        thread_id = sanitize_text(payload.get("threadId") or payload.get("gmailThreadId"))
+        error_message = sanitize_text(payload.get("error") or payload.get("message"))
+        updated_card = {
+            **target_card,
+            "emailDeliveryStatus": normalized_status,
+            "emailDeliveryUpdatedAt": timestamp,
+            "emailDeliveryMessageId": message_id if normalized_status == "sent" else sanitize_text(target_card.get("emailDeliveryMessageId")),
+            "emailDeliveryThreadId": thread_id if normalized_status == "sent" else sanitize_text(target_card.get("emailDeliveryThreadId")),
+            "emailDeliveryError": error_message if normalized_status == "failed" else "",
+        }
+        coverage_cards[card_index] = updated_card
+        documentation["coverageCards"] = coverage_cards
+        ticket_metadata["admin_documentation"] = documentation
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+        event_type = {
+            "sent": "coverage_tutor_request_email_sent",
+            "failed": "coverage_tutor_request_email_failed",
+        }.get(normalized_status, "coverage_tutor_request_email_pending")
+        insert_history_event(
+            ticket["id"],
+            event_type,
+            {"role": "system", "label": "System"},
+            build_coverage_tutor_email_delivery_history_payload(
+                ticket_public_id=normalized_ticket_public_id,
+                card_id=normalized_card_id,
+                status=normalized_status,
+                payload=payload,
+            ),
+        )
+
+    return {
+        "ok": True,
+        "ticketId": normalized_ticket_public_id,
+        "cardId": normalized_card_id,
+        "emailDeliveryStatus": normalized_status,
+    }
+
+
+def record_coverage_tutor_request_email_delivery_status(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_payload = normalize_json_object(payload)
+    token_payload = decode_coverage_tutor_email_delivery_callback_token(
+        normalized_payload.get("token") or normalized_payload.get("callbackToken")
+    )
+    ticket_public_id = sanitize_text(normalized_payload.get("ticketId")) or sanitize_text(token_payload.get("ticketId"))
+    card_id = sanitize_text(normalized_payload.get("cardId")) or sanitize_text(token_payload.get("cardId"))
+    status = normalize_coverage_tutor_email_delivery_status_from_payload(normalized_payload)
+
+    if sanitize_text(token_payload.get("ticketId")) != ticket_public_id or sanitize_text(token_payload.get("cardId")) != card_id:
+        raise ApiError(403, "Email delivery callback token does not match this request.")
+
+    return update_coverage_tutor_request_email_delivery_status(
+        ticket_public_id=ticket_public_id,
+        card_id=card_id,
+        status=status,
+        payload=normalized_payload,
+        token_payload=token_payload,
+    )
+
+
+def retry_coverage_tutor_request_email(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+    callback_origin = sanitize_text(payload.get("origin"))
+    webhook_delivery: dict[str, Any] | None = None
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    ensure_coverage_tutor_request_webhook_configured()
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.category,
+              t.technical_subcategory,
+              t.inquiry,
+              t.status,
+              t.status_reason,
+              t.assigned_team,
+              t.assigned_agent_id,
+              t.sla_status,
+              t.metadata,
+              t.is_archived,
+              l.full_name AS learner_name,
+              l.email AS learner_email
+            FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+        if not is_coverage_ticket_record(ticket):
+            raise ApiError(409, "This ticket is not a coverage ticket.")
+        if normalize_bool(ticket.get("is_archived")):
+            raise ApiError(409, "Restore this ticket before retrying the tutor request e-mail.")
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        documentation = normalize_admin_documentation(
+            ticket_metadata.get("admin_documentation"),
+            fallback_inquiry=sanitize_text(ticket.get("inquiry")),
+            fallback_ticket_id=ticket["public_id"],
+        )
+        coverage_cards = list(documentation.get("coverageCards") or [])
+        card_index = find_coverage_card_index(coverage_cards, card_id=card_id)
+        if card_index is None:
+            raise ApiError(404, "Coverage card not found.")
+
+        target_card = normalize_json_object(coverage_cards[card_index])
+        if sanitize_text(target_card.get("type")) != "tutor_choice":
+            raise ApiError(409, "Only tutor request cards can be retried.")
+
+        request_status = sanitize_text(target_card.get("requestStatus")).lower()
+        if request_status == "pending":
+            request_status = "requested"
+        if request_status != "requested":
+            raise ApiError(409, "Only requested tutor e-mails can be retried.")
+
+        email_delivery_status = sanitize_text(target_card.get("emailDeliveryStatus")).lower()
+        if email_delivery_status != "failed":
+            raise ApiError(409, "Only failed tutor request e-mails can be retried.")
+
+        response_token = sanitize_text(target_card.get("responseToken"))
+        tutor_email = normalize_email(target_card.get("tutorEmail"))
+        if not response_token:
+            raise ApiError(409, "This tutor request cannot be retried because it has no response token.")
+        if not tutor_email or not is_valid_email(tutor_email):
+            raise ApiError(400, "Please enter a valid recipient e-mail before retrying the request.")
+
+        timestamp = serialize_datetime_value(datetime.now(timezone.utc)) or datetime.now(timezone.utc).isoformat()
+        try:
+            retry_count = max(int(target_card.get("emailDeliveryRetryCount") or 0), 0) + 1
+        except (TypeError, ValueError):
+            retry_count = 1
+
+        previous_error = sanitize_text(target_card.get("emailDeliveryError"))
+        updated_target_card = {
+            **target_card,
+            "tutorEmail": tutor_email,
+            "emailDeliveryStatus": "pending",
+            "emailDeliveryUpdatedAt": timestamp,
+            "emailDeliveryMessageId": "",
+            "emailDeliveryThreadId": "",
+            "emailDeliveryError": "",
+            "emailDeliveryRetryCount": retry_count,
+            "updatedAt": timestamp,
+            **build_coverage_card_actor_stamp(actor_row, "updated"),
+        }
+        coverage_cards[card_index] = updated_target_card
+        documentation["coverageCards"] = coverage_cards
+        ticket_metadata["admin_documentation"] = documentation
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+        actor = {
+            "id": actor_row["id"],
+            "role": actor_row["role"],
+            "label": actor_row.get("full_name") or actor_row["username"],
+        }
+        insert_history_event(
+            ticket["id"],
+            "coverage_tutor_request_email_retry",
+            actor,
+            {
+                "ticketId": ticket["public_id"],
+                "cardId": updated_target_card["id"],
+                "tutor": sanitize_text(updated_target_card.get("tutor")),
+                "tutorEmail": tutor_email,
+                "emailDeliveryStatus": "pending",
+                "emailDeliveryRetryCount": retry_count,
+                "previousEmailDeliveryError": previous_error,
+            },
+        )
+
+        webhook_delivery = {
+            "ticket_id": int(ticket["id"]),
+            "ticket_public_id": ticket["public_id"],
+            "card_id": updated_target_card["id"],
+            "payload": build_coverage_tutor_request_webhook_payload(
+                ticket,
+                documentation,
+                updated_target_card,
+                actor_row,
+                callback_url=build_coverage_tutor_public_response_base_url(callback_origin),
+                result_base_url=build_coverage_tutor_public_result_base_url(callback_origin),
+            ),
+        }
+
+    if webhook_delivery:
+        queue_coverage_tutor_request_webhook_delivery(**webhook_delivery)
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
 
 
 def ensure_coverage_tutor_request_webhook_configured() -> None:
@@ -3792,11 +5695,28 @@ def queue_coverage_tutor_request_webhook_delivery(
                     "webhookConfigured": bool(result.get("configured")),
                     "webhookDelivered": bool(result.get("delivered")),
                     "webhookStatus": result.get("status"),
+                    "webhookResponse": result.get("response"),
                 },
             )
         except Exception:
             # Webhook delivery must never break the saved tutor request.
             return
+
+        if not result.get("delivered"):
+            try:
+                update_coverage_tutor_request_email_delivery_status(
+                    ticket_public_id=ticket_public_id,
+                    card_id=card_id,
+                    status="failed",
+                    payload={
+                        "message": extract_external_service_message(result.get("response"))
+                        or "Tutor request webhook was not accepted by n8n.",
+                        "webhookDelivered": bool(result.get("delivered")),
+                        "webhookStatus": result.get("status"),
+                    },
+                )
+            except Exception:
+                return
 
     thread = threading.Thread(
         target=deliver,
@@ -3834,6 +5754,7 @@ def queue_coverage_tutor_follow_up_webhook_delivery(
                     "webhookConfigured": bool(result.get("configured")),
                     "webhookDelivered": bool(result.get("delivered")),
                     "webhookStatus": result.get("status"),
+                    "webhookResponse": result.get("response"),
                 },
             )
         except Exception:
@@ -3847,7 +5768,7 @@ def queue_coverage_tutor_follow_up_webhook_delivery(
     thread.start()
 
 
-def build_coverage_tutor_refusal_mail_webhook_payload(
+def build_coverage_tutor_response_mail_webhook_payload(
     *,
     ticket: dict[str, Any],
     tutor_choice_card: dict[str, Any],
@@ -3860,9 +5781,11 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
     session_details = sanitize_text(tutor_choice_card.get("sessionDetails")) or sanitize_text(
         latest_response_payload.get("sessionDetails")
     )
+    outcome = sanitize_text(latest_response_payload.get("outcome")).lower()
+    was_accepted = outcome == "accepted"
 
     return {
-        "event": "coverage_tutor_refused",
+        "event": "coverage_tutor_accepted" if was_accepted else "coverage_tutor_refused",
         "source": "support_portal",
         "ticket": {
             "id": ticket["public_id"],
@@ -3883,9 +5806,11 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
             "coachEmail": sanitize_text(tutor_choice_card.get("coachEmail")),
             "sessionDetails": session_details,
             "presentationFiles": tutor_choice_card.get("presentationFiles") or [],
+            "selectedSessionIds": normalize_coverage_selected_session_ids(tutor_choice_card.get("selectedSessionIds")),
+            "sessionFiles": tutor_choice_card.get("sessionFiles") or [],
         },
         "response": {
-            "outcome": "rejected",
+            "outcome": "accepted" if was_accepted else "rejected",
             "respondedAt": latest_response_payload.get("respondedAt"),
             "replyText": latest_response_payload.get("replyText") or "",
         },
@@ -3895,6 +5820,26 @@ def build_coverage_tutor_refusal_mail_webhook_payload(
             "agentUsername": tutor_choice_card.get("requestSubmittedByAgentUsername") or "",
         },
     }
+
+
+def build_coverage_tutor_refusal_mail_webhook_payload(
+    *,
+    ticket: dict[str, Any],
+    tutor_choice_card: dict[str, Any],
+    latest_response_payload: dict[str, Any],
+    next_status: str,
+    next_status_reason: str,
+) -> dict[str, Any]:
+    return build_coverage_tutor_response_mail_webhook_payload(
+        ticket=ticket,
+        tutor_choice_card=tutor_choice_card,
+        latest_response_payload={
+            **latest_response_payload,
+            "outcome": "rejected",
+        },
+        next_status=next_status,
+        next_status_reason=next_status_reason,
+    )
 
 
 def send_coverage_tutor_response_mail_webhook(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3911,7 +5856,7 @@ def send_coverage_tutor_response_mail_webhook(payload: dict[str, Any]) -> dict[s
     }
 
 
-def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+def notify_coverage_tutor_response_mail_webhook(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     if not get_coverage_tutor_response_mail_webhook_url():
         return {"configured": False, "delivered": False, "status": None, "response": None}
 
@@ -3920,10 +5865,16 @@ def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str
     except Exception:
         webhook_result = {"configured": True, "delivered": False, "status": None, "response": None}
 
+    response_outcome = sanitize_text(payload.get("response", {}).get("outcome")).lower()
+    event_prefix = (
+        "coverage_tutor_acceptance_mail"
+        if response_outcome == "accepted"
+        else "coverage_tutor_refusal_mail"
+    )
     event_type = (
-        "coverage_tutor_refusal_mail_notified"
+        f"{event_prefix}_notified"
         if webhook_result["delivered"]
-        else "coverage_tutor_refusal_mail_failed"
+        else f"{event_prefix}_failed"
     )
     try:
         insert_history_event(
@@ -3934,6 +5885,7 @@ def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str
                 "ticketId": payload.get("ticket", {}).get("id"),
                 "tutor": payload.get("tutor", {}).get("name"),
                 "tutorEmail": payload.get("tutor", {}).get("email"),
+                "responseOutcome": response_outcome,
                 "webhookStatus": webhook_result.get("status"),
                 "webhookDelivered": webhook_result.get("delivered"),
             },
@@ -3942,6 +5894,10 @@ def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str
         pass
 
     return webhook_result
+
+
+def notify_coverage_tutor_refusal_mail_webhook(ticket_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    return notify_coverage_tutor_response_mail_webhook(ticket_id, payload)
 
 
 def find_coverage_card_index(
@@ -4076,6 +6032,7 @@ def build_coverage_tutor_response_payload(
         "requestedAt": tutor_choice_card.get("submittedAt"),
         "respondedAt": responded_at,
         "sessionDetails": extract_coverage_tutor_response_session_details(response_payload),
+        "selectedSessionIds": normalize_coverage_selected_session_ids(tutor_choice_card.get("selectedSessionIds")),
         "replyText": sanitize_text(response_payload.get("replyText") or response_payload.get("message") or response_payload.get("note")),
         "sessionStartAt": serialize_datetime_value(
             coerce_datetime(
@@ -4145,6 +6102,8 @@ def build_coverage_tutor_reply_card(
         "confirmedByAgentName": "",
         "confirmedByAgentUsername": "",
         "presentationFiles": [],
+        "selectedSessionIds": normalize_coverage_selected_session_ids(tutor_choice_card.get("selectedSessionIds")),
+        "sessionFiles": tutor_choice_card.get("sessionFiles") or [],
     }
 
 
@@ -4264,6 +6223,233 @@ def build_coverage_session_items_from_inquiry_details(parsed_inquiry: dict[str, 
     return sessions
 
 
+def normalize_coverage_original_session_items(value: Any, inquiry: Any = "") -> list[dict[str, Any]]:
+    raw_items: Any = value
+    if isinstance(raw_items, str):
+        try:
+            parsed_items = json.loads(raw_items)
+        except json.JSONDecodeError:
+            parsed_items = []
+        raw_items = parsed_items
+
+    normalized_items: list[dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        seen_ids: set[str] = set()
+        for index, raw_item in enumerate(raw_items):
+            item = normalize_json_object(raw_item)
+            if not item:
+                continue
+
+            session_id = sanitize_text(item.get("id")) or f"session-{index + 1}"
+            if session_id in seen_ids:
+                continue
+            seen_ids.add(session_id)
+            normalized_items.append(
+                {
+                    "id": session_id,
+                    "label": sanitize_text(item.get("label")) or f"Session {index + 1}",
+                    "date": sanitize_text(item.get("date")),
+                    "number": sanitize_text(item.get("number") or item.get("sessionNumber")),
+                    "subject": sanitize_text(item.get("subject")),
+                }
+            )
+
+    if normalized_items:
+        return normalized_items
+
+    return [
+        {
+            "id": f"session-{session_item['index']}",
+            "label": f"Session {session_item['index']}",
+            "date": sanitize_text(session_item.get("date")),
+            "number": sanitize_text(session_item.get("sessionNumber")),
+            "subject": sanitize_text(session_item.get("subject")),
+        }
+        for session_item in build_coverage_session_items_from_inquiry_details(
+            parse_coverage_inquiry_details(inquiry)
+        )
+    ]
+
+
+def build_coverage_session_ids_from_inquiry(inquiry: Any) -> list[str]:
+    return [
+        f"session-{session_item['index']}"
+        for session_item in build_coverage_session_items_from_inquiry_details(
+            parse_coverage_inquiry_details(inquiry)
+        )
+    ]
+
+
+def build_coverage_original_session_ids(
+    *,
+    metadata: Any = None,
+    documentation: Any = None,
+    inquiry: Any = "",
+) -> list[str]:
+    return [
+        item["id"]
+        for item in build_coverage_original_session_items(
+            metadata=metadata,
+            documentation=documentation,
+            inquiry=inquiry,
+        )
+        if sanitize_text(item.get("id"))
+    ]
+
+
+def build_coverage_original_session_items(
+    *,
+    metadata: Any = None,
+    documentation: Any = None,
+    inquiry: Any = "",
+) -> list[dict[str, Any]]:
+    metadata_payload = normalize_json_object(metadata)
+    documentation_payload = normalize_json_object(documentation)
+    candidate_session_item_sets = [
+        normalize_coverage_original_session_items(
+            metadata_payload.get(COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY),
+            "",
+        ),
+        normalize_coverage_original_session_items(
+            documentation_payload.get("coverageOriginalSessions"),
+            "",
+        ),
+        normalize_coverage_original_session_items(
+            documentation_payload.get("coverageSessions"),
+            "",
+        ),
+        normalize_coverage_original_session_items(None, inquiry),
+    ]
+    candidate_session_item_sets = [items for items in candidate_session_item_sets if items]
+    if not candidate_session_item_sets:
+        return []
+
+    # Prefer the widest reliable session plan. This prevents a partial tutor card
+    # snapshot from replacing the original request and closing the ticket early.
+    return max(candidate_session_item_sets, key=len)
+
+
+def normalize_coverage_session_match_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", sanitize_text(value).lower()).strip()
+
+
+def infer_coverage_card_session_ids_from_details(
+    card: dict[str, Any],
+    original_session_items: list[dict[str, Any]],
+) -> list[str]:
+    session_details = sanitize_text(card.get("sessionDetails"))
+    if not session_details or not original_session_items:
+        return []
+
+    detail_lines = [
+        normalize_coverage_session_match_text(line)
+        for line in session_details.splitlines()
+        if normalize_coverage_session_match_text(line)
+    ]
+    if not detail_lines:
+        detail_lines = [normalize_coverage_session_match_text(session_details)]
+
+    matched_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for item in original_session_items:
+        session_id = sanitize_text(item.get("id"))
+        if not session_id or session_id in seen_ids:
+            continue
+
+        date_text = normalize_coverage_session_match_text(item.get("date"))
+        number_text = normalize_coverage_session_match_text(item.get("number") or item.get("sessionNumber"))
+        subject_text = normalize_coverage_session_match_text(item.get("subject"))
+        for line in detail_lines:
+            date_matches = bool(date_text and date_text in line)
+            number_matches = bool(
+                number_text
+                and re.search(rf"(?:^|\b)(?:no\.?|number)?\s*{re.escape(number_text)}(?:\b|$)", line)
+            )
+            subject_matches = bool(subject_text and subject_text in line)
+            if date_matches or (number_matches and (subject_matches or not subject_text)):
+                seen_ids.add(session_id)
+                matched_ids.append(session_id)
+                break
+
+    return matched_ids
+
+
+def get_coverage_card_covered_session_ids(
+    card: dict[str, Any],
+    original_session_items: list[dict[str, Any]],
+) -> list[str]:
+    selected_session_ids = get_coverage_card_selected_session_ids(card)
+    if selected_session_ids:
+        return selected_session_ids
+
+    session_file_ids = get_coverage_card_session_file_ids(card)
+    if session_file_ids:
+        return session_file_ids
+
+    inferred_session_ids = infer_coverage_card_session_ids_from_details(card, original_session_items)
+    if inferred_session_ids:
+        return inferred_session_ids
+
+    if len(original_session_items) == 1:
+        session_id = sanitize_text(original_session_items[0].get("id"))
+        return [session_id] if session_id else []
+
+    return []
+
+
+def get_coverage_card_selected_session_ids(card: dict[str, Any]) -> list[str]:
+    return normalize_coverage_selected_session_ids(normalize_json_object(card).get("selectedSessionIds"))
+
+
+def get_coverage_card_session_file_ids(card: dict[str, Any]) -> list[str]:
+    session_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for group in normalize_coverage_session_file_groups(normalize_json_object(card).get("sessionFiles")):
+        session_id = sanitize_text(group.get("id"))
+        if not session_id or session_id in seen_ids:
+            continue
+        seen_ids.add(session_id)
+        session_ids.append(session_id)
+    return session_ids
+
+
+def is_coverage_tutor_acceptance_complete(
+    documentation: dict[str, Any],
+    inquiry: Any = "",
+    metadata: Any = None,
+) -> bool:
+    documentation_payload = normalize_json_object(documentation)
+    original_session_items = build_coverage_original_session_items(
+        metadata=metadata,
+        documentation=documentation_payload,
+        inquiry=documentation_payload.get("inquiry") or inquiry,
+    )
+    original_session_ids = [
+        item["id"]
+        for item in original_session_items
+        if sanitize_text(item.get("id"))
+    ]
+    if not original_session_ids:
+        return True
+
+    original_session_id_set = set(original_session_ids)
+    covered_session_ids: set[str] = set()
+    for raw_card in documentation_payload.get("coverageCards") or []:
+        card = normalize_json_object(raw_card)
+        if sanitize_text(card.get("type")) != "tutor_choice":
+            continue
+        if sanitize_text(card.get("requestStatus")).lower() != "accepted":
+            continue
+
+        covered_session_ids.update(
+            session_id
+            for session_id in get_coverage_card_covered_session_ids(card, original_session_items)
+            if session_id in original_session_id_set
+        )
+
+    return original_session_id_set.issubset(covered_session_ids)
+
+
 def build_coverage_ticket_operations_webhook_payload(
     *,
     public_id: str,
@@ -4273,10 +6459,14 @@ def build_coverage_ticket_operations_webhook_payload(
     requester_role: str,
     category: str,
     technical_subcategory: str,
+    subject: str,
     inquiry: str,
     priority: str,
     evidence_count: int,
     attachment_rows: list[dict[str, Any]] | None = None,
+    submitted_for_learner: dict[str, Any] | None = None,
+    notify_submitted_for_learner: bool = False,
+    submitted_for_notification_email: Any = "",
 ) -> dict[str, Any]:
     parsed_inquiry = parse_coverage_inquiry_details(inquiry) or {}
     public_base_url = get_support_portal_public_base_url("")
@@ -4292,6 +6482,7 @@ def build_coverage_ticket_operations_webhook_payload(
             "statusReason": "Coverage Ticket",
             "category": category,
             "technicalSubcategory": technical_subcategory,
+            "subject": subject,
             "priority": priority,
             "assignedTeam": ticket_row.get("assigned_team") or "Unassigned",
             "slaStatus": ticket_row.get("sla_status") or "",
@@ -4303,6 +6494,11 @@ def build_coverage_ticket_operations_webhook_payload(
             "email": learner.get("email") or "",
             "role": requester_role,
         },
+        "submittedFor": build_submitted_for_learner_payload(
+            submitted_for_learner,
+            notify_by_email=notify_submitted_for_learner,
+            notification_email=submitted_for_notification_email,
+        ),
         "coverage": {
             "tutor": parsed_inquiry.get("tutor") or "",
             "module": parsed_inquiry.get("module") or "",
@@ -4587,15 +6783,14 @@ def build_support_notification_webhook_payload(
 ) -> dict[str, Any]:
     public_base_url = get_support_portal_public_base_url("")
     dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
-    recipient_type = (
-        "operations"
-        if event in {
-            SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE,
-            SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
-        }
-        else "requester"
-    )
+    if event in {SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE, SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED}:
+        recipient_type = "operations"
+    elif event == SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED:
+        recipient_type = "ai_team_person"
+    else:
+        recipient_type = "requester"
     ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    ai_team_request = get_ai_team_request(ticket_metadata)
     requester_role = get_ticket_requester_role(ticket_metadata)
     requester_source = get_ticket_requester_source(
         ticket_metadata,
@@ -4610,17 +6805,33 @@ def build_support_notification_webhook_payload(
     )
     notification_status = status or sanitize_text(ticket.get("status"))
     notification_status_reason = status_reason if status_reason is not None else sanitize_text(ticket.get("status_reason"))
+    submitted_for_payload = normalize_json_object(ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+    if not submitted_for_payload and ticket.get("submitted_for_learner_id"):
+        submitted_for_payload = {
+            "id": int(ticket["submitted_for_learner_id"]),
+            "externalLearnerId": sanitize_text(ticket.get("submitted_for_external_learner_id")),
+            "fullName": sanitize_text(ticket.get("submitted_for_learner_name")) or sanitize_text(ticket.get("submitted_for_learner_email")),
+            "email": sanitize_text(ticket.get("submitted_for_learner_email")),
+        }
+    if submitted_for_payload:
+        submitted_for_payload["notifyByEmail"] = normalize_bool(
+            submitted_for_payload.get("notifyByEmail")
+            if "notifyByEmail" in submitted_for_payload
+            else ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY)
+        )
 
     # Operations mail is addressed from here, so a change of rota is a settings
     # change rather than an edit inside n8n. The learner's own notifications
     # still go to the learner, so they carry no operations addresses.
-    recipients = (
-        get_support_operations_notification_emails()
-        if recipient_type == "operations"
-        else [requester_email] if requester_email else []
-    )
+    if recipient_type == "operations":
+        recipients = get_support_operations_notification_emails()
+    elif recipient_type == "ai_team_person":
+        ai_team_email = normalize_email((ai_team_request or {}).get("personEmail"))
+        recipients = [ai_team_email] if ai_team_email else []
+    else:
+        recipients = [requester_email] if requester_email else []
 
-    return {
+    payload = {
         "event": event,
         "source": "support_portal",
         "recipientType": recipient_type,
@@ -4631,6 +6842,7 @@ def build_support_notification_webhook_payload(
             "statusReason": notification_status_reason,
             "category": ticket.get("category"),
             "technicalSubcategory": ticket.get("technical_subcategory") or "",
+            "subject": sanitize_text(ticket.get("subject")) or sanitize_text(ticket_metadata.get("subject")),
             "priority": ticket.get("priority") or "",
             "assignedTeam": ticket.get("assigned_team") or "Unassigned",
             "slaStatus": ticket.get("sla_status") or "",
@@ -4643,6 +6855,7 @@ def build_support_notification_webhook_payload(
             "role": requester_role,
             "source": requester_source,
         },
+        "submittedFor": submitted_for_payload or None,
         "liveChat": {
             "requestedAt": serialize_datetime_value(requested_at) if requested_at else "",
             "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
@@ -4653,6 +6866,32 @@ def build_support_notification_webhook_payload(
             "closedAt": serialize_datetime_value(closed_at) if closed_at else "",
         },
     }
+    if ai_team_request:
+        payload["aiTeamPerson"] = ai_team_request
+    if event == SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED:
+        payload["ticket"]["inquiry"] = sanitize_text(ticket.get("inquiry"))
+
+    return payload
+
+
+def send_webhook_with_optional_attachments(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout_seconds: int = 20,
+) -> tuple[bool, bool, int | None, Any]:
+    files = [normalize_json_object(file) for file in (attachments or []) if normalize_json_object(file)]
+    if files:
+        return post_multipart_webhook(
+            url,
+            strip_webhook_attachment_binary_fields(payload),
+            files,
+            headers=headers,
+            timeout_seconds=timeout_seconds,
+        )
+    return post_json_webhook(url, payload, headers=headers, timeout_seconds=timeout_seconds)
 
 
 def _is_retryable_notification_failure(status: int | None, response_payload: Any) -> bool:
@@ -4681,14 +6920,18 @@ def _is_retryable_notification_failure(status: int | None, response_payload: Any
     return not timed_out
 
 
-def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]:
+def send_support_notification_webhook(
+    payload: dict[str, Any],
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     # Every attempt carries the same X-Support-Delivery-Key, so a receiver that
     # checks it can recognise a repeat. See _is_retryable_notification_failure
     # for which failures are sent again and why a timeout is not one of them.
     delivery_key = ":".join(
         part for part in (
             sanitize_text(payload.get("event")),
-            sanitize_text(payload.get("ticketId")),
+            sanitize_text(payload.get("ticketId") or normalize_json_object(payload.get("ticket")).get("id")),
             sanitize_text(payload.get("recipientType")),
         ) if part
     )
@@ -4698,9 +6941,10 @@ def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]
     status = None
     response_payload: Any = None
     for attempts in range(1, SUPPORT_NOTIFICATION_MAX_ATTEMPTS + 1):
-        configured, delivered, status, response_payload = post_json_webhook(
+        configured, delivered, status, response_payload = send_webhook_with_optional_attachments(
             get_support_notification_webhook_url(),
             payload,
+            attachments=attachments,
             headers=request_headers,
             timeout_seconds=SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS,
         )
@@ -4720,6 +6964,75 @@ def send_support_notification_webhook(payload: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def deliver_support_notification(
+    *,
+    ticket_id: int,
+    ticket_public_id: str,
+    event: str,
+    payload: dict[str, Any],
+    sent_metadata_key: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    delivered_event_type, failed_event_type = SUPPORT_NOTIFICATION_HISTORY_EVENTS.get(
+        event,
+        ("support_notification_delivered", "support_notification_failed"),
+    )
+
+    try:
+        files = [normalize_json_object(file) for file in (attachments or []) if normalize_json_object(file)]
+        result = (
+            send_support_notification_webhook(payload, attachments=files)
+            if files
+            else send_support_notification_webhook(payload)
+        )
+    except Exception:
+        result = {"configured": True, "delivered": False, "status": None, "response": None}
+
+    delivered_at = datetime.now(timezone.utc)
+    delivered = bool(result.get("delivered"))
+    if delivered and sent_metadata_key:
+        try:
+            persist_ticket_metadata_patch(ticket_id, {sent_metadata_key: serialize_datetime_value(delivered_at)})
+        except Exception:
+            logger.warning(
+                "Failed to persist support notification metadata for ticket %s",
+                ticket_public_id,
+                exc_info=True,
+            )
+
+    try:
+        insert_history_event(
+            ticket_id,
+            delivered_event_type if delivered else failed_event_type,
+            {"role": "system", "label": "support_notification"},
+            {
+                "event": event,
+                "ticketId": ticket_public_id,
+                "recipientType": payload.get("recipientType"),
+                "requesterName": payload.get("requester", {}).get("name"),
+                "requesterEmail": payload.get("requester", {}).get("email"),
+                "webhookConfigured": bool(result.get("configured")),
+                "webhookDelivered": delivered,
+                "webhookStatus": result.get("status"),
+                "webhookAttempts": result.get("attempts", 1),
+                "webhookDeliveryKey": result.get("deliveryKey", ""),
+                "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Failed to record support notification history for ticket %s",
+            ticket_public_id,
+            exc_info=True,
+        )
+
+    return {
+        **result,
+        "deliveredAt": delivered_at,
+        "historyEventType": delivered_event_type if delivered else failed_event_type,
+    }
+
+
 def queue_support_notification_delivery(
     *,
     ticket_id: int,
@@ -4727,58 +7040,24 @@ def queue_support_notification_delivery(
     event: str,
     payload: dict[str, Any],
     sent_metadata_key: str,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> None:
-    if not get_support_notification_webhook_url():
+    if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
         return
 
-    delivered_event_type, failed_event_type = SUPPORT_NOTIFICATION_HISTORY_EVENTS.get(
-        event,
-        ("support_notification_delivered", "support_notification_failed"),
-    )
-
     def deliver() -> None:
+        close_old_connections()
         try:
-            result = send_support_notification_webhook(payload)
-        except Exception:
-            result = {"configured": True, "delivered": False, "status": None, "response": None}
-
-        delivered_at = datetime.now(timezone.utc)
-        delivered = bool(result.get("delivered"))
-        if delivered and sent_metadata_key:
-            try:
-                persist_ticket_metadata_patch(ticket_id, {sent_metadata_key: serialize_datetime_value(delivered_at)})
-            except Exception:
-                logger.warning(
-                    "Failed to persist support notification metadata for ticket %s",
-                    ticket_public_id,
-                    exc_info=True,
-                )
-
-        try:
-            insert_history_event(
-                ticket_id,
-                delivered_event_type if delivered else failed_event_type,
-                {"role": "system", "label": "support_notification"},
-                {
-                    "event": event,
-                    "ticketId": ticket_public_id,
-                    "recipientType": payload.get("recipientType"),
-                    "requesterName": payload.get("requester", {}).get("name"),
-                    "requesterEmail": payload.get("requester", {}).get("email"),
-                    "webhookConfigured": bool(result.get("configured")),
-                    "webhookDelivered": delivered,
-                    "webhookStatus": result.get("status"),
-                    "webhookAttempts": result.get("attempts", 1),
-                    "webhookDeliveryKey": result.get("deliveryKey", ""),
-                    "deliveredAt": serialize_datetime_value(delivered_at) if delivered else "",
-                },
+            deliver_support_notification(
+                ticket_id=ticket_id,
+                ticket_public_id=ticket_public_id,
+                event=event,
+                payload=payload,
+                sent_metadata_key=sent_metadata_key,
+                attachments=attachments,
             )
-        except Exception:
-            logger.warning(
-                "Failed to record support notification history for ticket %s",
-                ticket_public_id,
-                exc_info=True,
-            )
+        finally:
+            close_old_connections()
 
     thread = threading.Thread(
         target=deliver,
@@ -4796,11 +7075,33 @@ def should_notify_quick_ticket_submitted(
     next_status: Any,
     next_status_reason: Any,
 ) -> bool:
-    if is_coverage_ticket_record(ticket):
+    if is_coverage_ticket_record(ticket) or is_ai_team_ticket_record(ticket):
         return False
 
     metadata = normalize_json_object(ticket.get("metadata"))
     if metadata.get(QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+
+    was_quick_ticket = sanitize_text(previous_status) == "Pending" and is_quick_ticket_status_reason(previous_status_reason)
+    is_now_quick_ticket = sanitize_text(next_status) == "Pending" and is_quick_ticket_status_reason(next_status_reason)
+    return is_now_quick_ticket and not was_quick_ticket
+
+
+def should_notify_ai_team_ticket_submitted(
+    ticket: dict[str, Any],
+    *,
+    previous_status: Any,
+    previous_status_reason: Any,
+    next_status: Any,
+    next_status_reason: Any,
+) -> bool:
+    if not is_ai_team_ticket_record(ticket):
+        return False
+
+    metadata = normalize_json_object(ticket.get("metadata"))
+    if metadata.get(AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY):
+        return False
+    if not get_ai_team_request(metadata):
         return False
 
     was_quick_ticket = sanitize_text(previous_status) == "Pending" and is_quick_ticket_status_reason(previous_status_reason)
@@ -4842,6 +7143,27 @@ def queue_quick_ticket_submitted_notification(ticket: dict[str, Any], *, status:
         event=SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
         payload=payload,
         sent_metadata_key=QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+    )
+
+
+def queue_ai_team_ticket_submitted_notification(ticket: dict[str, Any], *, status: str, status_reason: str) -> None:
+    payload = build_support_notification_webhook_payload(
+        SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
+        ticket,
+        status=status,
+        status_reason=status_reason,
+    )
+    payload, files_to_attach = prepare_support_notification_webhook_delivery_payload(
+        payload,
+        list_ticket_evidence_webhook_files(ticket.get("id")),
+    )
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]),
+        ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED,
+        payload=payload,
+        sent_metadata_key=AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+        attachments=files_to_attach,
     )
 
 
@@ -4969,6 +7291,8 @@ def build_derived_coverage_tutor_choice_card(
         "confirmedByAgentName": "",
         "confirmedByAgentUsername": "",
         "presentationFiles": [],
+        "selectedSessionIds": [],
+        "sessionFiles": [],
     }
 
 
@@ -5560,7 +7884,12 @@ def synchronize_coverage_tutor_workflow_ticket(
         else sanitize_text(ticket.get("status_reason"))
     )
     status_reason_changed = next_status_reason != sanitize_text(ticket.get("status_reason"))
-    next_status = "Closed" if effective_outcome == "accepted" else sanitize_text(ticket.get("status")) or "Pending"
+    acceptance_complete = effective_outcome == "accepted" and is_coverage_tutor_acceptance_complete(
+        derived_documentation,
+        inquiry=ticket.get("inquiry"),
+        metadata=ticket_metadata,
+    )
+    next_status = "Closed" if acceptance_complete else sanitize_text(ticket.get("status")) or "Pending"
     status_changed = next_status != sanitize_text(ticket.get("status"))
 
     if not documentation_changed and not latest_response_changed and not status_changed and not status_reason_changed:
@@ -5576,12 +7905,22 @@ def synchronize_coverage_tutor_workflow_ticket(
         next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
             ticket,
             next_status,
+            status_reason=next_status_reason,
             metadata=updated_ticket_metadata,
         )
 
     next_chat_state = sanitize_text(ticket.get("conversation_status")) or map_conversation_status(next_status)
     if status_changed:
         next_chat_state = map_conversation_status(next_status)
+    updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        updated_ticket_metadata,
+        {
+            **ticket,
+            "status": next_status,
+            "status_reason": next_status_reason,
+        },
+        chat_state=next_chat_state,
+    )
 
     sync_timestamp = datetime.now(timezone.utc)
     with connection.cursor() as cursor:
@@ -5593,6 +7932,13 @@ def synchronize_coverage_tutor_workflow_ticket(
               status_reason = %s,
               sla_status = %s,
               metadata = %s::jsonb,
+              ticket_type = %s,
+              workflow_stage = %s,
+              queue_scope = %s,
+              dashboard_bucket = %s,
+              can_show_conversation = %s,
+              can_receive_chat = %s,
+              resolution_reason = %s,
               updated_at = NOW(),
               closed_at = CASE
                 WHEN %s = 'Closed' THEN COALESCE(closed_at, NOW())
@@ -5605,6 +7951,7 @@ def synchronize_coverage_tutor_workflow_ticket(
                 next_status_reason,
                 next_sla_status,
                 json.dumps(updated_ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
                 next_status,
                 ticket["id"],
             ],
@@ -5711,6 +8058,8 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
     auth_database_url = get_support_auth_database_url()
     if not normalized_value or not auth_database_url:
         return None
+    team_group_lookup = get_custom_support_team_auth_group_lookup()
+    team_group_names = list(team_group_lookup.keys())
 
     lookup_params: list[Any]
     if lookup_kind == "id":
@@ -5761,7 +8110,14 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
                     INNER JOIN auth_group g ON g.id = ug.group_id
                     WHERE ug.user_id = u.id
                       AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_admin_access
+                  ) AS has_admin_access,
+                  ARRAY(
+                    SELECT LOWER(TRIM(g.name))
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = ANY(%s::text[])
+                  ) AS team_access_group_names
                 FROM auth_user u
                 WHERE {lookup_clause}
                   AND u.is_active = TRUE
@@ -5771,6 +8127,7 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
                     SUPPORT_ACCESS_GROUP_NAME,
                     OPERATIONS_ACCESS_GROUP_NAME,
                     ADMIN_ACCESS_GROUP_NAME,
+                    team_group_names,
                     *lookup_params,
                 ],
             )
@@ -5792,8 +8149,10 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
         has_support_access,
         has_operations_access,
         has_admin_access,
+        team_access_group_names,
     ) = row
-    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access)):
+    team_access_keys = build_team_access_keys_from_auth_groups(team_access_group_names, team_group_lookup)
+    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access) or team_access_keys):
         return None
 
     full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
@@ -5812,6 +8171,7 @@ def _fetch_legacy_support_user_by_lookup(value: str, *, lookup_kind: str) -> dic
         "has_support_access": bool(has_support_access),
         "has_operations_access": bool(has_operations_access),
         "has_admin_access": bool(has_admin_access),
+        "team_access_keys": team_access_keys,
     }
 
 
@@ -5872,7 +8232,10 @@ def apply_public_requester_role_overrides(email: Any, requester_role: Any) -> st
     return normalized_role
 
 
-def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None:
+def _legacy_support_user_from_row(
+    row: tuple[Any, ...],
+    team_group_lookup: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     (
         user_id,
         username_val,
@@ -5886,8 +8249,10 @@ def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None
         has_support_access,
         has_operations_access,
         has_admin_access,
+        team_access_group_names,
     ) = row
-    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access)):
+    team_access_keys = build_team_access_keys_from_auth_groups(team_access_group_names, team_group_lookup or {})
+    if not (bool(has_support_access) or bool(has_operations_access) or bool(has_admin_access) or team_access_keys):
         return None
 
     full_name = " ".join(part for part in [sanitize_text(first_name), sanitize_text(last_name)] if part).strip()
@@ -5906,6 +8271,7 @@ def _legacy_support_user_from_row(row: tuple[Any, ...]) -> dict[str, Any] | None
         "has_support_access": bool(has_support_access),
         "has_operations_access": bool(has_operations_access),
         "has_admin_access": bool(has_admin_access),
+        "team_access_keys": team_access_keys,
     }
 
 
@@ -5947,6 +8313,8 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
 
     if not legacy_ids and not emails and not usernames:
         return {"id": {}, "email": {}, "username": {}}
+    team_group_lookup = get_custom_support_team_auth_group_lookup()
+    team_group_names = list(team_group_lookup.keys())
 
     with psycopg.connect(auth_database_url) as source_connection:
         with source_connection.cursor() as cursor:
@@ -5982,7 +8350,14 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
                     INNER JOIN auth_group g ON g.id = ug.group_id
                     WHERE ug.user_id = u.id
                       AND LOWER(TRIM(g.name)) = %s
-                  ) AS has_admin_access
+                  ) AS has_admin_access,
+                  ARRAY(
+                    SELECT LOWER(TRIM(g.name))
+                    FROM auth_user_groups ug
+                    INNER JOIN auth_group g ON g.id = ug.group_id
+                    WHERE ug.user_id = u.id
+                      AND LOWER(TRIM(g.name)) = ANY(%s::text[])
+                  ) AS team_access_group_names
                 FROM auth_user u
                 WHERE u.is_active = TRUE
                   AND (
@@ -5995,6 +8370,7 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
                     SUPPORT_ACCESS_GROUP_NAME,
                     OPERATIONS_ACCESS_GROUP_NAME,
                     ADMIN_ACCESS_GROUP_NAME,
+                    team_group_names,
                     list(legacy_ids),
                     list(emails),
                     list(usernames),
@@ -6006,7 +8382,7 @@ def fetch_legacy_support_users_for_accounts(accounts: list[dict[str, Any]]) -> d
     users_by_email: dict[str, dict[str, Any]] = {}
     users_by_username: dict[str, dict[str, Any]] = {}
     for row in rows:
-        legacy_user = _legacy_support_user_from_row(row)
+        legacy_user = _legacy_support_user_from_row(row, team_group_lookup)
         if not legacy_user:
             continue
         users_by_id[int(legacy_user["id"])] = legacy_user
@@ -6097,6 +8473,7 @@ def refresh_staff_account_legacy_access(
                 "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
                 "legacy_operations_access": normalize_bool(legacy_user.get("has_operations_access")),
                 "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
+                "team_access_keys": sorted(normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys"))),
             }
         )
     elif has_legacy_marker:
@@ -6106,10 +8483,17 @@ def refresh_staff_account_legacy_access(
                 "legacy_support_access": False,
                 "legacy_operations_access": False,
                 "legacy_admin_access": False,
+                "team_access_keys": [],
                 "session_active": False,
                 "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
             }
         )
+
+    if persist:
+        if legacy_user:
+            sync_account_team_access_from_legacy_user(int(account["id"]), legacy_user)
+        elif has_legacy_marker:
+            sync_account_team_access_from_legacy_user(int(account["id"]), {})
 
     if refreshed_metadata != metadata:
         if persist:
@@ -6352,6 +8736,8 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           t.public_id,
           t.category,
           t.technical_subcategory,
+          t.subject,
+          t.submitted_for_learner_id,
           t.inquiry,
           t.status,
           t.status_reason,
@@ -6377,6 +8763,7 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
           )
         ORDER BY
           CASE
+            WHEN t.status = 'Pending' AND COALESCE(t.metadata #>> '{ticket_state,workflowStage}', '') = 'awaiting_meeting' THEN 0
             WHEN t.status = 'Pending' AND t.status_reason = %s THEN 0
             WHEN t.status = 'Open' THEN 1
             ELSE 2
@@ -6387,6 +8774,124 @@ def find_latest_active_ticket_for_learner(learner_id: int) -> dict[str, Any] | N
         """,
         [learner_id, STATUS_REASON_AWAITING_MEETING],
     )
+
+
+def serialize_public_requester_ticket(
+    ticket: dict[str, Any],
+    *,
+    requester_email: str,
+    requester_name: str,
+    requester_role: str,
+    requester_source: str,
+) -> dict[str, Any]:
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    ticket_requester_role = apply_public_requester_role_overrides(
+        requester_email,
+        get_ticket_requester_role(ticket_metadata, default=requester_role),
+    )
+    ticket_requester_source = get_ticket_requester_source(ticket_metadata, default=requester_source)
+    ai_team_request = get_ai_team_request(ticket_metadata)
+    serialized_ticket = {
+        "id": ticket["public_id"],
+        "learnerName": requester_name,
+        "requesterName": requester_name,
+        "email": requester_email,
+        "requesterRole": ticket_requester_role,
+        "category": ticket["category"],
+        "technicalSubcategory": ticket.get("technical_subcategory") or "",
+        "subject": sanitize_text(ticket.get("subject")),
+        "inquiry": ticket.get("inquiry") or "",
+        "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+        "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
+        "status": ticket["status"],
+        "statusReason": ticket.get("status_reason") or "",
+        "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
+        "assignedTeam": ticket.get("assigned_team") or "Unassigned",
+        "slaStatus": ticket["sla_status"],
+        "createdAt": ticket["created_at"],
+        "updatedAt": ticket.get("updated_at") or ticket["created_at"],
+        "chatState": derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status")),
+        "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
+    }
+    if ticket_requester_source:
+        serialized_ticket["requesterSource"] = ticket_requester_source
+    return serialized_ticket
+
+
+def list_public_requester_tickets(payload: dict[str, Any]) -> dict[str, Any]:
+    email = normalize_email(payload.get("email"))
+
+    if not is_valid_email(email):
+        raise ApiError(400, "Please enter a valid email address.")
+
+    requester = resolve_public_support_requester(email)
+    if not requester:
+        raise ApiError(404, "This email is not registered in our records.")
+
+    learner = requester.get("learner")
+    requester_role = requester["role"]
+    requester_source = get_public_requester_source(requester)
+    requester_name = requester.get("display_name") or (learner.get("full_name") if learner else "")
+    response = {
+        "exists": True,
+        "requesterRole": requester_role,
+        "requesterSource": requester_source,
+        "learner": {
+            "id": learner["id"] if learner else None,
+            "fullName": requester_name,
+            "email": email,
+        },
+        "tickets": [],
+    }
+
+    if not learner:
+        return response
+
+    tickets = run_query(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          t.category,
+          t.technical_subcategory,
+          t.subject,
+          t.submitted_for_learner_id,
+          t.inquiry,
+          t.status,
+          t.status_reason,
+          t.assigned_agent_id,
+          t.assigned_team,
+          t.sla_status,
+          t.created_at,
+          t.updated_at,
+          t.metadata,
+          c.status AS conversation_status,
+          c.metadata AS conversation_metadata
+        FROM tickets t
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        WHERE t.learner_id = %s
+          AND COALESCE(t.is_archived, FALSE) = FALSE
+        ORDER BY t.updated_at DESC, t.id DESC
+        LIMIT 25
+        """,
+        [int(learner["id"])],
+    )
+
+    response["tickets"] = [
+        {
+            **serialize_public_requester_ticket(
+                ticket,
+                requester_email=email,
+                requester_name=requester_name,
+                requester_role=requester_role,
+                requester_source=requester_source,
+            ),
+            "bookingSummary": get_latest_ticket_booking_summary(int(ticket["id"])),
+        }
+        for ticket in tickets
+    ]
+    return response
 
 
 def is_chat_locked_for_learner(ticket_status: Any, ticket_status_reason: Any) -> bool:
@@ -6430,6 +8935,10 @@ def is_quick_ticket_record(ticket: dict[str, Any] | None) -> bool:
         return True
 
     metadata = normalize_json_object(ticket.get("metadata"))
+    if not normalize_bool(ticket.get("_ignore_persisted_ticket_state")):
+        ticket_state = normalize_json_object(metadata.get(TICKET_STATE_METADATA_KEY))
+        if sanitize_text(ticket_state.get("ticketType")) == "quick":
+            return True
     return (
         normalize_bool(metadata.get(QUICK_TICKET_ORIGIN_METADATA_KEY))
         or is_quick_ticket_status_reason(ticket.get("status_reason"))
@@ -6472,18 +8981,943 @@ def is_coverage_ticket_record(ticket: dict[str, Any] | None) -> bool:
         return True
 
     metadata = normalize_json_object(ticket.get("metadata"))
+    if not normalize_bool(ticket.get("_ignore_persisted_ticket_state")):
+        ticket_state = normalize_json_object(metadata.get(TICKET_STATE_METADATA_KEY))
+        if sanitize_text(ticket_state.get("ticketType")) == "coverage":
+            return True
     return sanitize_text(metadata.get("technical_subcategory")).lower() == "coverage"
+
+
+def build_support_team_key(value: Any) -> str:
+    normalized_value = sanitize_text(value).lower()
+    normalized_value = re.sub(r"[^a-z0-9]+", "_", normalized_value).strip("_")
+    if not normalized_value:
+        return ""
+    if not normalized_value[0].isalpha():
+        normalized_value = f"team_{normalized_value}"
+    return normalized_value[:64]
+
+
+def normalize_support_team_key(value: Any) -> str:
+    normalized_value = sanitize_text(value).lower()
+    if not normalized_value:
+        raise ApiError(400, "Team key is required.")
+    if normalized_value == "unassigned":
+        raise ApiError(400, "Team key is reserved.")
+    if not SUPPORT_TEAM_KEY_PATTERN.match(normalized_value):
+        raise ApiError(400, "Team key must start with a letter and use letters, numbers, hyphens or underscores.")
+    return normalized_value
+
+
+def normalize_auth_group_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", sanitize_text(value)).strip()
+
+
+def normalize_auth_group_lookup(value: Any) -> str:
+    return normalize_auth_group_name(value).casefold()
+
+
+def build_support_team_access_group_name(team_name: Any, team_key: Any = "") -> str:
+    label = normalize_auth_group_name(team_name)
+    if not label:
+        label = normalize_auth_group_name(re.sub(r"[-_]+", " ", sanitize_text(team_key)))
+    if not label:
+        raise ApiError(400, "Team name is required.")
+    if label.casefold().endswith(" access"):
+        return label
+    return f"{label} Access"
+
+
+def get_support_team_auth_group_name(team: dict[str, Any] | None) -> str:
+    if not isinstance(team, dict):
+        return ""
+
+    team_key = sanitize_text(team.get("key")).lower()
+    if team_key == TICKET_RECEIVER_SCOPE_SUPPORT:
+        return SUPPORT_ACCESS_GROUP_NAME
+    if team_key == TICKET_RECEIVER_SCOPE_OPERATIONS:
+        return OPERATIONS_ACCESS_GROUP_NAME
+
+    metadata = normalize_json_object(team.get("metadata"))
+    for metadata_key in (
+        SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY,
+        "authGroupName",
+        "legacy_auth_group_name",
+        "legacyAuthGroupName",
+    ):
+        group_name = normalize_auth_group_name(metadata.get(metadata_key))
+        if group_name:
+            return group_name
+
+    return build_support_team_access_group_name(team.get("name"), team_key)
+
+
+def get_custom_support_team_auth_group_lookup() -> dict[str, str]:
+    try:
+        rows = run_query(
+            """
+            SELECT key, name, metadata
+            FROM support_teams
+            WHERE is_active = TRUE
+            """
+        )
+    except Exception:
+        return {}
+
+    lookup: dict[str, str] = {}
+    for row in rows:
+        team_key = sanitize_text(row.get("key")).lower()
+        if not team_key or team_key in LEGACY_TEAM_ROUTING_POLICY_KEYS:
+            continue
+        group_lookup = normalize_auth_group_lookup(get_support_team_auth_group_name(row))
+        if group_lookup:
+            lookup[group_lookup] = team_key
+    return lookup
+
+
+def build_team_access_keys_from_auth_groups(group_names: Any, group_lookup: dict[str, str]) -> list[str]:
+    if not isinstance(group_names, (list, tuple, set)):
+        return []
+
+    team_keys: list[str] = []
+    seen: set[str] = set()
+    for group_name in group_names:
+        team_key = group_lookup.get(normalize_auth_group_lookup(group_name))
+        if team_key and team_key not in seen:
+            seen.add(team_key)
+            team_keys.append(team_key)
+    return team_keys
+
+
+def build_team_routing_policy_from_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+
+    team_key = sanitize_text(row.get("key")).lower()
+    team_name = sanitize_text(row.get("name"))
+    if not team_key or not team_name:
+        return None
+
+    return {
+        "id": int(row["id"]) if row.get("id") else None,
+        "key": team_key,
+        "assigned_team": team_name,
+        "receiver_access_metadata_key": (
+            sanitize_text(row.get("receiver_access_metadata_key"))
+            or f"team_access:{team_key}"
+        ),
+        "receiver_error_ticket_label": sanitize_text(row.get("receiver_error_ticket_label")) or team_name,
+    }
+
+
+def serialize_support_team(row: dict[str, Any]) -> dict[str, Any]:
+    policy = build_team_routing_policy_from_row(row) or {}
+    return {
+        "id": int(row["id"]) if row.get("id") else None,
+        "key": policy.get("key") or sanitize_text(row.get("key")).lower(),
+        "name": policy.get("assigned_team") or sanitize_text(row.get("name")),
+        "assignedTeam": policy.get("assigned_team") or sanitize_text(row.get("name")),
+        "label": policy.get("assigned_team") or sanitize_text(row.get("name")),
+        "description": sanitize_text(row.get("description")),
+        "receiverAccessMetadataKey": policy.get("receiver_access_metadata_key") or "",
+        "receiverErrorTicketLabel": policy.get("receiver_error_ticket_label") or "",
+        "isActive": normalize_bool(row.get("is_active")) if "is_active" in row else True,
+        "authGroupName": get_support_team_auth_group_name(row),
+        "metadata": normalize_json_object(row.get("metadata")),
+    }
+
+
+def get_default_support_team_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": None,
+            "key": policy["key"],
+            "name": policy["assigned_team"],
+            "description": "",
+            "receiver_access_metadata_key": policy["receiver_access_metadata_key"],
+            "receiver_error_ticket_label": policy["receiver_error_ticket_label"],
+            "is_active": True,
+            "metadata": {"fallback": True, "legacyTeam": True},
+        }
+        for policy in TEAM_ROUTING_POLICIES.values()
+    ]
+
+
+def fetch_optional_dynamic_team_row_by_assigned_team(assigned_team: Any) -> dict[str, Any] | None:
+    normalized_assigned_team = sanitize_text(assigned_team)
+    if not normalized_assigned_team:
+        return None
+
+    normalized_lookup = normalized_assigned_team.casefold()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, key, name, description, receiver_access_metadata_key,
+                       receiver_error_ticket_label, is_active, metadata
+                FROM support_teams
+                WHERE is_active = TRUE
+                  AND (
+                    LOWER(TRIM(name)) = %s
+                    OR LOWER(TRIM(key)) = %s
+                  )
+                LIMIT 1
+                """,
+                [normalized_lookup, normalized_lookup],
+            )
+            columns = cursor.description
+            row = cursor.fetchone()
+            if not row or not isinstance(columns, (list, tuple)):
+                return None
+            return dict(zip([column[0] for column in columns], row))
+    except Exception:
+        return None
+
+
+def fetch_optional_account_team_access(account_id: Any, team_key: Any) -> bool:
+    normalized_account_id = parse_int(account_id)
+    normalized_team_key = sanitize_text(team_key).lower()
+    if normalized_account_id <= 0 or not normalized_team_key:
+        return False
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM support_account_team_access ata
+                JOIN support_teams st
+                  ON st.id = ata.team_id
+                WHERE ata.account_id = %s
+                  AND st.key = %s
+                  AND st.is_active = TRUE
+                  AND ata.can_receive_tickets = TRUE
+                LIMIT 1
+                """,
+                [normalized_account_id, normalized_team_key],
+            )
+            row = cursor.fetchone()
+            return isinstance(row, (list, tuple, dict))
+    except Exception:
+        return False
+
+
+def fetch_optional_any_account_team_access(account_id: Any) -> bool:
+    normalized_account_id = parse_int(account_id)
+    if normalized_account_id <= 0:
+        return False
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM support_account_team_access ata
+                JOIN support_teams st
+                  ON st.id = ata.team_id
+                WHERE ata.account_id = %s
+                  AND st.is_active = TRUE
+                  AND ata.can_receive_tickets = TRUE
+                LIMIT 1
+                """,
+                [normalized_account_id],
+            )
+            row = cursor.fetchone()
+            return isinstance(row, (list, tuple, dict))
+    except Exception:
+        return False
+
+
+def normalize_preloaded_team_access_keys(value: Any) -> set[str]:
+    team_keys: set[str] = set()
+    if isinstance(value, dict):
+        for key, enabled in value.items():
+            normalized_key = sanitize_text(key).lower()
+            if normalized_key and normalize_bool(enabled):
+                team_keys.add(normalized_key)
+        return team_keys
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            if isinstance(item, str):
+                normalized_key = sanitize_text(item).lower()
+                if normalized_key:
+                    team_keys.add(normalized_key)
+                continue
+            if isinstance(item, dict):
+                normalized_key = sanitize_text(item.get("key")).lower()
+                receives_tickets = item.get("canReceiveTickets", item.get("can_receive_tickets", True))
+                if normalized_key and normalize_bool(receives_tickets):
+                    team_keys.add(normalized_key)
+        return team_keys
+
+    return team_keys
+
+
+def get_preloaded_account_team_access_keys(account: dict[str, Any] | None) -> set[str]:
+    if not isinstance(account, dict):
+        return set()
+
+    team_keys = normalize_preloaded_team_access_keys(account.get("team_access"))
+    team_keys.update(normalize_preloaded_team_access_keys(account.get("teamAccess")))
+    team_keys.update(normalize_preloaded_team_access_keys(account.get("team_access_keys")))
+    team_keys.update(normalize_preloaded_team_access_keys(account.get("teamAccessKeys")))
+    metadata = normalize_json_object(account.get("metadata"))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("team_access")))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("teamAccess")))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("team_access_keys")))
+    team_keys.update(normalize_preloaded_team_access_keys(metadata.get("teamAccessKeys")))
+    return team_keys
+
+
+def account_has_preloaded_team_access(account: dict[str, Any] | None, team_key: str) -> bool:
+    return sanitize_text(team_key).lower() in get_preloaded_account_team_access_keys(account)
+
+
+def apply_metadata_team_access_key(metadata: Any, team_key: Any, enabled: bool) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    normalized_metadata = normalize_json_object(metadata)
+    team_keys = get_preloaded_account_team_access_keys({"metadata": normalized_metadata})
+    if enabled:
+        team_keys.add(normalized_team_key)
+    else:
+        team_keys.discard(normalized_team_key)
+
+    # Keep one canonical local cache so stale legacy-shaped keys cannot re-enable a receiver.
+    normalized_metadata["team_access_keys"] = sorted(team_keys)
+    normalized_metadata.pop("teamAccessKeys", None)
+    normalized_metadata.pop("team_access", None)
+    normalized_metadata.pop("teamAccess", None)
+    return normalized_metadata
+
+
+def serialize_agent_team_access_from_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": sanitize_text(policy.get("key")).lower(),
+        "name": sanitize_text(policy.get("assigned_team")),
+        "assignedTeam": sanitize_text(policy.get("assigned_team")),
+        "label": sanitize_text(policy.get("assigned_team")),
+        "canReceiveTickets": True,
+    }
+
+
+def build_serialized_agent_team_access(row: dict[str, Any], metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    team_access_by_key: dict[str, dict[str, Any]] = {}
+
+    for item in row.get("team_access") or row.get("teamAccess") or []:
+        if not isinstance(item, dict):
+            continue
+        normalized_key = sanitize_text(item.get("key")).lower()
+        receives_tickets = item.get("canReceiveTickets", item.get("can_receive_tickets", True))
+        if not normalized_key or not normalize_bool(receives_tickets):
+            continue
+        team_access_by_key[normalized_key] = {
+            "key": normalized_key,
+            "name": sanitize_text(item.get("name") or item.get("assignedTeam") or item.get("assigned_team")),
+            "assignedTeam": sanitize_text(item.get("assignedTeam") or item.get("assigned_team") or item.get("name")),
+            "label": sanitize_text(item.get("label") or item.get("name") or item.get("assignedTeam")),
+            "canReceiveTickets": True,
+        }
+
+    for policy in TEAM_ROUTING_POLICIES.values():
+        if normalize_bool(metadata.get(policy["receiver_access_metadata_key"])):
+            team_access_by_key[policy["key"]] = serialize_agent_team_access_from_policy(policy)
+
+    for team_key in get_preloaded_account_team_access_keys(row):
+        if team_key not in team_access_by_key:
+            policy = next((item for item in TEAM_ROUTING_POLICIES.values() if item["key"] == team_key), None)
+            team_access_by_key[team_key] = (
+                serialize_agent_team_access_from_policy(policy)
+                if policy
+                else {
+                    "key": team_key,
+                    "name": team_key,
+                    "assignedTeam": team_key,
+                    "label": team_key,
+                    "canReceiveTickets": True,
+                }
+            )
+
+    return sorted(team_access_by_key.values(), key=lambda item: item["label"].casefold())
+
+
+def attach_account_team_access(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    account_ids = [int(account["id"]) for account in accounts if parse_int(account.get("id")) > 0]
+    if not account_ids:
+        return accounts
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  ata.account_id,
+                  ata.can_receive_tickets,
+                  st.id AS team_id,
+                  st.key,
+                  st.name,
+                  st.description,
+                  st.receiver_access_metadata_key,
+                  st.receiver_error_ticket_label,
+                  st.is_active,
+                  st.metadata
+                FROM support_account_team_access ata
+                JOIN support_teams st
+                  ON st.id = ata.team_id
+                WHERE ata.account_id = ANY(%s::bigint[])
+                  AND st.is_active = TRUE
+                  AND ata.can_receive_tickets = TRUE
+                ORDER BY st.name ASC
+                """,
+                [account_ids],
+            )
+            columns = cursor.description
+            fetched_rows = cursor.fetchall()
+            if not isinstance(columns, (list, tuple)) or not isinstance(fetched_rows, list):
+                return accounts
+            rows = [dict(zip([column[0] for column in columns], row)) for row in fetched_rows]
+    except Exception:
+        return accounts
+
+    access_by_account_id: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        account_id = parse_int(row.get("account_id"))
+        if account_id <= 0:
+            continue
+        access_by_account_id.setdefault(account_id, []).append(
+            {
+                **serialize_support_team(row),
+                "canReceiveTickets": normalize_bool(row.get("can_receive_tickets")),
+            }
+        )
+
+    return [
+        {
+            **account,
+            "team_access": access_by_account_id.get(int(account["id"]), []),
+        }
+        for account in accounts
+    ]
+
+
+def list_support_teams(*, include_inactive: bool = False) -> dict[str, Any]:
+    where_clause = "" if include_inactive else "WHERE is_active = TRUE"
+    try:
+        rows = run_query(
+            f"""
+            SELECT id, key, name, description, receiver_access_metadata_key,
+                   receiver_error_ticket_label, is_active, metadata
+            FROM support_teams
+            {where_clause}
+            ORDER BY name ASC
+            """
+        )
+    except Exception:
+        rows = get_default_support_team_rows()
+
+    return {"teams": [serialize_support_team(row) for row in rows]}
+
+
+def fetch_support_team_by_key(team_key: Any, *, active_only: bool = True) -> dict[str, Any] | None:
+    normalized_team_key = normalize_support_team_key(team_key)
+    active_filter = "AND is_active = TRUE" if active_only else ""
+    return run_query_one(
+        f"""
+        SELECT id, key, name, description, receiver_access_metadata_key,
+               receiver_error_ticket_label, is_active, metadata
+        FROM support_teams
+        WHERE key = %s
+          {active_filter}
+        LIMIT 1
+        """,
+        [normalized_team_key],
+    )
+
+
+def fetch_support_team_create_candidate(team_key: Any, team_name: Any) -> dict[str, Any] | None:
+    normalized_team_key = normalize_support_team_key(team_key)
+    normalized_team_name = sanitize_text(team_name).lower()
+    if not normalized_team_name:
+        return None
+
+    return run_query_one(
+        """
+        SELECT id, key, name, description, receiver_access_metadata_key,
+               receiver_error_ticket_label, is_active, metadata
+        FROM support_teams
+        WHERE key = %s
+           OR LOWER(TRIM(name)) = %s
+        ORDER BY
+          CASE WHEN key = %s THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [normalized_team_key, normalized_team_name, normalized_team_key],
+    )
+
+
+def ensure_legacy_auth_group_exists(group_name: Any, *, strict: bool = False) -> None:
+    normalized_group_name = normalize_auth_group_name(group_name)
+    normalized_group_lookup = normalize_auth_group_lookup(normalized_group_name)
+    if not normalized_group_name:
+        if strict:
+            raise ApiError(400, "A valid KBC auth access group is required.")
+        return
+
+    auth_database_url = get_support_auth_database_url()
+    if not auth_database_url:
+        if strict:
+            raise ApiError(503, "KBC auth database is not configured.")
+        return
+
+    try:
+        with psycopg.connect(auth_database_url) as source_connection:
+            with source_connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
+                    [normalized_group_lookup],
+                )
+                if cursor.fetchone():
+                    return
+                cursor.execute("INSERT INTO auth_group (name) VALUES (%s)", [normalized_group_name])
+    except ApiError:
+        raise
+    except Exception as exc:
+        if strict:
+            log_unexpected_api_error("Failed to ensure KBC access group exists.", exc)
+            raise ApiError(502, "We could not update the KBC auth database right now.") from exc
+        logger.warning("Could not ensure KBC auth group exists.", exc_info=(type(exc), exc, exc.__traceback__))
+
+
+def create_support_team(payload: dict[str, Any]) -> dict[str, Any]:
+    name = sanitize_text(payload.get("name") or payload.get("label") or payload.get("assignedTeam"))
+    if not name:
+        raise ApiError(400, "Team name is required.")
+
+    requested_key = sanitize_text(payload.get("key"))
+    team_key = normalize_support_team_key(requested_key or build_support_team_key(name))
+    description = sanitize_text(payload.get("description"))
+    receiver_error_ticket_label = sanitize_text(payload.get("receiverErrorTicketLabel")) or name
+    metadata = normalize_json_object(payload.get("metadata"))
+    existing_team = fetch_support_team_create_candidate(team_key, name)
+    existing_metadata = normalize_json_object(existing_team.get("metadata")) if existing_team else {}
+    auth_group_name = build_support_team_access_group_name(
+        payload.get("authGroupName")
+        or metadata.get(SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY)
+        or existing_metadata.get(SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY)
+        or name,
+        team_key,
+    )
+    metadata = {**existing_metadata, **metadata}
+    metadata[SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY] = auth_group_name
+
+    if existing_team:
+        if normalize_bool(existing_team.get("is_active")):
+            raise ApiError(400, "Team already exists.")
+
+        existing_team_key = sanitize_text(existing_team.get("key")).lower() or team_key
+        row = run_query_one(
+            """
+            UPDATE support_teams
+            SET name = %s,
+                description = %s,
+                receiver_access_metadata_key = %s,
+                receiver_error_ticket_label = %s,
+                is_active = TRUE,
+                metadata = %s::jsonb,
+                updated_at = NOW()
+            WHERE id = %s
+            RETURNING id, key, name, description, receiver_access_metadata_key,
+                      receiver_error_ticket_label, is_active, metadata
+            """,
+            [
+                name,
+                description,
+                f"team_access:{existing_team_key}",
+                receiver_error_ticket_label,
+                json.dumps(metadata),
+                int(existing_team["id"]),
+            ],
+        )
+        if not row:
+            raise ApiError(500, "We could not reactivate this team right now.")
+
+        ensure_legacy_auth_group_exists(auth_group_name)
+        return {"team": serialize_support_team(row)}
+
+    row = run_query_one(
+        """
+        INSERT INTO support_teams (
+          key,
+          name,
+          description,
+          receiver_access_metadata_key,
+          receiver_error_ticket_label,
+          metadata
+        )
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        RETURNING id, key, name, description, receiver_access_metadata_key,
+                  receiver_error_ticket_label, is_active, metadata
+        """,
+        [
+            team_key,
+            name,
+            description,
+            f"team_access:{team_key}",
+            receiver_error_ticket_label,
+            json.dumps(metadata),
+        ],
+    )
+    if not row:
+        raise ApiError(500, "We could not create this team right now.")
+
+    ensure_legacy_auth_group_exists(auth_group_name)
+
+    return {"team": serialize_support_team(row)}
+
+
+def require_mutable_support_team(team_key: str) -> None:
+    if team_key in LEGACY_TEAM_ROUTING_POLICY_KEYS:
+        raise ApiError(400, "Built-in teams cannot be changed from Team Management.")
+
+
+def support_team_transaction():
+    return transaction.atomic()
+
+
+def support_team_cursor():
+    return connection.cursor()
+
+
+def update_support_team(team_key: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    require_mutable_support_team(normalized_team_key)
+
+    current_row = fetch_support_team_by_key(normalized_team_key)
+    if not current_row:
+        raise ApiError(404, "Team not found.")
+
+    next_name = sanitize_text(payload.get("name") or payload.get("label") or payload.get("assignedTeam"))
+    if not next_name:
+        raise ApiError(400, "Team name is required.")
+
+    next_description = sanitize_text(payload.get("description"))
+    next_receiver_error_ticket_label = sanitize_text(payload.get("receiverErrorTicketLabel")) or next_name
+    previous_name = sanitize_text(current_row.get("name"))
+    metadata = normalize_json_object(current_row.get("metadata"))
+    auth_group_name = get_support_team_auth_group_name(current_row)
+    if SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY not in metadata and auth_group_name:
+        metadata[SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY] = auth_group_name
+
+    with support_team_transaction():
+        row = run_query_one(
+            """
+            UPDATE support_teams
+            SET name = %s,
+                description = %s,
+                receiver_error_ticket_label = %s,
+                metadata = %s::jsonb,
+                updated_at = NOW()
+            WHERE key = %s
+              AND is_active = TRUE
+            RETURNING id, key, name, description, receiver_access_metadata_key,
+                      receiver_error_ticket_label, is_active, metadata
+            """,
+            [
+                next_name,
+                next_description,
+                next_receiver_error_ticket_label,
+                json.dumps(metadata),
+                normalized_team_key,
+            ],
+        )
+        if not row:
+            raise ApiError(404, "Team not found.")
+
+        if previous_name and previous_name.casefold() != next_name.casefold():
+            with support_team_cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET assigned_team = %s,
+                        updated_at = NOW()
+                    WHERE LOWER(TRIM(assigned_team)) = %s
+                    """,
+                    [next_name, previous_name.lower()],
+                )
+
+    if auth_group_name:
+        ensure_legacy_auth_group_exists(auth_group_name)
+
+    return {"team": serialize_support_team(row)}
+
+
+def disable_support_team(team_key: Any) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    require_mutable_support_team(normalized_team_key)
+
+    current_row = fetch_support_team_by_key(normalized_team_key)
+    if not current_row:
+        raise ApiError(404, "Team not found.")
+
+    team_name = sanitize_text(current_row.get("name"))
+    active_ticket_count_row = run_query_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM tickets
+        WHERE LOWER(TRIM(assigned_team)) = %s
+          AND status <> 'Closed'
+          AND is_archived = FALSE
+        """,
+        [team_name.lower()],
+    )
+    active_ticket_count = parse_int(active_ticket_count_row.get("count") if active_ticket_count_row else 0)
+    if active_ticket_count > 0:
+        raise ApiError(400, "Move or close active tickets before disabling this team.")
+
+    row = run_query_one(
+        """
+        UPDATE support_teams
+        SET is_active = FALSE,
+            updated_at = NOW()
+        WHERE key = %s
+          AND is_active = TRUE
+        RETURNING id, key, name, description, receiver_access_metadata_key,
+                  receiver_error_ticket_label, is_active, metadata
+        """,
+        [normalized_team_key],
+    )
+    if not row:
+        raise ApiError(404, "Team not found.")
+
+    return {"team": serialize_support_team(row)}
+
+
+def persist_account_team_access(
+    account_id: int,
+    team_key: Any,
+    enabled: bool,
+    *,
+    source: str = "team_management",
+    strict: bool = False,
+) -> None:
+    normalized_team_key = normalize_support_team_key(team_key)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO support_account_team_access (
+                  account_id,
+                  team_id,
+                  can_receive_tickets,
+                  metadata
+                )
+                SELECT %s, st.id, %s, %s::jsonb
+                FROM support_teams st
+                WHERE st.key = %s
+                  AND st.is_active = TRUE
+                ON CONFLICT (account_id, team_id) DO UPDATE
+                SET can_receive_tickets = EXCLUDED.can_receive_tickets,
+                    metadata = support_account_team_access.metadata || EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    account_id,
+                    bool(enabled),
+                    json.dumps({"source": source}),
+                    normalized_team_key,
+                ],
+            )
+            if strict and cursor.rowcount == 0:
+                raise ApiError(404, "Team not found.")
+    except ApiError:
+        raise
+    except Exception as exc:
+        if strict:
+            raise ApiError(500, "We could not update this team access right now.") from exc
+        logger.warning("Could not sync support account team access.", exc_info=(type(exc), exc, exc.__traceback__))
+
+
+def update_agent_team_access(agent_id: int, *, team_key: Any, receive_tickets: bool) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    agent = run_query_one(
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE id = %s AND account_scope = %s
+        LIMIT 1
+        """,
+        [agent_id, ACCOUNT_SCOPE_STAFF],
+    )
+    if not agent:
+        raise ApiError(404, "Agent not found.")
+    team = fetch_support_team_by_key(normalized_team_key)
+    if not team:
+        raise ApiError(404, "Team not found.")
+
+    metadata = normalize_json_object(agent.get("metadata"))
+    updated_metadata = (
+        apply_metadata_team_access_key(metadata, normalized_team_key, False)
+        if normalized_team_key not in LEGACY_TEAM_ROUTING_POLICY_KEYS and not receive_tickets
+        else metadata
+    )
+
+    with transaction.atomic():
+        persist_account_team_access(
+            agent_id,
+            normalized_team_key,
+            receive_tickets,
+            strict=True,
+        )
+        if updated_metadata != metadata:
+            persist_agent_metadata(agent_id, updated_metadata)
+        sync_account_team_access_group_membership(agent, team, receive_tickets)
+    agent["metadata"] = updated_metadata
+    return serialize_agent(
+        attach_account_team_access([agent])[0],
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
+
+
+def sync_account_team_access_group_membership(
+    agent: dict[str, Any],
+    team: dict[str, Any],
+    enabled: bool,
+) -> None:
+    group_name = get_support_team_auth_group_name(team)
+    if not group_name:
+        return
+
+    metadata = normalize_json_object(agent.get("metadata"))
+    legacy_auth_user_id = _positive_int(metadata.get("legacy_auth_user_id"))
+    if legacy_auth_user_id:
+        sync_legacy_access_group_membership(legacy_auth_user_id, group_name, enabled)
+        return
+
+    from django.contrib.auth import get_user_model
+    from .admin import sync_access_group_membership
+
+    User = get_user_model()
+    django_user = None
+    agent_email = normalize_email(agent.get("email") or metadata.get("legacy_auth_email") or metadata.get("entra_email"))
+    if agent_email:
+        django_user = User.objects.filter(email__iexact=agent_email).first()
+    if not django_user:
+        username = sanitize_text(agent.get("username")).lower()
+        if username:
+            django_user = User.objects.filter(username__iexact=username).first()
+    if django_user:
+        sync_access_group_membership(django_user, group_name, enabled)
+
+
+def sync_legacy_team_access_memberships(
+    account_id: int,
+    *,
+    support_access: bool | None = None,
+    operations_access: bool | None = None,
+    strict: bool = False,
+) -> None:
+    if support_access is not None:
+        persist_account_team_access(
+            account_id,
+            TICKET_RECEIVER_SCOPE_SUPPORT,
+            support_access,
+            source="legacy_support_access",
+            strict=strict,
+        )
+    if operations_access is not None:
+        persist_account_team_access(
+            account_id,
+            TICKET_RECEIVER_SCOPE_OPERATIONS,
+            operations_access,
+            source="legacy_operations_access",
+            strict=strict,
+        )
+
+
+def sync_account_team_access_from_legacy_user(account_id: int, legacy_user: dict[str, Any]) -> None:
+    normalized_account_id = parse_int(account_id)
+    if normalized_account_id <= 0:
+        return
+
+    managed_team_keys = set(LEGACY_TEAM_ROUTING_POLICY_KEYS)
+    managed_team_keys.update(get_custom_support_team_auth_group_lookup().values())
+    if not managed_team_keys:
+        return
+
+    enabled_team_keys = normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys")) & managed_team_keys
+    if normalize_bool(legacy_user.get("has_support_access")):
+        enabled_team_keys.add(TICKET_RECEIVER_SCOPE_SUPPORT)
+    if normalize_bool(legacy_user.get("has_operations_access")):
+        enabled_team_keys.add(TICKET_RECEIVER_SCOPE_OPERATIONS)
+
+    for team_key in sorted(enabled_team_keys):
+        persist_account_team_access(
+            normalized_account_id,
+            team_key,
+            True,
+            source="legacy_auth_group_sync",
+        )
+
+    disabled_team_keys = sorted(managed_team_keys - enabled_team_keys)
+    if not disabled_team_keys:
+        return
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE support_account_team_access ata
+                SET can_receive_tickets = FALSE,
+                    metadata = ata.metadata || %s::jsonb,
+                    updated_at = NOW()
+                FROM support_teams st
+                WHERE ata.team_id = st.id
+                  AND ata.account_id = %s
+                  AND st.key = ANY(%s::text[])
+                  AND ata.can_receive_tickets = TRUE
+                """,
+                [
+                    json.dumps({"source": "legacy_auth_group_sync", "disabledByMissingAuthGroup": True}),
+                    normalized_account_id,
+                    disabled_team_keys,
+                ],
+            )
+    except Exception as exc:
+        logger.warning("Could not sync disabled legacy auth team access.", exc_info=(type(exc), exc, exc.__traceback__))
+
+
+def get_team_routing_policy_by_assigned_team(assigned_team: Any) -> dict[str, Any]:
+    normalized_assigned_team = sanitize_text(assigned_team).casefold()
+    if not normalized_assigned_team or normalized_assigned_team == ASSIGNED_TEAM_UNASSIGNED.casefold():
+        return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]
+
+    for team_name, policy in TEAM_ROUTING_POLICIES.items():
+        if normalized_assigned_team == team_name.casefold():
+            return policy
+
+    dynamic_policy = build_team_routing_policy_from_row(
+        fetch_optional_dynamic_team_row_by_assigned_team(assigned_team)
+    )
+    if dynamic_policy:
+        return dynamic_policy
+
+    return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]
+
+
+def get_ticket_routing_policy(ticket: dict[str, Any] | None) -> dict[str, str]:
+    if is_coverage_ticket_record(ticket):
+        return TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN]
+
+    assigned_team = get_ticket_scope_value(ticket or {}, "assigned_team", "assignedTeam")
+    return get_team_routing_policy_by_assigned_team(assigned_team)
 
 
 def is_learning_plan_ticket_record(ticket: dict[str, Any] | None) -> bool:
     if not isinstance(ticket, dict):
         return False
 
-    if is_coverage_ticket_record(ticket):
-        return True
-
-    assigned_team = sanitize_text(get_ticket_scope_value(ticket, "assigned_team", "assignedTeam"))
-    return assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold()
+    return get_ticket_routing_policy(ticket)["key"] == TICKET_RECEIVER_SCOPE_OPERATIONS
 
 
 def actor_has_metadata_flag(
@@ -6514,16 +9948,53 @@ def actor_has_admin_dashboard_access(actor: dict[str, Any] | None) -> bool:
 
 
 def actor_has_support_dashboard_access(actor: dict[str, Any] | None) -> bool:
-    if not isinstance(actor, dict):
-        return False
-
-    role = sanitize_text(actor.get("role")).lower()
-    legacy_default = role == ROLE_AGENT
-    return actor_has_metadata_flag(actor, "legacy_support_access", default=legacy_default)
+    return actor_has_team_routing_access(actor, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK])
 
 
 def actor_has_operations_dashboard_access(actor: dict[str, Any] | None) -> bool:
-    return actor_has_metadata_flag(actor, "legacy_operations_access")
+    return actor_has_team_routing_access(actor, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN])
+
+
+def actor_has_team_routing_access(actor: dict[str, Any] | None, policy: dict[str, str]) -> bool:
+    if not isinstance(actor, dict):
+        return False
+
+    if actor_has_metadata_flag(
+        actor,
+        policy["receiver_access_metadata_key"],
+        default=False,
+    ):
+        return True
+
+    if account_has_preloaded_team_access(actor, policy["key"]):
+        return True
+
+    return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
+        actor.get("id"),
+        policy["key"],
+    )
+
+
+def account_has_any_team_receiver_access(account: dict[str, Any] | None) -> bool:
+    if not is_active_staff_support_account(account):
+        return False
+
+    if get_preloaded_account_team_access_keys(account):
+        return True
+
+    return fetch_optional_any_account_team_access(account.get("id"))
+
+
+def actor_has_support_portal_login_access(actor: dict[str, Any] | None) -> bool:
+    if not is_active_staff_support_account(actor):
+        return False
+
+    return (
+        actor_has_support_dashboard_access(actor)
+        or actor_has_operations_dashboard_access(actor)
+        or actor_has_admin_dashboard_access(actor)
+        or account_has_any_team_receiver_access(actor)
+    )
 
 
 def actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> bool:
@@ -6533,18 +10004,37 @@ def actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str
     if actor_has_admin_dashboard_access(actor):
         return True
 
-    has_support_access = actor_has_support_dashboard_access(actor)
-    has_operations_access = actor_has_operations_dashboard_access(actor)
-    if has_support_access and has_operations_access:
+    return actor_has_team_routing_access(actor, get_ticket_routing_policy(ticket))
+
+
+def actor_can_transfer_ticket_between_teams(
+    actor: dict[str, Any] | None,
+    ticket: dict[str, Any] | None,
+    target_assigned_team: Any,
+) -> bool:
+    if not isinstance(ticket, dict):
+        return False
+
+    try:
+        normalized_target_team = normalize_assigned_team(target_assigned_team)
+        ensure_ticket_can_transfer_to_assigned_team(ticket, normalized_target_team)
+    except ApiError:
+        return False
+
+    if actor_has_admin_dashboard_access(actor):
         return True
 
-    is_learning_plan_ticket = is_learning_plan_ticket_record(ticket)
-    if has_operations_access:
-        return is_learning_plan_ticket
-    if has_support_access:
-        return not is_learning_plan_ticket
+    return actor_has_team_routing_access(actor, get_ticket_routing_policy(ticket))
 
-    return False
+
+def ensure_ticket_can_transfer_to_assigned_team(ticket: dict[str, Any], target_assigned_team: Any) -> None:
+    normalized_target_team = normalize_assigned_team(target_assigned_team)
+    if not is_coverage_ticket_record(ticket):
+        return
+
+    target_policy = get_team_routing_policy_by_assigned_team(normalized_target_team)
+    if target_policy["key"] != TICKET_RECEIVER_SCOPE_OPERATIONS:
+        raise ApiError(409, "Coverage tickets must stay in the Learning Plan Team workflow.")
 
 
 def require_actor_can_access_admin_ticket(actor: dict[str, Any] | None, ticket: dict[str, Any] | None) -> None:
@@ -6588,6 +10078,7 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         or sanitize_text(metadata.get("legacy_auth_email"))
         or None
     )
+    team_access = build_serialized_agent_team_access(row, metadata)
     return {
         "id": agent_id,
         "username": row["username"],
@@ -6601,6 +10092,8 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
         "legacyOperationsAccess": normalize_bool(metadata.get("legacy_operations_access")),
         "legacyAdminAccess": normalize_bool(metadata.get("legacy_admin_access")),
         "entraDirectoryAdmin": normalize_bool(metadata.get("entra_directory_admin_access")),
+        "teamAccess": team_access,
+        "teamAccessKeys": [item["key"] for item in team_access],
         "consoleStatus": resolve_agent_console_status(
             metadata,
             session_active=session_active,
@@ -6610,7 +10103,7 @@ def serialize_agent(row: dict[str, Any], *, open_assigned_chat_agent_ids: set[in
     }
 
 
-def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+def is_active_staff_support_account(account: dict[str, Any] | None) -> bool:
     if not account:
         return False
 
@@ -6622,8 +10115,48 @@ def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
     if account_scope != ACCOUNT_SCOPE_STAFF:
         return False
 
+    return True
+
+
+def account_has_team_receiver_access(account: dict[str, Any] | None, policy: dict[str, str]) -> bool:
+    if not is_active_staff_support_account(account):
+        return False
+
     metadata = normalize_json_object(account.get("metadata"))
-    return normalize_bool(metadata.get("legacy_support_access"))
+    if normalize_bool(metadata.get(policy["receiver_access_metadata_key"])):
+        return True
+
+    if account_has_preloaded_team_access(account, policy["key"]):
+        return True
+
+    return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
+        account.get("id"),
+        policy["key"],
+    )
+
+
+def is_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+    return account_has_team_receiver_access(account, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK])
+
+
+def is_operations_ticket_receiving_staff_account(account: dict[str, Any] | None) -> bool:
+    return account_has_team_receiver_access(account, TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN])
+
+
+def get_ticket_receiver_scope(ticket: dict[str, Any] | None) -> str:
+    return get_ticket_routing_policy(ticket)["key"]
+
+
+def account_can_receive_ticket_assignment(
+    account: dict[str, Any] | None,
+    ticket: dict[str, Any] | None,
+) -> bool:
+    return account_has_team_receiver_access(account, get_ticket_routing_policy(ticket))
+
+
+def get_ticket_assignment_receiver_error(ticket: dict[str, Any] | None) -> str:
+    ticket_label = get_ticket_routing_policy(ticket)["receiver_error_ticket_label"]
+    return f"The selected agent does not receive {ticket_label} tickets."
 
 
 def is_booking_in_progress_ticket_record(ticket: dict[str, Any] | None) -> bool:
@@ -6671,10 +10204,244 @@ def is_admin_hidden_support_flow_ticket_record(ticket: dict[str, Any] | None) ->
     )
 
 
+def derive_legacy_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+    normalized_status = sanitize_text(row.get("status")) or "Open"
+    normalized_status_reason = sanitize_text(row.get("status_reason"))
+    normalized_chat_state = sanitize_text(chat_state or row.get("conversation_status")).lower()
+    if normalized_chat_state not in ALLOWED_CHAT_STATES:
+        normalized_chat_state = "closed" if normalized_status == "Closed" else "open"
+
+    is_coverage = is_coverage_ticket_record(row)
+    is_quick = is_quick_ticket_record(row)
+    ticket_routing_policy = get_ticket_routing_policy(row)
+    is_learning_plan_other = ticket_routing_policy["key"] == TICKET_RECEIVER_SCOPE_OPERATIONS and not is_coverage
+    live_chat_requested = is_live_chat_requested(row.get("metadata"), row.get("conversation_metadata"))
+    teams_call_requested = is_teams_call_requested(row.get("metadata"))
+    ticket_metadata = normalize_json_object(row.get("metadata"))
+    booking_in_progress = sanitize_text(ticket_metadata.get(SUPPORT_FLOW_STAGE_METADATA_KEY)) == SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS
+    assigned_agent_id = parse_assigned_agent_id(row.get("assigned_agent_id"))
+
+    if is_coverage:
+        ticket_type = "coverage"
+    elif is_quick:
+        ticket_type = "quick"
+    elif booking_in_progress:
+        ticket_type = "booking"
+    elif normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        ticket_type = "booking"
+    elif teams_call_requested:
+        ticket_type = "teams_call"
+    elif live_chat_requested:
+        ticket_type = "live_chat"
+    else:
+        ticket_type = "standard"
+
+    if is_coverage:
+        if normalized_status_reason == STATUS_REASON_TUTOR_REQUESTED:
+            workflow_stage = "tutor_requested"
+        elif normalized_status_reason == STATUS_REASON_REREQUESTING:
+            workflow_stage = "rerequesting"
+        elif normalized_status_reason == STATUS_REASON_TUTOR_ACCEPTED:
+            workflow_stage = "tutor_accepted"
+        elif normalized_status_reason in {STATUS_REASON_TUTOR_REJECTED, STATUS_REASON_TUTOR_REFUSED}:
+            workflow_stage = "tutor_rejected"
+        elif normalized_status == "Closed":
+            workflow_stage = "closed"
+        else:
+            workflow_stage = "coverage_review"
+    elif normalized_status == "Closed":
+        workflow_stage = "closed"
+    elif is_quick:
+        workflow_stage = "awaiting_review"
+    elif booking_in_progress:
+        workflow_stage = "booking_in_progress"
+    elif normalized_status_reason == STATUS_REASON_AWAITING_MEETING:
+        workflow_stage = "awaiting_meeting"
+    elif normalized_status_reason == STATUS_REASON_ESCALATION:
+        workflow_stage = "escalated"
+    elif teams_call_requested:
+        workflow_stage = "awaiting_staff_call"
+    elif live_chat_requested:
+        workflow_stage = "with_agent" if assigned_agent_id else "awaiting_agent"
+    elif normalized_status == "Pending":
+        workflow_stage = "pending"
+    else:
+        workflow_stage = "active"
+
+    if normalized_status == "Closed":
+        dashboard_bucket = "closed"
+    elif is_coverage:
+        dashboard_bucket = "coverage"
+    elif is_learning_plan_other:
+        dashboard_bucket = "learning_plan"
+    elif is_quick:
+        dashboard_bucket = "quick"
+    elif normalized_status_reason == STATUS_REASON_ESCALATION:
+        dashboard_bucket = "escalation"
+    elif live_chat_requested:
+        dashboard_bucket = "live_chat"
+    elif normalized_status == "Pending":
+        dashboard_bucket = "pending"
+    elif ticket_routing_policy["key"] not in {TICKET_RECEIVER_SCOPE_SUPPORT, TICKET_RECEIVER_SCOPE_OPERATIONS}:
+        dashboard_bucket = ticket_routing_policy["key"]
+    else:
+        dashboard_bucket = "support"
+
+    queue_scope = ticket_routing_policy["key"]
+    can_show_conversation = not (is_coverage or is_quick)
+    can_receive_chat = (
+        can_show_conversation
+        and normalized_status == "Open"
+        and normalized_chat_state != "closed"
+        and live_chat_requested
+    )
+    resolution_reason = normalized_status_reason if normalized_status == "Closed" else ""
+
+    return {
+        "ticketType": ticket_type,
+        "workflowStage": workflow_stage,
+        "queueScope": queue_scope,
+        "dashboardBucket": dashboard_bucket,
+        "canShowConversation": can_show_conversation,
+        "canReceiveChat": can_receive_chat,
+        "resolutionReason": resolution_reason,
+    }
+
+
+def normalize_ticket_state_payload(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+    payload = normalize_json_object(value)
+    return {
+        "ticketType": sanitize_text(payload.get("ticketType")) or fallback["ticketType"],
+        "workflowStage": sanitize_text(payload.get("workflowStage")) or fallback["workflowStage"],
+        "queueScope": sanitize_text(payload.get("queueScope")) or fallback["queueScope"],
+        "dashboardBucket": sanitize_text(payload.get("dashboardBucket")) or fallback["dashboardBucket"],
+        "canShowConversation": normalize_bool(payload.get("canShowConversation"))
+        if payload.get("canShowConversation") is not None
+        else fallback["canShowConversation"],
+        "canReceiveChat": normalize_bool(payload.get("canReceiveChat"))
+        if payload.get("canReceiveChat") is not None
+        else fallback["canReceiveChat"],
+        "resolutionReason": sanitize_text(payload.get("resolutionReason")) or fallback["resolutionReason"],
+    }
+
+
+def build_ticket_state_metadata(ticket: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+    return derive_legacy_ticket_state(ticket, chat_state=chat_state)
+
+
+def build_ticket_state_column_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for column_key, payload_key in TICKET_STATE_COLUMN_PAYLOAD_KEYS.items():
+        if column_key not in row:
+            continue
+
+        value = row.get(column_key)
+        if payload_key in {"canShowConversation", "canReceiveChat"}:
+            if value is not None:
+                payload[payload_key] = value
+            continue
+
+        normalized_value = sanitize_text(value)
+        if normalized_value:
+            payload[payload_key] = normalized_value
+
+    return payload
+
+
+def build_ticket_state_column_values(ticket_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ticket_type": sanitize_text(ticket_state.get("ticketType")),
+        "workflow_stage": sanitize_text(ticket_state.get("workflowStage")),
+        "queue_scope": sanitize_text(ticket_state.get("queueScope")),
+        "dashboard_bucket": sanitize_text(ticket_state.get("dashboardBucket")),
+        "can_show_conversation": bool(ticket_state.get("canShowConversation")),
+        "can_receive_chat": bool(ticket_state.get("canReceiveChat")),
+        "resolution_reason": sanitize_text(ticket_state.get("resolutionReason")),
+    }
+
+
+def get_ticket_state_column_params(ticket_state_columns: dict[str, Any]) -> list[Any]:
+    return [
+        ticket_state_columns.get("ticket_type") or None,
+        ticket_state_columns.get("workflow_stage") or None,
+        ticket_state_columns.get("queue_scope") or None,
+        ticket_state_columns.get("dashboard_bucket") or None,
+        ticket_state_columns.get("can_show_conversation"),
+        ticket_state_columns.get("can_receive_chat"),
+        ticket_state_columns.get("resolution_reason") or None,
+    ]
+
+
+def build_ticket_state_persistence(
+    metadata: Any,
+    ticket: dict[str, Any],
+    *,
+    chat_state: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    next_metadata = normalize_json_object(metadata)
+    ticket_state = build_ticket_state_metadata(
+        {
+            **ticket,
+            "metadata": next_metadata,
+            "_ignore_persisted_ticket_state": True,
+        },
+        chat_state=chat_state,
+    )
+    next_metadata[TICKET_STATE_METADATA_KEY] = ticket_state
+    return next_metadata, build_ticket_state_column_values(ticket_state)
+
+
+def with_ticket_state_metadata(
+    metadata: Any,
+    ticket: dict[str, Any],
+    *,
+    chat_state: str | None = None,
+) -> dict[str, Any]:
+    next_metadata, _ticket_state_columns = build_ticket_state_persistence(
+        metadata,
+        ticket,
+        chat_state=chat_state,
+    )
+    return next_metadata
+
+
+def derive_ticket_state(row: dict[str, Any], *, chat_state: str | None = None) -> dict[str, Any]:
+    fallback = derive_legacy_ticket_state(row, chat_state=chat_state)
+    metadata = normalize_json_object(row.get("metadata"))
+    persisted_state = (
+        build_ticket_state_column_payload(row)
+        or row.get(TICKET_STATE_METADATA_KEY)
+        or metadata.get(TICKET_STATE_METADATA_KEY)
+    )
+    if not persisted_state:
+        return fallback
+
+    return normalize_ticket_state_payload(persisted_state, fallback)
+
+
+def serialize_ticket_sla_timestamp(metadata: dict[str, Any], key: str) -> str | None:
+    return serialize_datetime_value(coerce_datetime(metadata.get(key)))
+
+
 def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
     ticket_metadata = normalize_json_object(row.get("metadata"))
     conversation_metadata = normalize_json_object(row.get("conversation_metadata"))
+    ai_team_request = get_ai_team_request(ticket_metadata)
     requester_name = row.get("learner_name") or ""
+    submitted_for_payload = normalize_json_object(ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+    if not submitted_for_payload and row.get("submitted_for_learner_id"):
+        submitted_for_payload = {
+            "id": int(row["submitted_for_learner_id"]),
+            "externalLearnerId": sanitize_text(row.get("submitted_for_external_learner_id")),
+            "fullName": sanitize_text(row.get("submitted_for_learner_name")) or sanitize_text(row.get("submitted_for_learner_email")),
+            "email": sanitize_text(row.get("submitted_for_learner_email")),
+        }
+    if submitted_for_payload:
+        submitted_for_payload["notifyByEmail"] = normalize_bool(
+            submitted_for_payload.get("notifyByEmail")
+            if "notifyByEmail" in submitted_for_payload
+            else ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY)
+        )
     documentation = normalize_admin_documentation(
         row.get("_resolved_documentation", ticket_metadata.get("admin_documentation")),
         fallback_inquiry=sanitize_text(row.get("inquiry")),
@@ -6718,9 +10485,16 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "priority": normalize_ticket_priority(row.get("priority")),
         "category": row["category"],
         "technicalSubcategory": row.get("technical_subcategory") or "",
+        "subject": sanitize_text(row.get("subject")) or sanitize_text(ticket_metadata.get("subject")),
+        "aiTeamRequest": ai_team_request,
+        "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+        "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
+        "submittedForLearner": submitted_for_payload or None,
+        "notifySubmittedForLearner": normalize_bool(submitted_for_payload.get("notifyByEmail")) if submitted_for_payload else False,
         "inquiryPreview": sanitize_text(row.get("inquiry")),
         "status": row["status"],
         "statusReason": row.get("status_reason") or "",
+        "ticketState": derive_ticket_state(row, chat_state=chat_state),
         "isQuickTicket": is_quick_ticket_record(row),
         "assignedAgentId": int(row["assigned_agent_id"]) if row.get("assigned_agent_id") else None,
         "assignedAgentName": row.get("assigned_agent_name") or "Unassigned",
@@ -6738,6 +10512,7 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "pendingTransferRequest": get_pending_transfer_request(ticket_metadata),
         "pendingEscalationNotification": get_pending_escalation_notification(ticket_metadata),
         "pendingTeamsCallNotification": get_pending_teams_call_notification(ticket_metadata),
+        "pendingSupportQueueNotification": get_pending_support_queue_notification(ticket_metadata),
         "pendingCoverageTicketNotification": get_pending_coverage_ticket_notification(ticket_metadata),
         "pendingLearningPlanTransferNotification": get_pending_learning_plan_transfer_notification(ticket_metadata),
         "teamsCallRequested": is_teams_call_requested(ticket_metadata),
@@ -6747,6 +10522,13 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "documentation": documentation,
         "slaStatus": row["sla_status"],
         "slaAttentionRequired": bool(row.get("sla_attention_required")),
+        "slaAttentionReason": sanitize_text(ticket_metadata.get("sla_attention_reason")) or None,
+        "slaPolicyKey": sanitize_text(ticket_metadata.get(SLA_POLICY_KEY_METADATA_KEY)) or None,
+        "slaStartedAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_STARTED_AT_METADATA_KEY),
+        "slaDueAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_DUE_AT_METADATA_KEY),
+        "slaBreachedAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_BREACHED_AT_METADATA_KEY),
+        "slaResolvedAt": serialize_ticket_sla_timestamp(ticket_metadata, SLA_RESOLVED_AT_METADATA_KEY),
+        "slaOutcomeStatus": sanitize_text(ticket_metadata.get(SLA_OUTCOME_STATUS_METADATA_KEY)) or None,
         "evidenceCount": int(row.get("evidence_count") or 0),
         "isArchived": normalize_bool(row.get("is_archived")),
         "archivedAt": row.get("archived_at"),
@@ -7157,6 +10939,12 @@ def normalize_assigned_team(value: Any) -> str:
     for allowed_value in ALLOWED_ASSIGNED_TEAMS:
         if allowed_value.casefold() == normalized_lookup:
             return allowed_value
+
+    dynamic_policy = build_team_routing_policy_from_row(
+        fetch_optional_dynamic_team_row_by_assigned_team(normalized_value)
+    )
+    if dynamic_policy:
+        return dynamic_policy["assigned_team"]
 
     raise ApiError(400, "Invalid assigned team.")
 
@@ -8431,6 +12219,16 @@ def apply_ticket_chat_history_sync(
     next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
         ticket,
         status,
+        status_reason=next_status_reason,
+    )
+    updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        updated_ticket_metadata,
+        {
+            **ticket,
+            "status": status,
+            "status_reason": next_status_reason,
+        },
+        chat_state=map_conversation_status(status),
     )
 
     with connection.cursor() as cursor:
@@ -8441,6 +12239,13 @@ def apply_ticket_chat_history_sync(
                 status_reason = %s,
                 sla_status = %s,
                 metadata = %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW(),
                 closed_at = CASE
                   WHEN %s = 'Closed' THEN NOW()
@@ -8449,11 +12254,40 @@ def apply_ticket_chat_history_sync(
                 END
             WHERE id = %s
             """,
-            [status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), status, status, ticket["id"]],
+            [
+                status,
+                next_status_reason,
+                next_sla_status,
+                json.dumps(updated_ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
+                status,
+                status,
+                ticket["id"],
+            ],
         )
 
-    if status == "Pending" and is_quick_ticket_status_reason(next_status_reason) and not is_coverage_ticket_record(ticket):
-        try_auto_assign_quick_ticket(ticket, now=persisted_at)
+    if (
+        status == "Pending"
+        and is_quick_ticket_status_reason(next_status_reason)
+        and not is_coverage_ticket_record(ticket)
+        and not is_ai_team_ticket_record(ticket)
+    ):
+        assignment_ticket = {
+            **ticket,
+            "status": status,
+            "status_reason": next_status_reason,
+            "metadata": updated_ticket_metadata,
+        }
+        if try_auto_assign_quick_ticket(assignment_ticket, now=persisted_at):
+            ticket.update(
+                {
+                    "assigned_agent_id": assignment_ticket.get("assigned_agent_id"),
+                    "assigned_agent_username": assignment_ticket.get("assigned_agent_username"),
+                    "assigned_agent_name": assignment_ticket.get("assigned_agent_name"),
+                    "assigned_team": assignment_ticket.get("assigned_team"),
+                    "metadata": assignment_ticket.get("metadata"),
+                }
+            )
 
     if map_conversation_status(status) == "closed":
         persist_conversation_chat_duration(ticket["id"], ticket["conversation_id"], reference_time=persisted_at)
@@ -8861,6 +12695,7 @@ def legacy_auth_user_has_admin_login_access(legacy_user: dict[str, Any]) -> bool
         normalize_bool(legacy_user.get("has_support_access"))
         or normalize_bool(legacy_user.get("has_operations_access"))
         or normalize_bool(legacy_user.get("has_admin_access"))
+        or bool(normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys")))
     )
 
 
@@ -8934,6 +12769,7 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
         "legacy_support_access": normalize_bool(legacy_user.get("has_support_access")),
         "legacy_operations_access": normalize_bool(legacy_user.get("has_operations_access")),
         "legacy_admin_access": normalize_bool(legacy_user.get("has_admin_access")),
+        "team_access_keys": sorted(normalize_preloaded_team_access_keys(legacy_user.get("team_access_keys"))),
     }
 
     existing_account = (
@@ -8977,6 +12813,8 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
                     ],
                 )
 
+            sync_account_team_access_from_legacy_user(int(existing_account["id"]), legacy_user)
+
         refreshed_account = fetch_agent_account_by_id(int(existing_account["id"]))
         if refreshed_account:
             return refreshed_account
@@ -9019,6 +12857,8 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
                 ],
             )
             created_row = cursor.fetchone()
+            if created_row:
+                sync_account_team_access_from_legacy_user(int(created_row[0]), legacy_user)
 
     if not created_row:
         raise ApiError(500, "We could not create the linked support account right now.")
@@ -9424,10 +13264,14 @@ def persist_ticket_metadata_patch(ticket_id: int, metadata_patch: dict[str, Any]
         )
 
 
-def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+def sync_legacy_access_group_membership(legacy_auth_user_id: int, group_name: str, enabled: bool) -> None:
     normalized_user_id = int(legacy_auth_user_id or 0)
     if normalized_user_id <= 0:
         raise ApiError(400, "A linked KBC auth user is required.")
+    display_group_name = normalize_auth_group_name(group_name)
+    normalized_group_name = normalize_auth_group_lookup(display_group_name)
+    if not display_group_name:
+        raise ApiError(400, "A valid KBC auth access group is required.")
     auth_database_url = get_support_auth_database_url()
     if not auth_database_url:
         raise ApiError(503, "KBC auth database is not configured.")
@@ -9444,7 +13288,7 @@ def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enable
 
                 cursor.execute(
                     "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
-                    [SUPPORT_ACCESS_GROUP_NAME],
+                    [normalized_group_name],
                 )
                 group_row = cursor.fetchone()
                 if group_row:
@@ -9452,7 +13296,7 @@ def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enable
                 elif enabled:
                     cursor.execute(
                         "INSERT INTO auth_group (name) VALUES (%s) RETURNING id",
-                        [SUPPORT_ACCESS_GROUP_NAME],
+                        [display_group_name],
                     )
                     group_id = int(cursor.fetchone()[0])
                 else:
@@ -9479,13 +13323,29 @@ def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enable
     except ApiError:
         raise
     except Exception as exc:
-        log_unexpected_api_error("Failed to sync KBC support access group membership.", exc)
+        log_unexpected_api_error("Failed to sync KBC access group membership.", exc)
         raise ApiError(502, "We could not update this agent in the KBC auth database right now.") from exc
 
 
-def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
+def sync_legacy_support_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+    sync_legacy_access_group_membership(legacy_auth_user_id, SUPPORT_ACCESS_GROUP_NAME, enabled)
+
+
+def sync_legacy_operations_access_group_membership(legacy_auth_user_id: int, enabled: bool) -> None:
+    sync_legacy_access_group_membership(legacy_auth_user_id, OPERATIONS_ACCESS_GROUP_NAME, enabled)
+
+
+def update_agent_ticket_access(
+    agent_id: int,
+    *,
+    support_access: bool | None = None,
+    operations_access: bool | None = None,
+) -> dict[str, Any]:
     from django.contrib.auth import get_user_model
-    from .admin import sync_support_access_group_membership
+    from .admin import sync_operations_access_group_membership, sync_support_access_group_membership
+
+    if support_access is None and operations_access is None:
+        raise ApiError(400, "At least one ticket access field is required.")
 
     agent = run_query_one(
         """
@@ -9498,11 +13358,13 @@ def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[
     )
     if not agent:
         raise ApiError(404, "Agent not found.")
-
     metadata = normalize_json_object(agent.get("metadata"))
     legacy_auth_user_id = int(metadata.get("legacy_auth_user_id") or 0)
     if legacy_auth_user_id > 0:
-        sync_legacy_support_access_group_membership(legacy_auth_user_id, support_access)
+        if support_access is not None:
+            sync_legacy_support_access_group_membership(legacy_auth_user_id, support_access)
+        if operations_access is not None:
+            sync_legacy_operations_access_group_membership(legacy_auth_user_id, operations_access)
     else:
         User = get_user_model()
         django_user = None
@@ -9510,13 +13372,37 @@ def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[
         if agent_email:
             django_user = User.objects.filter(email__iexact=agent_email).first()
         if django_user:
-            sync_support_access_group_membership(django_user, support_access)
+            if support_access is not None:
+                sync_support_access_group_membership(django_user, support_access)
+            if operations_access is not None:
+                sync_operations_access_group_membership(django_user, operations_access)
 
-    metadata["legacy_support_access"] = support_access
-    persist_agent_metadata(agent_id, metadata)
+    if support_access is not None:
+        metadata["legacy_support_access"] = support_access
+    if operations_access is not None:
+        metadata["legacy_operations_access"] = operations_access
+    with transaction.atomic():
+        persist_agent_metadata(agent_id, metadata)
+        sync_legacy_team_access_memberships(
+            agent_id,
+            support_access=support_access,
+            operations_access=operations_access,
+            strict=True,
+        )
 
     agent["metadata"] = metadata
-    return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
+    return serialize_agent(
+        attach_account_team_access([agent])[0],
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
+
+
+def update_agent_support_access(agent_id: int, *, support_access: bool) -> dict[str, Any]:
+    return update_agent_ticket_access(agent_id, support_access=support_access)
+
+
+def update_agent_operations_access(agent_id: int, *, operations_access: bool) -> dict[str, Any]:
+    return update_agent_ticket_access(agent_id, operations_access=operations_access)
 
 
 def is_agent_session_active(metadata: Any, now: datetime | None = None) -> bool:
@@ -9847,6 +13733,20 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
     conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
     assigned_team = derive_assigned_team(agent)
     agent_name = agent.get("full_name") or agent["username"]
+    ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+        {
+            **ticket_metadata,
+            "queue_assigned_at": assigned_at_value,
+            "queue_assigned_agent_username": agent["username"],
+            "queue_assigned_agent_name": agent_name,
+        },
+        {
+            **ticket,
+            "assigned_agent_id": next_assigned_agent_id,
+            "assigned_team": assigned_team,
+        },
+        chat_state=ticket.get("conversation_status"),
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -9855,19 +13755,21 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
             SET assigned_agent_id = %s,
                 assigned_team = %s,
                 metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
             [
                 next_assigned_agent_id,
                 assigned_team,
-                json.dumps(
-                    {
-                        "queue_assigned_at": assigned_at_value,
-                        "queue_assigned_agent_username": agent["username"],
-                        "queue_assigned_agent_name": agent_name,
-                    }
-                ),
+                json.dumps(ticket_metadata_patch),
+                *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
             ],
         )
@@ -9916,12 +13818,7 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
     ticket["assigned_agent_username"] = agent["username"]
     ticket["assigned_agent_name"] = agent_name
     ticket["assigned_team"] = assigned_team
-    ticket["metadata"] = {
-        **ticket_metadata,
-        "queue_assigned_at": assigned_at_value,
-        "queue_assigned_agent_username": agent["username"],
-        "queue_assigned_agent_name": agent_name,
-    }
+    ticket["metadata"] = ticket_metadata_patch
     ticket["conversation_metadata"] = {
         **conversation_metadata,
         "assigned_agent_id": next_assigned_agent_id,
@@ -9944,6 +13841,20 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
     conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
     assigned_team = derive_assigned_team(agent)
     agent_name = agent.get("full_name") or agent["username"]
+    ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+        {
+            **ticket_metadata,
+            "quick_ticket_assigned_at": assigned_at_value,
+            "quick_ticket_assigned_admin_username": agent["username"],
+            "quick_ticket_assigned_admin_name": agent_name,
+        },
+        {
+            **ticket,
+            "assigned_agent_id": next_assigned_agent_id,
+            "assigned_team": assigned_team,
+        },
+        chat_state=ticket.get("conversation_status"),
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -9952,19 +13863,21 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
             SET assigned_agent_id = %s,
                 assigned_team = %s,
                 metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
             [
                 next_assigned_agent_id,
                 assigned_team,
-                json.dumps(
-                    {
-                        "quick_ticket_assigned_at": assigned_at_value,
-                        "quick_ticket_assigned_admin_username": agent["username"],
-                        "quick_ticket_assigned_admin_name": agent_name,
-                    }
-                ),
+                json.dumps(ticket_metadata_patch),
+                *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
             ],
         )
@@ -10012,12 +13925,7 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
     ticket["assigned_agent_username"] = agent["username"]
     ticket["assigned_agent_name"] = agent_name
     ticket["assigned_team"] = assigned_team
-    ticket["metadata"] = {
-        **ticket_metadata,
-        "quick_ticket_assigned_at": assigned_at_value,
-        "quick_ticket_assigned_admin_username": agent["username"],
-        "quick_ticket_assigned_admin_name": agent_name,
-    }
+    ticket["metadata"] = ticket_metadata_patch
     ticket["conversation_metadata"] = {
         **conversation_metadata,
         "assigned_agent_id": next_assigned_agent_id,
@@ -10030,6 +13938,8 @@ def assign_quick_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], 
 
 def try_auto_assign_quick_ticket(ticket: dict[str, Any], now: datetime | None = None) -> dict[str, Any] | None:
     if ticket.get("assigned_agent_id"):
+        return None
+    if is_ai_team_ticket_record(ticket):
         return None
 
     agent_candidates = run_query(
@@ -10190,7 +14100,10 @@ def register_agent_session(username: str, instance_id: str, console_status: str 
     persist_agent_metadata(int(agent["id"]), metadata)
     agent["metadata"] = metadata
     assign_waiting_live_chat_tickets(now)
-    return serialize_agent(agent, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())
+    return serialize_agent(
+        attach_account_team_access([agent])[0],
+        open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+    )
 
 
 def heartbeat_agent_session(payload: dict[str, Any]) -> dict[str, Any]:
@@ -10308,6 +14221,9 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
+          submitted_for.external_learner_id AS submitted_for_external_learner_id,
+          submitted_for.full_name AS submitted_for_learner_name,
+          submitted_for.email AS submitted_for_learner_email,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name,
@@ -10316,6 +14232,8 @@ def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
+        LEFT JOIN learners submitted_for
+          ON submitted_for.id = t.submitted_for_learner_id
         LEFT JOIN conversations c
           ON c.id = t.conversation_id
         LEFT JOIN LATERAL (
@@ -10578,6 +14496,7 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         existing_ticket_metadata,
         default=requester_source,
     )
+    ai_team_request = get_ai_team_request(existing_ticket_metadata)
     response["ticket"] = {
         "id": existing_ticket["public_id"],
         "learnerName": requester.get("display_name") or learner.get("full_name") or "",
@@ -10586,7 +14505,10 @@ def get_verify_email_response(payload: dict[str, Any]) -> dict[str, Any]:
         "requesterRole": existing_ticket_requester_role,
         "category": existing_ticket["category"],
         "technicalSubcategory": existing_ticket.get("technical_subcategory") or "",
+        "subject": sanitize_text(existing_ticket.get("subject")),
         "inquiry": existing_ticket.get("inquiry") or "",
+        "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+        "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
         "status": existing_ticket["status"],
         "statusReason": existing_ticket.get("status_reason") or "",
         "assignedAgentId": int(existing_ticket["assigned_agent_id"]) if existing_ticket.get("assigned_agent_id") else None,
@@ -10630,11 +14552,7 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
             [normalize_email(username), ACCOUNT_SCOPE_STAFF],
         )
     )
-    if dashboard_access_agent and (
-        actor_has_support_dashboard_access(dashboard_access_agent)
-        or actor_has_operations_dashboard_access(dashboard_access_agent)
-        or actor_has_admin_dashboard_access(dashboard_access_agent)
-    ):
+    if dashboard_access_agent and actor_has_support_portal_login_access(dashboard_access_agent):
         agent_metadata = normalize_json_object(dashboard_access_agent.get("metadata"))
         if get_agent_password_hash(agent_metadata):
             if not verify_agent_password(dashboard_access_agent, password):
@@ -10652,6 +14570,12 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
         # fallback below or Microsoft sign-in.
         if not fetch_legacy_support_user_by_username(username):
             raise ApiError(401, "This account does not have a password set. Please sign in with Microsoft.")
+    elif dashboard_access_agent:
+        agent_metadata = normalize_json_object(dashboard_access_agent.get("metadata"))
+        if get_agent_password_hash(agent_metadata):
+            if not verify_agent_password(dashboard_access_agent, password):
+                raise ApiError(401, "Invalid username or password.")
+            raise ApiError(403, "This account must have team, support, operations, or admin access.")
 
     # Fallback: legacy database login
     legacy_user = fetch_legacy_support_user_by_username(username)
@@ -10663,7 +14587,7 @@ def get_admin_login_response(payload: dict[str, Any]) -> dict[str, Any]:
         raise ApiError(401, "Invalid username or password.")
 
     if not legacy_auth_user_has_admin_login_access(legacy_user):
-        raise ApiError(403, "This account must have support, operations, or admin access.")
+        raise ApiError(403, "This account must have team, support, operations, or admin access.")
 
     matched_agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
@@ -10869,16 +14793,27 @@ def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[st
 def _login_support_access_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
     """Login path for staff who have KBC auth access but no Entra admin role."""
     candidate_emails = list(dict.fromkeys([normalized_email, *extract_microsoft_login_email_candidates(profile)]))
-    legacy_user = next(
-        (candidate for email in candidate_emails if (candidate := fetch_legacy_support_user_by_email(email))),
-        None,
-    )
-    if not legacy_user:
-        raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
-    if not legacy_auth_user_has_admin_login_access(legacy_user):
-        raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+    agent = None
+    for email in candidate_emails:
+        candidate = fetch_staff_support_account_by_email(email)
+        if not candidate:
+            continue
+        refreshed_candidate = refresh_staff_account_legacy_access(candidate, persist=True)
+        if actor_has_support_portal_login_access(refreshed_candidate):
+            agent = refreshed_candidate
+            break
 
-    agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
+    if not agent:
+        legacy_user = next(
+            (candidate for email in candidate_emails if (candidate := fetch_legacy_support_user_by_email(email))),
+            None,
+        )
+        if not legacy_user:
+            raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+        if not legacy_auth_user_has_admin_login_access(legacy_user):
+            raise ApiError(403, "Your Microsoft account does not have access to the support portal.")
+
+        agent = sync_support_staff_account_from_legacy_auth_user(legacy_user)
 
     if not normalize_bool(agent.get("is_active")):
         raise ApiError(403, "Your account has been disabled. Please contact an administrator.")
@@ -10987,7 +14922,7 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
     }
 
 
-def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
+def list_agents(*, include_inactive: bool = True, refresh_legacy: bool = True) -> dict[str, Any]:
     where_clause = "WHERE account_scope = %s"
     query_params: list[Any] = [ACCOUNT_SCOPE_STAFF]
     if not include_inactive:
@@ -11005,11 +14940,15 @@ def list_agents(*, include_inactive: bool = True) -> dict[str, Any]:
         query_params,
     )
     open_assigned_chat_agent_ids = get_open_assigned_live_chat_agent_ids()
-    legacy_lookup = fetch_legacy_support_users_for_accounts(accounts)
-    refreshed_accounts = [
-        refresh_staff_account_legacy_access(account, legacy_lookup)
-        for account in accounts
-    ]
+    if refresh_legacy:
+        legacy_lookup = fetch_legacy_support_users_for_accounts(accounts)
+        refreshed_accounts = [
+            refresh_staff_account_legacy_access(account, legacy_lookup)
+            for account in accounts
+        ]
+    else:
+        refreshed_accounts = accounts
+    refreshed_accounts = attach_account_team_access(refreshed_accounts)
     serialized_accounts = [
         serialize_agent(account, open_assigned_chat_agent_ids=open_assigned_chat_agent_ids)
         for account in refreshed_accounts
@@ -11063,22 +15002,24 @@ def search_entra_agents(q: str) -> dict[str, Any]:
     if not isinstance(values, list):
         return {"results": []}
 
-    existing_usernames: set[str] = set()
-    existing_emails: set[str] = set()
+    existing_accounts_by_username: dict[str, dict[str, Any]] = {}
+    existing_accounts_by_email: dict[str, dict[str, Any]] = {}
+    existing_accounts_by_entra_id: dict[str, dict[str, Any]] = {}
     for account in run_query(
         """
-        SELECT username, email
+        SELECT id, username, email, is_active, metadata
         FROM support_accounts
         WHERE account_scope = %s
-          AND is_active = TRUE
-          AND (metadata->>'legacy_support_access')::boolean = TRUE
         """,
         [ACCOUNT_SCOPE_STAFF],
     ):
         if account.get("username"):
-            existing_usernames.add(sanitize_text(account["username"]).lower())
+            existing_accounts_by_username[sanitize_text(account["username"]).lower()] = account
         if account.get("email"):
-            existing_emails.add(normalize_email(account["email"]))
+            existing_accounts_by_email[normalize_email(account["email"])] = account
+        account_entra_id = sanitize_text(normalize_json_object(account.get("metadata")).get("entra_object_id"))
+        if account_entra_id:
+            existing_accounts_by_entra_id[account_entra_id] = account
 
     results = []
     for user in values:
@@ -11093,13 +15034,19 @@ def search_entra_agents(q: str) -> dict[str, Any]:
         if not mail and not upn:
             continue
         username = (upn.split("@")[0] if upn else mail.split("@")[0]).lower()
-        already_added = username in existing_usernames or (mail and mail in existing_emails)
+        existing_account = (
+            existing_accounts_by_entra_id.get(entra_id)
+            or existing_accounts_by_email.get(mail)
+            or existing_accounts_by_username.get(username)
+        )
+        already_added = bool(existing_account and normalize_bool(existing_account.get("is_active", True)))
         results.append({
             "entraId": entra_id,
             "displayName": display_name,
             "email": mail or upn,
             "username": username,
             "alreadyAdded": already_added,
+            "existingAccountId": parse_int(existing_account.get("id")) if existing_account else None,
         })
 
     return {"results": results}
@@ -11113,8 +15060,8 @@ def _get_kbc_auth_db_connection():
     return None
 
 
-def _ensure_django_support_access(email: str, full_name: str) -> int | None:
-    """Ensure the person has a Django user in the KBC auth database Support Access group. Returns the Django user id."""
+def _ensure_django_support_access(email: str, full_name: str, *, add_support_access: bool = True) -> int | None:
+    """Ensure the person has a Django user in the KBC auth database. Returns the Django user id."""
     kbc_conn = _get_kbc_auth_db_connection()
     normalized_email = email.strip().lower()
     try:
@@ -11154,6 +15101,11 @@ def _ensure_django_support_access(email: str, full_name: str) -> int | None:
                 )
                 django_user_id = cursor.fetchone()[0]
 
+            if not add_support_access:
+                if kbc_conn:
+                    kbc_conn.commit()
+                return django_user_id
+
             cursor.execute(
                 "SELECT id FROM auth_group WHERE LOWER(TRIM(name)) = %s LIMIT 1",
                 [SUPPORT_ACCESS_GROUP_NAME],
@@ -11184,11 +15136,21 @@ def _ensure_django_support_access(email: str, full_name: str) -> int | None:
             kbc_conn.close()
 
 
+def apply_entra_agent_team_access(agent_id: int, team_key: str) -> dict[str, Any]:
+    normalized_team_key = normalize_support_team_key(team_key)
+    if normalized_team_key == TICKET_RECEIVER_SCOPE_SUPPORT:
+        return update_agent_support_access(agent_id, support_access=True)
+    if normalized_team_key == TICKET_RECEIVER_SCOPE_OPERATIONS:
+        return update_agent_operations_access(agent_id, operations_access=True)
+    return update_agent_team_access(agent_id, team_key=normalized_team_key, receive_tickets=True)
+
+
 def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     entra_id = sanitize_text(payload.get("entraId"))
     display_name = sanitize_text(payload.get("displayName"))
     email = normalize_email(sanitize_text(payload.get("email") or ""))
     username = sanitize_text(payload.get("username") or "").lower()
+    requested_team_key = sanitize_text(payload.get("teamKey") or payload.get("team_key")).lower()
 
     if not entra_id or not email:
         raise ApiError(400, "Entra ID and email are required.")
@@ -11196,18 +15158,53 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     if not is_valid_email(email):
         raise ApiError(400, "Invalid email address.")
 
+    if requested_team_key:
+        requested_team_key = normalize_support_team_key(requested_team_key)
+        if requested_team_key not in LEGACY_TEAM_ROUTING_POLICY_KEYS and not fetch_support_team_by_key(requested_team_key):
+            raise ApiError(404, "Team not found.")
+
+    should_enable_support_access = (
+        not requested_team_key
+        or requested_team_key == TICKET_RECEIVER_SCOPE_SUPPORT
+    )
+    full_name = display_name or email
+
     existing = run_query_one(
-        "SELECT id, role, is_active, metadata FROM support_accounts WHERE LOWER(TRIM(email)) = %s AND account_scope = %s LIMIT 1",
-        [email, ACCOUNT_SCOPE_STAFF],
+        """
+        SELECT id, username, full_name, email, account_scope, role, is_active, metadata
+        FROM support_accounts
+        WHERE account_scope = %s
+          AND (
+            LOWER(TRIM(email)) = %s
+            OR metadata->>'entra_object_id' = %s
+          )
+        ORDER BY
+          CASE WHEN is_active = TRUE THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
+        """,
+        [ACCOUNT_SCOPE_STAFF, email, entra_id],
     )
     if existing:
         existing_metadata = normalize_json_object(existing.get("metadata"))
-        if normalize_bool(existing_metadata.get("legacy_support_access")) and normalize_bool(existing.get("is_active", True)):
+        if (
+            not requested_team_key
+            and normalize_bool(existing_metadata.get("legacy_support_access"))
+            and normalize_bool(existing.get("is_active", True))
+        ):
             raise ApiError(409, "This person is already added as an agent.")
-        existing_metadata["legacy_support_access"] = True
+        django_user_id = _ensure_django_support_access(
+            email,
+            full_name,
+            add_support_access=should_enable_support_access,
+        )
+        existing_metadata["entra_object_id"] = entra_id
+        existing_metadata["entra_user_principal_name"] = sanitize_text(payload.get("email") or "")
+        existing_metadata["entra_directory_admin_access"] = normalize_bool(existing_metadata.get("entra_directory_admin_access"))
+        if should_enable_support_access:
+            existing_metadata["legacy_support_access"] = True
         existing_metadata.pop("manually_added_agent", None)
         existing_metadata.pop("agent_removed_at", None)
-        django_user_id = _ensure_django_support_access(email, display_name or email)
         if django_user_id and not existing_metadata.get("legacy_auth_user_id"):
             existing_metadata["legacy_auth_user_id"] = django_user_id
         persist_agent_metadata(int(existing["id"]), existing_metadata)
@@ -11224,11 +15221,19 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
             """,
             [display_name, next_role, int(existing["id"]), ACCOUNT_SCOPE_STAFF],
         )
+        if requested_team_key:
+            return {"agent": apply_entra_agent_team_access(int(existing["id"]), requested_team_key)}
+
         updated = run_query_one(
             "SELECT id, username, full_name, email, account_scope, role, is_active, metadata FROM support_accounts WHERE id = %s LIMIT 1",
             [int(existing["id"])],
         )
-        return {"agent": serialize_agent(updated, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())}
+        return {
+            "agent": serialize_agent(
+                attach_account_team_access([updated])[0],
+                open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+            )
+        }
 
     if not username:
         username = email.split("@")[0].lower()
@@ -11240,8 +15245,11 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     if username_taken:
         username = f"{username}.{entra_id[:6].lower()}"
 
-    full_name = display_name or email
-    django_user_id = _ensure_django_support_access(email, full_name)
+    django_user_id = _ensure_django_support_access(
+        email,
+        full_name,
+        add_support_access=should_enable_support_access,
+    )
 
     new_account = run_query_one(
         """
@@ -11259,7 +15267,7 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
                 "entra_object_id": entra_id,
                 "entra_user_principal_name": sanitize_text(payload.get("email") or ""),
                 "entra_directory_admin_access": False,
-                "legacy_support_access": True,
+                "legacy_support_access": should_enable_support_access,
                 **({"legacy_auth_user_id": django_user_id} if django_user_id else {}),
             }),
         ],
@@ -11267,7 +15275,15 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
     if not new_account:
         raise ApiError(500, "We could not add this agent right now.")
 
-    return {"agent": serialize_agent(new_account, open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids())}
+    if requested_team_key:
+        return {"agent": apply_entra_agent_team_access(int(new_account["id"]), requested_team_key)}
+
+    return {
+        "agent": serialize_agent(
+            attach_account_team_access([new_account])[0],
+            open_assigned_chat_agent_ids=get_open_assigned_live_chat_agent_ids(),
+        )
+    }
 
 
 def _remove_django_support_access(email: str) -> None:
@@ -11336,6 +15352,7 @@ def _sync_tickets_background() -> None:
     global _ticket_background_sync_in_progress
 
     try:
+        close_old_connections()
         sync_open_ticket_inactivity()
         tickets = run_query(
             """
@@ -11383,6 +15400,7 @@ def _sync_tickets_background() -> None:
     except Exception:
         pass
     finally:
+        close_old_connections()
         with _ticket_background_sync_lock:
             _ticket_background_sync_in_progress = False
 
@@ -11407,21 +15425,568 @@ def trigger_ticket_background_sync() -> None:
     threading.Thread(target=_sync_tickets_background, daemon=True).start()
 
 
-def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
-    trigger_ticket_background_sync()
+def _sync_ticket_detail_inactivity_background(public_id: str) -> None:
+    try:
+        close_old_connections()
+        sync_open_ticket_inactivity(public_id=public_id)
+    except Exception:
+        pass
+    finally:
+        close_old_connections()
+        with _ticket_detail_inactivity_sync_lock:
+            _ticket_detail_inactivity_sync_public_ids.discard(public_id)
 
-    tickets = run_query(
-        """
+
+def trigger_ticket_detail_inactivity_sync(public_id: Any) -> None:
+    normalized_public_id = sanitize_text(public_id)
+    if not normalized_public_id:
+        return
+    if getattr(settings, "IS_TESTING", False):
+        return
+
+    with _ticket_detail_inactivity_sync_lock:
+        if normalized_public_id in _ticket_detail_inactivity_sync_public_ids:
+            return
+        _ticket_detail_inactivity_sync_public_ids.add(normalized_public_id)
+
+    threading.Thread(
+        target=_sync_ticket_detail_inactivity_background,
+        args=(normalized_public_id,),
+        daemon=True,
+    ).start()
+
+
+ADMIN_TICKET_LIST_DEFAULT_PAGE_SIZE = 50
+ADMIN_TICKET_LIST_MAX_PAGE_SIZE = 200
+ADMIN_TICKET_LIST_SORTS = {
+    "newest",
+    "oldest",
+    "updatedNewest",
+    "updatedOldest",
+    "priorityDesc",
+    "priorityAsc",
+}
+ADMIN_TICKET_LIST_DASHBOARD_FILTERS = {
+    "all",
+    "open",
+    "pending",
+    "closed",
+    "slaBreached",
+    "quickResolution",
+    "escalation",
+    "coverage",
+    "learningPlanOther",
+}
+
+
+def normalize_admin_ticket_list_params(query_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = query_params or {}
+    page = max(parse_int(params.get("page"), 1), 1)
+    page_size_value = params.get("pageSize", params.get("limit"))
+    page_size = parse_int(page_size_value, ADMIN_TICKET_LIST_DEFAULT_PAGE_SIZE)
+    page_size = min(max(page_size, 1), ADMIN_TICKET_LIST_MAX_PAGE_SIZE)
+    sort_order = sanitize_text(params.get("sort") or params.get("sortOrder") or "priorityDesc")
+    if sort_order not in ADMIN_TICKET_LIST_SORTS:
+        sort_order = "priorityDesc"
+
+    archive_scope = sanitize_text(params.get("archiveScope") or params.get("archived") or "").lower()
+    if archive_scope in {"true", "1", "yes"}:
+        archive_scope = "archived"
+    elif archive_scope in {"false", "0", "no"}:
+        archive_scope = "active"
+    elif archive_scope not in {"active", "archived", "all"}:
+        archive_scope = ""
+
+    normalized_status = sanitize_text(params.get("status")).lower()
+    status_filter = next((status for status in ALLOWED_STATUSES if status.lower() == normalized_status), "")
+    normalized_sla_status = sanitize_text(params.get("slaStatus") or params.get("sla")).lower().replace("-", " ")
+    sla_filter = next((status for status in ALLOWED_SLA_STATUSES if status.lower() == normalized_sla_status), "")
+    dashboard_filter = sanitize_text(params.get("dashboardFilter") or params.get("filter"))
+    if dashboard_filter not in ADMIN_TICKET_LIST_DASHBOARD_FILTERS:
+        dashboard_filter = "all"
+    pagination_requested = any(key in params for key in {"page", "pageSize", "limit"})
+    created_bounds = {}
+    for key in ("createdFrom", "createdBefore"):
+        value = sanitize_text(params.get(key))
+        parsed_value = parse_iso_datetime(value)
+        if value and parsed_value is None:
+            raise ValueError(f"{key} must be a valid ISO date/time.")
+        created_bounds[key] = parsed_value
+    if (
+        created_bounds["createdFrom"] is not None
+        and created_bounds["createdBefore"] is not None
+        and created_bounds["createdFrom"] >= created_bounds["createdBefore"]
+    ):
+        raise ValueError("createdFrom must be earlier than createdBefore.")
+
+    return {
+        **created_bounds,
+        "page": page,
+        "pageSize": page_size,
+        "paginationRequested": pagination_requested,
+        "search": sanitize_text(params.get("search") or params.get("q")),
+        "status": status_filter,
+        "slaStatus": sla_filter,
+        "assigned": sanitize_text(params.get("assigned") or params.get("assignedTo")).lower(),
+        "team": sanitize_text(params.get("team") or params.get("teamKey")).lower(),
+        "archiveScope": archive_scope,
+        "sort": sort_order,
+        "dashboardFilter": dashboard_filter,
+    }
+
+
+def get_admin_ticket_search_fields(ticket: dict[str, Any]) -> list[str]:
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    conversation_metadata = normalize_json_object(ticket.get("conversation_metadata"))
+    return [
+        ticket.get("public_id"),
+        build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"), conversation_metadata),
+        ticket.get("learner_name"),
+        ticket.get("learner_email"),
+        ticket.get("learner_phone"),
+        ticket.get("submitted_for_external_learner_id"),
+        ticket.get("submitted_for_learner_name"),
+        ticket.get("submitted_for_learner_email"),
+        ticket.get("category"),
+        ticket.get("technical_subcategory"),
+        ticket.get("subject"),
+        ticket.get("inquiry"),
+        ticket.get("status"),
+        ticket.get("status_reason"),
+        ticket.get("priority"),
+        ticket.get("assigned_team"),
+        ticket.get("assigned_agent_name"),
+        ticket.get("assigned_agent_username"),
+        get_ticket_requester_role(ticket_metadata),
+        get_ticket_requester_source(
+            ticket_metadata,
+            learner_source=ticket.get("learner_source"),
+            learner_metadata=ticket.get("learner_metadata"),
+        ),
+    ]
+
+
+def admin_ticket_matches_search(ticket: dict[str, Any], search: str) -> bool:
+    normalized_search = search.casefold()
+    if not normalized_search:
+        return True
+
+    compact_search = re.sub(r"[\s_-]+", "", normalized_search)
+    for value in get_admin_ticket_search_fields(ticket):
+        normalized_value = sanitize_text(value).casefold()
+        if not normalized_value:
+            continue
+        if normalized_search in normalized_value:
+            return True
+        if compact_search and compact_search in re.sub(r"[\s_-]+", "", normalized_value):
+            return True
+
+    return False
+
+
+def admin_ticket_matches_assigned_filter(
+    ticket: dict[str, Any],
+    assigned_filter: str,
+    actor: dict[str, Any] | None,
+) -> bool:
+    if not assigned_filter or assigned_filter == "all":
+        return True
+    if assigned_filter == "unassigned":
+        return not ticket.get("assigned_agent_id")
+    if assigned_filter == "me":
+        actor_id = parse_int((actor or {}).get("id"))
+        return actor_id > 0 and (
+            parse_int(ticket.get("assigned_agent_id")) == actor_id
+            or is_admin_ticket_linked_to_escalation_agent(ticket, actor_id)
+        )
+
+    agent_id = parse_int(assigned_filter.replace("agent:", ""))
+    return agent_id > 0 and (
+        parse_int(ticket.get("assigned_agent_id")) == agent_id
+        or is_admin_ticket_linked_to_escalation_agent(ticket, agent_id)
+    )
+
+
+def is_admin_ticket_linked_to_escalation_agent(ticket: dict[str, Any], agent_id: int) -> bool:
+    if agent_id <= 0:
+        return False
+
+    ticket_metadata = normalize_json_object(ticket.get("metadata"))
+    pending_escalation_notification = get_pending_escalation_notification(ticket_metadata)
+    if pending_escalation_notification:
+        return (
+            parse_int(pending_escalation_notification.get("fromAgentId")) == agent_id
+            or parse_int(pending_escalation_notification.get("toAgentId")) == agent_id
+        )
+
+    latest_escalation_closure = get_latest_escalation_closure(ticket_metadata)
+    if not latest_escalation_closure:
+        if sanitize_text(ticket.get("status_reason")) != STATUS_REASON_ESCALATION:
+            return False
+
+        documentation = normalize_admin_documentation(ticket_metadata.get("admin_documentation"))
+        return (
+            parse_int(ticket.get("assigned_agent_id")) == agent_id
+            or parse_assigned_agent_id(documentation.get("escalationAgentId")) == agent_id
+        )
+
+    return (
+        parse_int(latest_escalation_closure.get("fromAgentId")) == agent_id
+        or parse_int(latest_escalation_closure.get("toAgentId")) == agent_id
+    )
+
+
+def admin_ticket_matches_team_filter(ticket: dict[str, Any], team_filter: str) -> bool:
+    if not team_filter or team_filter == "all":
+        return True
+
+    normalized_team_filter = team_filter.casefold()
+    ticket_routing_policy = get_ticket_routing_policy(ticket)
+    return normalized_team_filter in {
+        sanitize_text(ticket_routing_policy.get("key")).casefold(),
+        sanitize_text(ticket_routing_policy.get("assigned_team")).casefold(),
+    }
+
+
+def get_admin_ticket_dashboard_bucket(ticket: dict[str, Any]) -> str:
+    chat_state = derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status"))
+    ticket_state = derive_ticket_state(ticket, chat_state=chat_state)
+    return sanitize_text(ticket_state.get("dashboardBucket"))
+
+
+def is_admin_dashboard_open_ticket(ticket: dict[str, Any]) -> bool:
+    chat_state = derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status"))
+    return (
+        sanitize_text(ticket.get("status")) == "Open"
+        and chat_state != "closed"
+        and (
+            not is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata"))
+            or (
+                is_active_conversation(ticket.get("conversation_metadata"))
+                and is_latest_ticket_for_conversation(ticket.get("public_id"), ticket.get("conversation_metadata"))
+            )
+        )
+    )
+
+
+def is_admin_dashboard_pending_ticket(ticket: dict[str, Any]) -> bool:
+    return sanitize_text(ticket.get("status")) == "Pending" or get_admin_ticket_dashboard_bucket(ticket) == "pending"
+
+
+def is_admin_dashboard_escalation_ticket(ticket: dict[str, Any]) -> bool:
+    return (
+        get_admin_ticket_dashboard_bucket(ticket) == "escalation"
+        or (
+            sanitize_text(ticket.get("status")) == "Pending"
+            and sanitize_text(ticket.get("status_reason")) == STATUS_REASON_ESCALATION
+        )
+    )
+
+
+def is_admin_dashboard_closed_ticket(ticket: dict[str, Any]) -> bool:
+    return sanitize_text(ticket.get("status")) == "Closed" or get_admin_ticket_dashboard_bucket(ticket) == "closed"
+
+
+def admin_ticket_matches_dashboard_filter(ticket: dict[str, Any], dashboard_filter: str) -> bool:
+    if dashboard_filter in {"", "all"}:
+        return True
+    if dashboard_filter == "open":
+        return is_admin_dashboard_open_ticket(ticket)
+    if dashboard_filter == "pending":
+        return is_admin_dashboard_pending_ticket(ticket)
+    if dashboard_filter == "closed":
+        return is_admin_dashboard_closed_ticket(ticket)
+    if dashboard_filter == "slaBreached":
+        return normalize_sla_status(ticket.get("sla_status")) == "Breached"
+    if dashboard_filter == "quickResolution":
+        return is_quick_ticket_record(ticket) and not is_coverage_ticket_record(ticket)
+    if dashboard_filter == "escalation":
+        return is_admin_dashboard_escalation_ticket(ticket)
+    if dashboard_filter == "coverage":
+        return is_coverage_ticket_record(ticket)
+    if dashboard_filter == "learningPlanOther":
+        return (
+            get_ticket_receiver_scope(ticket) == TICKET_RECEIVER_SCOPE_OPERATIONS
+            and not is_coverage_ticket_record(ticket)
+        )
+    return True
+
+
+def filter_admin_ticket_list(
+    tickets: list[dict[str, Any]],
+    params: dict[str, Any],
+    actor: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    filtered_tickets = tickets
+    created_from = params.get("createdFrom")
+    created_before = params.get("createdBefore")
+    if created_from or created_before:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if (created_at := coerce_datetime(ticket.get("created_at"))) is not None
+            and (created_from is None or created_at >= created_from)
+            and (created_before is None or created_at < created_before)
+        ]
+    if params["archiveScope"] == "active":
+        filtered_tickets = [ticket for ticket in filtered_tickets if not normalize_bool(ticket.get("is_archived"))]
+    elif params["archiveScope"] == "archived":
+        filtered_tickets = [ticket for ticket in filtered_tickets if normalize_bool(ticket.get("is_archived"))]
+
+    if params["dashboardFilter"] and params["dashboardFilter"] != "all":
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_dashboard_filter(ticket, params["dashboardFilter"])
+        ]
+
+    if params["status"]:
+        filtered_tickets = [ticket for ticket in filtered_tickets if sanitize_text(ticket.get("status")) == params["status"]]
+
+    if params["slaStatus"]:
+        filtered_tickets = [ticket for ticket in filtered_tickets if normalize_sla_status(ticket.get("sla_status")) == params["slaStatus"]]
+
+    if params["assigned"]:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_assigned_filter(ticket, params["assigned"], actor)
+        ]
+
+    if params["team"]:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_team_filter(ticket, params["team"])
+        ]
+
+    if params["search"]:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if admin_ticket_matches_search(ticket, params["search"])
+        ]
+
+    return filtered_tickets
+
+
+def get_admin_ticket_sort_datetime(ticket: dict[str, Any], field: str) -> datetime:
+    return coerce_datetime(ticket.get(field)) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def get_ticket_priority_ascending_rank(priority: Any) -> int:
+    normalized_priority = normalize_ticket_priority(priority)
+    if normalized_priority == "Low":
+        return 0
+    if normalized_priority == "Normal":
+        return 1
+    if normalized_priority == "High":
+        return 2
+    if normalized_priority == "Urgent":
+        return 3
+    return 4
+
+
+def sort_admin_ticket_list(tickets: list[dict[str, Any]], sort_order: str) -> list[dict[str, Any]]:
+    if sort_order == "newest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "created_at"), parse_int(ticket.get("id"))), reverse=True)
+    if sort_order == "oldest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "created_at"), parse_int(ticket.get("id"))))
+    if sort_order == "updatedNewest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "updated_at"), parse_int(ticket.get("id"))), reverse=True)
+    if sort_order == "updatedOldest":
+        return sorted(tickets, key=lambda ticket: (get_admin_ticket_sort_datetime(ticket, "updated_at"), parse_int(ticket.get("id"))))
+    if sort_order == "priorityAsc":
+        return sorted(
+            tickets,
+            key=lambda ticket: (
+                0 if is_priority_sorted_ticket_status(ticket.get("status")) else 1,
+                get_ticket_priority_ascending_rank(ticket.get("priority")) if is_priority_sorted_ticket_status(ticket.get("status")) else 4,
+                get_admin_ticket_sort_datetime(ticket, "created_at"),
+                parse_int(ticket.get("id")),
+            ),
+        )
+
+    return sort_tickets_by_priority_and_recency(tickets)
+
+
+def paginate_admin_ticket_list(tickets: list[dict[str, Any]], params: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    total = len(tickets)
+    if not params["paginationRequested"]:
+        return tickets, {
+            "page": 1,
+            "pageSize": total,
+            "total": total,
+            "totalPages": 1 if total else 0,
+            "hasNext": False,
+            "hasPrevious": False,
+            "isPaginated": False,
+        }
+
+    page = params["page"]
+    page_size = params["pageSize"]
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    if total_pages:
+        page = min(page, total_pages)
+    start_index = (page - 1) * page_size
+    end_index = start_index + page_size
+
+    return tickets[start_index:end_index], {
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": total_pages,
+        "hasNext": bool(total_pages and page < total_pages),
+        "hasPrevious": page > 1,
+        "isPaginated": True,
+    }
+
+
+def build_admin_ticket_list_filter_response(params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "createdFrom": serialize_datetime_value(params.get("createdFrom")),
+        "createdBefore": serialize_datetime_value(params.get("createdBefore")),
+        "search": params["search"],
+        "status": params["status"],
+        "slaStatus": params["slaStatus"],
+        "assigned": params["assigned"],
+        "team": params["team"],
+        "archiveScope": params["archiveScope"],
+        "sort": params["sort"],
+        "dashboardFilter": params["dashboardFilter"],
+    }
+
+
+def sql_literal(value: Any) -> str:
+    return f"'{sanitize_text(value).replace("'", "''")}'"
+
+
+ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION = "LOWER(TRIM(COALESCE(t.technical_subcategory, '')))"
+ADMIN_TICKET_SQL_ASSIGNED_TEAM_EXPRESSION = "LOWER(TRIM(COALESCE(t.assigned_team, '')))"
+ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION = (
+    "LOWER(COALESCE(NULLIF(c.metadata->>'live_chat_requested', ''), "
+    "NULLIF(t.metadata->>'live_chat_requested', ''), 'false')) IN ('true', '1', 'yes', 'on')"
+)
+ADMIN_TICKET_SQL_ACTIVE_CONVERSATION_EXPRESSION = (
+    "LOWER(COALESCE(NULLIF(c.metadata->>'is_active_conversation', ''), 'false')) IN ('true', '1', 'yes', 'on')"
+)
+ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION = f"""
+COALESCE(
+  NULLIF(LOWER(TRIM(COALESCE(t.queue_scope, ''))), ''),
+  CASE
+    WHEN {ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION} = 'coverage'
+      THEN {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)}
+    WHEN {ADMIN_TICKET_SQL_ASSIGNED_TEAM_EXPRESSION} IN (
+      {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)},
+      {sql_literal(ASSIGNED_TEAM_LEARNING_PLAN.casefold())}
+    )
+      THEN {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)}
+    WHEN routed_team.key IS NOT NULL
+      THEN LOWER(TRIM(routed_team.key))
+    ELSE {sql_literal(TICKET_RECEIVER_SCOPE_SUPPORT)}
+  END
+)
+"""
+ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION = f"""
+COALESCE(
+  NULLIF(LOWER(TRIM(COALESCE(t.dashboard_bucket, ''))), ''),
+  CASE
+    WHEN t.status = 'Closed' THEN 'closed'
+    WHEN {ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION} = 'coverage' THEN 'coverage'
+    WHEN {ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)} THEN 'learning_plan'
+    WHEN LOWER(TRIM(COALESCE(t.ticket_type, ''))) = 'quick' THEN 'quick'
+    WHEN t.status_reason = {sql_literal(STATUS_REASON_ESCALATION)} THEN 'escalation'
+    WHEN {ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION} THEN 'live_chat'
+    WHEN t.status = 'Pending' THEN 'pending'
+    WHEN {ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} NOT IN (
+      {sql_literal(TICKET_RECEIVER_SCOPE_SUPPORT)},
+      {sql_literal(TICKET_RECEIVER_SCOPE_OPERATIONS)}
+    ) THEN {ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION}
+    ELSE 'support'
+  END
+)
+"""
+ADMIN_TICKET_SQL_OPEN_FILTER_EXPRESSION = f"""
+(
+  t.status = 'Open'
+  AND LOWER(COALESCE(c.status, 'open')) <> 'closed'
+  AND (
+    NOT ({ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION})
+    OR (
+      {ADMIN_TICKET_SQL_ACTIVE_CONVERSATION_EXPRESSION}
+      AND COALESCE(c.metadata->>'latest_ticket_public_id', '') IN ('', t.public_id)
+    )
+  )
+)
+"""
+ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION = f"""
+(
+  {ADMIN_TICKET_SQL_TECHNICAL_SUBCATEGORY_EXPRESSION} = 'coverage'
+  OR LOWER(TRIM(COALESCE(t.ticket_type, ''))) = 'coverage'
+  OR LOWER(TRIM(COALESCE(t.metadata #>> '{{ticket_state,ticketType}}', ''))) = 'coverage'
+  OR LOWER(TRIM(COALESCE(t.metadata->>'technical_subcategory', ''))) = 'coverage'
+)
+"""
+ADMIN_TICKET_SQL_QUICK_FILTER_EXPRESSION = f"""
+(
+  LOWER(TRIM(COALESCE(t.ticket_type, ''))) = 'quick'
+  OR LOWER(TRIM(COALESCE(t.metadata #>> '{{ticket_state,ticketType}}', ''))) = 'quick'
+  OR LOWER(COALESCE(NULLIF(t.metadata->>'{QUICK_TICKET_ORIGIN_METADATA_KEY}', ''), 'false')) IN ('true', '1', 'yes', 'on')
+  OR t.status_reason = ANY(%s::text[])
+)
+"""
+
+
+def get_admin_ticket_sql_from_clause() -> str:
+    return f"""
+        FROM tickets t
+        JOIN learners l
+          ON l.id = t.learner_id
+        LEFT JOIN learners submitted_for
+          ON submitted_for.id = t.submitted_for_learner_id
+        LEFT JOIN conversations c
+          ON c.id = t.conversation_id
+        LEFT JOIN support_teams routed_team
+          ON routed_team.is_active = TRUE
+         AND {ADMIN_TICKET_SQL_ASSIGNED_TEAM_EXPRESSION} IN (
+           LOWER(TRIM(routed_team.key)),
+           LOWER(TRIM(routed_team.name))
+         )
+        LEFT JOIN LATERAL (
+          SELECT ssr.status, ssr.metadata
+          FROM support_session_requests ssr
+          WHERE ssr.ticket_id = t.id
+          ORDER BY ssr.created_at DESC, ssr.id DESC
+          LIMIT 1
+        ) latest_session_request ON TRUE
+        LEFT JOIN support_accounts a
+          ON a.id = t.assigned_agent_id
+        LEFT JOIN support_accounts archived_by
+          ON archived_by.id = t.archived_by_id
+    """
+
+
+def get_admin_ticket_sql_select_clause() -> str:
+    return """
         SELECT
           t.id,
           t.public_id,
           t.category,
           t.inquiry,
           t.technical_subcategory,
+          t.subject,
+          t.submitted_for_learner_id,
           t.status,
           t.status_reason,
           t.priority,
           t.assigned_team,
+          t.ticket_type,
+          t.workflow_stage,
+          t.queue_scope,
+          t.dashboard_bucket,
+          t.can_show_conversation,
+          t.can_receive_chat,
+          t.resolution_reason,
           t.sla_status,
           t.metadata,
           t.evidence_count,
@@ -11440,27 +16005,380 @@ def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
           l.full_name AS learner_name,
           l.email AS learner_email,
           l.phone AS learner_phone,
+          l.source AS learner_source,
+          l.metadata AS learner_metadata,
+          submitted_for.external_learner_id AS submitted_for_external_learner_id,
+          submitted_for.full_name AS submitted_for_learner_name,
+          submitted_for.email AS submitted_for_learner_email,
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name,
           archived_by.username AS archived_by_username,
           archived_by.full_name AS archived_by_name
-        FROM tickets t
-        JOIN learners l
-          ON l.id = t.learner_id
-        LEFT JOIN conversations c
-          ON c.id = t.conversation_id
-        LEFT JOIN LATERAL (
-          SELECT ssr.status, ssr.metadata
-          FROM support_session_requests ssr
-          WHERE ssr.ticket_id = t.id
-          ORDER BY ssr.created_at DESC, ssr.id DESC
-          LIMIT 1
-        ) latest_session_request ON TRUE
-        LEFT JOIN support_accounts a
-          ON a.id = t.assigned_agent_id
-        LEFT JOIN support_accounts archived_by
-          ON archived_by.id = t.archived_by_id
+    """
+
+
+def get_admin_ticket_sql_order_by(sort_order: str) -> str:
+    if sort_order == "newest":
+        return "ORDER BY t.created_at DESC, t.id DESC"
+    if sort_order == "oldest":
+        return "ORDER BY t.created_at ASC, t.id ASC"
+    if sort_order == "updatedNewest":
+        return "ORDER BY t.updated_at DESC, t.id DESC"
+    if sort_order == "updatedOldest":
+        return "ORDER BY t.updated_at ASC, t.id ASC"
+    if sort_order == "priorityAsc":
+        return """
+        ORDER BY
+          CASE WHEN t.status = ANY(%s::text[]) THEN 0 ELSE 1 END,
+          CASE
+            WHEN t.status = ANY(%s::text[]) THEN
+              CASE t.priority
+                WHEN 'Low' THEN 0
+                WHEN 'Normal' THEN 1
+                WHEN 'High' THEN 2
+                WHEN 'Urgent' THEN 3
+                ELSE 4
+              END
+            ELSE 4
+          END,
+          t.created_at ASC,
+          t.id ASC
+        """
+
+    return """
+        ORDER BY
+          CASE WHEN t.status = ANY(%s::text[]) THEN 0 ELSE 1 END,
+          CASE
+            WHEN t.status = ANY(%s::text[]) THEN
+              CASE t.priority
+                WHEN 'Urgent' THEN 0
+                WHEN 'High' THEN 1
+                WHEN 'Normal' THEN 2
+                WHEN 'Low' THEN 3
+                ELSE 2
+              END
+            ELSE 2
+          END,
+          CASE WHEN t.status = ANY(%s::text[]) THEN t.created_at ELSE COALESCE(t.closed_at, t.updated_at, t.created_at) END DESC,
+          t.id DESC
+    """
+
+
+def get_admin_ticket_sql_order_params(sort_order: str) -> list[Any]:
+    if sort_order == "priorityAsc":
+        return [sorted(ACTIVE_PRIORITY_TICKET_STATUSES), sorted(ACTIVE_PRIORITY_TICKET_STATUSES)]
+    if sort_order not in {"newest", "oldest", "updatedNewest", "updatedOldest"}:
+        active_statuses = sorted(ACTIVE_PRIORITY_TICKET_STATUSES)
+        return [active_statuses, active_statuses, active_statuses]
+    return []
+
+
+def fetch_account_team_access_keys(account_id: Any) -> set[str]:
+    normalized_account_id = parse_int(account_id)
+    if normalized_account_id <= 0:
+        return set()
+
+    try:
+        rows = run_query(
+            """
+            SELECT st.key
+            FROM support_account_team_access ata
+            JOIN support_teams st
+              ON st.id = ata.team_id
+            WHERE ata.account_id = %s
+              AND st.is_active = TRUE
+              AND ata.can_receive_tickets = TRUE
+            """,
+            [normalized_account_id],
+        )
+    except Exception:
+        return set()
+
+    return {
+        sanitize_text(row.get("key")).lower()
+        for row in rows
+        if sanitize_text(row.get("key")).lower()
+    }
+
+
+def get_actor_ticket_access_team_keys(actor: dict[str, Any] | None) -> set[str] | None:
+    if actor is None or actor_has_admin_dashboard_access(actor):
+        return None
+
+    metadata = normalize_json_object(actor.get("metadata"))
+    team_keys = get_preloaded_account_team_access_keys(actor)
+    if normalize_bool(metadata.get(TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]["receiver_access_metadata_key"])):
+        team_keys.add(TICKET_RECEIVER_SCOPE_SUPPORT)
+    if normalize_bool(metadata.get(TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN]["receiver_access_metadata_key"])):
+        team_keys.add(TICKET_RECEIVER_SCOPE_OPERATIONS)
+    team_keys.update(fetch_account_team_access_keys(actor.get("id")))
+    return team_keys
+
+
+def resolve_admin_ticket_team_filter_key(team_filter: Any) -> str:
+    normalized_team_filter = sanitize_text(team_filter).lower()
+    if not normalized_team_filter or normalized_team_filter == "all":
+        return ""
+
+    for policy in TEAM_ROUTING_POLICIES.values():
+        if normalized_team_filter in {
+            sanitize_text(policy.get("key")).lower(),
+            sanitize_text(policy.get("assigned_team")).lower(),
+        }:
+            return policy["key"]
+
+    team = fetch_admin_ticket_sql_prefilter_team_row(normalized_team_filter)
+    if team:
+        return sanitize_text(team.get("key")).lower()
+
+    return "__no_matching_team__"
+
+
+def build_admin_ticket_search_sql(search: str) -> tuple[str, list[Any]]:
+    normalized_search = sanitize_text(search).casefold()
+    if not normalized_search:
+        return "", []
+
+    compact_search = re.sub(r"[\s_-]+", "", normalized_search)
+    like_value = f"%{normalized_search}%"
+    compact_like_value = f"%{compact_search}%"
+    searchable_fields = [
+        "t.public_id",
+        "('CHAT-' || LPAD(t.conversation_id::text, 6, '0'))",
+        "(c.metadata->>'chat_public_id')",
+        "l.full_name",
+        "l.email",
+        "l.phone",
+        "submitted_for.external_learner_id",
+        "submitted_for.full_name",
+        "submitted_for.email",
+        "t.category",
+        "t.technical_subcategory",
+        "t.subject",
+        "t.inquiry",
+        "t.status",
+        "t.status_reason",
+        "t.priority",
+        "t.assigned_team",
+        "a.full_name",
+        "a.username",
+        "(t.metadata->>'requester_role')",
+        "l.source",
+        "(l.metadata->>'legacy_source')",
+    ]
+    clauses = [f"LOWER(COALESCE({field}, '')) LIKE %s" for field in searchable_fields]
+    params: list[Any] = [like_value for _field in searchable_fields]
+    if compact_search:
+        clauses.extend([
+            f"REPLACE(REPLACE(REPLACE(LOWER(COALESCE({field}, '')), ' ', ''), '_', ''), '-', '') LIKE %s"
+            for field in searchable_fields
+        ])
+        params.extend([compact_like_value for _field in searchable_fields])
+
+    return f"({' OR '.join(clauses)})", params
+
+
+def build_admin_ticket_assigned_sql(assigned_filter: str, actor: dict[str, Any] | None) -> tuple[str, list[Any]]:
+    normalized_assigned_filter = sanitize_text(assigned_filter).lower()
+    if not normalized_assigned_filter or normalized_assigned_filter == "all":
+        return "", []
+    if normalized_assigned_filter == "unassigned":
+        return "t.assigned_agent_id IS NULL", []
+
+    if normalized_assigned_filter == "me":
+        agent_id = parse_int((actor or {}).get("id"))
+    else:
+        agent_id = parse_int(normalized_assigned_filter.replace("agent:", ""))
+
+    if agent_id <= 0:
+        return "FALSE", []
+
+    agent_id_text = str(agent_id)
+    return (
+        """
+        (
+          t.assigned_agent_id = %s
+          OR COALESCE(t.metadata #>> '{pending_transfer_request,toAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{pending_transfer_request,fromAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{pending_escalation_notification,toAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{pending_escalation_notification,fromAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{latest_escalation_closure,toAgentId}', '') = %s
+          OR COALESCE(t.metadata #>> '{latest_escalation_closure,fromAgentId}', '') = %s
+          OR (
+            t.status_reason = %s
+            AND COALESCE(t.metadata #>> '{admin_documentation,escalationAgentId}', '') = %s
+          )
+        )
+        """,
+        [agent_id, agent_id_text, agent_id_text, agent_id_text, agent_id_text, agent_id_text, agent_id_text, STATUS_REASON_ESCALATION, agent_id_text],
+    )
+
+
+def build_admin_ticket_hidden_sql() -> str:
+    return f"""
+    NOT (
+      (
+        t.is_archived = FALSE
+        AND t.status = 'Open'
+        AND COALESCE(t.metadata->>'{SUPPORT_FLOW_STAGE_METADATA_KEY}', '') = {sql_literal(SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS)}
+      )
+      OR (
+        t.is_archived = FALSE
+        AND t.status = 'Open'
+        AND COALESCE(t.status_reason, '') = ''
+        AND LOWER(COALESCE(latest_session_request.status, '')) = 'cancelled'
+        AND COALESCE(latest_session_request.metadata->>'return_path', '') = '/support/options'
+        AND NOT ({ADMIN_TICKET_SQL_LIVE_CHAT_REQUESTED_EXPRESSION})
+      )
+    )
+    """
+
+
+def fetch_admin_ticket_sql_prefilter_team_row(team_filter: Any) -> dict[str, Any] | None:
+    normalized_team_filter = sanitize_text(team_filter).lower()
+    if not normalized_team_filter or normalized_team_filter == "all":
+        return None
+
+    for policy in TEAM_ROUTING_POLICIES.values():
+        if normalized_team_filter in {
+            sanitize_text(policy.get("key")).lower(),
+            sanitize_text(policy.get("assigned_team")).lower(),
+        }:
+            return None
+
+    try:
+        team = fetch_support_team_by_key(normalized_team_filter)
+    except Exception:
+        team = None
+
+    if team:
+        return team
+
+    try:
+        return fetch_optional_dynamic_team_row_by_assigned_team(normalized_team_filter)
+    except Exception:
+        return None
+
+
+def build_admin_ticket_sql_prefilter(
+    params: dict[str, Any] | None = None,
+    actor: dict[str, Any] | None = None,
+    *,
+    include_actor: bool = False,
+    include_search: bool = False,
+    include_assigned: bool = False,
+    include_hidden: bool = False,
+) -> tuple[str, list[Any]]:
+    if not isinstance(params, dict):
+        params = {}
+
+    where_clauses: list[str] = []
+    query_params: list[Any] = []
+
+    created_from = coerce_datetime(params.get("createdFrom"))
+    created_before = coerce_datetime(params.get("createdBefore"))
+    if created_from is not None:
+        where_clauses.append("t.created_at >= %s")
+        query_params.append(created_from)
+    if created_before is not None:
+        where_clauses.append("t.created_at < %s")
+        query_params.append(created_before)
+
+    archive_scope = sanitize_text(params.get("archiveScope")).lower()
+    if archive_scope == "active":
+        where_clauses.append("t.is_archived = FALSE")
+    elif archive_scope == "archived":
+        where_clauses.append("t.is_archived = TRUE")
+
+    status_filter = sanitize_text(params.get("status"))
+    if status_filter in ALLOWED_STATUSES:
+        where_clauses.append("t.status = %s")
+        query_params.append(status_filter)
+
+    sla_filter = sanitize_text(params.get("slaStatus"))
+    if sla_filter in ALLOWED_SLA_STATUSES:
+        where_clauses.append("t.sla_status = %s")
+        query_params.append(sla_filter)
+
+    dashboard_filter = sanitize_text(params.get("dashboardFilter"))
+    if dashboard_filter == "coverage":
+        where_clauses.append(ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION)
+    elif dashboard_filter == "learningPlanOther":
+        where_clauses.append(
+            f"({ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = %s AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION}))"
+        )
+        query_params.append(TICKET_RECEIVER_SCOPE_OPERATIONS)
+    elif dashboard_filter == "slaBreached":
+        where_clauses.append("t.sla_status = %s")
+        query_params.append("Breached")
+    elif dashboard_filter == "quickResolution":
+        where_clauses.append(f"({ADMIN_TICKET_SQL_QUICK_FILTER_EXPRESSION} AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION}))")
+        query_params.append(sorted(QUICK_TICKET_STATUS_REASONS))
+    elif dashboard_filter == "escalation":
+        where_clauses.append(f"(t.status_reason = %s OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'escalation')")
+        query_params.append(STATUS_REASON_ESCALATION)
+    elif dashboard_filter == "open":
+        where_clauses.append(ADMIN_TICKET_SQL_OPEN_FILTER_EXPRESSION)
+    elif dashboard_filter == "pending":
+        where_clauses.append(f"(t.status = 'Pending' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'pending')")
+    elif dashboard_filter == "closed":
+        where_clauses.append(f"(t.status = 'Closed' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'closed')")
+
+    team_filter_key = resolve_admin_ticket_team_filter_key(params.get("team"))
+    if team_filter_key == "__no_matching_team__":
+        where_clauses.append("FALSE")
+    elif team_filter_key:
+        where_clauses.append(f"{ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = %s")
+        query_params.append(team_filter_key)
+
+    if include_search:
+        search_clause, search_params = build_admin_ticket_search_sql(params.get("search"))
+        if search_clause:
+            where_clauses.append(search_clause)
+            query_params.extend(search_params)
+
+    if include_assigned:
+        assigned_clause, assigned_params = build_admin_ticket_assigned_sql(params.get("assigned"), actor)
+        if assigned_clause:
+            where_clauses.append(assigned_clause)
+            query_params.extend(assigned_params)
+
+    if include_actor:
+        actor_team_keys = get_actor_ticket_access_team_keys(actor)
+        if actor_team_keys is not None:
+            if actor_team_keys:
+                where_clauses.append(f"{ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = ANY(%s::text[])")
+                query_params.append(sorted(actor_team_keys))
+            else:
+                where_clauses.append("FALSE")
+
+    if include_hidden:
+        where_clauses.append(build_admin_ticket_hidden_sql())
+
+    if not where_clauses:
+        return "", query_params
+
+    return f"WHERE {' AND '.join(where_clauses)}", query_params
+
+
+def fetch_admin_ticket_rows(
+    prefilter_params: dict[str, Any] | None = None,
+    actor: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    where_clause, query_params = build_admin_ticket_sql_prefilter(
+        prefilter_params,
+        actor,
+        include_actor=actor is not None,
+        include_search=False,
+        include_assigned=False,
+        include_hidden=False,
+    )
+    return run_query(
+        f"""
+        {get_admin_ticket_sql_select_clause()}
+        {get_admin_ticket_sql_from_clause()}
+        {where_clause}
         ORDER BY
           CASE t.priority
             WHEN 'Urgent' THEN 0
@@ -11470,14 +16388,231 @@ def list_admin_tickets(actor: dict[str, Any] | None = None) -> dict[str, Any]:
           END,
           t.created_at DESC,
           t.id DESC
-        """
+        """,
+        query_params,
     )
 
+
+def get_admin_ticket_rows_for_actor(
+    actor: dict[str, Any] | None = None,
+    *,
+    prefilter_params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    tickets = fetch_admin_ticket_rows(prefilter_params, actor)
     tickets = [ticket for ticket in tickets if not is_admin_hidden_support_flow_ticket_record(ticket)]
     tickets = filter_admin_tickets_for_actor(tickets, actor)
-    tickets = [apply_ticket_sla_policy(ticket) for ticket in tickets]
-    tickets = sort_tickets_by_priority_and_recency(tickets)
-    return {"tickets": [serialize_ticket_summary(ticket) for ticket in tickets]}
+    return [apply_ticket_sla_policy(ticket) for ticket in tickets]
+
+
+def build_admin_ticket_sql_list_where(
+    params: dict[str, Any],
+    actor: dict[str, Any] | None,
+) -> tuple[str, list[Any]]:
+    return build_admin_ticket_sql_prefilter(
+        params,
+        actor,
+        include_actor=actor is not None,
+        include_search=True,
+        include_assigned=True,
+        include_hidden=True,
+    )
+
+
+def build_admin_ticket_pagination(total: int, params: dict[str, Any]) -> dict[str, Any]:
+    page_size = params["pageSize"]
+    page = params["page"]
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    if total_pages:
+        page = min(page, total_pages)
+
+    return {
+        "page": page,
+        "pageSize": page_size,
+        "total": total,
+        "totalPages": total_pages,
+        "hasNext": bool(total_pages and page < total_pages),
+        "hasPrevious": page > 1,
+        "isPaginated": True,
+    }
+
+
+def fetch_admin_ticket_page_for_actor(
+    actor: dict[str, Any] | None,
+    params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    where_clause, where_params = build_admin_ticket_sql_list_where(params, actor)
+    count_row = run_query_one(
+        f"""
+        SELECT COUNT(*) AS total
+        {get_admin_ticket_sql_from_clause()}
+        {where_clause}
+        """,
+        where_params,
+    )
+    total = parse_int((count_row or {}).get("total"))
+    pagination = build_admin_ticket_pagination(total, params)
+    offset = max(pagination["page"] - 1, 0) * pagination["pageSize"]
+    order_by = get_admin_ticket_sql_order_by(params["sort"])
+    order_params = get_admin_ticket_sql_order_params(params["sort"])
+    rows = run_query(
+        f"""
+        {get_admin_ticket_sql_select_clause()}
+        {get_admin_ticket_sql_from_clause()}
+        {where_clause}
+        {order_by}
+        LIMIT %s OFFSET %s
+        """,
+        [*where_params, *order_params, pagination["pageSize"], offset],
+    )
+    return [apply_ticket_sla_policy(row) for row in rows], pagination
+
+
+def get_admin_ticket_metrics_params(query_params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = normalize_admin_ticket_list_params(query_params)
+    return {
+        **params,
+        "search": "",
+        "status": "",
+        "slaStatus": "",
+        "paginationRequested": False,
+    }
+
+
+def build_admin_ticket_metric_counts(tickets: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "total": len(tickets),
+        "open": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "open")),
+        "pending": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "pending")),
+        "escalation": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "escalation")),
+        "closed": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "closed")),
+        "slaBreached": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "slaBreached")),
+        "coverage": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "coverage")),
+        "quickResolution": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "quickResolution")),
+    }
+
+
+def build_admin_ticket_section_metric_counts(tickets: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "coverage": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "coverage")),
+        "learningPlanOther": sum(1 for ticket in tickets if admin_ticket_matches_dashboard_filter(ticket, "learningPlanOther")),
+    }
+
+
+def build_admin_ticket_metric_count_sql(where_clause: str) -> str:
+    return f"""
+    SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN {ADMIN_TICKET_SQL_OPEN_FILTER_EXPRESSION} THEN 1 ELSE 0 END), 0) AS open,
+      COALESCE(SUM(CASE WHEN (t.status = 'Pending' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'pending') THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN (t.status_reason = %s OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'escalation') THEN 1 ELSE 0 END), 0) AS escalation,
+      COALESCE(SUM(CASE WHEN (t.status = 'Closed' OR {ADMIN_TICKET_SQL_DASHBOARD_BUCKET_EXPRESSION} = 'closed') THEN 1 ELSE 0 END), 0) AS closed,
+      COALESCE(SUM(CASE WHEN t.sla_status = 'Breached' THEN 1 ELSE 0 END), 0) AS sla_breached,
+      COALESCE(SUM(CASE WHEN {ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION} THEN 1 ELSE 0 END), 0) AS coverage,
+      COALESCE(SUM(CASE WHEN ({ADMIN_TICKET_SQL_QUICK_FILTER_EXPRESSION} AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION})) THEN 1 ELSE 0 END), 0) AS quick_resolution
+    {get_admin_ticket_sql_from_clause()}
+    {where_clause}
+    """
+
+
+def normalize_admin_ticket_metric_row(row: dict[str, Any] | None) -> dict[str, int]:
+    return {
+        "total": parse_int((row or {}).get("total")),
+        "open": parse_int((row or {}).get("open")),
+        "pending": parse_int((row or {}).get("pending")),
+        "escalation": parse_int((row or {}).get("escalation")),
+        "closed": parse_int((row or {}).get("closed")),
+        "slaBreached": parse_int((row or {}).get("sla_breached")),
+        "coverage": parse_int((row or {}).get("coverage")),
+        "quickResolution": parse_int((row or {}).get("quick_resolution")),
+    }
+
+
+def get_admin_ticket_metrics_from_sql(
+    actor: dict[str, Any] | None,
+    metrics_params: dict[str, Any],
+    section_params: dict[str, Any],
+) -> dict[str, Any]:
+    metric_where_clause, metric_where_params = build_admin_ticket_sql_list_where(metrics_params, actor)
+    metric_row = run_query_one(
+        build_admin_ticket_metric_count_sql(metric_where_clause),
+        [
+            STATUS_REASON_ESCALATION,
+            sorted(QUICK_TICKET_STATUS_REASONS),
+            *metric_where_params,
+        ],
+    )
+
+    section_where_clause, section_where_params = build_admin_ticket_sql_list_where(section_params, actor)
+    section_row = run_query_one(
+        f"""
+        SELECT
+          COALESCE(SUM(CASE WHEN {ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION} THEN 1 ELSE 0 END), 0) AS coverage,
+          COALESCE(SUM(CASE WHEN ({ADMIN_TICKET_SQL_QUEUE_SCOPE_EXPRESSION} = %s AND NOT ({ADMIN_TICKET_SQL_COVERAGE_FILTER_EXPRESSION})) THEN 1 ELSE 0 END), 0) AS learning_plan_other
+        {get_admin_ticket_sql_from_clause()}
+        {section_where_clause}
+        """,
+        [
+            TICKET_RECEIVER_SCOPE_OPERATIONS,
+            *section_where_params,
+        ],
+    )
+
+    return {
+        **normalize_admin_ticket_metric_row(metric_row),
+        "sections": {
+            "coverage": parse_int((section_row or {}).get("coverage")),
+            "learningPlanOther": parse_int((section_row or {}).get("learning_plan_other")),
+        },
+    }
+
+
+def get_admin_ticket_metrics(
+    actor: dict[str, Any] | None = None,
+    *,
+    query_params: dict[str, Any] | None = None,
+    run_background_sync: bool = False,
+) -> dict[str, Any]:
+    if run_background_sync:
+        trigger_ticket_background_sync()
+    metrics_params = get_admin_ticket_metrics_params(query_params)
+    section_params = {
+        **metrics_params,
+        "dashboardFilter": "all",
+    }
+
+    return {
+        "metrics": get_admin_ticket_metrics_from_sql(actor, metrics_params, section_params),
+        "filters": build_admin_ticket_list_filter_response(metrics_params),
+    }
+
+
+def list_admin_tickets(
+    actor: dict[str, Any] | None = None,
+    *,
+    query_params: dict[str, Any] | None = None,
+    run_background_sync: bool = False,
+) -> dict[str, Any]:
+    if run_background_sync:
+        trigger_ticket_background_sync()
+    list_params = normalize_admin_ticket_list_params(query_params)
+
+    if list_params["paginationRequested"]:
+        paged_tickets, pagination = fetch_admin_ticket_page_for_actor(actor, list_params)
+        return {
+            "tickets": [serialize_ticket_summary(ticket) for ticket in paged_tickets],
+            "pagination": pagination,
+            "filters": build_admin_ticket_list_filter_response(list_params),
+        }
+
+    tickets = get_admin_ticket_rows_for_actor(actor, prefilter_params=list_params)
+    tickets = filter_admin_ticket_list(tickets, list_params, actor)
+    tickets = sort_admin_ticket_list(tickets, list_params["sort"])
+    paged_tickets, pagination = paginate_admin_ticket_list(tickets, list_params)
+    return {
+        "tickets": [serialize_ticket_summary(ticket) for ticket in paged_tickets],
+        "pagination": pagination,
+        "filters": build_admin_ticket_list_filter_response(list_params),
+    }
 
 
 def do_transfer_request_payloads_match(left: Any, right: Any) -> bool:
@@ -11688,7 +16823,7 @@ def get_admin_ticket_detail_response(public_id: str, actor: dict[str, Any] | Non
             raise ApiError(404, "Ticket not found.")
         require_actor_can_access_admin_ticket(actor, ticket_scope)
 
-    sync_open_ticket_inactivity(public_id=public_id)
+    trigger_ticket_detail_inactivity_sync(public_id)
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:
         raise ApiError(404, "Ticket not found.")
@@ -11750,9 +16885,17 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
                 "ticketId": ticket["public_id"],
                 "requestedAt": serialize_datetime_value(datetime.now(timezone.utc)),
             }
-            ticket_metadata[PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY] = pending_notification
+        ticket_metadata[PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY] = pending_notification
         ticket_metadata[TEAMS_CALL_REQUESTED_METADATA_KEY] = True
         next_assigned_team = derive_assigned_team_for_ticket_assignment(ticket.get("assigned_team"), target_agent)
+        ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            ticket_metadata,
+            {
+                **ticket,
+                "assigned_agent_id": target_agent["id"],
+                "assigned_team": next_assigned_team,
+            },
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -11761,10 +16904,23 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
                 SET assigned_agent_id = %s,
                     assigned_team = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                [target_agent["id"], next_assigned_team, json.dumps(ticket_metadata), ticket["id"]],
+                [
+                    target_agent["id"],
+                    next_assigned_team,
+                    json.dumps(ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -11838,6 +16994,14 @@ def clear_prepared_support_teams_call(ticket: dict[str, Any]) -> bool:
     ticket_metadata.pop(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY, None)
     next_assigned_agent_id = None if should_clear_assignment else current_assigned_agent_id
     next_assigned_team = "Unassigned" if should_clear_assignment else (sanitize_text(ticket.get("assigned_team")) or "Unassigned")
+    ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        ticket_metadata,
+        {
+            **ticket,
+            "assigned_agent_id": next_assigned_agent_id,
+            "assigned_team": next_assigned_team,
+        },
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -11846,6 +17010,13 @@ def clear_prepared_support_teams_call(ticket: dict[str, Any]) -> bool:
             SET assigned_agent_id = %s,
                 assigned_team = %s,
                 metadata = %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
@@ -11853,6 +17024,7 @@ def clear_prepared_support_teams_call(ticket: dict[str, Any]) -> bool:
                 next_assigned_agent_id,
                 next_assigned_team,
                 json.dumps(ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
             ],
         )
@@ -11930,17 +17102,20 @@ def request_ticket_transfer(public_id: str, payload: dict[str, Any]) -> dict[str
 
         target_agent = run_query_one(
             """
-            SELECT id, username, full_name, email, role, metadata
+            SELECT id, username, full_name, email, account_scope, role, is_active, metadata
             FROM support_accounts
             WHERE id = %s
               AND is_active = TRUE
+              AND account_scope = %s
             LIMIT 1
             """,
-            [target_agent_id],
+            [target_agent_id, ACCOUNT_SCOPE_STAFF],
         )
 
         if not target_agent:
             raise ApiError(400, "The selected admin does not exist.")
+        if not account_can_receive_ticket_assignment(target_agent, ticket):
+            raise ApiError(400, get_ticket_assignment_receiver_error(ticket))
         if int(ticket["assigned_agent_id"]) == int(target_agent["id"]):
             raise ApiError(400, "This ticket is already assigned to the selected admin.")
 
@@ -12046,24 +17221,27 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
 
         target_agent = run_query_one(
             """
-            SELECT id, username, full_name, email, role, metadata
+            SELECT id, username, full_name, email, account_scope, role, is_active, metadata
             FROM support_accounts
             WHERE id = %s
               AND is_active = TRUE
+              AND account_scope = %s
             LIMIT 1
             """,
-            [pending_transfer_request["toAgentId"]],
+            [pending_transfer_request["toAgentId"], ACCOUNT_SCOPE_STAFF],
         )
 
         if not target_agent:
             raise ApiError(409, "The requested admin is no longer available.")
+        if not account_can_receive_ticket_assignment(target_agent, ticket):
+            raise ApiError(409, "The requested admin no longer receives this ticket type.")
 
         actor = {
             "id": actor_row["id"],
             "role": actor_row["role"],
             "label": actor_row.get("full_name") or actor_row["username"],
         }
-        next_assigned_team = derive_assigned_team(target_agent)
+        next_assigned_team = derive_assigned_team_for_ticket_assignment(ticket.get("assigned_team"), target_agent)
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         ticket_metadata.pop(PENDING_TRANSFER_REQUEST_METADATA_KEY, None)
         ticket_metadata[LATEST_TRANSFER_DECISION_METADATA_KEY] = {
@@ -12075,6 +17253,14 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
             "decidedByUsername": actor_row["username"],
             "requesterAcknowledged": False,
         }
+        ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            ticket_metadata,
+            {
+                **ticket,
+                "assigned_agent_id": target_agent["id"],
+                "assigned_team": next_assigned_team,
+            },
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -12083,10 +17269,23 @@ def accept_ticket_transfer_request(public_id: str, payload: dict[str, Any]) -> d
                 SET assigned_agent_id = %s,
                     assigned_team = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                [target_agent["id"], next_assigned_team, json.dumps(ticket_metadata), ticket["id"]],
+                [
+                    target_agent["id"],
+                    next_assigned_team,
+                    json.dumps(ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -12435,6 +17634,7 @@ def submit_coverage_tutor_request(
     payload: dict[str, Any],
     *,
     uploaded_files: list[Any] | None = None,
+    uploaded_session_files: list[Any] | None = None,
 ) -> dict[str, Any]:
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     card_id = sanitize_text(payload.get("cardId"))
@@ -12443,6 +17643,12 @@ def submit_coverage_tutor_request(
     requested_card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else None
     raw_request_files = payload.get("presentationFiles") if isinstance(payload.get("presentationFiles"), list) else []
     uploaded_request_files = list(uploaded_files or [])
+    uploaded_session_request_files = list(uploaded_session_files or [])
+    raw_session_file_metadata = (
+        payload.get("sessionPresentationFileMetadata")
+        if isinstance(payload.get("sessionPresentationFileMetadata"), list)
+        else []
+    )
     webhook_delivery: dict[str, Any] | None = None
     stored_attachment_keys: list[str] = []
 
@@ -12584,23 +17790,76 @@ def submit_coverage_tutor_request(
             if (normalized_attachment := normalize_coverage_card_attachment(attachment))
         ]
         uploaded_presentation_files: list[dict[str, Any]] = []
-        if uploaded_request_files:
+        uploaded_session_files_by_session_id: dict[str, list[dict[str, Any]]] = {}
+        session_upload_metadata_by_session_id: dict[str, dict[str, Any]] = {}
+        if uploaded_request_files or uploaded_session_request_files:
             try:
-                stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_request_files)
-                stored_attachment_keys = [
-                    attachment.get("storageKey")
-                    for attachment in stored_attachment_rows
-                    if sanitize_text(attachment.get("storageKey"))
-                ]
-                uploaded_presentation_files = insert_ticket_attachment_rows(
-                    int(ticket["id"]),
-                    ticket["public_id"],
-                    stored_attachment_rows,
-                    metadata_overrides={
-                        "source": "coverage_tutor_request",
-                        "coverageCardId": card_id,
-                    },
-                )
+                if uploaded_request_files:
+                    stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_request_files)
+                    stored_attachment_keys.extend(
+                        attachment.get("storageKey")
+                        for attachment in stored_attachment_rows
+                        if sanitize_text(attachment.get("storageKey"))
+                    )
+                    uploaded_presentation_files = insert_ticket_attachment_rows(
+                        int(ticket["id"]),
+                        ticket["public_id"],
+                        stored_attachment_rows,
+                        metadata_overrides={
+                            "source": "coverage_tutor_request",
+                            "coverageCardId": card_id,
+                            "uploadPhase": "submit_fallback",
+                        },
+                    )
+
+                if uploaded_session_request_files:
+                    stored_session_attachment_rows = store_uploaded_ticket_attachments(
+                        ticket["public_id"],
+                        uploaded_session_request_files,
+                    )
+                    stored_attachment_keys.extend(
+                        attachment.get("storageKey")
+                        for attachment in stored_session_attachment_rows
+                        if sanitize_text(attachment.get("storageKey"))
+                    )
+                    for index, stored_attachment_row in enumerate(stored_session_attachment_rows):
+                        metadata = normalize_json_object(
+                            raw_session_file_metadata[index] if index < len(raw_session_file_metadata) else {}
+                        )
+                        session_id = sanitize_text(metadata.get("sessionId"))
+                        if not session_id:
+                            uploaded_presentation_files.extend(
+                                insert_ticket_attachment_rows(
+                                    int(ticket["id"]),
+                                    ticket["public_id"],
+                                    [stored_attachment_row],
+                                    metadata_overrides={
+                                        "source": "coverage_tutor_request",
+                                        "coverageCardId": card_id,
+                                        "uploadPhase": "submit_fallback",
+                                    },
+                                )
+                            )
+                            continue
+
+                        file_id = sanitize_text(metadata.get("fileId")) or sanitize_text(metadata.get("id"))
+                        stored_attachment_payload = {
+                            **stored_attachment_row,
+                            **({"id": file_id} if file_id else {}),
+                        }
+                        inserted_session_attachments = insert_ticket_attachment_rows(
+                            int(ticket["id"]),
+                            ticket["public_id"],
+                            [stored_attachment_payload],
+                            metadata_overrides={
+                                "source": "coverage_tutor_request",
+                                "coverageCardId": card_id,
+                                "coverageSessionId": session_id,
+                                "uploadPhase": "submit_fallback",
+                            },
+                        )
+                        uploaded_session_files_by_session_id.setdefault(session_id, []).extend(inserted_session_attachments)
+                        session_upload_metadata_by_session_id[session_id] = metadata
             except Exception:
                 for storage_key in stored_attachment_keys:
                     delete_support_attachment_file(storage_key)
@@ -12609,6 +17868,15 @@ def submit_coverage_tutor_request(
             target_card = {
                 **target_card,
                 "presentationFiles": [*existing_presentation_files, *uploaded_presentation_files],
+            }
+        if uploaded_session_files_by_session_id:
+            target_card = {
+                **target_card,
+                "sessionFiles": merge_coverage_session_attachments(
+                    target_card.get("sessionFiles"),
+                    uploaded_session_files_by_session_id,
+                    session_upload_metadata_by_session_id,
+                ),
             }
 
         current_assigned_agent_id = parse_assigned_agent_id(ticket.get("assigned_agent_id"))
@@ -12657,6 +17925,11 @@ def submit_coverage_tutor_request(
             "requestSubmittedByAgentId": int(actor_row["id"]),
             "requestSubmittedByAgentName": actor_row.get("full_name") or actor_row["username"],
             "requestSubmittedByAgentUsername": actor_row["username"],
+            "emailDeliveryStatus": "pending",
+            "emailDeliveryUpdatedAt": timestamp,
+            "emailDeliveryMessageId": "",
+            "emailDeliveryThreadId": "",
+            "emailDeliveryError": "",
         }
         coverage_cards[card_index] = updated_target_card
         documentation["coverageCards"] = coverage_cards
@@ -12682,6 +17955,17 @@ def submit_coverage_tutor_request(
         updated_ticket_metadata["admin_documentation"] = documentation
         # A fresh tutor request supersedes any prior accepted/refused response.
         updated_ticket_metadata.pop(LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY, None)
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+                "assigned_agent_id": next_assigned_agent_id,
+                "assigned_team": next_assigned_team,
+            },
+            chat_state=map_conversation_status(next_status),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -12694,6 +17978,13 @@ def submit_coverage_tutor_request(
                   assigned_team = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -12704,6 +17995,7 @@ def submit_coverage_tutor_request(
                     next_assigned_team,
                     next_sla_status,
                     json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     ticket["id"],
                 ],
             )
@@ -12774,6 +18066,8 @@ def submit_coverage_tutor_request(
                 "coachEmail": coach_email,
                 "requestedAt": updated_target_card["submittedAt"],
                 "sessionDetails": session_details,
+                "presentationFiles": updated_target_card.get("presentationFiles") or [],
+                "sessionFiles": updated_target_card.get("sessionFiles") or [],
             },
         )
 
@@ -12785,6 +18079,81 @@ def submit_coverage_tutor_request(
         raise ApiError(404, "Ticket not found.")
 
     return detail
+
+
+def upload_coverage_presentation_files(
+    public_id: str,
+    payload: dict[str, Any],
+    *,
+    uploaded_files: list[Any] | None = None,
+) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+    card_id = sanitize_text(payload.get("cardId"))
+    session_id = sanitize_text(payload.get("sessionId"))
+    source = sanitize_text(payload.get("source")).lower() or "coverage_tutor_request"
+    presentation_files = list(uploaded_files or [])
+    stored_attachment_keys: list[str] = []
+
+    if source not in {"coverage_tutor_request", "coverage_tutor_follow_up"}:
+        raise ApiError(400, "Invalid coverage upload source.")
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+    if not card_id:
+        raise ApiError(400, "Coverage card id is required.")
+    if not presentation_files:
+        raise ApiError(400, "Add at least one presentation file before uploading.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    try:
+        with transaction.atomic():
+            ticket = run_query_one(
+                """
+                SELECT id, public_id, category, technical_subcategory, is_archived
+                FROM tickets
+                WHERE public_id = %s
+                LIMIT 1
+                """,
+                [public_id],
+            )
+
+            if not ticket:
+                raise ApiError(404, "Ticket not found.")
+            if not is_coverage_ticket_record(ticket):
+                raise ApiError(409, "Presentation files can only be uploaded for coverage tickets.")
+            if normalize_bool(ticket.get("is_archived")):
+                raise ApiError(409, "Restore this ticket before uploading presentation files.")
+
+            stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], presentation_files)
+            stored_attachment_keys = [
+                attachment.get("storageKey")
+                for attachment in stored_attachment_rows
+                if sanitize_text(attachment.get("storageKey"))
+            ]
+            uploaded_attachments = insert_ticket_attachment_rows(
+                int(ticket["id"]),
+                ticket["public_id"],
+                stored_attachment_rows,
+                metadata_overrides={
+                    "source": source,
+                    "coverageCardId": card_id,
+                    **({"coverageSessionId": session_id} if session_id else {}),
+                    "uploadPhase": "pre_submit",
+                    "uploadedByAgentId": int(actor_row["id"]),
+                    "uploadedByAgentName": actor_row.get("full_name") or actor_row["username"],
+                    "uploadedByAgentUsername": actor_row["username"],
+                },
+            )
+    except Exception:
+        for storage_key in stored_attachment_keys:
+            delete_support_attachment_file(storage_key)
+        raise
+
+    return {"attachments": uploaded_attachments}
 
 
 def send_coverage_tutor_follow_up_files(
@@ -12876,6 +18245,9 @@ def send_coverage_tutor_follow_up_files(
                 request_status = "requested"
             if request_status not in {"requested", "accepted"}:
                 raise ApiError(409, "Follow-up files can only be sent for requested or accepted tutor requests.")
+            email_delivery_status = sanitize_text(target_card.get("emailDeliveryStatus")).lower()
+            if request_status == "requested" and email_delivery_status in {"pending", "failed"}:
+                raise ApiError(409, "Send the tutor request e-mail successfully before sending follow-up files.")
 
             if uploaded_follow_up_files:
                 stored_attachment_rows = store_uploaded_ticket_attachments(ticket["public_id"], uploaded_follow_up_files)
@@ -12999,8 +18371,8 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
 
     requested_card_id = sanitize_text(payload.get("cardId") or payload.get("relatedTutorChoiceCardId"))
     response_token = sanitize_text(payload.get("responseToken"))
-    refusal_mail_webhook_ticket_id: int | None = None
-    refusal_mail_webhook_payload: dict[str, Any] | None = None
+    response_mail_webhook_ticket_id: int | None = None
+    response_mail_webhook_payload: dict[str, Any] | None = None
 
     with transaction.atomic():
         ticket = run_query_one(
@@ -13011,6 +18383,7 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
               t.status,
               t.status_reason,
               t.technical_subcategory,
+              t.inquiry,
               t.metadata,
               t.assigned_team,
               t.assigned_agent_id,
@@ -13105,10 +18478,19 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
         )
         documentation["coverageCards"] = coverage_cards
 
-        next_status = "Closed" if outcome == "accepted" else "Pending"
+        acceptance_complete = outcome == "accepted" and is_coverage_tutor_acceptance_complete(
+            documentation,
+            inquiry=ticket.get("inquiry"),
+            metadata=ticket_metadata,
+        )
+        next_status = "Closed" if acceptance_complete else "Pending"
         next_status_reason = STATUS_REASON_TUTOR_ACCEPTED if outcome == "accepted" else STATUS_REASON_TUTOR_REJECTED
         next_sla_status = "On Track"
-        updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
+        updated_ticket_metadata = (
+            build_resolved_coverage_sla_metadata(ticket_metadata)
+            if outcome != "accepted" or acceptance_complete
+            else normalize_json_object(ticket_metadata)
+        )
         updated_ticket_metadata["admin_documentation"] = documentation
         latest_response_payload = build_coverage_tutor_response_payload(
             ticket_public_id=ticket_public_id,
@@ -13121,15 +18503,23 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             responded_at=responded_at,
         )
         updated_ticket_metadata[LATEST_COVERAGE_TUTOR_RESPONSE_METADATA_KEY] = latest_response_payload
-        if outcome == "rejected":
-            refusal_mail_webhook_ticket_id = int(ticket["id"])
-            refusal_mail_webhook_payload = build_coverage_tutor_refusal_mail_webhook_payload(
-                ticket=ticket,
-                tutor_choice_card=updated_tutor_choice_card,
-                latest_response_payload=latest_response_payload,
-                next_status=next_status,
-                next_status_reason=next_status_reason,
-            )
+        response_mail_webhook_ticket_id = int(ticket["id"])
+        response_mail_webhook_payload = build_coverage_tutor_response_mail_webhook_payload(
+            ticket=ticket,
+            tutor_choice_card=updated_tutor_choice_card,
+            latest_response_payload=latest_response_payload,
+            next_status=next_status,
+            next_status_reason=next_status_reason,
+        )
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+            },
+            chat_state=map_conversation_status(next_status),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13140,6 +18530,13 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
                   status_reason = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW(),
                   closed_at = CASE
                     WHEN %s = 'Closed' THEN COALESCE(closed_at, NOW())
@@ -13147,7 +18544,15 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
                   END
                 WHERE id = %s
                 """,
-                [next_status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), next_status, ticket["id"]],
+                [
+                    next_status,
+                    next_status_reason,
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    next_status,
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -13189,8 +18594,8 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             )
         insert_history_event(ticket["id"], "coverage_tutor_response", None, latest_response_payload)
 
-    if refusal_mail_webhook_ticket_id and refusal_mail_webhook_payload:
-        notify_coverage_tutor_refusal_mail_webhook(refusal_mail_webhook_ticket_id, refusal_mail_webhook_payload)
+    if response_mail_webhook_ticket_id and response_mail_webhook_payload:
+        notify_coverage_tutor_response_mail_webhook(response_mail_webhook_ticket_id, response_mail_webhook_payload)
 
     detail = fetch_admin_ticket_detail(ticket_public_id)
     if not detail:
@@ -13300,6 +18705,63 @@ def acknowledge_coverage_ticket_notification(public_id: str, payload: dict[str, 
             return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
 
         ticket_metadata.pop(PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY, None)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE tickets
+                SET metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [json.dumps(ticket_metadata), ticket["id"]],
+            )
+
+    detail = fetch_admin_ticket_detail(public_id)
+    if not detail:
+        raise ApiError(404, "Ticket not found.")
+
+    return detail
+
+
+def acknowledge_support_queue_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    if not actor_username:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    actor_row = fetch_actor_by_username(actor_username)
+    if not actor_row:
+        raise ApiError(403, "Admin sign-in is required.")
+
+    with transaction.atomic():
+        ticket = run_query_one(
+            """
+            SELECT
+              t.id,
+              t.public_id,
+              t.technical_subcategory,
+              t.assigned_team,
+              t.metadata
+            FROM tickets t
+            WHERE t.public_id = %s
+            LIMIT 1
+            """,
+            [public_id],
+        )
+
+        if not ticket:
+            raise ApiError(404, "Ticket not found.")
+
+        require_actor_can_access_admin_ticket(actor_row, ticket)
+
+        ticket_metadata = normalize_json_object(ticket.get("metadata"))
+        if not get_pending_support_queue_notification(ticket_metadata):
+            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
+
+        ticket_metadata.pop(PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY, None)
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13465,6 +18927,15 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
         next_sla_status = "On Track"
         updated_ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
         updated_ticket_metadata["admin_documentation"] = documentation
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+            },
+            chat_state=map_conversation_status(next_status),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -13475,11 +18946,25 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
                   status_reason = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW(),
                   closed_at = NOW()
                 WHERE id = %s
                 """,
-                [next_status, next_status_reason, next_sla_status, json.dumps(updated_ticket_metadata), ticket["id"]],
+                [
+                    next_status,
+                    next_status_reason,
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
@@ -13640,6 +19125,24 @@ def create_follow_up_ticket_from_source_ticket(
     )
     pending_escalation_notification = get_pending_escalation_notification(ticket_metadata)
     draft_public_id = f"TMP-{int(datetime.now().timestamp() * 1000)}-{uuid4().hex[:8]}"
+    follow_up_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        {
+            "source": "support_portal_follow_up",
+            "parent_ticket_public_id": ticket["public_id"],
+            "chat_public_id": chat_public_id,
+            "technical_subcategory": ticket.get("technical_subcategory") or None,
+            "requester_role": requester_role,
+            "requester_account_id": requester_account_id,
+            "requester_username": requester_username,
+        },
+        {
+            **ticket,
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": ticket.get("assigned_team") or "Unassigned",
+        },
+        chat_state="open",
+    )
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -13657,9 +19160,16 @@ def create_follow_up_ticket_from_source_ticket(
               assigned_team,
               priority,
               evidence_count,
-              metadata
+              metadata,
+              ticket_type,
+              workflow_stage,
+              queue_scope,
+              dashboard_bucket,
+              can_show_conversation,
+              can_receive_chat,
+              resolution_reason
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             [
@@ -13675,17 +19185,8 @@ def create_follow_up_ticket_from_source_ticket(
                 ticket.get("assigned_team") or "Unassigned",
                 next_priority,
                 0,
-                json.dumps(
-                    {
-                        "source": "support_portal_follow_up",
-                        "parent_ticket_public_id": ticket["public_id"],
-                        "chat_public_id": chat_public_id,
-                        "technical_subcategory": ticket.get("technical_subcategory") or None,
-                        "requester_role": requester_role,
-                        "requester_account_id": requester_account_id,
-                        "requester_username": requester_username,
-                    }
-                ),
+                json.dumps(follow_up_ticket_metadata),
+                *get_ticket_state_column_params(ticket_state_columns),
             ],
         )
         new_ticket_row = dictfetchone(cursor)
@@ -14162,7 +19663,7 @@ def set_ticket_booking_progress(public_id: str, *, active: bool) -> dict[str, An
 
     ticket = run_query_one(
         """
-        SELECT id, public_id, status, metadata
+        SELECT id, public_id, status, status_reason, technical_subcategory, assigned_team, metadata
         FROM tickets
         WHERE public_id = %s
         LIMIT 1
@@ -14174,19 +19675,32 @@ def set_ticket_booking_progress(public_id: str, *, active: bool) -> dict[str, An
         raise ApiError(404, "Ticket not found.")
 
     metadata_patch = {
+        **normalize_json_object(ticket.get("metadata")),
         SUPPORT_FLOW_STAGE_METADATA_KEY: SUPPORT_FLOW_STAGE_BOOKING_IN_PROGRESS if active else None,
         "booking_started_at": serialize_datetime_value(datetime.now(timezone.utc)) if active else None,
     }
+    metadata_patch, ticket_state_columns = build_ticket_state_persistence(metadata_patch, ticket)
 
     with connection.cursor() as cursor:
         cursor.execute(
             """
             UPDATE tickets
             SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                ticket_type = %s,
+                workflow_stage = %s,
+                queue_scope = %s,
+                dashboard_bucket = %s,
+                can_show_conversation = %s,
+                can_receive_chat = %s,
+                resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
             """,
-            [json.dumps(metadata_patch), ticket["id"]],
+            [
+                json.dumps(metadata_patch),
+                *get_ticket_state_column_params(ticket_state_columns),
+                ticket["id"],
+            ],
         )
 
     return {
@@ -14404,6 +19918,15 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
 
         mark_conversation_as_active(ticket["public_id"], ticket.get("conversation_id"))
         chat_public_id = build_public_chat_id(ticket.get("public_id"), ticket.get("conversation_id"))
+        ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+            {
+                **normalize_json_object(ticket.get("metadata")),
+                "live_chat_requested": True,
+                "live_chat_requested_at": request_time.isoformat(),
+            },
+            ticket,
+            chat_state="open",
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -14411,16 +19934,19 @@ def request_live_chat(public_id: str) -> dict[str, Any]:
                 UPDATE tickets
                 SET
                   metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW()
                 WHERE id = %s
                 """,
                 [
-                    json.dumps(
-                        {
-                            "live_chat_requested": True,
-                            "live_chat_requested_at": request_time.isoformat(),
-                        }
-                    ),
+                    json.dumps(ticket_metadata_patch),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     ticket["id"],
                 ],
             )
@@ -14600,6 +20126,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     learning_plan_transfer_webhook_ticket_id: int | None = None
     learning_plan_transfer_webhook_payload: dict[str, Any] | None = None
     learning_plan_transfer_notification_payload: dict[str, Any] | None = None
+    documentation_history_events: list[tuple[str, dict[str, Any]]] = []
 
     with transaction.atomic():
         ticket = run_query_one(
@@ -14685,14 +20212,29 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         if requested_assignment_changed:
             if actor_role not in ADMIN_ACCESS_ROLES:
                 raise ApiError(403, "Only admins and superadmins can assign tickets.")
-            if parsed_assigned_agent_id is None:
-                raise ApiError(400, "Select an agent with ticket access before assigning this ticket.")
 
         if requested_assigned_team is not None:
-            if actor_role not in ADMIN_ACCESS_ROLES:
-                raise ApiError(403, "Only admins and superadmins can transfer tickets between teams.")
             normalized_requested_assigned_team = normalize_assigned_team(requested_assigned_team)
             requested_team_changed = normalized_requested_assigned_team != current_assigned_team
+            if requested_team_changed:
+                ensure_ticket_can_transfer_to_assigned_team(ticket, normalized_requested_assigned_team)
+            if requested_team_changed and not actor_can_transfer_ticket_between_teams(
+                actor_row,
+                ticket,
+                normalized_requested_assigned_team,
+            ):
+                raise ApiError(403, "You do not have permission to transfer this ticket to another team.")
+            if requested_team_changed and actor_role not in ADMIN_ACCESS_ROLES and has_assigned_agent_input:
+                raise ApiError(403, "Team transfers by agents cannot assign a receiver.")
+            if requested_team_changed and not note:
+                raise ApiError(400, "Add a transfer note before moving this ticket to another team.")
+
+        target_assignment_ticket = {
+            **ticket,
+            "assigned_team": normalized_requested_assigned_team
+            if requested_assigned_team is not None
+            else current_assigned_team,
+        }
 
         escalation_target_agent = None
         if has_escalation_agent_input and parsed_escalation_agent_id is not None:
@@ -14718,14 +20260,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 WHERE id = %s
                   AND is_active = TRUE
                   AND account_scope = %s
-                  AND (metadata->>'legacy_support_access')::boolean = TRUE
                 LIMIT 1
                 """,
                 [parsed_assigned_agent_id, ACCOUNT_SCOPE_STAFF],
             )
-            if not is_ticket_receiving_staff_account(assigned_agent):
-                raise ApiError(400, "The selected agent does not receive tickets.")
-        elif not has_assigned_agent_input and ticket.get("assigned_agent_id"):
+            if not account_can_receive_ticket_assignment(assigned_agent, target_assignment_ticket):
+                raise ApiError(400, get_ticket_assignment_receiver_error(target_assignment_ticket))
+        elif not has_assigned_agent_input and ticket.get("assigned_agent_id") and not requested_team_changed:
             assigned_agent = {
                 "id": ticket["assigned_agent_id"],
                 "username": ticket.get("assigned_agent_username"),
@@ -14737,9 +20278,10 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         if (
             not has_assigned_agent_input
             and current_assigned_agent_id is None
+            and not requested_team_changed
             and actor_row
             and sanitize_text(actor_row.get("role")).lower() in {ROLE_ADMIN, ROLE_SUPERADMIN}
-            and is_ticket_receiving_staff_account(actor_row)
+            and account_can_receive_ticket_assignment(actor_row, target_assignment_ticket)
         ):
             auto_assigned_actor = {
                 "id": int(actor_row["id"]),
@@ -14807,6 +20349,10 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 previous_documentation_payload,
                 actor_row,
             )
+            documentation_history_events = build_documentation_card_history_events(
+                previous_documentation_payload,
+                documentation_payload,
+            )
             updated_ticket_metadata["admin_documentation"] = documentation_payload
 
         if is_escalation_notification and escalation_target_agent:
@@ -14861,15 +20407,20 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         next_sla_status, next_sla_attention_required, next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
             ticket,
             next_status,
+            status_reason=next_status_reason,
             metadata=updated_ticket_metadata,
             requested_sla_status=requested_sla_status,
         )
 
-        next_assigned_agent_id = (
-            parsed_assigned_agent_id
-            if has_assigned_agent_input
-            else (auto_assigned_actor["id"] if auto_assigned_actor else ticket.get("assigned_agent_id"))
-        )
+        if has_assigned_agent_input:
+            next_assigned_agent_id = parsed_assigned_agent_id
+        elif auto_assigned_actor:
+            next_assigned_agent_id = auto_assigned_actor["id"]
+        elif requested_team_changed:
+            next_assigned_agent_id = None
+        else:
+            next_assigned_agent_id = ticket.get("assigned_agent_id")
+
         if requested_assigned_team is not None:
             next_assigned_team = normalized_requested_assigned_team or derive_assigned_team_for_ticket_assignment(
                 current_assigned_team,
@@ -14879,21 +20430,24 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             next_assigned_team = derive_assigned_team_for_ticket_assignment(current_assigned_team, assigned_agent)
         else:
             next_assigned_team = current_assigned_team
-        next_assigned_agent_name = (
-            sanitize_text(assigned_agent.get("full_name") or assigned_agent.get("username"))
-            if isinstance(assigned_agent, dict)
-            else sanitize_text(ticket.get("assigned_agent_name"))
-        )
-        next_assigned_agent_username = (
-            sanitize_text(assigned_agent.get("username"))
-            if isinstance(assigned_agent, dict)
-            else sanitize_text(ticket.get("assigned_agent_username"))
-        )
+        if next_assigned_agent_id is None:
+            next_assigned_agent_name = ""
+            next_assigned_agent_username = ""
+        elif isinstance(assigned_agent, dict):
+            next_assigned_agent_name = sanitize_text(assigned_agent.get("full_name") or assigned_agent.get("username"))
+            next_assigned_agent_username = sanitize_text(assigned_agent.get("username"))
+        else:
+            next_assigned_agent_name = sanitize_text(ticket.get("assigned_agent_name"))
+            next_assigned_agent_username = sanitize_text(ticket.get("assigned_agent_username"))
 
         next_requester_role = get_ticket_requester_role(updated_ticket_metadata)
         next_requester_email = sanitize_text(ticket.get("learner_email"))
         next_requester_name = sanitize_text(ticket.get("learner_name")) or next_requester_email
         is_next_learning_plan_team = next_assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold()
+
+        if requested_team_changed:
+            updated_ticket_metadata.pop(PENDING_TRANSFER_REQUEST_METADATA_KEY, None)
+            updated_ticket_metadata.pop(LATEST_TRANSFER_DECISION_METADATA_KEY, None)
 
         if not is_next_learning_plan_team:
             updated_ticket_metadata.pop(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY, None)
@@ -14917,6 +20471,18 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 learning_plan_transfer_notification_payload
             )
 
+        updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+            updated_ticket_metadata,
+            {
+                **ticket,
+                "status": next_status,
+                "status_reason": next_status_reason,
+                "assigned_agent_id": next_assigned_agent_id,
+                "assigned_team": next_assigned_team,
+            },
+            chat_state=next_chat_state,
+        )
+
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -14928,6 +20494,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                   assigned_team = %s,
                   sla_status = %s,
                   metadata = %s::jsonb,
+                  ticket_type = %s,
+                  workflow_stage = %s,
+                  queue_scope = %s,
+                  dashboard_bucket = %s,
+                  can_show_conversation = %s,
+                  can_receive_chat = %s,
+                  resolution_reason = %s,
                   updated_at = NOW(),
                   closed_at = CASE
                     WHEN %s = 'Closed' THEN NOW()
@@ -14943,6 +20516,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                     next_assigned_team,
                     next_sla_status,
                     json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     next_status,
                     next_status,
                     ticket["id"],
@@ -15008,6 +20582,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 {
                     "fromTeam": current_assigned_team,
                     "toTeam": next_assigned_team,
+                    **({"note": note} if note else {}),
                 },
             )
             if next_assigned_team.casefold() == ASSIGNED_TEAM_LEARNING_PLAN.casefold():
@@ -15039,6 +20614,9 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
 
         if note:
             insert_history_event(ticket["id"], "internal_note", actor, {"note": note})
+
+        for event_type, event_payload in documentation_history_events:
+            insert_history_event(ticket["id"], event_type, actor, event_payload)
 
         if is_escalation_notification and escalation_target_agent:
             insert_history_event(
@@ -15327,6 +20905,7 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
     category = sanitize_text(payload.get("category"))
     technical_subcategory = normalize_technical_subcategory(payload.get("technicalSubcategory"))
     inquiry = sanitize_text(payload.get("inquiry"))
+    subject = sanitize_text(payload.get("subject"))
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
     uploaded_files = list(uploaded_files or [])
     evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
@@ -15343,6 +20922,9 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
         raise ApiError(400, "Technical sub category can only be used with Technical inquiries.")
     if not inquiry:
         raise ApiError(400, "Inquiry details are required.")
+    if not subject:
+        subject = sanitize_text((inquiry.splitlines() or [""])[0])[:140] or technical_subcategory or category
+    ai_team_request = normalize_ai_team_request_payload(payload, technical_subcategory)
 
     try:
         with transaction.atomic():
@@ -15354,15 +20936,51 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             requester_source = get_public_requester_source(requester)
             if technical_subcategory == "Coverage":
                 ensure_requester_can_submit_coverage_ticket(requester_source)
+            if is_ai_team_technical_subcategory(technical_subcategory):
+                ensure_requester_can_submit_ai_team_ticket(requester_source)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
+            submitted_for_learner = resolve_submitted_for_learner(
+                payload.get("submittedForLearnerId"),
+                requester_role=requester_role,
+                requester_source=requester_source,
+            )
+            notify_submitted_for_learner = bool(
+                submitted_for_learner and normalize_bool(payload.get("notifySubmittedForLearner"))
+            )
+            submitted_for_notification_email = ""
+            if submitted_for_learner:
+                raw_submitted_for_notification_email = sanitize_text(payload.get("submittedForNotificationEmail"))
+                submitted_for_notification_email = normalize_email(raw_submitted_for_notification_email) or normalize_email(submitted_for_learner.get("email"))
+                if raw_submitted_for_notification_email and not is_valid_email(submitted_for_notification_email):
+                    raise ApiError(400, "Please enter a valid learner notification email.")
+                if notify_submitted_for_learner and not is_valid_email(submitted_for_notification_email):
+                    raise ApiError(400, "Please enter a valid learner notification email before enabling learner notifications.")
             managed_account = requester.get("account")
             ticket_metadata = {
                 "source": "support_portal",
                 "technical_subcategory": technical_subcategory or None,
                 "requester_role": requester_role,
                 "requester_source": requester_source or None,
+                "subject": subject,
             }
+            if technical_subcategory == "Coverage":
+                coverage_original_sessions = normalize_coverage_original_session_items(
+                    payload.get("coverageSessions"),
+                    inquiry,
+                )
+                if coverage_original_sessions:
+                    ticket_metadata[COVERAGE_ORIGINAL_SESSIONS_METADATA_KEY] = coverage_original_sessions
+            if ai_team_request:
+                ticket_metadata[AI_TEAM_REQUEST_METADATA_KEY] = ai_team_request
+            submitted_for_payload = build_submitted_for_learner_payload(
+                submitted_for_learner,
+                notify_by_email=notify_submitted_for_learner,
+                notification_email=submitted_for_notification_email,
+            )
+            if submitted_for_payload:
+                ticket_metadata[SUBMITTED_FOR_LEARNER_METADATA_KEY] = submitted_for_payload
+                ticket_metadata[NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY] = notify_submitted_for_learner
             if managed_account:
                 ticket_metadata.update(
                     {
@@ -15389,12 +21007,14 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                       learner_id,
                       category,
                       technical_subcategory,
+                      subject,
                       inquiry,
+                      submitted_for_learner_id,
                       priority,
                       evidence_count,
                       metadata
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     RETURNING id, status, assigned_team, sla_status, created_at
                     """,
                     [
@@ -15402,7 +21022,9 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         learner["id"],
                         category,
                         technical_subcategory or None,
+                        subject,
                         inquiry,
+                        submitted_for_learner["id"] if submitted_for_learner else None,
                         ticket_priority,
                         evidence_count,
                         json.dumps(ticket_metadata),
@@ -15413,6 +21035,8 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     raise ApiError(500, "We could not create the ticket right now.")
 
                 public_id = build_public_ticket_id(int(ticket_row["id"]))
+                initial_assigned_team = ASSIGNED_TEAM_AI_TEAM if ai_team_request else ticket_row["assigned_team"]
+                initial_sla_status = "On Track" if technical_subcategory == "Coverage" else ticket_row["sla_status"]
                 if technical_subcategory == "Coverage":
                     ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {
                         "ticketId": public_id,
@@ -15421,6 +21045,43 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                         "requesterRole": requester_role,
                         "createdAt": serialize_datetime_value(ticket_row.get("created_at")) or serialize_datetime_value(datetime.now(timezone.utc)),
                     }
+                else:
+                    ticket_metadata[PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY] = build_support_queue_notification_payload(
+                        ticket_id=public_id,
+                        requester_name=requester.get("display_name") or learner.get("full_name") or learner["email"],
+                        requester_email=learner["email"],
+                        requester_role=requester_role,
+                        reason="support_ticket_created",
+                        created_at=ticket_row.get("created_at") or datetime.now(timezone.utc),
+                        queue=initial_assigned_team,
+                    )
+                if technical_subcategory == "Coverage":
+                    ticket_metadata = build_resolved_coverage_sla_metadata(ticket_metadata)
+                else:
+                    _initial_sla_status, _initial_sla_attention_required, _initial_sla_attention_reason, ticket_metadata = resolve_sla_policy_update(
+                        {
+                            "status": ticket_row["status"],
+                            "status_reason": "",
+                            "created_at": ticket_row.get("created_at"),
+                            "sla_status": initial_sla_status,
+                            "metadata": ticket_metadata,
+                        },
+                        ticket_row["status"],
+                        status_reason="",
+                        metadata=ticket_metadata,
+                    )
+                ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+                    ticket_metadata,
+                    {
+                        "public_id": public_id,
+                        "category": category,
+                        "technical_subcategory": technical_subcategory or "",
+                        "status": ticket_row["status"],
+                        "status_reason": "",
+                        "assigned_team": initial_assigned_team,
+                    },
+                    chat_state="open",
+                )
 
                 cursor.execute(
                     """
@@ -15454,8 +21115,11 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                                 "ticket_public_id": public_id,
                                 "learner_id": learner["id"],
                                 "technical_subcategory": technical_subcategory or None,
+                                "subject": subject,
+                                "ai_team_request": ai_team_request,
                                 "requester_role": requester_role,
                                 "requester_source": requester_source or None,
+                                "submitted_for_learner": submitted_for_payload,
                                 "requester_account_id": int(managed_account["id"]) if managed_account else None,
                                 "requester_username": sanitize_text(managed_account.get("username")) if managed_account else "",
                             }
@@ -15468,11 +21132,40 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 cursor.execute(
                     """
                     UPDATE tickets
-                    SET public_id = %s, conversation_id = %s, metadata = %s::jsonb, updated_at = NOW()
+                    SET public_id = %s,
+                        conversation_id = %s,
+                        sla_status = %s,
+                        metadata = %s::jsonb,
+                        ticket_type = %s,
+                        workflow_stage = %s,
+                        queue_scope = %s,
+                        dashboard_bucket = %s,
+                        can_show_conversation = %s,
+                        can_receive_chat = %s,
+                        resolution_reason = %s,
+                        updated_at = NOW()
                     WHERE id = %s
                     """,
-                    [public_id, conversation_id, json.dumps(ticket_metadata), ticket_row["id"]],
+                    [
+                        public_id,
+                        conversation_id,
+                        initial_sla_status,
+                        json.dumps(ticket_metadata),
+                        *get_ticket_state_column_params(ticket_state_columns),
+                        ticket_row["id"],
+                    ],
                 )
+
+                if initial_assigned_team != ticket_row["assigned_team"]:
+                    cursor.execute(
+                        """
+                        UPDATE tickets
+                        SET assigned_team = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        [initial_assigned_team, ticket_row["id"]],
+                    )
 
                 if conversation_id:
                     cursor.execute(
@@ -15531,7 +21224,10 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 {
                     "category": category,
                     "technical_subcategory": technical_subcategory or None,
+                    "subject": subject,
+                    "ai_team_request": ai_team_request,
                     "evidence_count": evidence_count,
+                    "submitted_for_learner": submitted_for_payload,
                 },
             )
     except Exception:
@@ -15550,10 +21246,14 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                 requester_role=requester_role,
                 category=category,
                 technical_subcategory=technical_subcategory,
+                subject=subject,
                 inquiry=inquiry,
                 priority=ticket_priority,
                 evidence_count=evidence_count,
                 attachment_rows=attachment_rows,
+                submitted_for_learner=submitted_for_learner,
+                notify_submitted_for_learner=notify_submitted_for_learner,
+                submitted_for_notification_email=submitted_for_notification_email,
             ),
         )
 
@@ -15582,15 +21282,20 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             "requesterSource": requester_source,
             "category": category,
             "technicalSubcategory": technical_subcategory,
+            "subject": subject,
             "inquiry": inquiry,
+            "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+            "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
+            "submittedForLearner": submitted_for_payload,
+            "notifySubmittedForLearner": notify_submitted_for_learner,
             "status": ticket_row["status"],
-        "statusReason": "",
-        "assignedTeam": ticket_row["assigned_team"],
-        "slaStatus": ticket_row["sla_status"],
-        "createdAt": ticket_row["created_at"],
-        "chatState": "open",
-        "liveChatRequested": False,
-    }
+            "statusReason": "",
+            "assignedTeam": initial_assigned_team,
+            "slaStatus": initial_sla_status,
+            "createdAt": ticket_row["created_at"],
+            "chatState": "open",
+            "liveChatRequested": False,
+        }
     }
 
 
@@ -15598,11 +21303,15 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
     category = sanitize_text(payload.get("category"))
     technical_subcategory = normalize_technical_subcategory(payload.get("technicalSubcategory"))
     inquiry = sanitize_text(payload.get("inquiry"))
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    subject = sanitize_text(payload.get("subject"))
     uploaded_files = list(uploaded_files or [])
-    evidence_count = len(uploaded_files) if uploaded_files else len(evidence)
+    raw_evidence = payload.get("evidence")
+    evidence = raw_evidence if isinstance(raw_evidence, list) else []
+    should_replace_attachments = bool(uploaded_files) or isinstance(raw_evidence, list)
     stored_attachment_keys: list[str] = []
     existing_attachment_storage_keys: list[str] = []
+    submitted_for_payload: dict[str, Any] | None = None
+    notify_submitted_for_learner = False
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -15614,6 +21323,9 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
         raise ApiError(400, "Technical sub category can only be used with Technical inquiries.")
     if not inquiry:
         raise ApiError(400, "Inquiry details are required.")
+    if not subject:
+        subject = sanitize_text((inquiry.splitlines() or [""])[0])[:140] or technical_subcategory or category
+    ai_team_request = normalize_ai_team_request_payload(payload, technical_subcategory)
 
     try:
         with transaction.atomic():
@@ -15627,10 +21339,12 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                   t.priority,
                   t.assigned_team,
                   t.sla_status,
+                  t.evidence_count,
                   t.metadata,
                   t.created_at,
                   t.conversation_id,
                   t.technical_subcategory,
+                  t.submitted_for_learner_id,
                   l.full_name AS learner_name,
                   l.email,
                   l.source AS learner_source,
@@ -15656,6 +21370,71 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                 ensure_requester_can_submit_coverage_ticket(requester_source)
             next_priority = derive_requester_ticket_priority(requester_role, existing_ticket.get("priority"))
             existing_attachment_storage_keys = list_ticket_attachment_storage_keys(int(existing_ticket["id"]))
+            evidence_count = (
+                len(uploaded_files)
+                if uploaded_files
+                else len(evidence)
+                if should_replace_attachments
+                else int(existing_ticket.get("evidence_count") or 0)
+            )
+            should_update_submitted_for = any(
+                key in payload
+                for key in {
+                    "submittedForLearnerId",
+                    "notifySubmittedForLearner",
+                    "submittedForNotificationEmail",
+                }
+            )
+            next_submitted_for_learner_id = existing_ticket.get("submitted_for_learner_id")
+            updated_ticket_metadata = normalize_json_object(existing_ticket.get("metadata"))
+            updated_ticket_metadata.update(
+                {
+                    **({"requester_source": requester_source} if requester_source else {}),
+                    "subject": subject,
+                }
+            )
+            if ai_team_request:
+                updated_ticket_metadata[AI_TEAM_REQUEST_METADATA_KEY] = ai_team_request
+            else:
+                updated_ticket_metadata.pop(AI_TEAM_REQUEST_METADATA_KEY, None)
+            next_assigned_team = ASSIGNED_TEAM_AI_TEAM if ai_team_request else existing_ticket["assigned_team"]
+            if should_update_submitted_for:
+                submitted_for_learner = resolve_submitted_for_learner(
+                    payload.get("submittedForLearnerId"),
+                    requester_role=requester_role,
+                    requester_source=requester_source,
+                )
+                notify_submitted_for_learner = bool(
+                    submitted_for_learner and normalize_bool(payload.get("notifySubmittedForLearner"))
+                )
+                submitted_for_notification_email = ""
+                if submitted_for_learner:
+                    raw_submitted_for_notification_email = sanitize_text(payload.get("submittedForNotificationEmail"))
+                    submitted_for_notification_email = normalize_email(raw_submitted_for_notification_email) or normalize_email(submitted_for_learner.get("email"))
+                    if raw_submitted_for_notification_email and not is_valid_email(submitted_for_notification_email):
+                        raise ApiError(400, "Please enter a valid learner notification email.")
+                    if notify_submitted_for_learner and not is_valid_email(submitted_for_notification_email):
+                        raise ApiError(400, "Please enter a valid learner notification email before enabling learner notifications.")
+
+                submitted_for_payload = build_submitted_for_learner_payload(
+                    submitted_for_learner,
+                    notify_by_email=notify_submitted_for_learner,
+                    notification_email=submitted_for_notification_email,
+                )
+                next_submitted_for_learner_id = submitted_for_learner["id"] if submitted_for_learner else None
+                if submitted_for_payload:
+                    updated_ticket_metadata[SUBMITTED_FOR_LEARNER_METADATA_KEY] = submitted_for_payload
+                    updated_ticket_metadata[NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY] = notify_submitted_for_learner
+                else:
+                    updated_ticket_metadata.pop(SUBMITTED_FOR_LEARNER_METADATA_KEY, None)
+                    updated_ticket_metadata.pop(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY, None)
+            else:
+                submitted_for_payload = normalize_json_object(updated_ticket_metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+                notify_submitted_for_learner = (
+                    normalize_bool(submitted_for_payload.get("notifyByEmail"))
+                    if submitted_for_payload
+                    else normalize_bool(updated_ticket_metadata.get(NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY))
+                )
 
             apply_ticket_sla_policy(existing_ticket, persist=True)
 
@@ -15666,20 +21445,24 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                     SET
                       category = %s,
                       technical_subcategory = %s,
+                      subject = %s,
                       inquiry = %s,
+                      submitted_for_learner_id = %s,
                       priority = %s,
                       evidence_count = %s,
-                      metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                      metadata = %s::jsonb,
                       updated_at = NOW()
                     WHERE id = %s
                     """,
                     [
                         category,
                         technical_subcategory or None,
+                        subject,
                         inquiry,
+                        next_submitted_for_learner_id,
                         next_priority,
                         evidence_count,
-                        json.dumps({"requester_source": requester_source} if requester_source else {}),
+                        json.dumps(updated_ticket_metadata),
                         existing_ticket["id"],
                     ],
                 )
@@ -15707,53 +21490,68 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                                     "latest_inquiry": inquiry,
                                     "evidence_count": evidence_count,
                                     "requester_source": requester_source or None,
+                                    "ai_team_request": ai_team_request,
+                                    "submitted_for_learner": submitted_for_payload,
                                 }
                             ),
                             existing_ticket["conversation_id"],
                         ],
                     )
 
-                attachment_rows = [normalize_ticket_attachment_row_payload(file) for file in evidence]
-                if uploaded_files:
-                    attachment_rows = store_uploaded_ticket_attachments(existing_ticket["public_id"], uploaded_files)
-                    stored_attachment_keys = [
-                        attachment.get("storageKey")
-                        for attachment in attachment_rows
-                        if sanitize_text(attachment.get("storageKey"))
-                    ]
+                if should_replace_attachments:
+                    attachment_rows = [normalize_ticket_attachment_row_payload(file) for file in evidence]
+                    if uploaded_files:
+                        attachment_rows = store_uploaded_ticket_attachments(existing_ticket["public_id"], uploaded_files)
+                        stored_attachment_keys = [
+                            attachment.get("storageKey")
+                            for attachment in attachment_rows
+                            if sanitize_text(attachment.get("storageKey"))
+                        ]
 
-                cursor.execute("DELETE FROM ticket_attachments WHERE ticket_id = %s", [existing_ticket["id"]])
+                    cursor.execute("DELETE FROM ticket_attachments WHERE ticket_id = %s", [existing_ticket["id"]])
 
-                for file in attachment_rows:
-                    normalized_file = normalize_ticket_attachment_row_payload(file)
+                    for file in attachment_rows:
+                        normalized_file = normalize_ticket_attachment_row_payload(file)
+                        cursor.execute(
+                            """
+                            INSERT INTO ticket_attachments (
+                              ticket_id,
+                              file_name,
+                              mime_type,
+                              file_size,
+                              storage_url,
+                              metadata
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                            """,
+                            [
+                                existing_ticket["id"],
+                                normalized_file["name"],
+                                normalized_file["mimeType"],
+                                normalized_file["size"],
+                                normalized_file["storageKey"],
+                                json.dumps(normalized_file["metadata"]),
+                            ],
+                        )
+
+                if next_assigned_team != existing_ticket["assigned_team"]:
                     cursor.execute(
                         """
-                        INSERT INTO ticket_attachments (
-                          ticket_id,
-                          file_name,
-                          mime_type,
-                          file_size,
-                          storage_url,
-                          metadata
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                        UPDATE tickets
+                        SET assigned_team = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
                         """,
-                        [
-                            existing_ticket["id"],
-                            normalized_file["name"],
-                            normalized_file["mimeType"],
-                            normalized_file["size"],
-                            normalized_file["storageKey"],
-                            json.dumps(normalized_file["metadata"]),
-                        ],
+                        [next_assigned_team, existing_ticket["id"]],
                     )
 
-            transaction.on_commit(
-                lambda old_storage_keys=list(existing_attachment_storage_keys): [
-                    delete_support_attachment_file(storage_key)
-                    for storage_key in old_storage_keys
-                ]
-            )
+            if should_replace_attachments:
+                transaction.on_commit(
+                    lambda old_storage_keys=list(existing_attachment_storage_keys): [
+                        delete_support_attachment_file(storage_key)
+                        for storage_key in old_storage_keys
+                    ]
+                )
 
             insert_history_event(
                 int(existing_ticket["id"]),
@@ -15762,7 +21560,9 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                 {
                     "category": category,
                     "technical_subcategory": technical_subcategory or None,
+                    "subject": subject,
                     "priority": next_priority,
+                    "ai_team_request": ai_team_request,
                     "evidence_count": evidence_count,
                 },
             )
@@ -15781,10 +21581,15 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
             "requesterSource": requester_source,
             "category": category,
             "technicalSubcategory": technical_subcategory,
+            "subject": subject,
             "inquiry": inquiry,
+            "aiTeamPersonName": ai_team_request["personName"] if ai_team_request else "",
+            "aiTeamPersonEmail": ai_team_request["personEmail"] if ai_team_request else "",
+            "submittedForLearner": submitted_for_payload or None,
+            "notifySubmittedForLearner": normalize_bool(submitted_for_payload.get("notifyByEmail")) if submitted_for_payload else False,
             "status": existing_ticket["status"],
             "statusReason": existing_ticket.get("status_reason") or "",
-            "assignedTeam": existing_ticket["assigned_team"],
+            "assignedTeam": next_assigned_team,
             "slaStatus": existing_ticket["sla_status"],
             "createdAt": existing_ticket["created_at"],
             "chatState": derive_ticket_chat_state(existing_ticket.get("status"), None),
@@ -15814,6 +21619,9 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
               t.conversation_id,
               t.category,
               t.technical_subcategory,
+              t.subject,
+              t.inquiry,
+              t.submitted_for_learner_id,
               t.priority,
               t.status,
               t.status_reason,
@@ -15826,12 +21634,17 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
               l.email AS learner_email,
               l.source AS learner_source,
               l.metadata AS learner_metadata,
+              submitted_for.external_learner_id AS submitted_for_external_learner_id,
+              submitted_for.full_name AS submitted_for_learner_name,
+              submitted_for.email AS submitted_for_learner_email,
               c.status AS conversation_status,
               a.full_name AS assigned_agent_name,
               a.username AS assigned_agent_username
             FROM tickets t
             JOIN learners l
               ON l.id = t.learner_id
+            LEFT JOIN learners submitted_for
+              ON submitted_for.id = t.submitted_for_learner_id
             LEFT JOIN conversations c
               ON c.id = t.conversation_id
             LEFT JOIN support_accounts a
@@ -15888,6 +21701,13 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
             next_status=status,
             next_status_reason=next_status_reason,
         )
+        should_queue_ai_team_submitted_notification = should_notify_ai_team_ticket_submitted(
+            ticket,
+            previous_status=previous_status,
+            previous_status_reason=previous_status_reason,
+            next_status=status,
+            next_status_reason=next_status_reason,
+        )
         should_queue_quick_closed_notification = should_notify_quick_ticket_closed(
             ticket,
             previous_status=previous_status,
@@ -15897,6 +21717,8 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
 
     if should_queue_quick_submitted_notification:
         queue_quick_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
+    if should_queue_ai_team_submitted_notification:
+        queue_ai_team_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
     if should_queue_quick_closed_notification:
         queue_quick_ticket_closed_notification(
             ticket,
@@ -15968,8 +21790,11 @@ def execute_http_request(request: urllib_request.Request, *, timeout_seconds: in
         return True, False, error.code, parsed or sanitize_text(body)
     except TimeoutError:
         return True, False, None, {"message": "Request timed out."}
-    except Exception:
-        return True, False, None, None
+    except Exception as error:
+        return True, False, None, {
+            "message": sanitize_text(str(error)) or "Request failed.",
+            "type": error.__class__.__name__,
+        }
 
 
 def post_form_request(url: str, payload: dict[str, Any]) -> tuple[bool, bool, int | None, Any]:
@@ -16032,6 +21857,7 @@ def post_multipart_webhook(
     payload: dict[str, Any],
     files: list[dict[str, Any]],
     *,
+    headers: dict[str, str] | None = None,
     timeout_seconds: int = 30,
 ) -> tuple[bool, bool, int | None, Any]:
     """Send a multipart/form-data POST with a JSON body field and binary file attachments."""
@@ -16081,7 +21907,7 @@ def post_multipart_webhook(
     request = urllib_request.Request(
         url,
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={**(headers or {}), "Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
     )
     return execute_http_request(request, timeout_seconds=timeout_seconds)
@@ -16643,15 +22469,40 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
             {"requestedDate": requested_date, "requestedTime": requested_time},
         )
 
+        support_session_ticket_metadata = {
+            **normalize_json_object(ticket.get("metadata")),
+            "support_session_requested_start_at": requested_datetime.isoformat(),
+            "support_session_requested_end_at": requested_end_at.isoformat(),
+        }
         next_sla_status, next_sla_attention_required, _next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
             ticket,
             "Pending",
+            status_reason=STATUS_REASON_AWAITING_MEETING,
+            metadata=support_session_ticket_metadata,
         )
         session_ticket_metadata_patch = {
             **updated_ticket_metadata,
             SUPPORT_FLOW_STAGE_METADATA_KEY: None,
             "booking_started_at": None,
         }
+        if not is_coverage_ticket_record(ticket):
+            session_ticket_metadata_patch[PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY] = build_support_queue_notification_payload(
+                ticket_id=ticket["public_id"],
+                requester_name=ticket.get("learner_full_name") or ticket.get("learner_email"),
+                requester_email=ticket.get("learner_email"),
+                requester_role=get_ticket_requester_role(session_ticket_metadata_patch),
+                reason="support_session_requested",
+                created_at=datetime.now(timezone.utc),
+            )
+        session_ticket_metadata_patch, ticket_state_columns = build_ticket_state_persistence(
+            session_ticket_metadata_patch,
+            {
+                **ticket,
+                "status": "Pending",
+                "status_reason": STATUS_REASON_AWAITING_MEETING,
+            },
+            chat_state=map_conversation_status("Pending"),
+        )
 
         with connection.cursor() as cursor:
             cursor.execute(
@@ -16661,6 +22512,13 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                     status_reason = %s,
                     sla_status = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW(),
                     closed_at = CASE
                       WHEN status = 'Closed' THEN NULL
@@ -16673,6 +22531,7 @@ def create_support_session_request(public_id: str, payload: dict[str, Any]) -> d
                     STATUS_REASON_AWAITING_MEETING,
                     next_sla_status,
                     json.dumps(session_ticket_metadata_patch),
+                    *get_ticket_state_column_params(ticket_state_columns),
                     ticket["id"],
                 ],
             )
@@ -16875,6 +22734,7 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
     next_sla_status, next_sla_attention_required, _next_sla_attention_reason, updated_ticket_metadata = resolve_ticket_sla_update(
         ticket,
         "Open",
+        status_reason="",
     )
     cancellation_metadata_patch = {
         "cancelled_at": datetime.now(timezone.utc).isoformat(),
@@ -16884,6 +22744,15 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
         "reservation_confirmed": False,
         "meeting_join_url": None,
     }
+    updated_ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+        updated_ticket_metadata,
+        {
+            **ticket,
+            "status": "Open",
+            "status_reason": "",
+        },
+        chat_state=map_conversation_status("Open"),
+    )
 
     with transaction.atomic():
         update_support_session_request_record(
@@ -16901,6 +22770,13 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
                     status_reason = %s,
                     sla_status = %s,
                     metadata = %s::jsonb,
+                    ticket_type = %s,
+                    workflow_stage = %s,
+                    queue_scope = %s,
+                    dashboard_bucket = %s,
+                    can_show_conversation = %s,
+                    can_receive_chat = %s,
+                    resolution_reason = %s,
                     updated_at = NOW(),
                     closed_at = CASE
                       WHEN status = 'Closed' THEN NULL
@@ -16908,7 +22784,14 @@ def cancel_support_session_request(public_id: str) -> dict[str, Any]:
                     END
                 WHERE id = %s
                 """,
-                ["Open", "", next_sla_status, json.dumps(updated_ticket_metadata), ticket["id"]],
+                [
+                    "Open",
+                    "",
+                    next_sla_status,
+                    json.dumps(updated_ticket_metadata),
+                    *get_ticket_state_column_params(ticket_state_columns),
+                    ticket["id"],
+                ],
             )
 
             if ticket.get("conversation_id"):
