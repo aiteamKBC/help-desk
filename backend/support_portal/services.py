@@ -15201,8 +15201,22 @@ def normalize_admin_ticket_list_params(query_params: dict[str, Any] | None = Non
     if dashboard_filter not in ADMIN_TICKET_LIST_DASHBOARD_FILTERS:
         dashboard_filter = "all"
     pagination_requested = any(key in params for key in {"page", "pageSize", "limit"})
+    created_bounds = {}
+    for key in ("createdFrom", "createdBefore"):
+        value = sanitize_text(params.get(key))
+        parsed_value = parse_iso_datetime(value)
+        if value and parsed_value is None:
+            raise ValueError(f"{key} must be a valid ISO date/time.")
+        created_bounds[key] = parsed_value
+    if (
+        created_bounds["createdFrom"] is not None
+        and created_bounds["createdBefore"] is not None
+        and created_bounds["createdFrom"] >= created_bounds["createdBefore"]
+    ):
+        raise ValueError("createdFrom must be earlier than createdBefore.")
 
     return {
+        **created_bounds,
         "page": page,
         "pageSize": page_size,
         "paginationRequested": pagination_requested,
@@ -15400,6 +15414,16 @@ def filter_admin_ticket_list(
     actor: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     filtered_tickets = tickets
+    created_from = params.get("createdFrom")
+    created_before = params.get("createdBefore")
+    if created_from or created_before:
+        filtered_tickets = [
+            ticket
+            for ticket in filtered_tickets
+            if (created_at := coerce_datetime(ticket.get("created_at"))) is not None
+            and (created_from is None or created_at >= created_from)
+            and (created_before is None or created_at < created_before)
+        ]
     if params["archiveScope"] == "active":
         filtered_tickets = [ticket for ticket in filtered_tickets if not normalize_bool(ticket.get("is_archived"))]
     elif params["archiveScope"] == "archived":
@@ -15516,6 +15540,8 @@ def paginate_admin_ticket_list(tickets: list[dict[str, Any]], params: dict[str, 
 
 def build_admin_ticket_list_filter_response(params: dict[str, Any]) -> dict[str, Any]:
     return {
+        "createdFrom": serialize_datetime_value(params.get("createdFrom")),
+        "createdBefore": serialize_datetime_value(params.get("createdBefore")),
         "search": params["search"],
         "status": params["status"],
         "slaStatus": params["slaStatus"],
@@ -15945,6 +15971,15 @@ def build_admin_ticket_sql_prefilter(
 
     where_clauses: list[str] = []
     query_params: list[Any] = []
+
+    created_from = coerce_datetime(params.get("createdFrom"))
+    created_before = coerce_datetime(params.get("createdBefore"))
+    if created_from is not None:
+        where_clauses.append("t.created_at >= %s")
+        query_params.append(created_from)
+    if created_before is not None:
+        where_clauses.append("t.created_at < %s")
+        query_params.append(created_before)
 
     archive_scope = sanitize_text(params.get("archiveScope")).lower()
     if archive_scope == "active":

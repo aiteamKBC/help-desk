@@ -7000,6 +7000,63 @@ class ChatInactivitySyncCommandTests(SimpleTestCase):
 
 
 class AdminTicketListPrefilterTests(SimpleTestCase):
+    def test_created_date_filter_includes_start_and_excludes_end_with_other_filters(self):
+        end = datetime(2026, 10, 28, tzinfo=ZoneInfo("Africa/Cairo"))
+        for days in (1, 7):
+            with self.subTest(days=days):
+                start = end - timedelta(days=days)
+                base_ticket = {"status": "Pending", "is_archived": False, "assigned_agent_id": 4}
+                tickets = [
+                    {**base_ticket, "id": "before", "created_at": start - timedelta(microseconds=1), "updated_at": end},
+                    {**base_ticket, "id": "start", "created_at": start.astimezone(timezone.utc)},
+                    {**base_ticket, "id": "last", "created_at": end - timedelta(microseconds=1)},
+                    {**base_ticket, "id": "end", "created_at": end},
+                    {**base_ticket, "id": "missing", "created_at": None},
+                    {**base_ticket, "id": "archived", "created_at": start, "is_archived": True},
+                    {**base_ticket, "id": "closed", "created_at": start, "status": "Closed"},
+                    {**base_ticket, "id": "other_agent", "created_at": start, "assigned_agent_id": 5},
+                ]
+                params = services.normalize_admin_ticket_list_params({
+                    "createdFrom": start.isoformat(),
+                    "createdBefore": end.isoformat(),
+                    "archiveScope": "active",
+                    "status": "Pending",
+                    "assigned": "me",
+                })
+
+                result = services.filter_admin_ticket_list(tickets, params, {"id": 4})
+
+                self.assertEqual([ticket["id"] for ticket in result], ["start", "last"])
+
+    def test_created_date_filter_rejects_invalid_or_reversed_bounds(self):
+        for params in (
+            {"createdFrom": "invalid"},
+            {"createdBefore": "invalid"},
+            {"createdFrom": "2026-10-28T00:00:00Z", "createdBefore": "2026-10-27T00:00:00Z"},
+            {"createdFrom": "2026-10-27T00:00:00Z", "createdBefore": "2026-10-27T00:00:00Z"},
+        ):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                services.normalize_admin_ticket_list_params(params)
+
+    def test_ticket_metrics_apply_created_date_bounds_to_counts_and_sections(self):
+        start = datetime(2026, 10, 20, 21, tzinfo=timezone.utc)
+        end = datetime(2026, 10, 27, 21, tzinfo=timezone.utc)
+        with patch.object(services, "run_query_one", return_value={}) as run_query_one:
+            response = services.get_admin_ticket_metrics(
+                {"id": 4, "role": services.ROLE_SUPERADMIN},
+                query_params={"createdFrom": start.isoformat(), "createdBefore": end.isoformat()},
+            )
+
+        self.assertEqual(run_query_one.call_count, 2)
+        for call in run_query_one.call_args_list:
+            sql, params = call.args
+            self.assertIn("t.created_at >= %s", sql)
+            self.assertIn("t.created_at < %s", sql)
+            self.assertIn(start, params)
+            self.assertIn(end, params)
+        self.assertEqual(response["filters"]["createdFrom"], start.isoformat())
+        self.assertEqual(response["filters"]["createdBefore"], end.isoformat())
+
     def test_fetch_admin_ticket_rows_prefilters_dynamic_team_in_sql(self):
         team = {
             "id": 7,
@@ -7123,6 +7180,8 @@ class AdminTicketListPrefilterTests(SimpleTestCase):
             "pageSize": "25",
             "archiveScope": "active",
             "sort": "newest",
+            "createdFrom": "2026-10-27T00:00:00+03:00",
+            "createdBefore": "2026-10-28T00:00:00+03:00",
         })
 
         with (
@@ -7136,6 +7195,11 @@ class AdminTicketListPrefilterTests(SimpleTestCase):
         page_params = run_query.call_args.args[1]
         self.assertIn("COUNT(*) AS total", count_sql)
         self.assertIn("LIMIT %s OFFSET %s", page_sql)
+        for sql, query_params in (run_query_one.call_args.args, run_query.call_args.args):
+            self.assertIn("t.created_at >= %s", sql)
+            self.assertIn("t.created_at < %s", sql)
+            self.assertIn(params["createdFrom"], query_params)
+            self.assertIn(params["createdBefore"], query_params)
         self.assertEqual(page_params[-2:], [25, 25])
         self.assertEqual(pagination["total"], 51)
         self.assertEqual(pagination["page"], 2)

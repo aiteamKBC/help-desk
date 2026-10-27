@@ -563,6 +563,108 @@ describe("AgentDashboard runtime", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("filters cached tickets by local creation day and the last seven calendar days", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    // Cairo's daylight saving change skips midnight on this date.
+    vi.setSystemTime(new Date(2026, 3, 24, 12));
+    const tickets = [
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000101", createdAt: new Date(2026, 3, 24).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000102", createdAt: new Date(2026, 3, 18).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000103", createdAt: new Date(2026, 3, 17, 23, 59, 59).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000104", createdAt: new Date(2026, 3, 25).toISOString() },
+    ];
+    const defaultFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith("/api/admin/tickets") && !String(input).includes("/metrics")) {
+        // No pagination metadata: exercise the cached-list fallback.
+        return new Response(JSON.stringify({ tickets }), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    await screen.findByText("KBC-000101");
+    const selectPeriod = async (name: string) => {
+      fireEvent.keyDown(screen.getByRole("combobox", { name: "Filter tickets by creation date" }), { key: "ArrowDown" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+
+    await selectPeriod("Today");
+    await waitFor(() => {
+      expect(screen.getByText("KBC-000101")).toBeInTheDocument();
+      expect(screen.queryByText("KBC-000102")).not.toBeInTheDocument();
+      expect(screen.queryByText("KBC-000103")).not.toBeInTheDocument();
+      expect(screen.queryByText("KBC-000104")).not.toBeInTheDocument();
+    });
+
+    await selectPeriod("Last 7 Days");
+    await waitFor(() => {
+      expect(screen.getByText("KBC-000101")).toBeInTheDocument();
+      expect(screen.getByText("KBC-000102")).toBeInTheDocument();
+      expect(screen.queryByText("KBC-000103")).not.toBeInTheDocument();
+      expect(screen.queryByText("KBC-000104")).not.toBeInTheDocument();
+    });
+
+    fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "KBC-000103" } });
+    await screen.findByText("No matching tickets found for this search.");
+    fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
+    await waitFor(() => {
+      expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
+      expect(screen.getByText("KBC-000103")).toBeInTheDocument();
+      expect(screen.getByText("KBC-000104")).toBeInTheDocument();
+    });
+  });
+
+  it("requests the same date range for pages and metrics and returns to the first page", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 5, 14, 12));
+    const defaultFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname === "/api/admin/tickets" && url.searchParams.has("page")) {
+        const page = Number(url.searchParams.get("page"));
+        const filtered = url.searchParams.has("createdFrom");
+        return new Response(JSON.stringify({
+          tickets: filtered ? [] : [dashboardPayload.tickets.tickets[0]],
+          pagination: {
+            page, pageSize: 25, total: filtered ? 0 : 26, totalPages: filtered ? 0 : 2,
+            hasNext: !filtered && page === 1, hasPrevious: page > 1, isPaginated: true,
+          },
+        }), { status: 200 });
+      }
+      if (url.pathname === "/api/admin/tickets/metrics" && url.searchParams.has("createdFrom")) {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload([])), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+    await screen.findByText("Page 2 of 2");
+
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Filter tickets by creation date" }), { key: "ArrowDown" });
+    fireEvent.click(await screen.findByRole("option", { name: "Today" }));
+    await screen.findByText("No tickets match the current filters for today.");
+    const expectedFrom = new Date(2026, 5, 14).toISOString();
+    const expectedBefore = new Date(2026, 5, 15).toISOString();
+    await waitFor(() => {
+      const requests = vi.mocked(globalThis.fetch).mock.calls.map(([input]) => new URL(String(input), "http://localhost"));
+      for (const path of ["/api/admin/tickets", "/api/admin/tickets/metrics"]) {
+        expect(requests.some((url) => url.pathname === path
+          && url.searchParams.get("createdFrom") === expectedFrom
+          && url.searchParams.get("createdBefore") === expectedBefore
+          && (path.endsWith("metrics") || url.searchParams.get("page") === "1"))).toBe(true);
+      }
+      expect(screen.getByRole("button", { name: /Open Tickets/ })).toHaveTextContent("0");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
+    await screen.findByText("Page 1 of 2");
+    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
   });
 
   it("renders the admin dashboard with live payload data", async () => {

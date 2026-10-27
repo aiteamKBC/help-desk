@@ -933,6 +933,7 @@ type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreache
 type AdminTicketDashboardFilterParam = DashboardTicketFilter | "learningPlanOther";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
+type DashboardDateFilter = "all" | "today" | "last7Days";
 type DashboardArchiveScope = "active" | "archived";
 type DashboardStatusFilterParam = "Open" | "Pending" | "Closed";
 type DashboardTicketPageLoadOptions = { silent?: boolean; signal?: AbortSignal };
@@ -1113,6 +1114,8 @@ const AgentDashboard = () => {
     getDefaultDashboardSortOrder(initialConsoleDeepLink.view === "coverage")
   ));
   const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
+  const [dashboardDateFilter, setDashboardDateFilter] = useState<DashboardDateFilter>("all");
+  const { createdFrom: dashboardCreatedFrom, createdBefore: dashboardCreatedBefore } = getDashboardDateRange(dashboardDateFilter);
   const [dashboardArchiveScope, setDashboardArchiveScope] = useState<DashboardArchiveScope>("active");
   const [learningPlanTeamSection, setLearningPlanTeamSection] = useState<LearningPlanTeamSection>("coverage");
   const [dashboardSearch, setDashboardSearch] = useState("");
@@ -1799,7 +1802,13 @@ const AgentDashboard = () => {
   const activeAccessibleTickets = accessibleTickets.filter((ticket) => !isArchivedTicket(ticket));
   const dashboardArchiveScopedTickets = accessibleTickets.filter((ticket) => (
     dashboardArchiveScope === "archived" ? isArchivedTicket(ticket) : !isArchivedTicket(ticket)
-  ));
+  )).filter((ticket) => {
+    if (!dashboardCreatedFrom || !dashboardCreatedBefore) {
+      return true;
+    }
+    const createdAt = Date.parse(ticket.createdAt);
+    return createdAt >= Date.parse(dashboardCreatedFrom) && createdAt < Date.parse(dashboardCreatedBefore);
+  });
   const learningPlanCoverageBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isCoverageTicket(ticket));
   const learningPlanOtherBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => isLearningPlanOtherTicket(ticket));
   const supportDashboardBaseTickets = dashboardArchiveScopedTickets.filter((ticket) => (
@@ -1959,6 +1968,7 @@ const AgentDashboard = () => {
   const dashboardCellClassName = useCompactDashboardTable ? "px-3 py-3 align-middle" : "px-4 py-3";
   const hasDashboardViewOverrides = (
     dashboardTicketFilter !== "all"
+    || dashboardDateFilter !== "all"
     || dashboardSortOrder !== defaultDashboardSortOrder
     || dashboardArchiveScope !== "active"
   );
@@ -2074,6 +2084,8 @@ const AgentDashboard = () => {
   );
   const dashboardEmptyMessage = normalizedDashboardSearch
     ? "No matching tickets found for this search."
+    : dashboardDateFilter !== "all"
+      ? `No tickets match the current filters ${dashboardDateFilter === "today" ? "for today" : "in the last 7 days"}.`
     : dashboardArchiveScope === "archived"
       ? (
         isCoverageDashboardView
@@ -2628,6 +2640,8 @@ const AgentDashboard = () => {
     adminView,
     dashboardArchiveScope,
     dashboardAssignedFilter,
+    dashboardCreatedFrom,
+    dashboardCreatedBefore,
     dashboardPageSize,
     dashboardSearch,
     dashboardSortOrder,
@@ -2661,6 +2675,8 @@ const AgentDashboard = () => {
     adminView,
     dashboardArchiveScope,
     dashboardAssignedFilter,
+    dashboardCreatedFrom,
+    dashboardCreatedBefore,
     dashboardPage,
     dashboardPageSize,
     dashboardSearch,
@@ -2690,6 +2706,8 @@ const AgentDashboard = () => {
     adminView,
     dashboardArchiveScope,
     dashboardAssignedFilter,
+    dashboardCreatedFrom,
+    dashboardCreatedBefore,
     hasCheckedTeamRoutingPolicies,
     isDashboardLikeView,
     learningPlanTeamSection,
@@ -3424,6 +3442,10 @@ const AgentDashboard = () => {
     params.set("pageSize", String(dashboardPageSize));
     params.set("sort", dashboardSortOrder);
     params.set("archiveScope", dashboardArchiveScope);
+    if (dashboardCreatedFrom && dashboardCreatedBefore) {
+      params.set("createdFrom", dashboardCreatedFrom);
+      params.set("createdBefore", dashboardCreatedBefore);
+    }
 
     const teamKey = getDashboardServerTeamKey();
     if (teamKey) {
@@ -3546,6 +3568,10 @@ const AgentDashboard = () => {
   function buildDashboardMetricsSearchParams() {
     const params = new URLSearchParams();
     params.set("archiveScope", dashboardArchiveScope);
+    if (dashboardCreatedFrom && dashboardCreatedBefore) {
+      params.set("createdFrom", dashboardCreatedFrom);
+      params.set("createdBefore", dashboardCreatedBefore);
+    }
 
     const teamKey = getDashboardServerTeamKey();
     if (teamKey) {
@@ -6469,6 +6495,7 @@ const AgentDashboard = () => {
                       )}
                       onClick={() => {
                         setDashboardTicketFilter("all");
+                        setDashboardDateFilter("all");
                         setDashboardSortOrder(defaultDashboardSortOrder);
                         setDashboardArchiveScope("active");
                       }}
@@ -6542,6 +6569,29 @@ const AgentDashboard = () => {
                             {option.label}
                           </SelectItem>
                         ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="w-full sm:w-[170px]">
+                    <Select
+                      value={dashboardDateFilter}
+                      onValueChange={(value) => setDashboardDateFilter(value as DashboardDateFilter)}
+                    >
+                      <SelectTrigger
+                        aria-label="Filter tickets by creation date"
+                        title="Ticket creation date in your local time"
+                        className={cn(
+                          "gap-2 [&>span]:flex-1 [&>span]:text-left [&>svg]:shrink-0",
+                          dashboardDateFilter !== "all" && "border-primary/50 bg-primary/5 text-primary",
+                        )}
+                      >
+                        <CalendarDays className="h-4 w-4 text-primary" aria-hidden="true" />
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All Time</SelectItem>
+                        <SelectItem value="today">Today</SelectItem>
+                        <SelectItem value="last7Days">Last 7 Days</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -16696,6 +16746,19 @@ function hasTicketAccess(agent: Pick<AdminAgent, "accountScope" | "role" | "lega
 
   return getActiveTeamRoutingPolicies().some((policy) => canReceiveTeamTickets(agent, policy))
     || hasAnyPreloadedTeamAccess(agent);
+}
+
+function getDashboardDateRange(filter: DashboardDateFilter) {
+  if (filter === "all") {
+    return { createdFrom: "", createdBefore: "" };
+  }
+
+  // Calendar boundaries match the local dates displayed in the Created column,
+  // including days that are shorter or longer due to daylight saving changes.
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (filter === "last7Days" ? 6 : 0));
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  return { createdFrom: start.toISOString(), createdBefore: end.toISOString() };
 }
 
 function filterDashboardTickets(tickets: TicketSummary[], filter: DashboardTicketFilter) {
