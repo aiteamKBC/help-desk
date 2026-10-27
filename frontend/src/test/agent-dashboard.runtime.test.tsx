@@ -484,6 +484,80 @@ describe("AgentDashboard runtime", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("filters tickets and counts by creation date while preserving search and archive filters", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    // Cairo's daylight saving change skips midnight on this date.
+    vi.setSystemTime(new Date(2026, 3, 24, 12));
+    const tickets = [
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000101", createdAt: new Date(2026, 3, 24).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000102", createdAt: new Date(2026, 3, 18).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000103", createdAt: new Date(2026, 3, 17, 23, 59, 59).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000104", createdAt: new Date(2026, 3, 25).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000105", isArchived: true, createdAt: new Date(2026, 3, 24).toISOString() },
+      { ...dashboardPayload.tickets.tickets[0], id: "KBC-000106", isArchived: true, createdAt: new Date(2026, 3, 17).toISOString() },
+    ];
+    const defaultFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/admin/tickets") {
+        return new Response(JSON.stringify({ tickets }), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    await screen.findByText("KBC-000101");
+    const selectPeriod = async (name: string) => {
+      fireEvent.keyDown(screen.getByRole("combobox", { name: "Filter tickets by creation date" }), { key: "ArrowDown" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    const expectOpenCount = (count: string) => {
+      expect(within(screen.getByRole("button", { name: /Open Tickets/ })).getByText(count, { exact: true })).toBeInTheDocument();
+    };
+    expectOpenCount("4");
+
+    await selectPeriod("Today");
+    expect(screen.getByText("KBC-000101")).toBeInTheDocument();
+    for (const id of ["KBC-000102", "KBC-000103", "KBC-000104", "KBC-000105"]) {
+      expect(screen.queryByText(id)).not.toBeInTheDocument();
+    }
+    expectOpenCount("1");
+
+    fireEvent.click(screen.getByRole("button", { name: /Pending Tickets/ }));
+    expect(screen.getByText("No tickets match the current filters for today.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Pending Tickets/ }));
+
+    await selectPeriod("Last 7 Days");
+    expect(screen.getByText("KBC-000101")).toBeInTheDocument();
+    expect(screen.getByText("KBC-000102")).toBeInTheDocument();
+    expect(screen.queryByText("KBC-000103")).not.toBeInTheDocument();
+    expect(screen.queryByText("KBC-000104")).not.toBeInTheDocument();
+    expectOpenCount("2");
+
+    fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "KBC-000102" } });
+    expect(screen.getByText("KBC-000102")).toBeInTheDocument();
+    expect(screen.queryByText("KBC-000101")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "KBC-000103" } });
+    expect(screen.getByText("No matching tickets found for this search.")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
+    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
+    expect(screen.getByText("KBC-000103")).toBeInTheDocument();
+    expect(screen.getByText("KBC-000104")).toBeInTheDocument();
+    expectOpenCount("4");
+
+    await selectPeriod("Today");
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    expect(screen.getByText("KBC-000105")).toBeInTheDocument();
+    expect(screen.queryByText("KBC-000101")).not.toBeInTheDocument();
+    expect(screen.queryByText("KBC-000106")).not.toBeInTheDocument();
+    expectOpenCount("1");
+    fireEvent.click(screen.getByRole("button", { name: "Back to Active" }));
+    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
+    expectOpenCount("4");
   });
 
   it("renders the admin dashboard with live payload data", async () => {
