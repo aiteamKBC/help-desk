@@ -55,7 +55,7 @@ const getVerificationErrorState = (
       title: "Support API Offline",
       message:
         payload?.message ||
-        "The frontend is running, but the Django backend on 127.0.0.1:3001 is unavailable. Start or restart the backend and try again.",
+        "The frontend is running, but the Django backend is unavailable. Restart the development server and try again.",
     };
   }
 
@@ -78,7 +78,7 @@ const getVerificationErrorState = (
 
 const getVerificationRequestFailureMessage = () =>
   import.meta.env.DEV
-    ? "We could not reach the support API. Make sure the Django backend is running on 127.0.0.1:3001, then try again."
+    ? "We could not reach the support API. Make sure the Django backend is running, then try again."
     : "We could not verify your email right now. Please try again.";
 
 const EmailVerification = () => {

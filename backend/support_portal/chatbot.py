@@ -668,6 +668,63 @@ def _build_inquiry_from_conversation(history: list[dict[str, str]], message: str
     return "\n".join(lines).strip()
 
 
+def _generate_ticket_subject(history: list[dict[str, str]], message: str, route: str) -> str:
+    """Ask the model for a short, descriptive subject line for the opened ticket.
+
+    Falls back to a trimmed form of the learner's latest message when the model
+    is unavailable or returns nothing usable, so a ticket is never created with
+    an empty or generic subject line.
+    """
+    learner_turns = [entry["text"] for entry in history if entry.get("sender") == "user" and entry.get("text")]
+    learner_turns.append(message)
+    transcript_lines: list[str] = []
+    for entry in history[-10:]:
+        who = "Assistant" if entry.get("sender") == "bot" else "Learner"
+        text = sanitize_text(entry.get("text"))
+        if text:
+            transcript_lines.append(f"{who}: {text}")
+    transcript_lines.append(f"Learner: {message}")
+    transcript = "\n".join(transcript_lines)
+
+    system_prompt = (
+        "You write ticket subject lines for a support help-desk. "
+        "Given a short conversation between a learner and the support assistant, "
+        "produce ONE concise title (5-10 words) that names the specific problem "
+        "the learner is reporting. "
+        "Do not add quotes, trailing punctuation, prefixes like 'Subject:', "
+        "or markdown. Keep it in English. "
+        "If the conversation is too vague to name a specific problem, respond with the single word: General"
+    )
+    user_prompt = (
+        f"Area: {route or 'general'}\n\n"
+        f"Conversation:\n{transcript}\n\n"
+        "Write the subject line now."
+    )
+
+    try:
+        raw = _chat_completion(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+    except Exception as error:  # pragma: no cover - defensive
+        logger.warning("Ticket subject generation failed: %s", error)
+        raw = ""
+
+    subject = sanitize_text(raw).strip().strip('"').strip("'")
+    # Trim stray prefixes some models still emit.
+    for prefix in ("Subject:", "Title:", "subject:", "title:"):
+        if subject.lower().startswith(prefix.lower()):
+            subject = subject[len(prefix):].strip()
+    subject = subject.splitlines()[0].strip() if subject else ""
+    if not subject or subject.lower() == "general":
+        # Fallback: use the learner's latest message, trimmed to a title length.
+        fallback = sanitize_text(message) or (learner_turns[0] if learner_turns else "")
+        subject = fallback[:140].strip()
+    return subject[:140]
+
+
 def generate_ticket_chat_reply(
     ticket: dict[str, Any],
     message: str,
@@ -803,6 +860,111 @@ def _ensure_assistant_log_table() -> bool:
     return True
 
 
+def fetch_chatbot_history_for_ticket(ticket_id: str) -> list[dict[str, Any]]:
+    """Return every assistant turn linked to a ticket, oldest first.
+
+    Each row is one user message paired with the bot reply that followed, so
+    the admin UI can render them as a conversation.
+    """
+    cleaned = sanitize_text(ticket_id)
+    if not cleaned:
+        return []
+    if not _ensure_assistant_log_table():
+        return []
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT user_message, assistant_reply, route, escalated, created_at
+                FROM assistant_conversations
+                WHERE ticket_id = %s
+                ORDER BY created_at ASC, id ASC
+                """,
+                [cleaned[:64]],
+            )
+            rows = cursor.fetchall()
+    except Exception as error:  # pragma: no cover
+        logger.warning("Could not fetch chatbot history for ticket %s: %s", cleaned, error)
+        return []
+    messages: list[dict[str, Any]] = []
+    for user_message, assistant_reply, route, escalated, created_at in rows:
+        timestamp = created_at.isoformat() if created_at else None
+        if user_message:
+            messages.append(
+                {
+                    "sender": "user",
+                    "text": user_message,
+                    "route": route or "",
+                    "createdAt": timestamp,
+                }
+            )
+        if assistant_reply:
+            messages.append(
+                {
+                    "sender": "bot",
+                    "text": assistant_reply,
+                    "route": route or "",
+                    "escalated": bool(escalated),
+                    "createdAt": timestamp,
+                }
+            )
+    return messages
+
+
+def log_chatbot_history_for_ticket(
+    *,
+    ticket_id: str,
+    email: str,
+    mode: str,
+    route: str,
+    history: list[dict[str, str]],
+) -> None:
+    """Persist the full chatbot conversation that led to a ticket.
+
+    Pairs each user message with the bot reply that followed it so the admin
+    dashboard can show the pre-ticket conversation in order. Called once right
+    after a ticket is opened by the assistant. Failures never interrupt the reply.
+    """
+    if not ticket_id or not history:
+        return
+    if not _ensure_assistant_log_table():
+        return
+    pairs: list[tuple[str, str]] = []
+    pending_user: str | None = None
+    for entry in history:
+        sender = (entry.get("sender") or "").lower()
+        text = entry.get("text") or ""
+        if not text:
+            continue
+        if sender == "user":
+            if pending_user is not None:
+                pairs.append((pending_user, ""))
+            pending_user = text
+        else:
+            pairs.append((pending_user or "", text))
+            pending_user = None
+    if pending_user is not None:
+        pairs.append((pending_user, ""))
+    if not pairs:
+        return
+    try:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO assistant_conversations
+                  (session_id, email, mode, route, user_message, assistant_reply, escalated, kb_distance, ticket_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    ("", email[:320], mode[:16], route[:32], user_msg, bot_reply, False, None, ticket_id[:64])
+                    for user_msg, bot_reply in pairs
+                ],
+            )
+        logger.info("Logged %d chatbot history pairs for ticket=%s", len(pairs), ticket_id)
+    except Exception as error:  # pragma: no cover
+        logger.warning("Could not log chatbot history for ticket %s: %s", ticket_id, error)
+
+
 def log_assistant_turn(
     *,
     session_id: str,
@@ -936,6 +1098,7 @@ def _find_or_create_ticket(
             "email": email,
             "category": category,
             "technicalSubcategory": subcategory,
+            "subject": _generate_ticket_subject(history, message, route),
             "inquiry": _build_inquiry_from_conversation(history, message, route),
         }
     )
@@ -1009,6 +1172,17 @@ def perform_escalation_action(
     opened = "I've opened" if ticket.get("created") else "I've added this to"
     response["ticket"] = {"id": ticket_id, "status": ticket.get("status")}
     response["assistantAction"] = "ticket_created" if ticket.get("created") else "ticket_linked"
+
+    # Persist the chatbot history for the newly opened ticket so admins can
+    # review the conversation that led up to the escalation.
+    if ticket.get("created") and ticket_id:
+        log_chatbot_history_for_ticket(
+            ticket_id=str(ticket_id),
+            email=email,
+            mode="learner",
+            route="support",
+            history=history,
+        )
 
     if action == "live_chat":
         # Actually join the queue rather than describing how to.
@@ -1243,6 +1417,18 @@ def get_support_assistant_response(payload: dict[str, Any]) -> dict[str, Any]:
         response["assistantAction"] = "escalate_failed"
         response["ticketError"] = error.message
         return _finish(response, None)
+
+    # When this escalation opens a new ticket, persist the chatbot conversation
+    # that led up to it so the support team can read it from the ticket detail.
+    if ticket.get("created") and ticket.get("id"):
+        history_with_last_turn = list(history) + [{"sender": "user", "text": message}]
+        log_chatbot_history_for_ticket(
+            ticket_id=str(ticket["id"]),
+            email=email,
+            mode=mode,
+            route=result["route"],
+            history=history_with_last_turn,
+        )
 
     response["ticket"] = {"id": ticket["id"], "status": ticket.get("status")}
     response["assistantAction"] = "ticket_linked" if not ticket.get("created") else "ticket_created"

@@ -30,6 +30,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
+  SELECTABLE_TECHNICAL_SUBCATEGORIES,
+  formatTechnicalSubcategoryLabel,
   type EvidenceFile,
   type SubmittedForLearner,
   type TechnicalSubcategory,
@@ -68,7 +70,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "AI Team", "Coverage", "Others"];
+const inquiryPlatforms: TechnicalSubcategory[] = SELECTABLE_TECHNICAL_SUBCATEGORIES;
 
 const getExtension = (name: string) => {
   const dotIndex = name.lastIndexOf(".");
@@ -1060,7 +1062,7 @@ const InquiryDetails = () => {
                 </SelectTrigger>
                 <SelectContent>
                   {availableInquiryPlatforms.map((item) => (
-                    <SelectItem key={item} value={item}>{item}</SelectItem>
+                    <SelectItem key={item} value={item}>{formatTechnicalSubcategoryLabel(item)}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>

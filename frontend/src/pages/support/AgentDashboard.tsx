@@ -1106,8 +1106,19 @@ const AgentDashboard = () => {
   const [consoleTicketId, setConsoleTicketId] = useState(initialConsoleDeepLink.ticketId);
   const [consoleDetail, setConsoleDetail] = useState<TicketDetailResponse | null>(null);
   const [consoleChatInput, setConsoleChatInput] = useState("");
+  const [activeConversationInput, setActiveConversationInput] = useState("");
   const [consolePendingAttachments, setConsolePendingAttachments] = useState<ChatAttachment[]>([]);
   const [chatPreviewAttachment, setChatPreviewAttachment] = useState<ChatAttachment | null>(null);
+  const [chatbotHistoryOpen, setChatbotHistoryOpen] = useState(false);
+  const [chatbotHistoryLoading, setChatbotHistoryLoading] = useState(false);
+  const [chatbotHistoryError, setChatbotHistoryError] = useState<string | null>(null);
+  const [chatbotHistoryMessages, setChatbotHistoryMessages] = useState<Array<{
+    sender: string;
+    text: string;
+    route?: string;
+    escalated?: boolean;
+    createdAt?: string | null;
+  }>>([]);
   const consoleAttachmentInputRef = useRef<HTMLInputElement | null>(null);
   const consolePendingAttachmentsRef = useRef<ChatAttachment[]>([]);
   const standardActionNoteRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1156,10 +1167,47 @@ const AgentDashboard = () => {
   const [isOpening, setIsOpening] = useState(false);
   const [isConsoleOpening, setIsConsoleOpening] = useState(false);
   const [isSendingConsoleChat, setIsSendingConsoleChat] = useState(false);
+  const [isSendingActiveConversation, setIsSendingActiveConversation] = useState(false);
   const [isForceClosingConsoleChat, setIsForceClosingConsoleChat] = useState(false);
   const [isTransferMenuOpen, setIsTransferMenuOpen] = useState(false);
   const [isTransferringConsoleTicket, setIsTransferringConsoleTicket] = useState(false);
   const [isTransferNotificationsOpen, setIsTransferNotificationsOpen] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(
+    () => (typeof window !== "undefined" && "Notification" in window ? window.Notification.permission : "unsupported"),
+  );
+  const [showNotificationBlockedDialog, setShowNotificationBlockedDialog] = useState(false);
+  const requestDesktopNotificationPermission = async () => {
+    if (!browserDesktopNotificationsSupported()) {
+      return;
+    }
+    // Once the browser recorded a "denied" verdict, requestPermission() just
+    // returns "denied" without showing the native prompt again. The only path
+    // back is the site-settings dialog in the browser's URL bar.
+    if (window.Notification.permission === "denied") {
+      setShowNotificationBlockedDialog(true);
+      return;
+    }
+    try {
+      const result = await window.Notification.requestPermission();
+      setNotificationPermission(result);
+      if (result === "granted") {
+        try {
+          const probe = new window.Notification("Desktop notifications enabled", {
+            body: "You will now be alerted when new support tickets arrive, even on other tabs.",
+            tag: "support-admin:permission-granted",
+            icon: "/kent-crest.svg",
+          });
+          probe.onclick = () => probe.close();
+        } catch {
+          // Ignore browser notification failures.
+        }
+      } else if (result === "denied") {
+        setShowNotificationBlockedDialog(true);
+      }
+    } catch {
+      // Ignore rejected prompts.
+    }
+  };
   const [activeTransferRequestTicketId, setActiveTransferRequestTicketId] = useState("");
   const [transferReason, setTransferReason] = useState("");
   const [teamTransferTicketId, setTeamTransferTicketId] = useState("");
@@ -1618,13 +1666,13 @@ const AgentDashboard = () => {
       return;
     }
 
-    const promptStorageKey = getAdminDesktopNotificationPromptStorageKey(session.username);
-    if (window.localStorage.getItem(promptStorageKey) === "1") {
-      return;
-    }
-
-    window.localStorage.setItem(promptStorageKey, "1");
-    void window.Notification.requestPermission().catch(() => undefined);
+    // Ask every time the dashboard mounts while permission is still "default".
+    // The browser is the one deciding whether to actually show the popup, so a
+    // user that previously dismissed it will see it again on the next load; a
+    // user that already granted or denied is skipped by the check above.
+    void window.Notification.requestPermission()
+      .then((result) => setNotificationPermission(result))
+      .catch(() => undefined);
   }, [session?.username]);
 
   const searchMatchedConsoleTickets = scopedConsoleTickets.filter((ticket) => {
@@ -2594,16 +2642,47 @@ const AgentDashboard = () => {
     return () => window.clearInterval(intervalId);
   }, [adminView, consoleTicketId, isConsoleOpening, isSendingConsoleChat]);
 
+  // The ticket sheet is also a live conversation surface for direct tickets.
+  // Poll it independently from the 10-second dashboard list refresh so a reply
+  // is visible immediately when the admin returns to this browser tab.
+  useEffect(() => {
+    if (!activeTicketId || isOpening || isSendingActiveConversation) {
+      return;
+    }
+
+    const refreshActiveConversation = () => {
+      if (isBrowserTabHidden()) {
+        return;
+      }
+      void fetchTicketDetail(activeTicketId)
+        .then((detail) => syncDetailAcrossViews(detail))
+        .catch(() => {
+          // A transient refresh failure should not close the ticket sheet.
+        });
+    };
+
+    refreshActiveConversation();
+    const intervalId = window.setInterval(refreshActiveConversation, consolePollIntervalMs);
+    document.addEventListener("visibilitychange", refreshActiveConversation);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", refreshActiveConversation);
+    };
+    // fetchTicketDetail and syncDetailAcrossViews are stable function declarations in this component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTicketId, isOpening, isSendingActiveConversation]);
+
   useEffect(() => {
     if (!isDashboardLikeView) {
       return;
     }
 
     const ticketsIntervalId = window.setInterval(() => {
-      if (isBrowserTabHidden()) {
-        return;
-      }
-
+      // Keep polling even when the browser tab is hidden so a new ticket (or an
+      // escalation / transfer notification) can trigger a desktop notification
+      // while the admin is on another tab. Browsers throttle setInterval in
+      // background tabs anyway, so the extra load is small.
       void loadDashboardTicketPageRef.current({ silent: true });
       void loadDashboardMetricsRef.current({ silent: true });
       void fetchNotificationLogRef.current()
@@ -4198,6 +4277,25 @@ const AgentDashboard = () => {
     return payload;
   }
 
+  async function openChatbotHistoryDialog(ticketId: string) {
+    setChatbotHistoryOpen(true);
+    setChatbotHistoryLoading(true);
+    setChatbotHistoryError(null);
+    setChatbotHistoryMessages([]);
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticketId)}/chatbot-history`, { cache: "no-store" });
+      const payload = (await response.json().catch(() => null)) as { messages?: Array<{ sender: string; text: string; route?: string; escalated?: boolean; createdAt?: string | null }>; message?: string } | null;
+      if (!response.ok) {
+        throw new Error(payload?.message || "We could not load the chatbot history right now.");
+      }
+      setChatbotHistoryMessages(Array.isArray(payload?.messages) ? payload!.messages : []);
+    } catch (error) {
+      setChatbotHistoryError(error instanceof Error ? error.message : "Something went wrong.");
+    } finally {
+      setChatbotHistoryLoading(false);
+    }
+  }
+
   function shouldAutoAcknowledgeCoverageTutorResponse(ticket: TicketSummary) {
     const latestCoverageTutorResponse = ticket.latestCoverageTutorResponse;
     if (!latestCoverageTutorResponse || latestCoverageTutorResponse.requesterAcknowledged || !session?.username) {
@@ -5572,6 +5670,67 @@ const AgentDashboard = () => {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
       setIsSendingConsoleChat(false);
+    }
+  }
+
+  async function handleActiveConversationSend() {
+    if (!activeDetail || !activeConversationInput.trim() || isSendingActiveConversation) {
+      return;
+    }
+
+    const messageText = activeConversationInput.trim();
+    const outgoingMessage: ChatHistoryItem = {
+      id: crypto.randomUUID(),
+      clientMessageId: crypto.randomUUID(),
+      role: "agent",
+      senderLabel: session?.fullName || session?.username || "Support team",
+      text: messageText,
+      createdAt: new Date().toISOString(),
+      attachments: [],
+    };
+    const previousDetail = activeDetail;
+    const optimisticDetail: TicketDetailResponse = {
+      ...previousDetail,
+      chatHistory: [...previousDetail.chatHistory, outgoingMessage],
+    };
+    setActiveDetail(optimisticDetail);
+    setActiveConversationInput("");
+    setIsSendingActiveConversation(true);
+
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(previousDetail.ticket.id)}/chat-history`, {
+        method: "POST",
+        headers: buildCsrfHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          status: previousDetail.ticket.status,
+          statusReason: previousDetail.ticket.statusReason,
+          appendMessage: {
+            sender: "agent",
+            text: outgoingMessage.text,
+            timestamp: outgoingMessage.createdAt,
+            clientMessageId: outgoingMessage.clientMessageId,
+          },
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as { message?: string } | null;
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        setActiveDetail(previousDetail);
+        setActiveConversationInput(messageText);
+        toast.error(payload?.message || "We could not send the message right now.");
+        return;
+      }
+
+      const refreshedDetail = await fetchTicketDetail(previousDetail.ticket.id);
+      syncDetailAcrossViews(refreshedDetail);
+    } catch {
+      setActiveDetail(previousDetail);
+      setActiveConversationInput(messageText);
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      setIsSendingActiveConversation(false);
     }
   }
 
@@ -7551,6 +7710,20 @@ const AgentDashboard = () => {
                   >
                     <ChevronRight className="h-4 w-4" />
                   </Button>
+                  {notificationPermission !== "granted" && notificationPermission !== "unsupported" ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => void requestDesktopNotificationPermission()}
+                      aria-label={notificationPermission === "denied" ? "Browser notifications blocked - click for instructions" : "Enable desktop notifications"}
+                      title={notificationPermission === "denied" ? "Browser notifications blocked - click to see how to unblock" : "Enable desktop notifications"}
+                      className="relative h-11 w-11 rounded-2xl border border-amber-300 bg-amber-50 text-amber-700 shadow-sm hover:bg-amber-100"
+                    >
+                      <Bell className="h-4 w-4" />
+                      <span className="absolute -right-1 -top-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">!</span>
+                    </Button>
+                  ) : null}
                   <DropdownMenu open={isTransferNotificationsOpen} onOpenChange={setIsTransferNotificationsOpen}>
                     <DropdownMenuTrigger asChild>
                       <Button variant="ghost" size="icon" className="relative h-11 w-11 rounded-2xl border bg-background/90">
@@ -7611,6 +7784,20 @@ const AgentDashboard = () => {
                     </div>
                   </div>
                   <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-2">
+                    {notificationPermission !== "granted" && notificationPermission !== "unsupported" ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => void requestDesktopNotificationPermission()}
+                        aria-label={notificationPermission === "denied" ? "Browser notifications blocked - click for instructions" : "Enable desktop notifications"}
+                        title={notificationPermission === "denied" ? "Browser notifications blocked - click to see how to unblock" : "Enable desktop notifications"}
+                        className="relative h-8 w-8 rounded-full border border-amber-300 bg-amber-50 text-amber-700 shadow-sm hover:bg-amber-100"
+                      >
+                        <Bell className="h-4 w-4" />
+                        <span className="absolute -right-0.5 -top-0.5 inline-flex h-3 w-3 items-center justify-center rounded-full bg-amber-500 text-[8px] font-bold text-white">!</span>
+                      </Button>
+                    ) : null}
                     <DropdownMenu open={isTransferNotificationsOpen} onOpenChange={setIsTransferNotificationsOpen}>
                       <DropdownMenuTrigger asChild>
                         <Button
@@ -8645,6 +8832,24 @@ const AgentDashboard = () => {
                     </section>
 
                     <section>
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <Label className="block">Chatbot conversation</Label>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => openChatbotHistoryDialog(activeDetail.ticket.id)}
+                        >
+                          <MessageSquareText className="mr-1.5 h-3.5 w-3.5" />
+                          Chatbot History
+                        </Button>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Review the conversation the learner had with the assistant before this ticket was opened.
+                      </p>
+                    </section>
+
+                    <section>
                       <Label className="mb-1.5 block">Support session requests</Label>
                       <div className="rounded-xl border p-3 space-y-3">
                         {activeDetail.sessionRequests.length === 0 ? (
@@ -8675,20 +8880,31 @@ const AgentDashboard = () => {
                     </section>
 
                     <section>
-                      <Label className="mb-1.5 block">Chat history</Label>
-                      <div className="space-y-2 max-h-[28rem] overflow-y-auto rounded-xl border p-3">
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <div>
+                          <Label className="block text-sm font-semibold">Ticket conversation</Label>
+                          <p className="mt-0.5 text-xs text-muted-foreground">Messages shared with {getRequesterDisplayName(activeDetail.ticket, activeDetail.ticket.email || "the requester")}</p>
+                        </div>
+                        <span className="rounded-full border border-primary/15 bg-primary/5 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-primary">{activeDetail.ticket.id}</span>
+                      </div>
+                      <div className="max-h-[28rem] min-h-[18rem] space-y-4 overflow-y-auto rounded-2xl border border-primary/15 bg-gradient-to-b from-primary/[0.045] via-background to-background p-4 shadow-inner">
                         {activeDetail.chatHistory.length === 0 ? (
-                          <div className="text-sm text-muted-foreground">No chat messages stored for this ticket yet.</div>
+                          <div className="flex min-h-48 flex-col items-center justify-center text-center">
+                            <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary"><MessageSquareText className="h-5 w-5" /></div>
+                            <p className="text-sm font-semibold">No messages yet</p>
+                            <p className="mt-1 max-w-xs text-xs leading-5 text-muted-foreground">Your reply will be delivered to the requester in their ticket conversation.</p>
+                          </div>
                         ) : (
                           activeDetail.chatHistory.map((message) => (
-                            <div key={message.id} className="rounded-lg bg-secondary/40 p-3">
-                              <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
-                                <span className="font-medium text-foreground">{message.senderLabel}</span>
-                                <span>{formatDateTime(message.createdAt)}</span>
+                            <div key={message.id} className={message.role === "agent" ? "ml-auto flex max-w-[88%] flex-col items-end" : "mr-auto flex max-w-[88%] flex-col items-start"}>
+                              <div className="mb-1 flex items-center gap-2 px-1 text-[11px] text-muted-foreground">
+                                {message.role !== "agent" ? <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-[9px] font-bold text-primary">{message.senderLabel.trim().slice(0, 1).toUpperCase() || "R"}</span> : null}
+                                <span className="font-medium text-foreground/80">{message.role === "agent" ? "You" : message.senderLabel}</span>
+                                <span>{formatTimeShort(message.createdAt)}</span>
                               </div>
-                              {message.text ? <div className="mt-1 text-sm leading-6">{message.text}</div> : null}
+                              {message.text ? <div className={message.role === "agent" ? "rounded-2xl rounded-tr-md bg-gradient-to-br from-primary to-primary/85 px-4 py-3 text-sm leading-6 text-primary-foreground shadow-[0_10px_24px_rgba(98,73,238,0.22)]" : "rounded-2xl rounded-tl-md border border-border/80 bg-background px-4 py-3 text-sm leading-6 text-foreground shadow-sm"}>{message.text}</div> : null}
                               {message.attachments?.length ? (
-                                <div className="mt-3 flex flex-col gap-2">
+                                <div className="mt-2 flex w-full flex-col gap-2">
                                   {message.attachments.map((attachment) => (
                                     getChatAttachmentOpenUrl(attachment) ? (
                                       <button
@@ -8718,6 +8934,34 @@ const AgentDashboard = () => {
                           ))
                         )}
                       </div>
+                      {!activeDetail.ticket.liveChatRequested ? (
+                        <div className="mt-3 rounded-2xl border border-primary/15 bg-muted/[0.3] p-2 shadow-inner transition focus-within:border-primary/40 focus-within:ring-4 focus-within:ring-primary/10">
+                          <div className="flex items-end gap-2">
+                          <Textarea
+                            value={activeConversationInput}
+                            onChange={(event) => setActiveConversationInput(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                void handleActiveConversationSend();
+                              }
+                            }}
+                            placeholder="Write a reply to the requester..."
+                            disabled={isSendingActiveConversation}
+                            className="min-h-12 max-h-28 flex-1 resize-y border-0 bg-transparent shadow-none focus-visible:ring-0"
+                          />
+                          <Button
+                            type="button"
+                            onClick={() => void handleActiveConversationSend()}
+                            disabled={!activeConversationInput.trim() || isSendingActiveConversation}
+                            className="h-11 rounded-xl border-0 gradient-primary px-4 shadow-lg shadow-primary/20"
+                          >
+                            <SendHorizontal className="mr-1.5 h-4 w-4" /> {isSendingActiveConversation ? "Sending" : "Send"}
+                          </Button>
+                          </div>
+                          <p className="mt-1.5 px-1 text-[11px] text-muted-foreground">Enter sends the message</p>
+                        </div>
+                      ) : null}
                     </section>
                     </TabsContent>
                   ) : null}
@@ -8849,8 +9093,8 @@ const AgentDashboard = () => {
                       ) : null}
                       {activeDetail.ticket.aiTeamRequest ? (
                         <>
-                          <InfoCard label="AI Team Person" value={activeDetail.ticket.aiTeamRequest.personName || "-"} />
-                          <InfoCard label="AI Team E-mail" value={activeDetail.ticket.aiTeamRequest.personEmail || "-"} />
+                          <InfoCard label="Tech team Person" value={activeDetail.ticket.aiTeamRequest.personName || "-"} />
+                          <InfoCard label="Tech team E-mail" value={activeDetail.ticket.aiTeamRequest.personEmail || "-"} />
                         </>
                       ) : null}
                       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(activeDetail.ticket.requesterRole)} />
@@ -9218,6 +9462,85 @@ const AgentDashboard = () => {
               </Button>
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showNotificationBlockedDialog} onOpenChange={setShowNotificationBlockedDialog}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Browser notifications are blocked</DialogTitle>
+            <DialogDescription>
+              Your browser is set to block notifications for this site, so new-ticket alerts cannot pop up while you are on another tab. Follow these steps to re-enable them.
+            </DialogDescription>
+          </DialogHeader>
+          <ol className="list-decimal space-y-2 pl-5 text-sm text-foreground">
+            <li>
+              Click the <strong>padlock icon</strong> <span className="inline-block align-middle">🔒</span> on the left of the URL bar (next to <code className="rounded bg-muted px-1 py-0.5 text-xs">{typeof window !== "undefined" ? window.location.origin : ""}</code>).
+            </li>
+            <li>
+              Open <strong>Site settings</strong> (Chrome / Edge) or <strong>Permissions</strong>.
+            </li>
+            <li>
+              Find <strong>Notifications</strong> in the list and change it from <strong>Block</strong> to <strong>Allow</strong>.
+            </li>
+            <li>
+              Come back here and press <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[11px] font-semibold">Ctrl</kbd> + <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[11px] font-semibold">Shift</kbd> + <kbd className="rounded border bg-muted px-1.5 py-0.5 text-[11px] font-semibold">R</kbd> to reload — the warning icon will disappear and you will get a test notification.
+            </li>
+          </ol>
+          <p className="text-xs text-muted-foreground">
+            On deployment, the help-desk must be served over HTTPS for notifications to work; <code className="rounded bg-muted px-1 py-0.5 text-xs">http://</code> is only allowed on <code className="rounded bg-muted px-1 py-0.5 text-xs">localhost</code>.
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowNotificationBlockedDialog(false)}>
+              Got it
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={chatbotHistoryOpen} onOpenChange={(open) => !open && setChatbotHistoryOpen(false)}>
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-hidden">
+          <DialogHeader>
+            <DialogTitle>Chatbot conversation</DialogTitle>
+            <DialogDescription>
+              Messages exchanged between the learner and the assistant before this ticket was opened.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] space-y-3 overflow-y-auto rounded-xl border bg-secondary/20 p-4">
+            {chatbotHistoryLoading ? (
+              <div className="py-10 text-center text-sm text-muted-foreground">Loading chatbot history...</div>
+            ) : chatbotHistoryError ? (
+              <div className="py-10 text-center text-sm text-destructive">{chatbotHistoryError}</div>
+            ) : chatbotHistoryMessages.length === 0 ? (
+              <div className="py-10 text-center text-sm text-muted-foreground">
+                No chatbot messages were recorded for this ticket.
+              </div>
+            ) : (
+              chatbotHistoryMessages.map((message, index) => (
+                <div
+                  key={`${message.createdAt || "msg"}-${index}`}
+                  className={message.sender === "user" ? "ml-auto flex max-w-[85%] flex-col items-end" : "mr-auto flex max-w-[85%] flex-col items-start"}
+                >
+                  <div className="mb-1 px-1 text-[11px] text-muted-foreground">
+                    {message.sender === "user" ? "Learner" : "Assistant"}
+                    {message.createdAt ? ` - ${formatTimeShort(message.createdAt)}` : ""}
+                  </div>
+                  <div
+                    className={
+                      message.sender === "user"
+                        ? "rounded-2xl rounded-tr-md bg-primary px-4 py-2.5 text-sm leading-6 text-primary-foreground"
+                        : "rounded-2xl rounded-tl-md border bg-background px-4 py-2.5 text-sm leading-6 text-foreground"
+                    }
+                  >
+                    {message.text}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setChatbotHistoryOpen(false)}>Close</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -10828,8 +11151,8 @@ const CoverageTicketDetailsPanel = ({
       ) : null}
       {ticket.aiTeamRequest ? (
         <>
-          <InfoCard label="AI Team Person" value={ticket.aiTeamRequest.personName || "-"} />
-          <InfoCard label="AI Team E-mail" value={ticket.aiTeamRequest.personEmail || "-"} />
+          <InfoCard label="Tech team Person" value={ticket.aiTeamRequest.personName || "-"} />
+          <InfoCard label="Tech team E-mail" value={ticket.aiTeamRequest.personEmail || "-"} />
         </>
       ) : null}
       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(ticket.requesterRole)} />
@@ -17040,11 +17363,16 @@ function isDashboardQuickResolutionTicket(
 function canShowTicketConversation(
   ticket: Pick<TicketSummary, "statusReason" | "technicalSubcategory" | "isQuickTicket"> & Partial<Pick<TicketSummary, "ticketState">>,
 ) {
+  // Direct/quick tickets use the ticket conversation instead of the separate live-chat queue.
+  if (isDashboardQuickResolutionTicket(ticket)) {
+    return true;
+  }
+
   if (typeof ticket.ticketState?.canShowConversation === "boolean") {
     return ticket.ticketState.canShowConversation;
   }
 
-  return !isDashboardQuickResolutionTicket(ticket) && !isCoverageTicket(ticket);
+  return !isCoverageTicket(ticket);
 }
 
 function getTicketDashboardBucket(ticket: Partial<Pick<TicketSummary, "ticketState">>) {
@@ -17797,9 +18125,15 @@ function formatBytes(value: number) {
   return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
+// Display-only: the stored subcategory value stays "AI Team" (routing, team
+// assignment and webhooks all depend on it); only the user-facing label changes.
+function formatTechnicalSubcategoryDisplay(technicalSubcategory: string) {
+  return (technicalSubcategory || "").trim() === "AI Team" ? "Tech team" : technicalSubcategory;
+}
+
 function formatCategoryLabel(category: string, technicalSubcategory: string) {
   if (category === "Technical" && technicalSubcategory) {
-    return `${category} - ${technicalSubcategory}`;
+    return `${category} - ${formatTechnicalSubcategoryDisplay(technicalSubcategory)}`;
   }
 
   return category;
@@ -17871,7 +18205,33 @@ type DashboardRelatedPersonSummary = {
 };
 
 function shouldShowDashboardRelatedPersonSummary(ticket: Pick<TicketSummary, "technicalSubcategory"> | null | undefined) {
-  return ticket?.technicalSubcategory === "AI Team" || ticket?.technicalSubcategory === "Coverage";
+  return (
+    ticket?.technicalSubcategory === "AI Team"
+    || ticket?.technicalSubcategory === "Coverage"
+    || ticket?.technicalSubcategory === "LMS"
+    || ticket?.technicalSubcategory === "Aptem"
+    || ticket?.technicalSubcategory === "Teams"
+  );
+}
+
+function getDashboardGenericTechnicalRelatedPersonSummary(
+  ticket: DashboardRelatedPersonSummarySubject,
+): DashboardRelatedPersonSummary | null {
+  const subject = (ticket.subject || "").trim();
+  const inquiry = (ticket.inquiryPreview || "").trim();
+  if (!subject && !inquiry) {
+    return null;
+  }
+  const primaryText = subject || inquiry.split("\n")[0]?.slice(0, 120) || "";
+  const issueLine = buildDashboardRelatedPersonLine("Issue", inquiry.split("\n")[0]?.slice(0, 160));
+  return {
+    primaryText,
+    secondaryText: issueLine,
+    tertiaryText: "",
+    detailLines: [],
+    searchTerms: [primaryText, issueLine],
+    isMuted: !subject,
+  };
 }
 
 function buildDashboardRelatedPersonLine(label: string, value: string | null | undefined) {
@@ -18022,7 +18382,7 @@ function getDashboardCoverageRelatedPersonSummary(
 function getDashboardAiTeamRelatedPersonSummary(
   ticket: DashboardRelatedPersonSummarySubject,
 ): DashboardRelatedPersonSummary {
-  const personName = (ticket.aiTeamRequest?.personName || ticket.aiTeamPersonName || "").trim() || "AI Team request";
+  const personName = (ticket.aiTeamRequest?.personName || ticket.aiTeamPersonName || "").trim() || "Tech team request";
   const subjectLine = buildDashboardRelatedPersonLine("Subject", ticket.subject);
   const issueLine = buildDashboardRelatedPersonLine("Issue", ticket.inquiryPreview);
 
@@ -18032,7 +18392,7 @@ function getDashboardAiTeamRelatedPersonSummary(
     tertiaryText: issueLine,
     detailLines: [],
     searchTerms: [personName, subjectLine, issueLine],
-    isMuted: personName === "AI Team request",
+    isMuted: personName === "Tech team request",
   };
 }
 
@@ -18051,6 +18411,17 @@ function getDashboardRelatedPersonSummary(
     return getDashboardCoverageRelatedPersonSummary(ticket);
   }
 
+  // Chatbot-opened Technical tickets (LMS / Aptem / Teams) carry the generated
+  // subject plus the inquiry preview — surface them in the Related Person
+  // column so the admin can read the problem at a glance.
+  if (
+    ticket.technicalSubcategory === "LMS"
+    || ticket.technicalSubcategory === "Aptem"
+    || ticket.technicalSubcategory === "Teams"
+  ) {
+    return getDashboardGenericTechnicalRelatedPersonSummary(ticket);
+  }
+
   return null;
 }
 
@@ -18060,7 +18431,7 @@ function getDashboardRelatedPersonSearchTerms(ticket: DashboardRelatedPersonSumm
 
 function formatTicketHeaderCategoryLabel(category: string, technicalSubcategory: string) {
   if (category === "Technical" && technicalSubcategory) {
-    return technicalSubcategory;
+    return formatTechnicalSubcategoryDisplay(technicalSubcategory);
   }
 
   return formatCategoryLabel(category, technicalSubcategory);

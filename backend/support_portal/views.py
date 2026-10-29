@@ -937,6 +937,17 @@ def admin_ticket_chat_attachment_download(request, public_id: str, client_attach
         return handle_api_error(error)
 
 
+@require_GET
+def admin_ticket_chatbot_history(request, public_id: str):
+    try:
+        require_request_admin_session(request)
+        from .chatbot import fetch_chatbot_history_for_ticket
+
+        return JsonResponse({"messages": fetch_chatbot_history_for_ticket(public_id)})
+    except Exception as error:
+        return handle_api_error(error)
+
+
 @require_http_methods(["POST"])
 def admin_ticket_chat_history(request, public_id: str):
     try:

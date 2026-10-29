@@ -23,8 +23,10 @@ export const StepIndicator = ({ current }: { current: number }) => {
       return 4;
     }
 
+    // An Open ticket counts as having reached the status step too — the
+    // learner can keep chatting with the team from this page while it is open.
     if (ticket.id) {
-      return 3;
+      return ticket.status === "Open" ? 4 : 3;
     }
 
     if (ticket.email) {
@@ -42,10 +44,12 @@ export const StepIndicator = ({ current }: { current: number }) => {
       <div className="flex items-center justify-between">
         {steps.map((step, i) => {
           const idx = i + 1;
-          const isCompleted = idx < normalizedCurrent;
-          const isActive = !isInterimStep && idx === normalizedCurrent;
+          const isTicketOpenWithoutBooking = Boolean(ticket.id && ticket.status === "Open" && !bookingSummary);
+          const isFinalStepComplete = !isInterimStep && normalizedCurrent === steps.length && idx === steps.length && !isTicketOpenWithoutBooking;
+          const isCompleted = idx < normalizedCurrent || isFinalStepComplete;
+          const isActive = !isInterimStep && idx === normalizedCurrent && !isFinalStepComplete;
           const isReached = idx <= furthestStepReached;
-          const isClickable = isStepAvailable(idx) && !isActive;
+          const isClickable = isStepAvailable(idx) && !isActive && !isFinalStepComplete;
           const connectorProgress = Math.max(0, Math.min(1, normalizedCurrent - idx));
           return (
             <div key={step.label} className="flex items-center flex-1 last:flex-none">
@@ -61,6 +65,7 @@ export const StepIndicator = ({ current }: { current: number }) => {
                   className={cn(
                     "flex h-10 w-10 items-center justify-center rounded-full border text-[13px] font-semibold transition-all sm:h-9 sm:w-9 sm:text-sm",
                     isCompleted && "border-primary bg-primary text-primary-foreground shadow-soft",
+                    isFinalStepComplete && "border-success bg-success text-success-foreground shadow-soft",
                     isActive && "border-primary bg-primary text-primary-foreground ring-4 ring-primary/15 shadow-card scale-[1.03]",
                     !isCompleted && !isActive && !isReached && "bg-card border-border text-muted-foreground",
                     !isCompleted && !isActive && isReached && "border-primary/25 bg-primary/5 text-primary/80",
@@ -74,13 +79,14 @@ export const StepIndicator = ({ current }: { current: number }) => {
                   className={cn(
                     "text-[10px] font-medium tracking-[0.01em] sm:text-xs",
                     isCompleted && "text-primary",
+                    isFinalStepComplete && "text-success",
                     isActive && "text-primary",
                     !isCompleted && !isActive && isReached && "text-foreground/80",
                     !isReached && "text-muted-foreground",
                     isClickable && "cursor-pointer"
                   )}
                 >
-                  {step.label}
+                  {isFinalStepComplete ? "Completed" : step.label}
                 </span>
               </div>
               {i < steps.length - 1 && (
