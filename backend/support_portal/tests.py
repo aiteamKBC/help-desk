@@ -9149,7 +9149,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             patch.object(services, "fetch_actor_by_username", return_value=actor_row),
             patch.object(services, "get_latest_ticket_escalation_notification", return_value=None),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
-            patch.object(services, "persist_conversation_chat_duration"),
+            patch.object(services, "persist_conversation_chat_duration") as persist_duration,
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
             patch.object(services, "fetch_admin_ticket_detail", return_value=detail),
@@ -9172,6 +9172,8 @@ class AdminTicketUpdateTests(SimpleTestCase):
         update_params = cursor.execute.call_args_list[0].args[1]
         updated_metadata = json.loads(update_params[5])
         self.assertTrue(updated_metadata[services.QUICK_TICKET_ORIGIN_METADATA_KEY])
+        self.assertEqual(cursor.execute.call_args_list[1].args[1][0], "open")
+        persist_duration.assert_not_called()
 
     def test_update_admin_ticket_allows_admin_to_assign_ticket_receiver(self):
         ticket = {
@@ -11097,7 +11099,7 @@ class AgentQueueTests(SimpleTestCase):
             "status_reason": "",
             "assigned_team": "Support Desk",
             "sla_status": "Pending Review",
-            "metadata": {},
+            "metadata": {"live_chat_requested": True},
             "created_at": datetime.now(timezone.utc),
             "assigned_agent_username": "fatma",
         }
@@ -11119,6 +11121,50 @@ class AgentQueueTests(SimpleTestCase):
 
         self.assertEqual(error_context.exception.status_code, 403)
         self.assertEqual(error_context.exception.message, "Only the assigned agent can reply to this live chat.")
+
+    def test_save_chat_history_appends_direct_ticket_conversation_message(self):
+        ticket = {
+            "id": 23,
+            "public_id": "KBC-000023",
+            "conversation_id": 88,
+            "status": "Pending",
+            "status_reason": "Quick Ticket",
+            "assigned_team": "Support Desk",
+            "sla_status": "Pending Review",
+            "metadata": {},
+            "created_at": datetime.now(timezone.utc),
+            "conversation_status": "pending",
+            "assigned_agent_username": None,
+        }
+
+        with (
+            patch.object(services, "sync_open_ticket_inactivity"),
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=ticket),
+            patch.object(services, "mark_conversation_as_active"),
+            patch.object(services, "append_ticket_conversation_message", return_value=True) as append_message,
+            patch.object(services, "try_auto_assign_quick_ticket", return_value=False),
+            patch.object(services, "queue_quick_ticket_submitted_notification"),
+            patch.object(services, "queue_ai_team_ticket_submitted_notification"),
+            patch.object(services, "queue_quick_ticket_closed_notification"),
+            patch.object(services, "insert_history_event"),
+        ):
+            response = services.save_chat_history(
+                "KBC-000023",
+                {
+                    "status": "Pending",
+                    "statusReason": "Quick Ticket",
+                    "appendMessage": {
+                        "sender": "user",
+                        "text": "Can you update me?",
+                        "timestamp": "2026-10-28T18:15:00Z",
+                        "clientMessageId": "learner-update-1",
+                    },
+                },
+            )
+
+        self.assertTrue(response["ok"])
+        append_message.assert_called_once()
 
     def test_save_chat_history_clears_inactivity_tracking_after_user_reply(self):
         ticket = {
@@ -13059,7 +13105,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                             "id": "card-1",
                             "type": "tutor_choice",
                             "tutor": "Adey",
-                            "tutorEmail": "omar.helmy@kentbusinesscollege.com",
+                            "tutorEmail": "test.tutor@kentbusinesscollege.com",
                             "sessionDetails": "Module: Marketing Impact\nPreferred Time: Friday 09:00 - 11:00 | G2-Fri | Jun 2026\nSessions:\n1. Friday 12 Jun 2026 | test",
                             "requestStatus": "accepted",
                             "submittedAt": "2026-06-05T13:09:28.808965+00:00",
@@ -13074,7 +13120,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                             "type": "tutor_reply",
                             "title": "Tutor Accepted",
                             "tutor": "Adey",
-                            "tutorEmail": "omar.helmy@kentbusinesscollege.com",
+                            "tutorEmail": "test.tutor@kentbusinesscollege.com",
                             "sessionDetails": "Module: Marketing Impact\nPreferred Time: Friday 09:00 - 11:00 | G2-Fri | Jun 2026\nSessions:\n1. Friday 12 Jun 2026 | test",
                             "requestStatus": "accepted",
                             "replyOutcome": "accepted",
@@ -16039,18 +16085,18 @@ class BookingContextTests(SimpleTestCase):
                 return_value=[
                     {
                         "id": 23,
-                        "username": "Omar1",
-                        "full_name": "Omar1",
+                        "username": "Meeka",
+                        "full_name": "Meeka",
                         "email": None,
                         "role": "admin",
                     }
                 ],
             ),
         ):
-            response = services.resolve_support_teams_call_notification_target(["Omar.Helmy@kentbusinesscollege.com"])
+            response = services.resolve_support_teams_call_notification_target(["Meeka@kentbusinesscollege.com"])
 
         self.assertEqual(response["id"], 23)
-        self.assertEqual(response["username"], "Omar1")
+        self.assertEqual(response["username"], "Meeka")
 
     def test_request_support_teams_call_creates_pending_admin_notification(self):
         ticket = {

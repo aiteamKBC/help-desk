@@ -77,7 +77,7 @@ describe("TicketStatus", () => {
     });
   });
 
-  it("does not show a chat transcript action for direct tickets without chat history", async () => {
+  it("shows the ticket conversation for direct tickets", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({
@@ -135,6 +135,8 @@ describe("TicketStatus", () => {
     await waitFor(() => {
       expect(globalThis.fetch).toHaveBeenCalledWith("/api/tickets/KBC-000611/chat-history");
     });
+    expect(screen.getByRole("heading", { name: /ticket conversation/i })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/write a message to the support team/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /view chat transcript/i })).not.toBeInTheDocument();
   });
 });

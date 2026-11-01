@@ -58,7 +58,21 @@ TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
 TECHNICAL_SUBCATEGORY_AI_TEAM = "AI Team"
-ALLOWED_TECHNICAL_SUBCATEGORIES = {TECHNICAL_SUBCATEGORY_AI_TEAM, "Aptem", "Coverage", "LMS", "Teams", "Others"}
+ALLOWED_TECHNICAL_SUBCATEGORIES = {
+    TECHNICAL_SUBCATEGORY_AI_TEAM,
+    "Aptem",
+    "Coverage",
+    "LMS",
+    "Teams",
+    "Others",
+    # Department categories: picked when creating a ticket, each auto-routes to a
+    # matching support team and e-mails only that team's shared mailbox. See
+    # DEPARTMENT_SUBCATEGORY_ROUTING below.
+    "Enrolment",
+    "Quality",
+    "Operation",
+    "Curriculum",
+}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
 ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
@@ -92,6 +106,19 @@ TEAM_ROUTING_POLICIES = {
 LEGACY_TEAM_ROUTING_POLICY_KEYS = {policy["key"] for policy in TEAM_ROUTING_POLICIES.values()}
 SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY = "auth_group_name"
 ALLOWED_ASSIGNED_TEAMS = {ASSIGNED_TEAM_UNASSIGNED, *TEAM_ROUTING_POLICIES.keys()}
+
+# Department routing: maps a Technical subcategory the learner/admin can pick
+# (and the support_teams.name a ticket is transferred to) onto the shared mailbox
+# that should be e-mailed for that department's tickets. Only the department
+# mailbox is notified for its tickets -- the global operations inbox
+# (SUPPORT_OPERATIONS_NOTIFICATION_EMAILS) is skipped for them. The team rows
+# must exist in support_teams for dashboard visibility and manual transfers.
+DEPARTMENT_SUBCATEGORY_ROUTING: dict[str, dict[str, str]] = {
+    "Enrolment": {"team": "Enrolment Team", "email": "enrolment.team@kentbusinesscollege.com"},
+    "Quality": {"team": "Quality team", "email": "quality.support@kentbusinesscollege.com"},
+    "Operation": {"team": "Operation Team", "email": "Operation.Team@kentbusinesscollege.com"},
+    "Curriculum": {"team": "Curriculum Team", "email": "Curriculum.Team@kentbusinesscollege.com"},
+}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
     "High": 1,
@@ -178,8 +205,29 @@ SLA_POLICY_AWAITING_SUPPORT_MEETING = "awaiting_support_meeting"
 SLA_POLICY_COVERAGE_SESSION_DEADLINE = "coverage_session_deadline"
 SLA_POLICY_CLOSED = "closed"
 SLA_POLICY_ARCHIVED = "archived"
-CHAT_INACTIVITY_REMINDER_AFTER = timedelta(minutes=2)
-CHAT_INACTIVITY_AUTO_CLOSE_AFTER = timedelta(minutes=3)
+def _env_minutes(name: str, default_minutes: int) -> int:
+    from config.env import get_env
+    raw = get_env(name, str(default_minutes)) or str(default_minutes)
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return default_minutes
+
+
+_CHAT_INACTIVITY_REMINDER_MINUTES = _env_minutes("CHAT_INACTIVITY_REMINDER_MINUTES", 0)
+_CHAT_INACTIVITY_AUTO_CLOSE_MINUTES = _env_minutes("CHAT_INACTIVITY_AUTO_CLOSE_MINUTES", 0)
+# A value of 0 disables the timer (chat stays open indefinitely). We use a far-future
+# timedelta so the comparisons in process_ticket_chat_inactivity never trip.
+CHAT_INACTIVITY_REMINDER_AFTER = (
+    timedelta(minutes=_CHAT_INACTIVITY_REMINDER_MINUTES)
+    if _CHAT_INACTIVITY_REMINDER_MINUTES > 0
+    else timedelta(days=36500)
+)
+CHAT_INACTIVITY_AUTO_CLOSE_AFTER = (
+    timedelta(minutes=_CHAT_INACTIVITY_AUTO_CLOSE_MINUTES)
+    if _CHAT_INACTIVITY_AUTO_CLOSE_MINUTES > 0
+    else timedelta(days=36500)
+)
 OPEN_TICKET_INACTIVITY_SYNC_MIN_INTERVAL_SECONDS = 10
 BACKGROUND_TICKET_SYNC_MIN_INTERVAL_SECONDS = 10
 INACTIVITY_WAITING_SINCE_METADATA_KEY = "inactivity_waiting_since"
@@ -3553,6 +3601,34 @@ def is_ai_team_technical_subcategory(value: Any) -> bool:
     return sanitize_text(value).casefold() == TECHNICAL_SUBCATEGORY_AI_TEAM.casefold()
 
 
+def resolve_department_routing(technical_subcategory: Any) -> dict[str, str] | None:
+    """Return the department routing config for a subcategory value, or None."""
+    normalized = sanitize_text(technical_subcategory).casefold()
+    if not normalized:
+        return None
+    for subcategory, config in DEPARTMENT_SUBCATEGORY_ROUTING.items():
+        if subcategory.casefold() == normalized:
+            return config
+    return None
+
+
+def resolve_department_routing_by_team(assigned_team: Any) -> dict[str, str] | None:
+    """Return the department routing config for an assigned team name, or None."""
+    normalized = sanitize_text(assigned_team).casefold()
+    if not normalized:
+        return None
+    for config in DEPARTMENT_SUBCATEGORY_ROUTING.values():
+        if config["team"].casefold() == normalized:
+            return config
+    return None
+
+
+def resolve_department_assigned_team(technical_subcategory: Any) -> str | None:
+    """Return the support team a department subcategory routes to, or None."""
+    config = resolve_department_routing(technical_subcategory)
+    return config["team"] if config else None
+
+
 def is_ai_team_ticket_record(ticket: dict[str, Any] | None) -> bool:
     if not isinstance(ticket, dict):
         return False
@@ -3571,6 +3647,12 @@ def normalize_ai_team_request_payload(payload: dict[str, Any], technical_subcate
 
     person_name = sanitize_text(payload.get("aiTeamPersonName"))
     person_email = normalize_email(payload.get("aiTeamPersonEmail"))
+    # A person contact is optional: staff designate a specific person (the
+    # classic "AI Team request"), while a learner's Tech team ticket carries no
+    # person and simply routes to the Ai Team queue. Only validate when at least
+    # one person field was supplied.
+    if not person_name and not person_email:
+        return None
     if not person_name:
         raise ApiError(400, "Please enter the AI Team person's name.")
     if not is_valid_email(person_email):
@@ -3799,6 +3881,14 @@ def fetch_lms_learner_by_email(email: str) -> dict[str, Any] | None:
     if not settings.LMS_DATABASE_URL:
         return None
 
+    # The query lowercases the stored columns, so the lookup value must be
+    # lowercased too. Every current caller already normalizes, but normalize here
+    # as well so a future caller that forgets cannot silently miss uppercase
+    # emails.
+    normalized_email = normalize_email(email)
+    if not normalized_email:
+        return None
+
     try:
         with psycopg.connect(settings.LMS_DATABASE_URL) as source_connection:
             with source_connection.cursor() as cursor:
@@ -3816,7 +3906,7 @@ def fetch_lms_learner_by_email(email: str) -> dict[str, Any] | None:
                        OR LOWER(TRIM(secondary_email)) = %s
                     LIMIT 1
                     """,
-                    [email, email],
+                    [normalized_email, normalized_email],
                 )
                 row = cursor.fetchone()
     except Exception:
@@ -6824,7 +6914,18 @@ def build_support_notification_webhook_payload(
     # change rather than an edit inside n8n. The learner's own notifications
     # still go to the learner, so they carry no operations addresses.
     if recipient_type == "operations":
-        recipients = get_support_operations_notification_emails()
+        # Department tickets notify only that department's shared mailbox; every
+        # other ticket still reaches the global operations inbox. The subcategory
+        # covers freshly created tickets; the assigned team covers tickets
+        # transferred into a department after creation.
+        department = resolve_department_routing_by_team(
+            ticket.get("assigned_team")
+        ) or resolve_department_routing(ticket.get("technical_subcategory"))
+        if department:
+            department_email = normalize_email(department["email"])
+            recipients = [department_email] if department_email else []
+        else:
+            recipients = get_support_operations_notification_emails()
     elif recipient_type == "ai_team_person":
         ai_team_email = normalize_email((ai_team_request or {}).get("personEmail"))
         recipients = [ai_team_email] if ai_team_email else []
@@ -7227,6 +7328,52 @@ def queue_ticket_created_notification(ticket: dict[str, Any]) -> None:
         payload=payload,
         sent_metadata_key=TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY,
     )
+
+
+def notify_department_ticket_assignment(ticket_row: dict[str, Any]) -> dict[str, Any]:
+    """E-mail a department's shared mailbox when a ticket is routed to it.
+
+    Reuses the proven operations notification webhook (the same one that reaches
+    the global operations inbox today); the recipient resolves to the department
+    mailbox because the ticket's assigned_team is the department team.
+    """
+    department = resolve_department_routing_by_team(ticket_row.get("assigned_team"))
+    if not department:
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    # Honour the same delivery gate as every other notification path, so a
+    # deployment that disables delivery (or has no webhook configured) never
+    # sends department mail either.
+    if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    try:
+        payload = build_support_notification_webhook_payload(
+            SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+            ticket_row,
+        )
+        result = send_support_notification_webhook(payload)
+    except Exception:
+        result = {"configured": True, "delivered": False, "status": None, "response": None}
+
+    try:
+        insert_history_event(
+            int(ticket_row["id"]),
+            "department_transfer_notified"
+            if result.get("delivered")
+            else "department_transfer_notification_failed",
+            None,
+            {
+                "assignedTeam": ticket_row.get("assigned_team"),
+                "recipient": normalize_email(department["email"]),
+                "webhookStatus": result.get("status"),
+                "webhookDelivered": result.get("delivered"),
+            },
+        )
+    except Exception:
+        pass
+
+    return result
 
 
 def queue_live_agent_unavailable_notification(ticket: dict[str, Any], *, requested_at: Any) -> None:
@@ -9319,10 +9466,6 @@ def build_serialized_agent_team_access(row: dict[str, Any], metadata: dict[str, 
             "canReceiveTickets": True,
         }
 
-    for policy in TEAM_ROUTING_POLICIES.values():
-        if normalize_bool(metadata.get(policy["receiver_access_metadata_key"])):
-            team_access_by_key[policy["key"]] = serialize_agent_team_access_from_policy(policy)
-
     for team_key in get_preloaded_account_team_access_keys(row):
         if team_key not in team_access_by_key:
             policy = next((item for item in TEAM_ROUTING_POLICIES.values() if item["key"] == team_key), None)
@@ -9959,17 +10102,10 @@ def actor_has_team_routing_access(actor: dict[str, Any] | None, policy: dict[str
     if not isinstance(actor, dict):
         return False
 
-    if actor_has_metadata_flag(
-        actor,
-        policy["receiver_access_metadata_key"],
-        default=False,
-    ):
-        return True
-
     if account_has_preloaded_team_access(actor, policy["key"]):
         return True
 
-    return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
+    return fetch_optional_account_team_access(
         actor.get("id"),
         policy["key"],
     )
@@ -10122,14 +10258,10 @@ def account_has_team_receiver_access(account: dict[str, Any] | None, policy: dic
     if not is_active_staff_support_account(account):
         return False
 
-    metadata = normalize_json_object(account.get("metadata"))
-    if normalize_bool(metadata.get(policy["receiver_access_metadata_key"])):
-        return True
-
     if account_has_preloaded_team_access(account, policy["key"]):
         return True
 
-    return policy["key"] not in LEGACY_TEAM_ROUTING_POLICY_KEYS and fetch_optional_account_team_access(
+    return fetch_optional_account_team_access(
         account.get("id"),
         policy["key"],
     )
@@ -12189,6 +12321,84 @@ def sync_conversation_messages(
     return filtered_messages
 
 
+def append_ticket_conversation_message(
+    ticket: dict[str, Any],
+    *,
+    status: str,
+    message: dict[str, Any],
+    reference_time: datetime | None = None,
+) -> bool:
+    """Append one ordinary ticket-conversation message without replacing the timeline.
+
+    The legacy chat-history API synchronizes a whole client-side transcript. That is
+    appropriate for the chatbot workflow, but can drop a concurrent reply from the
+    other participant. Direct ticket conversations use this append-only path instead.
+    """
+    normalized_messages = normalize_chat_messages([message])
+    if len(normalized_messages) != 1:
+        raise ApiError(400, "A message is required.")
+
+    normalized_message = normalized_messages[0]
+    if normalized_message.get("attachments"):
+        raise ApiError(400, "Attachments are not supported in ticket conversations yet.")
+
+    conversation_id = int(ticket["conversation_id"])
+    client_message_id = normalized_message["client_message_id"]
+    persisted_at = reference_time or datetime.now(timezone.utc)
+    conversation_status = (
+        "open"
+        if is_quick_ticket_record(ticket) and not is_live_chat_requested(ticket.get("metadata"))
+        else map_conversation_status(status)
+    )
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id
+            FROM messages
+            WHERE conversation_id = %s
+              AND metadata->>%s = %s
+            LIMIT 1
+            """,
+            [conversation_id, CHAT_MESSAGE_ID_METADATA_KEY, client_message_id],
+        )
+        if cursor.fetchone():
+            return False
+
+        cursor.execute(
+            """
+            INSERT INTO messages (conversation_id, role, content, channel, metadata)
+            VALUES (%s, %s, %s, %s, %s::jsonb)
+            """,
+            [
+                conversation_id,
+                normalized_message["role"],
+                normalized_message["content"],
+                "support",
+                json.dumps(normalized_message["metadata"]),
+            ],
+        )
+        cursor.execute(
+            """
+            UPDATE conversations
+            SET status = %s,
+                last_message_at = %s,
+                metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+            WHERE id = %s
+            """,
+            [
+                conversation_status,
+                persisted_at,
+                json.dumps({"synced_messages": 1}),
+                conversation_id,
+            ],
+        )
+        # Updating the ticket causes the admin detail poll to reload the new message.
+        cursor.execute("UPDATE tickets SET updated_at = NOW() WHERE id = %s", [ticket["id"]])
+
+    return True
+
+
 def apply_ticket_chat_history_sync(
     ticket: dict[str, Any],
     *,
@@ -12339,6 +12549,12 @@ def process_ticket_chat_inactivity(
     reference_time: datetime | None = None,
     allow_reminder: bool = True,
 ) -> str | None:
+    # Hard-off: when the reminder/auto-close timers are set to effectively
+    # infinite, skip the whole flow — nothing to compute, nothing to persist,
+    # nothing to send. Keeps the chat open indefinitely.
+    if _CHAT_INACTIVITY_REMINDER_MINUTES <= 0 and _CHAT_INACTIVITY_AUTO_CLOSE_MINUTES <= 0:
+        return None
+
     if sanitize_text(ticket.get("status")) != "Open":
         return None
 
@@ -13944,14 +14160,19 @@ def try_auto_assign_quick_ticket(ticket: dict[str, Any], now: datetime | None = 
 
     agent_candidates = run_query(
         """
-        SELECT id, username, full_name, email, account_scope, role, metadata
-        FROM support_accounts
-        WHERE is_active = TRUE
-          AND account_scope = %s
-          AND (metadata->>'legacy_support_access')::boolean = TRUE
-        ORDER BY id ASC
+        SELECT DISTINCT sa.id, sa.username, sa.full_name, sa.email,
+               sa.account_scope, sa.role, sa.metadata
+        FROM support_accounts sa
+        JOIN support_account_team_access ata ON ata.account_id = sa.id
+        JOIN support_teams st ON st.id = ata.team_id
+        WHERE sa.is_active = TRUE
+          AND sa.account_scope = %s
+          AND st.key = %s
+          AND st.is_active = TRUE
+          AND ata.can_receive_tickets = TRUE
+        ORDER BY sa.id ASC
         """,
-        [ACCOUNT_SCOPE_STAFF],
+        [ACCOUNT_SCOPE_STAFF, TICKET_RECEIVER_SCOPE_SUPPORT],
     )
     if not agent_candidates:
         return None
@@ -13972,14 +14193,19 @@ def assign_waiting_live_chat_tickets(now: datetime | None = None) -> list[int]:
         agent
         for agent in run_query(
             """
-            SELECT id, username, full_name, email, account_scope, role, metadata
-            FROM support_accounts
-            WHERE is_active = TRUE
-              AND account_scope = %s
-              AND (metadata->>'legacy_support_access')::boolean = TRUE
-            ORDER BY id ASC
+            SELECT DISTINCT sa.id, sa.username, sa.full_name, sa.email,
+                   sa.account_scope, sa.role, sa.metadata
+            FROM support_accounts sa
+            JOIN support_account_team_access ata ON ata.account_id = sa.id
+            JOIN support_teams st ON st.id = ata.team_id
+            WHERE sa.is_active = TRUE
+              AND sa.account_scope = %s
+              AND st.key = %s
+              AND st.is_active = TRUE
+              AND ata.can_receive_tickets = TRUE
+            ORDER BY sa.id ASC
             """,
-            [ACCOUNT_SCOPE_STAFF],
+            [ACCOUNT_SCOPE_STAFF, TICKET_RECEIVER_SCOPE_SUPPORT],
         )
         if is_agent_assignable_for_live_chat(agent.get("metadata"), assignment_now)
     ]
@@ -16106,12 +16332,7 @@ def get_actor_ticket_access_team_keys(actor: dict[str, Any] | None) -> set[str] 
     if actor is None or actor_has_admin_dashboard_access(actor):
         return None
 
-    metadata = normalize_json_object(actor.get("metadata"))
     team_keys = get_preloaded_account_team_access_keys(actor)
-    if normalize_bool(metadata.get(TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_SUPPORT_DESK]["receiver_access_metadata_key"])):
-        team_keys.add(TICKET_RECEIVER_SCOPE_SUPPORT)
-    if normalize_bool(metadata.get(TEAM_ROUTING_POLICIES[ASSIGNED_TEAM_LEARNING_PLAN]["receiver_access_metadata_key"])):
-        team_keys.add(TICKET_RECEIVER_SCOPE_OPERATIONS)
     team_keys.update(fetch_account_team_access_keys(actor.get("id")))
     return team_keys
 
@@ -19833,6 +20054,7 @@ def get_ticket_chat_history_response(public_id: str) -> dict[str, Any]:
             "createdAt": ticket["created_at"],
             "chatState": derive_ticket_chat_state(ticket.get("status"), ticket.get("conversation_status")),
             "liveChatRequested": is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")),
+            "isQuickTicket": is_quick_ticket_record(ticket),
         },
         "chatHistory": serialize_chat_timeline_rows(ticket["public_id"], messages, history_rows),
         "bookingSummary": booking_summary,
@@ -20125,6 +20347,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     parsed_escalation_agent_id = parse_assigned_agent_id(payload.get("escalationAgentId")) if has_escalation_agent_input else None
     learning_plan_transfer_webhook_ticket_id: int | None = None
     learning_plan_transfer_webhook_payload: dict[str, Any] | None = None
+    department_transfer_notification_ticket: dict[str, Any] | None = None
     learning_plan_transfer_notification_payload: dict[str, Any] | None = None
     documentation_history_events: list[tuple[str, dict[str, Any]]] = []
 
@@ -20310,7 +20533,14 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             elif requested_status_reason is None and not is_status_reason_allowed_for_status(next_status, next_status_reason):
                 next_status_reason = ""
         validate_status_reason_for_status(next_status, next_status_reason)
-        next_chat_state = requested_chat_state or map_conversation_status(next_status)
+        keep_direct_ticket_conversation_open = (
+            (is_quick_ticket_record(ticket) or is_quick_ticket_status_reason(next_status_reason))
+            and not is_coverage_ticket_record(ticket)
+            and not is_live_chat_requested(ticket.get("metadata"))
+        )
+        next_chat_state = requested_chat_state or (
+            "open" if keep_direct_ticket_conversation_open else map_conversation_status(next_status)
+        )
         ensure_open_ticket_uses_open_chat(next_status, next_chat_state)
         updated_ticket_metadata = normalize_json_object(ticket.get("metadata"))
         if is_quick_ticket_record(ticket) or (
@@ -20608,6 +20838,18 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                     assigned_agent_username=next_assigned_agent_username,
                     note=note,
                 )
+            elif resolve_department_routing_by_team(next_assigned_team):
+                department_transfer_notification_ticket = {
+                    **ticket,
+                    "status": next_status,
+                    "status_reason": next_status_reason,
+                    "assigned_agent_id": next_assigned_agent_id,
+                    "assigned_agent_name": next_assigned_agent_name,
+                    "assigned_agent_username": next_assigned_agent_username,
+                    "assigned_team": next_assigned_team,
+                    "sla_status": next_sla_status,
+                    "metadata": updated_ticket_metadata,
+                }
 
         if ticket["sla_status"] != next_sla_status:
             insert_history_event(ticket["id"], "sla_changed", actor, {"from": ticket["sla_status"], "to": next_sla_status})
@@ -20682,6 +20924,8 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             learning_plan_transfer_webhook_ticket_id,
             learning_plan_transfer_webhook_payload,
         )
+    if department_transfer_notification_ticket:
+        notify_department_ticket_assignment(department_transfer_notification_ticket)
 
     detail_public_id = follow_up_public_id or public_id
     detail = fetch_admin_ticket_detail(detail_public_id)
@@ -20936,7 +21180,11 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             requester_source = get_public_requester_source(requester)
             if technical_subcategory == "Coverage":
                 ensure_requester_can_submit_coverage_ticket(requester_source)
-            if is_ai_team_technical_subcategory(technical_subcategory):
+            # Only the staff "AI Team request" flow (which designates a specific
+            # person) is gated to non-learners. A learner's Tech team ticket
+            # carries no person and just routes to the Ai Team queue, so it is
+            # allowed through.
+            if ai_team_request:
                 ensure_requester_can_submit_ai_team_ticket(requester_source)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
@@ -21035,7 +21283,11 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     raise ApiError(500, "We could not create the ticket right now.")
 
                 public_id = build_public_ticket_id(int(ticket_row["id"]))
-                initial_assigned_team = ASSIGNED_TEAM_AI_TEAM if ai_team_request else ticket_row["assigned_team"]
+                initial_assigned_team = (
+                    ASSIGNED_TEAM_AI_TEAM
+                    if (ai_team_request or is_ai_team_technical_subcategory(technical_subcategory))
+                    else (resolve_department_assigned_team(technical_subcategory) or ticket_row["assigned_team"])
+                )
                 initial_sla_status = "On Track" if technical_subcategory == "Coverage" else ticket_row["sla_status"]
                 if technical_subcategory == "Coverage":
                     ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {
@@ -21603,6 +21855,7 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
     status_reason = sanitize_text(payload.get("statusReason")) if "statusReason" in payload else None
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    append_message = payload.get("appendMessage") if isinstance(payload.get("appendMessage"), dict) else None
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -21659,11 +21912,28 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
             raise ApiError(404, "Ticket not found.")
         if not ticket.get("conversation_id"):
             raise ApiError(400, "This ticket is not linked to a conversation.")
-        if actor_username and any(sanitize_text(message.get("sender")) == "agent" for message in messages):
+        messages_for_actor_check = messages if messages else ([append_message] if append_message else [])
+        if (
+            is_live_chat_requested(ticket.get("metadata"))
+            and actor_username
+            and any(sanitize_text(message.get("sender")) == "agent" for message in messages_for_actor_check)
+        ):
             if sanitize_text(ticket.get("assigned_agent_username")).lower() != actor_username:
                 raise ApiError(403, "Only the assigned agent can reply to this live chat.")
         if is_ticket_chat_closed(ticket.get("status"), ticket.get("conversation_status")) and status != "Closed":
             raise ApiError(409, "This chat has been closed by support. Start a new chat to continue.")
+
+        is_ticket_conversation_append = bool(
+            append_message
+            and not messages
+            and not is_live_chat_requested(ticket.get("metadata"))
+        )
+        if is_ticket_conversation_append:
+            append_sender = sanitize_text(append_message.get("sender")).lower()
+            if actor_username and append_sender != "agent":
+                raise ApiError(400, "Support replies must be sent as an agent message.")
+            if not actor_username and append_sender != "user":
+                raise ApiError(400, "Requester messages must be sent as a user message.")
 
         preview_status_reason = status_reason if status_reason is not None else (ticket.get("status_reason") or "")
         if status == "Pending" and not preview_status_reason:
@@ -21679,21 +21949,33 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
         persisted_at = datetime.now(timezone.utc)
         previous_status = ticket.get("status")
         previous_status_reason = ticket.get("status_reason")
-        preview_messages = normalize_chat_messages(messages)
-        filtered_messages, next_status_reason, next_sla_status, next_sla_attention_required = apply_ticket_chat_history_sync(
-            ticket,
-            status=status,
-            status_reason=status_reason,
-            messages=messages,
-            ticket_public_id=ticket["public_id"],
-            uploaded_files=uploaded_files,
-            conversation_metadata_patch=build_inactivity_metadata_patch_for_messages(
-                status,
-                preview_messages,
+        if is_ticket_conversation_append:
+            append_ticket_conversation_message(
+                ticket,
+                status=status,
+                message=append_message,
                 reference_time=persisted_at,
-            ),
-            reference_time=persisted_at,
-        )
+            )
+            filtered_messages = normalize_chat_messages([append_message])
+            next_status_reason = preview_status_reason
+            next_sla_status = ticket.get("sla_status") or "Pending Review"
+            next_sla_attention_required = False
+        else:
+            preview_messages = normalize_chat_messages(messages)
+            filtered_messages, next_status_reason, next_sla_status, next_sla_attention_required = apply_ticket_chat_history_sync(
+                ticket,
+                status=status,
+                status_reason=status_reason,
+                messages=messages,
+                ticket_public_id=ticket["public_id"],
+                uploaded_files=uploaded_files,
+                conversation_metadata_patch=build_inactivity_metadata_patch_for_messages(
+                    status,
+                    preview_messages,
+                    reference_time=persisted_at,
+                ),
+                reference_time=persisted_at,
+            )
         should_queue_quick_submitted_notification = should_notify_quick_ticket_submitted(
             ticket,
             previous_status=previous_status,

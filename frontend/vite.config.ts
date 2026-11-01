@@ -7,9 +7,14 @@ import { componentTagger } from "lovable-tagger";
 
 const DEV_HOST = "127.0.0.1";
 const FRONTEND_PORT = 3000;
-const BACKEND_PORT = 3001;
-const BACKEND_URL = `http://${DEV_HOST}:${BACKEND_PORT}`;
-const BACKEND_HEALTH_URL = `${BACKEND_URL}/api/health`;
+const requestedBackendPort = Number(process.env.SUPPORT_BACKEND_PORT || 8000);
+const configuredBackendPort = Number.isInteger(requestedBackendPort)
+  && requestedBackendPort > 0
+  && requestedBackendPort < 65536
+  ? requestedBackendPort
+  : 8000;
+const BACKEND_PORT_CANDIDATES = [configuredBackendPort];
+let backendUrl = `http://${DEV_HOST}:${configuredBackendPort}`;
 const BACKEND_ROOT = path.resolve(__dirname, "../backend");
 
 let managedBackendProcess: ChildProcess | null = null;
@@ -17,12 +22,17 @@ let cleanupRegistered = false;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function isBackendHealthy() {
+async function isBackendHealthy(url = backendUrl) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 1500);
+
   try {
-    const response = await fetch(BACKEND_HEALTH_URL);
+    const response = await fetch(`${url}/api/health`, { signal: controller.signal });
     return response.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -37,7 +47,10 @@ function resolveBackendPythonExecutable() {
     return unixPython;
   }
 
-  return null;
+  // Keep local development usable when the project virtualenv has not been
+  // created yet. The machine Python is still a valid fallback as long as the
+  // backend requirements are installed there.
+  return process.platform === "win32" ? "python.exe" : "python";
 }
 
 function stopManagedBackend() {
@@ -100,38 +113,38 @@ async function ensureBackendReady() {
     return;
   }
 
-  if (await isBackendHealthy()) {
-    return;
-  }
-
   const pythonExecutable = resolveBackendPythonExecutable();
-  if (!pythonExecutable) {
-    console.warn(
-      `[support-dev] Django backend is offline and no virtualenv Python was found under ${BACKEND_ROOT}. Start the backend manually or create backend/.venv first.`,
+  for (const port of BACKEND_PORT_CANDIDATES) {
+    backendUrl = `http://${DEV_HOST}:${port}`;
+
+    if (await isBackendHealthy()) {
+      console.log(`[support-dev] Using the existing Django backend at ${backendUrl}.`);
+      return;
+    }
+
+    console.log(`[support-dev] Starting Django backend on ${backendUrl}...`);
+    managedBackendProcess = spawn(
+      pythonExecutable,
+      ["manage.py", "runserver", `${DEV_HOST}:${port}`],
+      {
+        cwd: BACKEND_ROOT,
+        stdio: "inherit",
+        windowsHide: true,
+      },
     );
-    return;
+
+    registerBackendCleanup();
+
+    if (await waitForBackendReady(5000)) {
+      return;
+    }
+
+    stopManagedBackend();
   }
 
-  console.log(`[support-dev] Starting Django backend on ${BACKEND_URL}...`);
-
-  managedBackendProcess = spawn(
-    pythonExecutable,
-    ["manage.py", "runserver", `${DEV_HOST}:${BACKEND_PORT}`],
-    {
-      cwd: BACKEND_ROOT,
-      stdio: "inherit",
-      windowsHide: true,
-    },
+  console.warn(
+    `[support-dev] Django backend is unavailable on ${BACKEND_PORT_CANDIDATES.join(" or ")}. Start it manually or set SUPPORT_BACKEND_PORT to an available port.`,
   );
-
-  registerBackendCleanup();
-
-  const ready = await waitForBackendReady(30000);
-  if (!ready) {
-    console.warn(
-      "[support-dev] Django backend did not become ready within 30 seconds. Check the backend logs above if the API still appears offline.",
-    );
-  }
 }
 
 // https://vitejs.dev/config/
@@ -149,7 +162,7 @@ export default defineConfig(async ({ mode, command }) => {
       },
       proxy: {
         "/api": {
-          target: BACKEND_URL,
+          target: backendUrl,
           changeOrigin: true,
         },
       },

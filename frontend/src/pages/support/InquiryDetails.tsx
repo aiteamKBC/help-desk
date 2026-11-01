@@ -30,6 +30,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
+  SELECTABLE_TECHNICAL_SUBCATEGORIES,
+  formatTechnicalSubcategoryLabel,
   type EvidenceFile,
   type SubmittedForLearner,
   type TechnicalSubcategory,
@@ -68,7 +70,7 @@ const textMimeTypes = new Set([
   "application/x-javascript",
 ]);
 
-const inquiryPlatforms: TechnicalSubcategory[] = ["LMS", "Aptem", "Teams", "AI Team", "Coverage", "Others"];
+const inquiryPlatforms: TechnicalSubcategory[] = SELECTABLE_TECHNICAL_SUBCATEGORIES;
 
 const getExtension = (name: string) => {
   const dotIndex = name.lastIndexOf(".");
@@ -206,9 +208,12 @@ const InquiryDetails = () => {
   const isLearnerSource = ticket.requesterSource === "kbc_users_data" || ticket.requesterSource === "lms_learners";
   const canUseCoverage = !isLearnerSource;
   const canSubmitForLearner = !isLearnerSource || ticket.requesterRole === "coach" || ticket.requesterRole === "tutor" || ticket.requesterRole === "employer";
+  // Coverage stays staff-only (it is a tutor-coverage workflow). Tech team
+  // ("AI Team") IS offered to learners now, but as a plain route to the Ai Team
+  // queue -- the person-contact fields below are hidden for learner sources.
   const availableInquiryPlatforms = inquiryPlatforms.filter((item) => (
     !isLearnerSource
-    || (item !== "Coverage" && item !== "AI Team")
+    || item !== "Coverage"
   ));
   const selectedCoverageSessionNumbers = coverageSessionDates.map(
     (sessionDate) => (coverageSessionNumberByDate[sessionDate] || getDefaultCoverageSessionNumber(sessionDate, coverageSessionDateOptions)).trim(),
@@ -219,7 +224,9 @@ const InquiryDetails = () => {
   const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
   const isReadOnlyReview = isSubmittedSupportFlowLocked(ticket, bookingSummary);
 
-  const isAiTeamFlow = technicalSubcategory === "AI Team";
+  // The AI Team person-contact flow is for staff only. A learner picking Tech
+  // team just routes to the Ai Team queue with no person fields.
+  const isAiTeamFlow = technicalSubcategory === "AI Team" && !isLearnerSource;
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
   const hasSubmittedForLearner = requestFor !== "learner" || Boolean(selectedSubmittedForLearner);
   const trimmedSubmittedForNotificationEmail = submittedForNotificationEmail.trim();
@@ -697,15 +704,13 @@ const InquiryDetails = () => {
         chatHistory: ticket.id ? ticket.chatHistory : [],
       };
 
-      if (isCoverageFlow || isAiTeamFlow) {
+      if (isCoverageFlow) {
         const persistedTicket = await persistTicketDraft(nextTicket);
         const submittedTicket = await submitTicketDirectlyForReview(persistedTicket);
 
         clearBookingSummary();
         updateTicket(submittedTicket);
-        toast.success(isAiTeamFlow
-          ? "Your AI Team ticket has been submitted."
-          : "Your coverage ticket has been submitted to the Learning Plan team.");
+        toast.success("Your coverage ticket has been submitted to the Learning Plan team.");
         navigate("/support/status");
         return;
       }
@@ -1060,7 +1065,7 @@ const InquiryDetails = () => {
                 </SelectTrigger>
                 <SelectContent>
                   {availableInquiryPlatforms.map((item) => (
-                    <SelectItem key={item} value={item}>{item}</SelectItem>
+                    <SelectItem key={item} value={item}>{formatTechnicalSubcategoryLabel(item)}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>

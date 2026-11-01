@@ -38,6 +38,7 @@ urlpatterns = [
     path("admin/tickets/<str:public_id>/attachments/<int:attachment_id>/download", views.admin_ticket_attachment_download, name="admin-ticket-attachment-download"),
     path("admin/tickets/<str:public_id>/chat-attachments/<str:client_attachment_id>/download", views.admin_ticket_chat_attachment_download, name="admin-ticket-chat-attachment-download"),
     path("admin/tickets/<str:public_id>/chat-history", views.admin_ticket_chat_history, name="admin-ticket-chat-history"),
+    path("admin/tickets/<str:public_id>/chatbot-history", views.admin_ticket_chatbot_history, name="admin-ticket-chatbot-history"),
     path("admin/tickets/<str:public_id>/ai-agent-message", views.admin_ticket_ai_message, name="admin-ticket-ai-message"),
     path("admin/tickets/<str:public_id>/follow-up-ticket", views.admin_ticket_follow_up, name="admin-ticket-follow-up"),
     path("admin/tickets/<str:public_id>/transfer-request", views.admin_ticket_transfer_request, name="admin-ticket-transfer-request"),

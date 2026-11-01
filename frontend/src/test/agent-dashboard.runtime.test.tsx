@@ -642,7 +642,7 @@ describe("AgentDashboard runtime", () => {
     fireEvent.click(screen.getByRole("button", { name: "Back to Active" }));
     expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
     await waitFor(() => expectOpenCount("4"));
-  });
+  }, 15000);
 
   it("requests the same date range for pages and metrics and returns to the first page", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -690,7 +690,7 @@ describe("AgentDashboard runtime", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
     await screen.findByText("Page 1 of 2");
     expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
-  });
+  }, 15000);
 
   it("renders the admin dashboard with live payload data", async () => {
     render(

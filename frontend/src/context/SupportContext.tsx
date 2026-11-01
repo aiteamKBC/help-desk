@@ -5,7 +5,41 @@ import { SupportContext } from "@/context/support-context-value";
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
-export type TechnicalSubcategory = "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
+export type TechnicalSubcategory =
+  | "AI Team"
+  | "Aptem"
+  | "Coverage"
+  | "LMS"
+  | "Teams"
+  | "Enrolment"
+  | "Quality"
+  | "Operation"
+  | "Curriculum"
+  | "Others"
+  | "";
+
+// The subcategories offered in the "Create inquiry" dropdown. "Aptem" and "Teams"
+// are intentionally omitted from the picker but stay valid values the backend and
+// chatbot may still produce, so existing tickets keep rendering correctly.
+export const SELECTABLE_TECHNICAL_SUBCATEGORIES: TechnicalSubcategory[] = [
+  "LMS",
+  "AI Team",
+  "Coverage",
+  "Enrolment",
+  "Quality",
+  "Operation",
+  "Curriculum",
+  "Others",
+];
+
+// Display-only label. The stored/internal value stays "AI Team" (all routing,
+// team assignment and webhooks depend on it); only what the user reads changes.
+export function formatTechnicalSubcategoryLabel(value: TechnicalSubcategory | string | null | undefined): string {
+  if ((value || "").trim() === "AI Team") {
+    return "Tech team";
+  }
+  return (value || "").trim();
+}
 export type RequesterRole = "user" | "coach" | "tutor" | "employer";
 export type RequesterSource = "kbc_users_data" | "lms_learners" | "microsoft_entra" | "support_portal_requester" | "";
 
@@ -68,6 +102,7 @@ export interface Ticket {
   createdAt: string;
   chatState: TicketChatState;
   liveChatRequested: boolean;
+  isQuickTicket: boolean;
   chatHistory: ChatMessage[];
 }
 
@@ -107,6 +142,7 @@ const defaultTicket: Ticket = {
   createdAt: "",
   chatState: "open",
   liveChatRequested: false,
+  isQuickTicket: false,
   chatHistory: [],
 };
 
@@ -131,6 +167,10 @@ function normalizeTechnicalSubcategory(
     || value === "Coverage"
     || value === "LMS"
     || value === "Teams"
+    || value === "Enrolment"
+    || value === "Quality"
+    || value === "Operation"
+    || value === "Curriculum"
     || value === "Others"
     || value === ""
   ) {
@@ -284,6 +324,7 @@ function normalizeTicketState(ticket?: Partial<Ticket> | null): Ticket {
     createdAt: normalizeString(nextTicket.createdAt),
     chatState: normalizeTicketChatState(nextTicket.chatState),
     liveChatRequested: Boolean(nextTicket.liveChatRequested),
+    isQuickTicket: Boolean(nextTicket.isQuickTicket),
     chatHistory: Array.isArray(nextTicket.chatHistory) ? nextTicket.chatHistory : [],
   };
 }
@@ -326,6 +367,7 @@ function buildPersistedTicket(ticket: Ticket): Partial<Ticket> | null {
     createdAt: ticket.createdAt,
     chatState: ticket.chatState,
     liveChatRequested: ticket.liveChatRequested,
+    isQuickTicket: ticket.isQuickTicket,
   };
 }
 

@@ -76,7 +76,7 @@ DATABASES = build_database_config(
 )
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = get_env("TIME_ZONE", "Africa/Cairo")
+TIME_ZONE = get_env("TIME_ZONE", "Europe/London")
 USE_I18N = True
 USE_TZ = True
 
