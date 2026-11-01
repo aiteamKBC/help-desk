@@ -58,7 +58,21 @@ TICKET_PUBLIC_ID_PATTERN = re.compile(r"^KBC-\d{6}$", re.IGNORECASE)
 ALLOWED_STATUSES = {"Open", "Pending", "Closed"}
 ALLOWED_CATEGORIES = {"Learning", "Technical", "Others"}
 TECHNICAL_SUBCATEGORY_AI_TEAM = "AI Team"
-ALLOWED_TECHNICAL_SUBCATEGORIES = {TECHNICAL_SUBCATEGORY_AI_TEAM, "Aptem", "Coverage", "LMS", "Teams", "Others"}
+ALLOWED_TECHNICAL_SUBCATEGORIES = {
+    TECHNICAL_SUBCATEGORY_AI_TEAM,
+    "Aptem",
+    "Coverage",
+    "LMS",
+    "Teams",
+    "Others",
+    # Department categories: picked when creating a ticket, each auto-routes to a
+    # matching support team and e-mails only that team's shared mailbox. See
+    # DEPARTMENT_SUBCATEGORY_ROUTING below.
+    "Enrolment",
+    "Quality",
+    "Operation",
+    "Curriculum",
+}
 ALLOWED_SLA_STATUSES = {"Pending Review", "On Track", "Breached"}
 ALLOWED_TICKET_PRIORITIES = {"Low", "Normal", "High", "Urgent"}
 DEFAULT_TICKET_PRIORITY = "Normal"
@@ -92,6 +106,19 @@ TEAM_ROUTING_POLICIES = {
 LEGACY_TEAM_ROUTING_POLICY_KEYS = {policy["key"] for policy in TEAM_ROUTING_POLICIES.values()}
 SUPPORT_TEAM_AUTH_GROUP_METADATA_KEY = "auth_group_name"
 ALLOWED_ASSIGNED_TEAMS = {ASSIGNED_TEAM_UNASSIGNED, *TEAM_ROUTING_POLICIES.keys()}
+
+# Department routing: maps a Technical subcategory the learner/admin can pick
+# (and the support_teams.name a ticket is transferred to) onto the shared mailbox
+# that should be e-mailed for that department's tickets. Only the department
+# mailbox is notified for its tickets -- the global operations inbox
+# (SUPPORT_OPERATIONS_NOTIFICATION_EMAILS) is skipped for them. The team rows
+# must exist in support_teams for dashboard visibility and manual transfers.
+DEPARTMENT_SUBCATEGORY_ROUTING: dict[str, dict[str, str]] = {
+    "Enrolment": {"team": "Enrolment Team", "email": "enrolment.team@kentbusinesscollege.com"},
+    "Quality": {"team": "Quality team", "email": "quality.support@kentbusinesscollege.com"},
+    "Operation": {"team": "Operation Team", "email": "Operation.Team@kentbusinesscollege.com"},
+    "Curriculum": {"team": "Curriculum Team", "email": "Curriculum.Team@kentbusinesscollege.com"},
+}
 TICKET_PRIORITY_RANKS = {
     "Urgent": 0,
     "High": 1,
@@ -3574,6 +3601,34 @@ def is_ai_team_technical_subcategory(value: Any) -> bool:
     return sanitize_text(value).casefold() == TECHNICAL_SUBCATEGORY_AI_TEAM.casefold()
 
 
+def resolve_department_routing(technical_subcategory: Any) -> dict[str, str] | None:
+    """Return the department routing config for a subcategory value, or None."""
+    normalized = sanitize_text(technical_subcategory).casefold()
+    if not normalized:
+        return None
+    for subcategory, config in DEPARTMENT_SUBCATEGORY_ROUTING.items():
+        if subcategory.casefold() == normalized:
+            return config
+    return None
+
+
+def resolve_department_routing_by_team(assigned_team: Any) -> dict[str, str] | None:
+    """Return the department routing config for an assigned team name, or None."""
+    normalized = sanitize_text(assigned_team).casefold()
+    if not normalized:
+        return None
+    for config in DEPARTMENT_SUBCATEGORY_ROUTING.values():
+        if config["team"].casefold() == normalized:
+            return config
+    return None
+
+
+def resolve_department_assigned_team(technical_subcategory: Any) -> str | None:
+    """Return the support team a department subcategory routes to, or None."""
+    config = resolve_department_routing(technical_subcategory)
+    return config["team"] if config else None
+
+
 def is_ai_team_ticket_record(ticket: dict[str, Any] | None) -> bool:
     if not isinstance(ticket, dict):
         return False
@@ -3592,6 +3647,12 @@ def normalize_ai_team_request_payload(payload: dict[str, Any], technical_subcate
 
     person_name = sanitize_text(payload.get("aiTeamPersonName"))
     person_email = normalize_email(payload.get("aiTeamPersonEmail"))
+    # A person contact is optional: staff designate a specific person (the
+    # classic "AI Team request"), while a learner's Tech team ticket carries no
+    # person and simply routes to the Ai Team queue. Only validate when at least
+    # one person field was supplied.
+    if not person_name and not person_email:
+        return None
     if not person_name:
         raise ApiError(400, "Please enter the AI Team person's name.")
     if not is_valid_email(person_email):
@@ -6853,7 +6914,18 @@ def build_support_notification_webhook_payload(
     # change rather than an edit inside n8n. The learner's own notifications
     # still go to the learner, so they carry no operations addresses.
     if recipient_type == "operations":
-        recipients = get_support_operations_notification_emails()
+        # Department tickets notify only that department's shared mailbox; every
+        # other ticket still reaches the global operations inbox. The subcategory
+        # covers freshly created tickets; the assigned team covers tickets
+        # transferred into a department after creation.
+        department = resolve_department_routing_by_team(
+            ticket.get("assigned_team")
+        ) or resolve_department_routing(ticket.get("technical_subcategory"))
+        if department:
+            department_email = normalize_email(department["email"])
+            recipients = [department_email] if department_email else []
+        else:
+            recipients = get_support_operations_notification_emails()
     elif recipient_type == "ai_team_person":
         ai_team_email = normalize_email((ai_team_request or {}).get("personEmail"))
         recipients = [ai_team_email] if ai_team_email else []
@@ -7256,6 +7328,52 @@ def queue_ticket_created_notification(ticket: dict[str, Any]) -> None:
         payload=payload,
         sent_metadata_key=TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY,
     )
+
+
+def notify_department_ticket_assignment(ticket_row: dict[str, Any]) -> dict[str, Any]:
+    """E-mail a department's shared mailbox when a ticket is routed to it.
+
+    Reuses the proven operations notification webhook (the same one that reaches
+    the global operations inbox today); the recipient resolves to the department
+    mailbox because the ticket's assigned_team is the department team.
+    """
+    department = resolve_department_routing_by_team(ticket_row.get("assigned_team"))
+    if not department:
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    # Honour the same delivery gate as every other notification path, so a
+    # deployment that disables delivery (or has no webhook configured) never
+    # sends department mail either.
+    if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    try:
+        payload = build_support_notification_webhook_payload(
+            SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+            ticket_row,
+        )
+        result = send_support_notification_webhook(payload)
+    except Exception:
+        result = {"configured": True, "delivered": False, "status": None, "response": None}
+
+    try:
+        insert_history_event(
+            int(ticket_row["id"]),
+            "department_transfer_notified"
+            if result.get("delivered")
+            else "department_transfer_notification_failed",
+            None,
+            {
+                "assignedTeam": ticket_row.get("assigned_team"),
+                "recipient": normalize_email(department["email"]),
+                "webhookStatus": result.get("status"),
+                "webhookDelivered": result.get("delivered"),
+            },
+        )
+    except Exception:
+        pass
+
+    return result
 
 
 def queue_live_agent_unavailable_notification(ticket: dict[str, Any], *, requested_at: Any) -> None:
@@ -20229,6 +20347,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     parsed_escalation_agent_id = parse_assigned_agent_id(payload.get("escalationAgentId")) if has_escalation_agent_input else None
     learning_plan_transfer_webhook_ticket_id: int | None = None
     learning_plan_transfer_webhook_payload: dict[str, Any] | None = None
+    department_transfer_notification_ticket: dict[str, Any] | None = None
     learning_plan_transfer_notification_payload: dict[str, Any] | None = None
     documentation_history_events: list[tuple[str, dict[str, Any]]] = []
 
@@ -20719,6 +20838,18 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                     assigned_agent_username=next_assigned_agent_username,
                     note=note,
                 )
+            elif resolve_department_routing_by_team(next_assigned_team):
+                department_transfer_notification_ticket = {
+                    **ticket,
+                    "status": next_status,
+                    "status_reason": next_status_reason,
+                    "assigned_agent_id": next_assigned_agent_id,
+                    "assigned_agent_name": next_assigned_agent_name,
+                    "assigned_agent_username": next_assigned_agent_username,
+                    "assigned_team": next_assigned_team,
+                    "sla_status": next_sla_status,
+                    "metadata": updated_ticket_metadata,
+                }
 
         if ticket["sla_status"] != next_sla_status:
             insert_history_event(ticket["id"], "sla_changed", actor, {"from": ticket["sla_status"], "to": next_sla_status})
@@ -20793,6 +20924,8 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             learning_plan_transfer_webhook_ticket_id,
             learning_plan_transfer_webhook_payload,
         )
+    if department_transfer_notification_ticket:
+        notify_department_ticket_assignment(department_transfer_notification_ticket)
 
     detail_public_id = follow_up_public_id or public_id
     detail = fetch_admin_ticket_detail(detail_public_id)
@@ -21047,7 +21180,11 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             requester_source = get_public_requester_source(requester)
             if technical_subcategory == "Coverage":
                 ensure_requester_can_submit_coverage_ticket(requester_source)
-            if is_ai_team_technical_subcategory(technical_subcategory):
+            # Only the staff "AI Team request" flow (which designates a specific
+            # person) is gated to non-learners. A learner's Tech team ticket
+            # carries no person and just routes to the Ai Team queue, so it is
+            # allowed through.
+            if ai_team_request:
                 ensure_requester_can_submit_ai_team_ticket(requester_source)
             ticket_priority = derive_requester_ticket_priority(requester_role)
             learner = ensure_public_requester_learner(requester)
@@ -21146,7 +21283,11 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     raise ApiError(500, "We could not create the ticket right now.")
 
                 public_id = build_public_ticket_id(int(ticket_row["id"]))
-                initial_assigned_team = ASSIGNED_TEAM_AI_TEAM if ai_team_request else ticket_row["assigned_team"]
+                initial_assigned_team = (
+                    ASSIGNED_TEAM_AI_TEAM
+                    if (ai_team_request or is_ai_team_technical_subcategory(technical_subcategory))
+                    else (resolve_department_assigned_team(technical_subcategory) or ticket_row["assigned_team"])
+                )
                 initial_sla_status = "On Track" if technical_subcategory == "Coverage" else ticket_row["sla_status"]
                 if technical_subcategory == "Coverage":
                     ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {

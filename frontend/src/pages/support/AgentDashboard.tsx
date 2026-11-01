@@ -18211,6 +18211,10 @@ function shouldShowDashboardRelatedPersonSummary(ticket: Pick<TicketSummary, "te
     || ticket?.technicalSubcategory === "LMS"
     || ticket?.technicalSubcategory === "Aptem"
     || ticket?.technicalSubcategory === "Teams"
+    || ticket?.technicalSubcategory === "Enrolment"
+    || ticket?.technicalSubcategory === "Quality"
+    || ticket?.technicalSubcategory === "Operation"
+    || ticket?.technicalSubcategory === "Curriculum"
   );
 }
 
@@ -18411,13 +18415,17 @@ function getDashboardRelatedPersonSummary(
     return getDashboardCoverageRelatedPersonSummary(ticket);
   }
 
-  // Chatbot-opened Technical tickets (LMS / Aptem / Teams) carry the generated
-  // subject plus the inquiry preview — surface them in the Related Person
-  // column so the admin can read the problem at a glance.
+  // Technical tickets that carry a subject + inquiry preview (chatbot-opened
+  // LMS / Aptem / Teams, and the department categories) surface them in the
+  // Related Person column so the admin can read the problem at a glance.
   if (
     ticket.technicalSubcategory === "LMS"
     || ticket.technicalSubcategory === "Aptem"
     || ticket.technicalSubcategory === "Teams"
+    || ticket.technicalSubcategory === "Enrolment"
+    || ticket.technicalSubcategory === "Quality"
+    || ticket.technicalSubcategory === "Operation"
+    || ticket.technicalSubcategory === "Curriculum"
   ) {
     return getDashboardGenericTechnicalRelatedPersonSummary(ticket);
   }

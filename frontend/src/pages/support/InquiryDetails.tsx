@@ -208,9 +208,12 @@ const InquiryDetails = () => {
   const isLearnerSource = ticket.requesterSource === "kbc_users_data" || ticket.requesterSource === "lms_learners";
   const canUseCoverage = !isLearnerSource;
   const canSubmitForLearner = !isLearnerSource || ticket.requesterRole === "coach" || ticket.requesterRole === "tutor" || ticket.requesterRole === "employer";
+  // Coverage stays staff-only (it is a tutor-coverage workflow). Tech team
+  // ("AI Team") IS offered to learners now, but as a plain route to the Ai Team
+  // queue -- the person-contact fields below are hidden for learner sources.
   const availableInquiryPlatforms = inquiryPlatforms.filter((item) => (
     !isLearnerSource
-    || (item !== "Coverage" && item !== "AI Team")
+    || item !== "Coverage"
   ));
   const selectedCoverageSessionNumbers = coverageSessionDates.map(
     (sessionDate) => (coverageSessionNumberByDate[sessionDate] || getDefaultCoverageSessionNumber(sessionDate, coverageSessionDateOptions)).trim(),
@@ -221,7 +224,9 @@ const InquiryDetails = () => {
   const availableCoverageTimeOptions = coverageTimeOptions.filter((item) => !item.completed);
   const isReadOnlyReview = isSubmittedSupportFlowLocked(ticket, bookingSummary);
 
-  const isAiTeamFlow = technicalSubcategory === "AI Team";
+  // The AI Team person-contact flow is for staff only. A learner picking Tech
+  // team just routes to the Ai Team queue with no person fields.
+  const isAiTeamFlow = technicalSubcategory === "AI Team" && !isLearnerSource;
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
   const hasSubmittedForLearner = requestFor !== "learner" || Boolean(selectedSubmittedForLearner);
   const trimmedSubmittedForNotificationEmail = submittedForNotificationEmail.trim();

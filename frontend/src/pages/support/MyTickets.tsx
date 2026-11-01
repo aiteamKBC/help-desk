@@ -22,7 +22,7 @@ interface RestoredTicketPayload {
   requesterRole?: RequesterRole;
   requesterSource?: RequesterSource;
   category: "" | "Learning" | "Technical" | "Others";
-  technicalSubcategory: "" | "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others";
+  technicalSubcategory: "" | "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Enrolment" | "Quality" | "Operation" | "Curriculum" | "Others";
   subject?: string;
   inquiry: string;
   aiTeamPersonName?: string;

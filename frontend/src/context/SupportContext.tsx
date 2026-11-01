@@ -5,7 +5,18 @@ import { SupportContext } from "@/context/support-context-value";
 export type TicketStatus = "Open" | "Pending" | "Closed";
 export type TicketChatState = "open" | "closed";
 export type Category = "Learning" | "Technical" | "Others" | "";
-export type TechnicalSubcategory = "AI Team" | "Aptem" | "Coverage" | "LMS" | "Teams" | "Others" | "";
+export type TechnicalSubcategory =
+  | "AI Team"
+  | "Aptem"
+  | "Coverage"
+  | "LMS"
+  | "Teams"
+  | "Enrolment"
+  | "Quality"
+  | "Operation"
+  | "Curriculum"
+  | "Others"
+  | "";
 
 // The subcategories offered in the "Create inquiry" dropdown. "Aptem" and "Teams"
 // are intentionally omitted from the picker but stay valid values the backend and
@@ -14,6 +25,10 @@ export const SELECTABLE_TECHNICAL_SUBCATEGORIES: TechnicalSubcategory[] = [
   "LMS",
   "AI Team",
   "Coverage",
+  "Enrolment",
+  "Quality",
+  "Operation",
+  "Curriculum",
   "Others",
 ];
 
@@ -152,6 +167,10 @@ function normalizeTechnicalSubcategory(
     || value === "Coverage"
     || value === "LMS"
     || value === "Teams"
+    || value === "Enrolment"
+    || value === "Quality"
+    || value === "Operation"
+    || value === "Curriculum"
     || value === "Others"
     || value === ""
   ) {
