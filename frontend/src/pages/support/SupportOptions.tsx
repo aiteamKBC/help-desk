@@ -110,6 +110,7 @@ const SupportOptions = () => {
               callUrl?: string;
               targetLabel?: string;
               message?: string;
+              targets?: string[];
             }
           | null;
 

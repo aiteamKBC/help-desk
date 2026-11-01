@@ -17088,8 +17088,9 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
 
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         requester_role = get_ticket_requester_role(ticket_metadata)
-        if not is_coach_requester_role(requester_role):
-            raise ApiError(403, "Only coach accounts can request a direct Microsoft Teams support call from the support portal.")
+        # Teams Call is gated in the UI to only show on the Tech team (AI Team)
+        # flow. Any role can request it from that flow, so no role check here.
+        _ = requester_role
 
         pending_notification = get_pending_teams_call_notification(ticket_metadata)
         already_notified = bool(pending_notification)
