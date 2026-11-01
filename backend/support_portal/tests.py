@@ -13105,7 +13105,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                             "id": "card-1",
                             "type": "tutor_choice",
                             "tutor": "Adey",
-                            "tutorEmail": "omar.helmy@kentbusinesscollege.com",
+                            "tutorEmail": "test.tutor@kentbusinesscollege.com",
                             "sessionDetails": "Module: Marketing Impact\nPreferred Time: Friday 09:00 - 11:00 | G2-Fri | Jun 2026\nSessions:\n1. Friday 12 Jun 2026 | test",
                             "requestStatus": "accepted",
                             "submittedAt": "2026-06-05T13:09:28.808965+00:00",
@@ -13120,7 +13120,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                             "type": "tutor_reply",
                             "title": "Tutor Accepted",
                             "tutor": "Adey",
-                            "tutorEmail": "omar.helmy@kentbusinesscollege.com",
+                            "tutorEmail": "test.tutor@kentbusinesscollege.com",
                             "sessionDetails": "Module: Marketing Impact\nPreferred Time: Friday 09:00 - 11:00 | G2-Fri | Jun 2026\nSessions:\n1. Friday 12 Jun 2026 | test",
                             "requestStatus": "accepted",
                             "replyOutcome": "accepted",
@@ -16085,18 +16085,18 @@ class BookingContextTests(SimpleTestCase):
                 return_value=[
                     {
                         "id": 23,
-                        "username": "Omar1",
-                        "full_name": "Omar1",
+                        "username": "Meeka",
+                        "full_name": "Meeka",
                         "email": None,
                         "role": "admin",
                     }
                 ],
             ),
         ):
-            response = services.resolve_support_teams_call_notification_target(["Omar.Helmy@kentbusinesscollege.com"])
+            response = services.resolve_support_teams_call_notification_target(["Meeka@kentbusinesscollege.com"])
 
         self.assertEqual(response["id"], 23)
-        self.assertEqual(response["username"], "Omar1")
+        self.assertEqual(response["username"], "Meeka")
 
     def test_request_support_teams_call_creates_pending_admin_notification(self):
         ticket = {

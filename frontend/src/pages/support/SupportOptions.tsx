@@ -18,7 +18,6 @@ import {
 import { useSupport } from "@/context/useSupport";
 import {
   getSupportResumePath,
-  isCoachRequesterRole,
   shouldShowStatusStep,
   type SupportChatEntryAction,
 } from "@/lib/supportFlow";
@@ -48,7 +47,8 @@ const SupportOptions = () => {
   const [isPreparingTeamsCall, setIsPreparingTeamsCall] = useState(false);
   const [isOpeningTeamsCall, setIsOpeningTeamsCall] = useState(false);
   const [hasPreparedTeamsCall, setHasPreparedTeamsCall] = useState(false);
-  const isCoachRequester = isCoachRequesterRole(ticket.requesterRole);
+  const isTechTeamFlow = ticket.technicalSubcategory === "AI Team";
+  const showTeamsCall = isTechTeamFlow;
   const [isCreatingTicket, setIsCreatingTicket] = useState(false);
   const ticketRef = useRef(ticket);
   const pendingTicketCreationRef = useRef<Promise<Ticket | null> | null>(null);
@@ -88,7 +88,7 @@ const SupportOptions = () => {
   }, [bookingSummary, ticket]);
 
   useEffect(() => {
-    if (!isCoachRequester) {
+    if (!showTeamsCall) {
       setTeamsCallUrl("");
       setTeamsCallTargetLabel("");
       setTeamsCallMessage("");
@@ -147,7 +147,7 @@ const SupportOptions = () => {
     return () => {
       cancelled = true;
     };
-  }, [isCoachRequester, ticket.id]);
+  }, [showTeamsCall, ticket.id]);
 
   const ensureTicketCreated = async () => {
     const currentTicket = ticketRef.current;
@@ -370,7 +370,7 @@ const SupportOptions = () => {
       disabled: isCreatingTicket || isQuickSubmitting,
       statusText: isCreatingTicket ? "Creating ticket..." : isQuickSubmitting ? "Submitting..." : "Send now",
     },
-    ...(isCoachRequester
+    ...(showTeamsCall
       ? [{
           id: "teams-call",
           title: "Call on Microsoft Teams",
@@ -397,11 +397,11 @@ const SupportOptions = () => {
       : []),
   ];
   const pageTitle = "Choose how you want to continue";
-  const pageDescription = isCoachRequester
-    ? "Your inquiry details are saved. Pick the route that fits your issue, or open a direct Microsoft Teams call when you want the fastest coach hand-off."
+  const pageDescription = showTeamsCall
+    ? "Your inquiry details are saved. Pick the route that fits your issue, or open a direct Microsoft Teams call when you want the fastest hand-off."
     : "Your inquiry details are saved. Pick the route that fits your issue and we will take you straight there.";
   const actionTitle = "Support Actions";
-  const actionDescription = isCoachRequester
+  const actionDescription = showTeamsCall
     ? "Everything is in one focused panel. Choose chatbot, live chat, booking, direct ticket submission, or a Microsoft Teams call."
     : "Everything is in one focused panel. Choose chatbot, live chat, booking, or direct ticket submission.";
   const supportActionsGridClassName = "mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-12 xl:auto-rows-fr";
@@ -436,7 +436,7 @@ const SupportOptions = () => {
     : "grid gap-3 sm:grid-cols-2 xl:grid-cols-4";
 
   const getSupportActionCardLayout = (actionId: string, index: number) => {
-    if (!isCoachRequester) {
+    if (!showTeamsCall) {
       return "xl:col-span-6";
     }
 
@@ -497,7 +497,7 @@ const SupportOptions = () => {
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
               <div className="flex items-start gap-4">
                 <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-soft">
-                  {isCoachRequester ? <PhoneCall className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
+                  {showTeamsCall ? <PhoneCall className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
                 </div>
                 <div>
                   <h2 className="text-xl font-semibold text-foreground">
@@ -509,11 +509,11 @@ const SupportOptions = () => {
                 </div>
               </div>
               <div className="rounded-full border border-primary/10 bg-primary/[0.05] px-4 py-2 text-xs font-semibold text-primary">
-                {isCoachRequester ? "5 support paths" : "4 support paths"}
+                {showTeamsCall ? "5 support paths" : "4 support paths"}
               </div>
             </div>
 
-            {isCoachRequester && (
+            {showTeamsCall && (
               <div className="mt-5 rounded-[24px] border border-primary/15 bg-primary/[0.04] px-4 py-4">
                 <div className="text-sm font-semibold text-foreground">
                   {hasPreparedTeamsCall

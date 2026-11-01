@@ -44,8 +44,12 @@ export const StepIndicator = ({ current }: { current: number }) => {
       <div className="flex items-center justify-between">
         {steps.map((step, i) => {
           const idx = i + 1;
-          const isTicketOpenWithoutBooking = Boolean(ticket.id && ticket.status === "Open" && !bookingSummary);
-          const isFinalStepComplete = !isInterimStep && normalizedCurrent === steps.length && idx === steps.length && !isTicketOpenWithoutBooking;
+          // The final step only counts as "Completed" once the ticket is
+          // actually Closed. Any active status (Open / Pending) keeps the step
+          // on its live status instead. A booking-based flow still completes on
+          // its booking summary.
+          const isTicketNotYetClosed = Boolean(ticket.id && ticket.status !== "Closed" && !bookingSummary);
+          const isFinalStepComplete = !isInterimStep && normalizedCurrent === steps.length && idx === steps.length && !isTicketNotYetClosed;
           const isCompleted = idx < normalizedCurrent || isFinalStepComplete;
           const isActive = !isInterimStep && idx === normalizedCurrent && !isFinalStepComplete;
           const isReached = idx <= furthestStepReached;
@@ -86,7 +90,11 @@ export const StepIndicator = ({ current }: { current: number }) => {
                     isClickable && "cursor-pointer"
                   )}
                 >
-                  {isFinalStepComplete ? "Completed" : step.label}
+                  {isFinalStepComplete
+                    ? "Completed"
+                    : idx === steps.length && ticket.id
+                      ? ticket.status
+                      : step.label}
                 </span>
               </div>
               {i < steps.length - 1 && (

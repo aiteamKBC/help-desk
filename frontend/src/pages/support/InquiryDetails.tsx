@@ -704,15 +704,13 @@ const InquiryDetails = () => {
         chatHistory: ticket.id ? ticket.chatHistory : [],
       };
 
-      if (isCoverageFlow || isAiTeamFlow) {
+      if (isCoverageFlow) {
         const persistedTicket = await persistTicketDraft(nextTicket);
         const submittedTicket = await submitTicketDirectlyForReview(persistedTicket);
 
         clearBookingSummary();
         updateTicket(submittedTicket);
-        toast.success(isAiTeamFlow
-          ? "Your AI Team ticket has been submitted."
-          : "Your coverage ticket has been submitted to the Learning Plan team.");
+        toast.success("Your coverage ticket has been submitted to the Learning Plan team.");
         navigate("/support/status");
         return;
       }
