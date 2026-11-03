@@ -13980,6 +13980,10 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
                 resolution_reason = %s,
                 updated_at = NOW()
             WHERE id = %s
+              -- A transfer may have completed since the queue read this ticket.
+              AND COALESCE(assigned_team, %s) IN (%s, %s)
+              AND assigned_agent_id IS NOT DISTINCT FROM %s
+              AND status = 'Open'
             """,
             [
                 next_assigned_agent_id,
@@ -13987,8 +13991,14 @@ def assign_ticket_to_agent(ticket: dict[str, Any], agent: dict[str, Any], assign
                 json.dumps(ticket_metadata_patch),
                 *get_ticket_state_column_params(ticket_state_columns),
                 ticket["id"],
+                ASSIGNED_TEAM_UNASSIGNED,
+                ASSIGNED_TEAM_UNASSIGNED,
+                ASSIGNED_TEAM_SUPPORT_DESK,
+                current_assigned_agent_id,
             ],
         )
+        if cursor.rowcount == 0:
+            return False
 
         if ticket.get("conversation_id"):
             cursor.execute(
@@ -14251,6 +14261,9 @@ def assign_waiting_live_chat_tickets(now: datetime | None = None) -> list[int]:
         if not is_live_chat_requested(ticket.get("metadata"), ticket.get("conversation_metadata")):
             continue
         if sanitize_text(ticket.get("conversation_status")).lower() == "closed":
+            continue
+        # Department transfers leave the Support Desk live-chat queue.
+        if get_effective_assigned_team(ticket.get("assigned_team")) not in DEFAULT_ASSIGNED_TEAMS:
             continue
 
         assigned_agent_id = int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None
@@ -17088,8 +17101,9 @@ def request_support_teams_call(public_id: str) -> dict[str, Any]:
 
         ticket_metadata = normalize_json_object(ticket.get("metadata"))
         requester_role = get_ticket_requester_role(ticket_metadata)
-        if not is_coach_requester_role(requester_role):
-            raise ApiError(403, "Only coach accounts can request a direct Microsoft Teams support call from the support portal.")
+        # Teams Call is gated in the UI to only show on the Tech team (AI Team)
+        # flow. Any role can request it from that flow, so no role check here.
+        _ = requester_role
 
         pending_notification = get_pending_teams_call_notification(ticket_metadata)
         already_notified = bool(pending_notification)

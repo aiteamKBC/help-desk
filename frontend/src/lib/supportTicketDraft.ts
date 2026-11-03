@@ -109,8 +109,11 @@ export function buildTicketDraftFormData(currentTicket: Ticket) {
 }
 
 export async function persistTicketDraft(currentTicket: Ticket) {
+  // Always use POST (even for updates). Django does not populate request.POST
+  // for PATCH requests, so multipart form fields come through empty on PATCH.
+  // The server view accepts both methods and routes by public_id.
   const response = await fetch(currentTicket.id ? `/api/tickets/${encodeURIComponent(currentTicket.id)}` : "/api/tickets", {
-    method: currentTicket.id ? "PATCH" : "POST",
+    method: "POST",
     body: buildTicketDraftFormData(currentTicket),
   });
   const payload = (await response.json().catch(() => null)) as
