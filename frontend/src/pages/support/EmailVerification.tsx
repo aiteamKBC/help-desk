@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Mail, AlertTriangle, ArrowRight, ListChecks, MessageSquarePlus } from "lucide-react";
+import { Mail, Info, AlertTriangle, ArrowRight, ListChecks, MessageSquarePlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -12,7 +12,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { KentCrestMark } from "@/components/support/KentCrestMark";
+import "./EmailVerification.css";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
   type RequesterRole,
@@ -87,7 +87,7 @@ const EmailVerification = () => {
   const { ticket, setTicket, clearBookingSummary } = useSupport();
   const prefillEmail = searchParams.get("email")?.trim().toLowerCase() || "";
   const ssoToken = searchParams.get("token")?.trim() || "";
-  const [email, setEmail] = useState(ticket.email || prefillEmail);
+  const [email, setEmail] = useState(ticket.email || prefillEmail || "ayman.badewi@kentbusinesscollege.com");
   const autoSubmittedRef = useRef(false);
   const [errorTitle, setErrorTitle] = useState("Invalid Email");
   const [errorMessage, setErrorMessage] = useState("Please enter a valid email address.");
@@ -298,63 +298,55 @@ const EmailVerification = () => {
   };
 
   return (
-    <SupportLayout>
-      <StepIndicator current={1} />
-      <div className="mx-auto max-w-[22rem] sm:max-w-md">
-        <div className="rounded-2xl border bg-card p-6 shadow-card sm:p-8">
-          <div className="mb-6 flex flex-col items-center sm:mb-7">
-            <KentCrestMark
-              variant="full"
-              frame="plain"
-              className="h-[56px] w-full max-w-[220px] sm:h-[60px] sm:max-w-[248px]"
-              imageClassName="object-contain"
-            />
-            <div className="mt-3 inline-flex items-center gap-2 rounded-full border border-primary/10 bg-primary/[0.04] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-primary/80 sm:text-[11px] sm:tracking-[0.18em]">
-              <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
-              Support Portal
-            </div>
+    <SupportLayout landing mainClassName="support-landing-main">
+      <aside className="support-hero" aria-label="Kent Business College">
+        <div className="support-hero-photo" />
+        <div className="support-hero-copy">
+          <h2>Support,<br />made simple.</h2>
+          <p>Get the help you need, when you need it.</p>
+        </div>
+      </aside>
+
+      <section className="support-entry" aria-labelledby="support-request-title">
+        <div className="support-entry-content">
+          <div className="support-entry-steps">
+            <StepIndicator current={1} finalLabel="Open" />
           </div>
-          <div className="mb-5 text-center sm:mb-6">
-            <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.03em] text-foreground sm:text-[2rem]">
-              Support Request
-            </h1>
+          <div className="support-entry-heading">
+            <h1 id="support-request-title">Support Request</h1>
+            <p id="email-description">
+              {isSubmitting && ssoToken
+                ? "Verifying your account, please wait..."
+                : <>Enter your registered email address to continue.<br className="support-description-break" /> For learners, this is usually your Aptem email.</>}
+            </p>
           </div>
-          <p className="mx-auto mb-6 max-w-[320px] text-center text-sm leading-6 text-muted-foreground sm:mb-7 sm:text-[15px] sm:leading-7">
-            {isSubmitting && ssoToken
-              ? "Verifying your account, please wait..."
-              : "Enter your registered email address to continue. For learners, this is usually your Aptem email."}
-          </p>
-          <form onSubmit={handleNext} className="space-y-4 sm:space-y-5">
-            <div>
-              <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  id="email"
-                  type="email"
-                  placeholder="Enter your registered email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="h-12 pl-9 text-[15px]"
-                  autoFocus
-                  required
-                />
-              </div>
+          <form onSubmit={handleNext} className="support-entry-form">
+            <div className="support-email-field">
+              <label htmlFor="email" className="sr-only">Registered email address</label>
+              <Mail aria-hidden="true" />
+              <Input
+                id="email"
+                type="email"
+                autoComplete="email"
+                aria-describedby="email-description"
+                placeholder="Enter your registered email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoFocus
+                required
+              />
             </div>
-            <Button
-              type="submit"
-              className="h-11 w-full border-0 text-sm font-semibold gradient-primary"
-              disabled={isSubmitting}
-            >
+            <Button type="submit" className="support-next-button" disabled={isSubmitting}>
               {isSubmitting ? "Checking..." : "Next"}
-              {!isSubmitting && <ArrowRight className="ml-2 h-4 w-4" />}
+              {!isSubmitting && <ArrowRight aria-hidden="true" />}
             </Button>
           </form>
-          <p className="mt-5 text-center text-[11px] leading-5 text-muted-foreground sm:mt-6 sm:text-xs">
-            Your role will be identified automatically from your registered account.
-          </p>
+          <div className="support-role-note">
+            <Info aria-hidden="true" />
+            <p>Your role will be identified automatically from your registered account.</p>
+          </div>
         </div>
-      </div>
-
+      </section>
       <Dialog open={errorOpen} onOpenChange={setErrorOpen}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
