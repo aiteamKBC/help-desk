@@ -198,6 +198,29 @@ class TicketCreatedNotificationGuardTests(SimpleTestCase):
             services.queue_ticket_created_notification(ticket)
         queue.assert_not_called()
 
+    @override_settings(SUPPORT_TICKET_CREATED_ALWAYS_NOTIFY_EMAILS=["Super.Admin@Example.com"])
+    def test_always_notify_admins_are_cc_on_every_new_ticket(self):
+        ticket = {
+            "id": 2,
+            "public_id": "KBC-000002",
+            "status": "Open",
+            "category": "Learning",
+            "metadata": {},
+            "learner_email": "learner@example.com",
+        }
+        captured: dict = {}
+        with patch.object(
+            services,
+            "queue_support_notification_delivery",
+            side_effect=lambda **kwargs: captured.update(kwargs),
+        ):
+            services.queue_ticket_created_notification(ticket)
+
+        recipients = captured["payload"]["recipients"]
+        # The admin address is appended (normalised) to whatever the team /
+        # operations recipients already were, for every newly created ticket.
+        self.assertIn("super.admin@example.com", recipients)
+
 
 @override_settings(SUPPORT_SSO_SECRET="test-sso-secret", SUPPORT_SSO_TOKEN_MAX_AGE_SECONDS=300)
 class SsoTokenLifetimeTests(SimpleTestCase):

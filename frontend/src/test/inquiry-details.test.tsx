@@ -148,7 +148,7 @@ describe("InquiryDetails", () => {
     });
   });
 
-  it("renders Others as a supported inquiry category", () => {
+  it("renders the team-based inquiry categories in the picker", () => {
     render(
       <MemoryRouter initialEntries={["/support/inquiry"]}>
         <SupportProvider>
@@ -157,8 +157,16 @@ describe("InquiryDetails", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByRole("combobox")).toHaveTextContent("Others");
-    expect(screen.getAllByText("Others").length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("combobox"));
+    expect(screen.getByText("Learning Plan Team")).toBeInTheDocument();
+    expect(screen.getByText("Ai Team")).toBeInTheDocument();
+    expect(screen.getByText("Curriculum Team")).toBeInTheDocument();
+    expect(screen.getByText("Enrolment Team")).toBeInTheDocument();
+    expect(screen.getByText("Operation Team")).toBeInTheDocument();
+    expect(screen.getByText("Quality team")).toBeInTheDocument();
+    // LMS and Others no longer route to a team mailbox, so they are not pickable.
+    expect(screen.queryByText("LMS")).not.toBeInTheDocument();
+    expect(screen.queryByText("Others")).not.toBeInTheDocument();
   });
 
   it("accepts PowerPoint files as supporting evidence", async () => {
@@ -237,7 +245,7 @@ describe("InquiryDetails", () => {
           email: "learner@example.com",
           requesterRole: "user",
           requesterSource,
-          technicalSubcategory: "Others",
+          technicalSubcategory: "",
         },
       }),
     );
@@ -251,9 +259,16 @@ describe("InquiryDetails", () => {
     );
 
     fireEvent.click(screen.getByRole("combobox"));
-    expect(screen.queryByText("Coverage")).not.toBeInTheDocument();
-    expect(screen.queryByText("AI Team")).not.toBeInTheDocument();
-    expect(screen.getByText("LMS")).toBeInTheDocument();
+    // Coverage (Learning Plan Team) stays staff-only; LMS/Others are not pickable.
+    expect(screen.queryByText("Learning Plan Team")).not.toBeInTheDocument();
+    expect(screen.queryByText("LMS")).not.toBeInTheDocument();
+    expect(screen.queryByText("Others")).not.toBeInTheDocument();
+    // The team-based categories a learner can still pick remain available.
+    expect(screen.getByText("Ai Team")).toBeInTheDocument();
+    expect(screen.getByText("Curriculum Team")).toBeInTheDocument();
+    expect(screen.getByText("Enrolment Team")).toBeInTheDocument();
+    expect(screen.getByText("Operation Team")).toBeInTheDocument();
+    expect(screen.getByText("Quality team")).toBeInTheDocument();
   });
 
   it("shows submitted tickets in read-only inquiry review mode", () => {

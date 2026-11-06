@@ -18,27 +18,36 @@ export type TechnicalSubcategory =
   | "Others"
   | "";
 
-// The subcategories offered in the "Create inquiry" dropdown. "Aptem" and "Teams"
-// are intentionally omitted from the picker but stay valid values the backend and
-// chatbot may still produce, so existing tickets keep rendering correctly.
+// The subcategories offered in the "Create inquiry" dropdown. Only categories
+// that route to a real support team AND send that team an e-mail are picker-able,
+// listed in the same order as the team sidebar. "LMS", "Others", "Aptem" and
+// "Teams" are intentionally omitted from the picker but stay valid values the
+// backend and chatbot may still produce, so existing tickets keep rendering.
 export const SELECTABLE_TECHNICAL_SUBCATEGORIES: TechnicalSubcategory[] = [
-  "LMS",
-  "AI Team",
   "Coverage",
-  "Enrolment",
-  "Quality",
-  "Operation",
+  "AI Team",
   "Curriculum",
-  "Others",
+  "Enrolment",
+  "Operation",
+  "Quality",
 ];
 
-// Display-only label. The stored/internal value stays "AI Team" (all routing,
-// team assignment and webhooks depend on it); only what the user reads changes.
+// Display-only labels. The stored/internal values stay as-is (all routing, team
+// assignment and webhooks depend on them); only what the user reads changes, so
+// every surface (create form, dashboard column, sort menu) reads the team name
+// shown in the sidebar.
+const TECHNICAL_SUBCATEGORY_TEAM_LABELS: Record<string, string> = {
+  Coverage: "Learning Plan Team",
+  "AI Team": "Ai Team",
+  Curriculum: "Curriculum Team",
+  Enrolment: "Enrolment Team",
+  Operation: "Operation Team",
+  Quality: "Quality team",
+};
+
 export function formatTechnicalSubcategoryLabel(value: TechnicalSubcategory | string | null | undefined): string {
-  if ((value || "").trim() === "AI Team") {
-    return "Tech team";
-  }
-  return (value || "").trim();
+  const trimmed = (value || "").trim();
+  return TECHNICAL_SUBCATEGORY_TEAM_LABELS[trimmed] ?? trimmed;
 }
 export type RequesterRole = "user" | "coach" | "tutor" | "employer";
 export type RequesterSource = "kbc_users_data" | "lms_learners" | "microsoft_entra" | "support_portal_requester" | "";

@@ -82,7 +82,11 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-SUPPORT_ATTACHMENT_ROOT = BASE_DIR / "media" / "support_attachments"
+SUPPORT_ATTACHMENT_ROOT = Path(
+    get_env("SUPPORT_ATTACHMENT_ROOT", "").strip() or BASE_DIR / "media" / "support_attachments"
+).expanduser()
+if not SUPPORT_ATTACHMENT_ROOT.is_absolute():
+    SUPPORT_ATTACHMENT_ROOT = BASE_DIR / SUPPORT_ATTACHMENT_ROOT
 SUPPORT_ATTACHMENT_MAX_FILE_BYTES = max(
     int(get_env("SUPPORT_ATTACHMENT_MAX_FILE_BYTES", str(50 * 1024 * 1024)) or str(50 * 1024 * 1024)),
     1024,
@@ -174,6 +178,14 @@ LEGACY_EXPRESS_ENTRYPOINT = BASE_DIR / "index.mjs"
 AZURE_BOOKING_TENANT_ID = get_env("AZURE_BOOKING_TENANT_ID", get_env("AZURE_TENANT_ID"))
 AZURE_BOOKING_CLIENT_ID = get_env("AZURE_BOOKING_CLIENT_ID", get_env("AZURE_CLIENT_ID"))
 AZURE_BOOKING_CLIENT_SECRET = get_env("AZURE_BOOKING_CLIENT_SECRET", get_env("AZURE_CLIENT_SECRET"))
+# Direct Microsoft Graph e-mail sender (the replacement for n8n delivery). Uses the
+# client-credentials (app-only) flow with Mail.Send application permission and sends
+# as AZURE_MAIL_SENDER. The sender is a config value so it can switch (e.g. to
+# support@) once the tenant's AppOnly Access Policy allows that mailbox.
+AZURE_MAIL_TENANT_ID = get_env("AZURE_MAIL_TENANT_ID", get_env("AZURE_LOGIN_TENANT_ID", get_env("AZURE_TENANT_ID")))
+AZURE_MAIL_CLIENT_ID = get_env("AZURE_MAIL_CLIENT_ID")
+AZURE_MAIL_CLIENT_SECRET = get_env("AZURE_MAIL_CLIENT_SECRET")
+AZURE_MAIL_SENDER = get_env("AZURE_MAIL_SENDER", "lms@kentbusinesscollege.com")
 AZURE_LOGIN_TENANT_ID = get_env("AZURE_LOGIN_TENANT_ID", get_env("AZURE_TENANT_ID"))
 AZURE_LOGIN_CLIENT_ID = get_env("AZURE_LOGIN_CLIENT_ID", get_env("AZURE_CLIENT_ID"))
 AZURE_LOGIN_CLIENT_SECRET = get_env("AZURE_LOGIN_CLIENT_SECRET", get_env("AZURE_CLIENT_SECRET"))
@@ -194,6 +206,13 @@ SUPPORT_TEAMS_CALL_TARGETS = get_env_list("SUPPORT_TEAMS_CALL_TARGETS", "")
 # Who the support team's own notifications reach. Sent in the webhook payload so
 # n8n addresses the mail from here rather than from its own copy of the rota.
 SUPPORT_OPERATIONS_NOTIFICATION_EMAILS = get_env_list("SUPPORT_OPERATIONS_NOTIFICATION_EMAILS", "")
+# Addresses that are CC'd on EVERY newly created ticket, on top of the team /
+# operations recipients. Lets a super admin keep an eye on all incoming tickets.
+# Comma-separated; override from the environment to add or remove people.
+SUPPORT_TICKET_CREATED_ALWAYS_NOTIFY_EMAILS = get_env_list(
+    "SUPPORT_TICKET_CREATED_ALWAYS_NOTIFY_EMAILS",
+    "khaled.ashraf@kentbusinesscollege.com",
+)
 SUPPORT_TEAMS_CALL_LABEL = get_env("SUPPORT_TEAMS_CALL_LABEL", "")
 SUPPORT_BOOKING_URL = get_env(
     "SUPPORT_BOOKING_URL",

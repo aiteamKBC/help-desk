@@ -27,6 +27,7 @@ from django.core import signing
 from django.db import close_old_connections, connection, transaction
 from django.utils import timezone as django_timezone
 
+from . import graph_mail
 from .roles import (
     ACCOUNT_ROLES,
     ACCOUNT_SCOPE_REQUESTER,
@@ -263,11 +264,15 @@ AI_TEAM_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY = "ai_team_ticket_sub
 LIVE_AGENT_UNAVAILABLE_NOTIFICATION_SENT_AT_METADATA_KEY = "live_agent_unavailable_operations_notified_at"
 SUBMITTED_FOR_LEARNER_METADATA_KEY = "submitted_for_learner"
 NOTIFY_SUBMITTED_FOR_LEARNER_METADATA_KEY = "notify_submitted_for_learner"
+LEARNER_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "submitted_for_learner_created_email_sent_at"
+LEARNER_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY = "submitted_for_learner_closed_email_sent_at"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED = "quick_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED = "quick_ticket_closed"
 SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED = "ai_team_ticket_submitted"
 SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
 SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED = "ticket_created"
+SUPPORT_NOTIFICATION_EVENT_LEARNER_CREATED = "submitted_for_learner_created"
+SUPPORT_NOTIFICATION_EVENT_LEARNER_CLOSED = "submitted_for_learner_closed"
 TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "ticket_created_operations_notified_at"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
@@ -279,6 +284,8 @@ SUPPORT_NOTIFICATION_RETRY_BACKOFF_SECONDS = (1.0, 4.0, 15.0)
 SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024
 SUPPORT_NOTIFICATION_ATTACHMENT_DEFAULT_MAX_TOTAL_BYTES = 18 * 1024 * 1024
 SUPPORT_NOTIFICATION_HISTORY_EVENTS = {
+    SUPPORT_NOTIFICATION_EVENT_LEARNER_CREATED: ("submitted_for_learner_created_email_sent", "submitted_for_learner_created_email_failed"),
+    SUPPORT_NOTIFICATION_EVENT_LEARNER_CLOSED: ("submitted_for_learner_closed_email_sent", "submitted_for_learner_closed_email_failed"),
     SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED: (
         "quick_ticket_confirmation_email_sent",
         "quick_ticket_confirmation_email_failed",
@@ -6862,6 +6869,23 @@ def get_support_operations_notification_emails() -> list[str]:
     return emails
 
 
+def get_ticket_created_always_notify_emails() -> list[str]:
+    """Extra addresses CC'd on EVERY newly created ticket (e.g. a super admin).
+
+    Appended to the team / operations recipients on the ticket-created webhook so
+    these people get one e-mail per new ticket, whatever team it is routed to.
+    Configured via SUPPORT_TICKET_CREATED_ALWAYS_NOTIFY_EMAILS.
+    """
+    configured = getattr(settings, "SUPPORT_TICKET_CREATED_ALWAYS_NOTIFY_EMAILS", None)
+    raw = [configured] if isinstance(configured, str) else list(configured or [])
+    emails: list[str] = []
+    for item in raw:
+        address = normalize_email(item)
+        if address and address not in emails:
+            emails.append(address)
+    return emails
+
+
 def build_support_notification_webhook_payload(
     event: str,
     ticket: dict[str, Any],
@@ -6922,8 +6946,14 @@ def build_support_notification_webhook_payload(
             ticket.get("assigned_team")
         ) or resolve_department_routing(ticket.get("technical_subcategory"))
         if department:
-            department_email = normalize_email(department["email"])
-            recipients = [department_email] if department_email else []
+            # Department tickets notify the team's registered members directly, so
+            # each person sees it in their own inbox (instead of only the shared
+            # mailbox). The shared mailbox is kept only as a safety net when a team
+            # has no members configured, so a ticket is never sent to nobody.
+            recipients = resolve_team_member_notification_emails(department["team"])
+            if not recipients:
+                department_email = normalize_email(department["email"])
+                recipients = [department_email] if department_email else []
         else:
             recipients = get_support_operations_notification_emails()
     elif recipient_type == "ai_team_person":
@@ -7026,6 +7056,14 @@ def send_support_notification_webhook(
     *,
     attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # Direct Microsoft Graph delivery replaces n8n whenever the mail app is
+    # configured (AZURE_MAIL_*). The e-mail is rendered in-backend from this same
+    # payload; n8n stays only as a fallback for deployments without Graph set up.
+    # Skipped under the test runner so the webhook-mocking tests keep exercising
+    # the webhook transport.
+    if not settings.IS_TESTING and graph_mail.is_graph_mail_configured():
+        return graph_mail.send_notification_via_graph(payload, attachments=attachments)
+
     # Every attempt carries the same X-Support-Delivery-Key, so a receiver that
     # checks it can recognise a repeat. See _is_retryable_notification_failure
     # for which failures are sent again and why a timeout is not one of them.
@@ -7143,7 +7181,7 @@ def queue_support_notification_delivery(
     sent_metadata_key: str,
     attachments: list[dict[str, Any]] | None = None,
 ) -> None:
-    if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
+    if (not get_support_notification_webhook_url() and not graph_mail.is_graph_mail_configured()) or not is_support_notification_delivery_enabled():
         return
 
     def deliver() -> None:
@@ -7224,10 +7262,14 @@ def should_notify_quick_ticket_closed(
     if metadata.get(QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY):
         return False
 
+    # Notify the requester whenever their ticket is closed -- for EVERY ticket
+    # type, not only chatbot "quick" tickets -- so whoever opened it (learner,
+    # coach, ...) always receives the "resolved / closed" e-mail. Coverage tickets
+    # and already-notified tickets are excluded above. previous_status_reason is
+    # kept in the signature for the call sites but no longer gates the e-mail.
     return (
         sanitize_text(previous_status) != "Closed"
         and sanitize_text(next_status) == "Closed"
-        and is_quick_ticket_status_reason(previous_status_reason)
     )
 
 
@@ -7285,6 +7327,37 @@ def queue_quick_ticket_closed_notification(ticket: dict[str, Any], *, status: st
     )
 
 
+def queue_submitted_for_learner_notification(
+    ticket: dict[str, Any], *, closed: bool = False, status: str | None = None,
+    status_reason: str | None = None, closed_at: Any = None,
+) -> None:
+    metadata = normalize_json_object(ticket.get("metadata"))
+    learner = normalize_json_object(metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
+    if not learner or not normalize_bool(learner.get("notifyByEmail")):
+        return
+    event = SUPPORT_NOTIFICATION_EVENT_LEARNER_CLOSED if closed else SUPPORT_NOTIFICATION_EVENT_LEARNER_CREATED
+    sent_key = LEARNER_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY if closed else LEARNER_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY
+    if metadata.get(sent_key):
+        return
+    # Resolve the address again from the learner record, so stored ticket metadata
+    # and client-provided fields cannot redirect a notification.
+    official_learner = fetch_local_learner_by_id(learner.get("id"))
+    recipient = normalize_email((official_learner or {}).get("email"))
+    requester_email = normalize_email(ticket.get("learner_email") or ticket.get("email"))
+    if not is_valid_email(recipient) or recipient == requester_email:
+        return
+    payload = build_support_notification_webhook_payload(
+        event, ticket, status=status, status_reason=status_reason, closed_at=closed_at,
+    )
+    payload["recipientType"] = "submitted_for_learner"
+    payload["recipients"] = [recipient]
+    payload["submittedFor"] = {**learner, "email": recipient, "notificationEmail": recipient}
+    queue_support_notification_delivery(
+        ticket_id=int(ticket["id"]), ticket_public_id=sanitize_text(ticket.get("public_id")),
+        event=event, payload=payload, sent_metadata_key=sent_key,
+    )
+
+
 def should_notify_live_agent_unavailable(ticket: dict[str, Any], *, assigned_agent_id: Any) -> bool:
     if assigned_agent_id:
         return False
@@ -7321,6 +7394,16 @@ def queue_ticket_created_notification(ticket: dict[str, Any]) -> None:
         SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
         ticket,
     )
+    # CC any "always notify" admins (e.g. a super admin watching every ticket) on
+    # top of the team / operations recipients the payload already carries, so a
+    # single new ticket reaches them regardless of which team it is routed to.
+    always_notify = get_ticket_created_always_notify_emails()
+    if always_notify:
+        combined = list(payload.get("recipients") or [])
+        for address in always_notify:
+            if address not in combined:
+                combined.append(address)
+        payload["recipients"] = combined
     queue_support_notification_delivery(
         ticket_id=int(ticket["id"]),
         ticket_public_id=sanitize_text(ticket.get("public_id")),
@@ -7344,7 +7427,7 @@ def notify_department_ticket_assignment(ticket_row: dict[str, Any]) -> dict[str,
     # Honour the same delivery gate as every other notification path, so a
     # deployment that disables delivery (or has no webhook configured) never
     # sends department mail either.
-    if not get_support_notification_webhook_url() or not is_support_notification_delivery_enabled():
+    if (not get_support_notification_webhook_url() and not graph_mail.is_graph_mail_configured()) or not is_support_notification_delivery_enabled():
         return {"configured": False, "delivered": False, "status": None, "response": None}
 
     try:
@@ -7366,6 +7449,94 @@ def notify_department_ticket_assignment(ticket_row: dict[str, Any]) -> dict[str,
             {
                 "assignedTeam": ticket_row.get("assigned_team"),
                 "recipient": normalize_email(department["email"]),
+                "webhookStatus": result.get("status"),
+                "webhookDelivered": result.get("delivered"),
+            },
+        )
+    except Exception:
+        pass
+
+    return result
+
+
+def resolve_team_member_notification_emails(assigned_team: Any) -> list[str]:
+    """Active member e-mails for a team, addressed by its assigned_team name.
+
+    Used to notify a destination team's members when a ticket is transferred to a
+    team that has no dedicated shared mailbox (Support Desk, Ai Team, or a custom
+    team). Department teams keep using their shared mailbox instead.
+    """
+    team_row = fetch_optional_dynamic_team_row_by_assigned_team(assigned_team)
+    team_key = sanitize_text(team_row.get("key")) if team_row else ""
+    if not team_key:
+        return []
+
+    rows = run_query(
+        """
+        SELECT DISTINCT sa.email
+        FROM support_accounts sa
+        JOIN support_account_team_access ata ON ata.account_id = sa.id
+        JOIN support_teams st ON st.id = ata.team_id
+        WHERE sa.is_active = TRUE
+          AND sa.account_scope = %s
+          AND st.key = %s
+          AND st.is_active = TRUE
+          AND ata.can_receive_tickets = TRUE
+          AND sa.email IS NOT NULL
+          AND TRIM(sa.email) <> ''
+        ORDER BY sa.email ASC
+        """,
+        [ACCOUNT_SCOPE_STAFF, team_key],
+    )
+
+    emails: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        normalized = normalize_email(row.get("email"))
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            emails.append(normalized)
+    return emails
+
+
+def notify_team_members_ticket_assignment(ticket_row: dict[str, Any]) -> dict[str, Any]:
+    """E-mail a destination team's members when a ticket is transferred to them.
+
+    Covers teams without a dedicated shared mailbox (Support Desk, Ai Team, and
+    custom teams). Department teams are notified through their shared mailbox in
+    notify_department_ticket_assignment, and the Learning Plan Team keeps its own
+    transfer webhook, so this path only runs for the remaining teams.
+    """
+    recipients = resolve_team_member_notification_emails(ticket_row.get("assigned_team"))
+    if not recipients:
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    # Honour the same delivery gate as every other notification path.
+    if (not get_support_notification_webhook_url() and not graph_mail.is_graph_mail_configured()) or not is_support_notification_delivery_enabled():
+        return {"configured": False, "delivered": False, "status": None, "response": None}
+
+    try:
+        payload = build_support_notification_webhook_payload(
+            SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED,
+            ticket_row,
+        )
+        # Reuse the proven ticket-created webhook shape, but address the
+        # destination team's members instead of the operations inbox.
+        payload["recipients"] = recipients
+        result = send_support_notification_webhook(payload)
+    except Exception:
+        result = {"configured": True, "delivered": False, "status": None, "response": None}
+
+    try:
+        insert_history_event(
+            int(ticket_row["id"]),
+            "team_transfer_notified"
+            if result.get("delivered")
+            else "team_transfer_notification_failed",
+            None,
+            {
+                "assignedTeam": ticket_row.get("assigned_team"),
+                "recipients": recipients,
                 "webhookStatus": result.get("status"),
                 "webhookDelivered": result.get("delivered"),
             },
@@ -10631,6 +10802,13 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "assignedAgentId": int(row["assigned_agent_id"]) if row.get("assigned_agent_id") else None,
         "assignedAgentName": row.get("assigned_agent_name") or "Unassigned",
         "assignedAgentUsername": row.get("assigned_agent_username") or "",
+        "assignedAgentEmail": row.get("assigned_agent_email") or normalize_json_object(ticket_metadata.get("assigned_agent_record")).get("email") or "",
+        "assignedAt": (
+            normalize_json_object(ticket_metadata.get("assigned_agent_record")).get("assignedAt")
+            or ticket_metadata.get("quick_ticket_assigned_at")
+            or ticket_metadata.get("queue_assigned_at")
+        ) if row.get("assigned_agent_id") else None,
+        "resolvedBy": normalize_json_object(ticket_metadata.get("resolved_by")) if row.get("status") == "Closed" else {},
         "assignedTeam": row.get("assigned_team") or "Unassigned",
         "chatId": build_public_chat_id(row.get("public_id"), row.get("conversation_id"), conversation_metadata),
         "chatIsActive": is_active_conversation(conversation_metadata)
@@ -12475,29 +12653,6 @@ def apply_ticket_chat_history_sync(
                 ticket["id"],
             ],
         )
-
-    if (
-        status == "Pending"
-        and is_quick_ticket_status_reason(next_status_reason)
-        and not is_coverage_ticket_record(ticket)
-        and not is_ai_team_ticket_record(ticket)
-    ):
-        assignment_ticket = {
-            **ticket,
-            "status": status,
-            "status_reason": next_status_reason,
-            "metadata": updated_ticket_metadata,
-        }
-        if try_auto_assign_quick_ticket(assignment_ticket, now=persisted_at):
-            ticket.update(
-                {
-                    "assigned_agent_id": assignment_ticket.get("assigned_agent_id"),
-                    "assigned_agent_username": assignment_ticket.get("assigned_agent_username"),
-                    "assigned_agent_name": assignment_ticket.get("assigned_agent_name"),
-                    "assigned_team": assignment_ticket.get("assigned_team"),
-                    "metadata": assignment_ticket.get("metadata"),
-                }
-            )
 
     if map_conversation_status(status) == "closed":
         persist_conversation_chat_duration(ticket["id"], ticket["conversation_id"], reference_time=persisted_at)
@@ -14417,44 +14572,9 @@ def insert_history_event(ticket_id: int, event_type: str, actor: dict[str, Any] 
 
 def fetch_admin_ticket_detail(public_id: str) -> dict[str, Any] | None:
     ticket = run_query_one(
-        """
-        SELECT
-          t.id,
-          t.public_id,
-          t.category,
-          t.technical_subcategory,
-          t.inquiry,
-          t.status,
-          t.status_reason,
-          t.assigned_team,
-          t.sla_status,
-          t.priority,
-          t.evidence_count,
-          t.metadata,
-          t.is_archived,
-          t.archived_at,
-          t.archived_by_id,
-          t.created_at,
-          t.updated_at,
-          t.closed_at,
-          t.conversation_id,
-          c.status AS conversation_status,
-          c.metadata AS conversation_metadata,
-          c.chat_duration_minutes,
-          c.last_message_at,
-          latest_session_request.status AS latest_session_request_status,
-          latest_session_request.metadata AS latest_session_request_metadata,
-          l.full_name AS learner_name,
-          l.email AS learner_email,
-          l.phone AS learner_phone,
-          submitted_for.external_learner_id AS submitted_for_external_learner_id,
-          submitted_for.full_name AS submitted_for_learner_name,
-          submitted_for.email AS submitted_for_learner_email,
-          a.id AS assigned_agent_id,
-          a.username AS assigned_agent_username,
-          a.full_name AS assigned_agent_name,
-          archived_by.username AS archived_by_username,
-          archived_by.full_name AS archived_by_name
+        get_admin_ticket_sql_select_clause()
+        + """,
+          t.closed_at
         FROM tickets t
         JOIN learners l
           ON l.id = t.learner_id
@@ -15599,7 +15719,8 @@ def _sync_tickets_background() -> None:
               c.status AS conversation_status,
               c.metadata AS conversation_metadata,
               a.username AS assigned_agent_username,
-              a.full_name AS assigned_agent_name
+              a.full_name AS assigned_agent_name,
+              a.email AS assigned_agent_email
             FROM tickets t
             LEFT JOIN conversations c
               ON c.id = t.conversation_id
@@ -16239,6 +16360,7 @@ def get_admin_ticket_sql_select_clause() -> str:
           a.id AS assigned_agent_id,
           a.username AS assigned_agent_username,
           a.full_name AS assigned_agent_name,
+          a.email AS assigned_agent_email,
           archived_by.username AS archived_by_username,
           archived_by.full_name AS archived_by_name
     """
@@ -18819,6 +18941,12 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
     if response_mail_webhook_ticket_id and response_mail_webhook_payload:
         notify_coverage_tutor_response_mail_webhook(response_mail_webhook_ticket_id, response_mail_webhook_payload)
 
+    if ticket.get("status") != "Closed" and next_status == "Closed":
+        try:
+            queue_submitted_for_learner_notification(ticket, closed=True, status=next_status, status_reason=next_status_reason)
+        except Exception:
+            logger.warning("Could not queue the learner closure notification for %s", ticket_public_id, exc_info=True)
+
     detail = fetch_admin_ticket_detail(ticket_public_id)
     if not detail:
         raise ApiError(404, "Ticket not found.")
@@ -19242,6 +19370,12 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
                 "confirmedByUsername": actor_row["username"],
             },
         )
+
+    if ticket.get("status") != "Closed":
+        try:
+            queue_submitted_for_learner_notification(ticket, closed=True, status="Closed", status_reason=STATUS_REASON_CLOSED_BY_AGENT)
+        except Exception:
+            logger.warning("Could not queue the learner closure notification for %s", public_id, exc_info=True)
 
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:
@@ -20328,6 +20462,9 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     note = sanitize_text(payload.get("note"))
     has_assigned_agent_input = "assignedAgentId" in payload
+    is_claim_request = payload.get("claim") is True
+    if is_claim_request and (has_assigned_agent_input or requested_assigned_team is not None or requested_status is not None):
+        raise ApiError(400, "Claim must be a separate ticket action.")
 
     if not public_id:
         raise ApiError(400, "Ticket id is required.")
@@ -20349,6 +20486,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     learning_plan_transfer_webhook_ticket_id: int | None = None
     learning_plan_transfer_webhook_payload: dict[str, Any] | None = None
     department_transfer_notification_ticket: dict[str, Any] | None = None
+    team_member_notification_ticket: dict[str, Any] | None = None
     learning_plan_transfer_notification_payload: dict[str, Any] | None = None
     documentation_history_events: list[tuple[str, dict[str, Any]]] = []
 
@@ -20379,7 +20517,8 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
               l.metadata AS learner_metadata,
               c.metadata AS conversation_metadata,
               a.username AS assigned_agent_username,
-              a.full_name AS assigned_agent_name
+              a.full_name AS assigned_agent_name,
+              a.email AS assigned_agent_email
             FROM tickets t
             JOIN learners l
               ON l.id = t.learner_id
@@ -20389,6 +20528,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
               ON c.id = t.conversation_id
             WHERE t.public_id = %s
             LIMIT 1
+            FOR UPDATE OF t
             """,
             [public_id],
         )
@@ -20403,6 +20543,15 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
 
         actor_row = fetch_actor_by_username(actor_username) if actor_username else None
         require_actor_can_access_admin_ticket(actor_row, ticket)
+        if is_claim_request:
+            if ticket.get("assigned_agent_id"):
+                raise ApiError(409, "This ticket has already been claimed.")
+            if ticket.get("status") == "Closed":
+                raise ApiError(409, "Closed tickets cannot be claimed.")
+            if not account_can_receive_ticket_assignment(actor_row, ticket):
+                raise ApiError(403, "You are not a receiving member of this ticket's team.")
+            has_assigned_agent_input = True
+            parsed_assigned_agent_id = int(actor_row["id"])
         actor = (
             {
                 "id": actor_row["id"],
@@ -20434,7 +20583,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
 
         if requested_assignment_changed:
-            if actor_role not in ADMIN_ACCESS_ROLES:
+            if actor_role not in ADMIN_ACCESS_ROLES and not is_claim_request:
                 raise ApiError(403, "Only admins and superadmins can assign tickets.")
 
         if requested_assigned_team is not None:
@@ -20448,8 +20597,8 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 normalized_requested_assigned_team,
             ):
                 raise ApiError(403, "You do not have permission to transfer this ticket to another team.")
-            if requested_team_changed and actor_role not in ADMIN_ACCESS_ROLES and has_assigned_agent_input:
-                raise ApiError(403, "Team transfers by agents cannot assign a receiver.")
+            if requested_team_changed and has_assigned_agent_input:
+                raise ApiError(400, "Transfer the ticket first, then let a receiving team member claim it.")
             if requested_team_changed and not note:
                 raise ApiError(400, "Add a transfer note before moving this ticket to another team.")
 
@@ -20497,24 +20646,6 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 "full_name": ticket.get("assigned_agent_name"),
                 "role": "agent",
             }
-
-        auto_assigned_actor = None
-        if (
-            not has_assigned_agent_input
-            and current_assigned_agent_id is None
-            and not requested_team_changed
-            and actor_row
-            and sanitize_text(actor_row.get("role")).lower() in {ROLE_ADMIN, ROLE_SUPERADMIN}
-            and account_can_receive_ticket_assignment(actor_row, target_assignment_ticket)
-        ):
-            auto_assigned_actor = {
-                "id": int(actor_row["id"]),
-                "username": actor_row["username"],
-                "full_name": actor_row.get("full_name") or actor_row["username"],
-                "email": actor_row.get("email"),
-                "role": actor_row["role"],
-            }
-            assigned_agent = auto_assigned_actor
 
         next_status = requested_status or ticket["status"]
         is_escalation_notification = next_status == "Pending" and requested_status_reason == STATUS_REASON_ESCALATION
@@ -20645,8 +20776,6 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
 
         if has_assigned_agent_input:
             next_assigned_agent_id = parsed_assigned_agent_id
-        elif auto_assigned_actor:
-            next_assigned_agent_id = auto_assigned_actor["id"]
         elif requested_team_changed:
             next_assigned_agent_id = None
         else:
@@ -20657,8 +20786,12 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 current_assigned_team,
                 assigned_agent,
             )
-        elif has_assigned_agent_input or auto_assigned_actor:
-            next_assigned_team = derive_assigned_team_for_ticket_assignment(current_assigned_team, assigned_agent)
+        elif has_assigned_agent_input:
+            next_assigned_team = (
+                derive_assigned_team_for_ticket_assignment(current_assigned_team, assigned_agent)
+                if current_assigned_team == ASSIGNED_TEAM_UNASSIGNED
+                else current_assigned_team
+            )
         else:
             next_assigned_team = current_assigned_team
         if next_assigned_agent_id is None:
@@ -20679,6 +20812,32 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         if requested_team_changed:
             updated_ticket_metadata.pop(PENDING_TRANSFER_REQUEST_METADATA_KEY, None)
             updated_ticket_metadata.pop(LATEST_TRANSFER_DECISION_METADATA_KEY, None)
+
+        if next_assigned_agent_id != current_assigned_agent_id:
+            if next_assigned_agent_id:
+                updated_ticket_metadata["assigned_agent_record"] = {
+                    "id": int(next_assigned_agent_id),
+                    "name": next_assigned_agent_name,
+                    "username": next_assigned_agent_username,
+                    "email": sanitize_text(assigned_agent.get("email")) if assigned_agent else "",
+                    "assignedAt": datetime.now(timezone.utc).isoformat(),
+                    "assignmentSource": "claim" if is_claim_request else "admin",
+                }
+            else:
+                updated_ticket_metadata.pop("assigned_agent_record", None)
+
+        if ticket["status"] != "Closed" and next_status == "Closed":
+            updated_ticket_metadata["resolved_by"] = (
+                {
+                    "id": int(actor_row["id"]),
+                    "name": sanitize_text(actor_row.get("full_name") or actor_row.get("username")),
+                    "username": sanitize_text(actor_row.get("username")),
+                    "email": sanitize_text(actor_row.get("email")),
+                    "resolvedAt": datetime.now(timezone.utc).isoformat(),
+                } if actor_row else {}
+            )
+        elif ticket["status"] == "Closed" and next_status != "Closed":
+            updated_ticket_metadata.pop("resolved_by", None)
 
         if not is_next_learning_plan_team:
             updated_ticket_metadata.pop(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY, None)
@@ -20800,8 +20959,13 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 actor,
                 {
                     "fromAgentId": ticket.get("assigned_agent_id"),
+                    "fromAgentName": ticket.get("assigned_agent_name"),
+                    "fromAgentEmail": ticket.get("assigned_agent_email"),
                     "toAgentId": next_assigned_agent_id,
                     "toAgentName": assigned_agent.get("full_name") if assigned_agent else None,
+                    "toAgentEmail": assigned_agent.get("email") if assigned_agent else None,
+                    "assignedAt": datetime.now(timezone.utc).isoformat() if next_assigned_agent_id else None,
+                    "assignmentSource": "claim" if is_claim_request else "admin",
                 },
             )
 
@@ -20841,6 +21005,20 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 )
             elif resolve_department_routing_by_team(next_assigned_team):
                 department_transfer_notification_ticket = {
+                    **ticket,
+                    "status": next_status,
+                    "status_reason": next_status_reason,
+                    "assigned_agent_id": next_assigned_agent_id,
+                    "assigned_agent_name": next_assigned_agent_name,
+                    "assigned_agent_username": next_assigned_agent_username,
+                    "assigned_team": next_assigned_team,
+                    "sla_status": next_sla_status,
+                    "metadata": updated_ticket_metadata,
+                }
+            else:
+                # Any other destination team (Support Desk, Ai Team, or a custom
+                # team) has no shared mailbox, so notify its members directly.
+                team_member_notification_ticket = {
                     **ticket,
                     "status": next_status,
                     "status_reason": next_status_reason,
@@ -20914,6 +21092,11 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 requested_inquiry=requested_follow_up_inquiry,
             )
 
+    if sanitize_text(ticket.get("status")) != "Closed" and next_status == "Closed":
+        try:
+            queue_submitted_for_learner_notification(ticket, closed=True, status=next_status, status_reason=next_status_reason)
+        except Exception:
+            logger.warning("Could not queue the learner closure notification for %s", ticket.get("public_id"), exc_info=True)
     if should_queue_admin_quick_closed_notification:
         queue_quick_ticket_closed_notification(
             ticket,
@@ -20927,6 +21110,8 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
         )
     if department_transfer_notification_ticket:
         notify_department_ticket_assignment(department_transfer_notification_ticket)
+    if team_member_notification_ticket:
+        notify_team_members_ticket_assignment(team_member_notification_ticket)
 
     detail_public_id = follow_up_public_id or public_id
     detail = fetch_admin_ticket_detail(detail_public_id)
@@ -21199,12 +21384,9 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
             )
             submitted_for_notification_email = ""
             if submitted_for_learner:
-                raw_submitted_for_notification_email = sanitize_text(payload.get("submittedForNotificationEmail"))
-                submitted_for_notification_email = normalize_email(raw_submitted_for_notification_email) or normalize_email(submitted_for_learner.get("email"))
-                if raw_submitted_for_notification_email and not is_valid_email(submitted_for_notification_email):
-                    raise ApiError(400, "Please enter a valid learner notification email.")
+                submitted_for_notification_email = normalize_email(submitted_for_learner.get("email"))
                 if notify_submitted_for_learner and not is_valid_email(submitted_for_notification_email):
-                    raise ApiError(400, "Please enter a valid learner notification email before enabling learner notifications.")
+                    raise ApiError(400, "The selected learner needs a valid official email before enabling notifications.")
             managed_account = requester.get("account")
             ticket_metadata = {
                 "source": "support_portal",
@@ -21289,6 +21471,12 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
                     if (ai_team_request or is_ai_team_technical_subcategory(technical_subcategory))
                     else (resolve_department_assigned_team(technical_subcategory) or ticket_row["assigned_team"])
                 )
+                # Tickets that match no department / AI / Coverage routing used to
+                # stay "Unassigned" (e.g. Learning, Others, and Technical > LMS /
+                # Aptem / Teams / Others). Fall them back to the Support Desk queue
+                # so every new ticket lands in a team the moment it is created.
+                if get_effective_assigned_team(initial_assigned_team) == ASSIGNED_TEAM_UNASSIGNED:
+                    initial_assigned_team = ASSIGNED_TEAM_SUPPORT_DESK
                 initial_sla_status = "On Track" if technical_subcategory == "Coverage" else ticket_row["sla_status"]
                 if technical_subcategory == "Coverage":
                     ticket_metadata[PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY] = {
@@ -21525,6 +21713,21 @@ def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None =
     except Exception as error:  # pragma: no cover - notification is best effort
         logger.warning("Could not queue the ticket-created notification: %s", error)
 
+    if notify_submitted_for_learner:
+        try:
+            queue_submitted_for_learner_notification({
+                **ticket_row,
+                "public_id": public_id,
+                "metadata": ticket_metadata,
+                "subject": subject,
+                "category": category,
+                "technical_subcategory": technical_subcategory,
+                "learner_email": learner.get("email", ""),
+                "learner_name": requester.get("display_name") or learner.get("full_name") or "",
+            })
+        except Exception as error:  # pragma: no cover - notification is best effort
+            logger.warning("Could not queue the learner ticket notification: %s", error)
+
     return {
         "ticket": {
             "id": public_id,
@@ -21662,12 +21865,9 @@ def update_ticket(public_id: str, payload: dict[str, Any], *, uploaded_files: li
                 )
                 submitted_for_notification_email = ""
                 if submitted_for_learner:
-                    raw_submitted_for_notification_email = sanitize_text(payload.get("submittedForNotificationEmail"))
-                    submitted_for_notification_email = normalize_email(raw_submitted_for_notification_email) or normalize_email(submitted_for_learner.get("email"))
-                    if raw_submitted_for_notification_email and not is_valid_email(submitted_for_notification_email):
-                        raise ApiError(400, "Please enter a valid learner notification email.")
+                    submitted_for_notification_email = normalize_email(submitted_for_learner.get("email"))
                     if notify_submitted_for_learner and not is_valid_email(submitted_for_notification_email):
-                        raise ApiError(400, "Please enter a valid learner notification email before enabling learner notifications.")
+                        raise ApiError(400, "The selected learner needs a valid official email before enabling notifications.")
 
                 submitted_for_payload = build_submitted_for_learner_payload(
                     submitted_for_learner,
@@ -22002,6 +22202,13 @@ def save_chat_history(public_id: str, payload: dict[str, Any], *, uploaded_files
         queue_quick_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
     if should_queue_ai_team_submitted_notification:
         queue_ai_team_ticket_submitted_notification(ticket, status=status, status_reason=next_status_reason)
+    if previous_status != "Closed" and status == "Closed":
+        try:
+            queue_submitted_for_learner_notification(
+                ticket, closed=True, status=status, status_reason=next_status_reason, closed_at=persisted_at,
+            )
+        except Exception:
+            logger.warning("Could not queue the learner closure notification for %s", ticket.get("public_id"), exc_info=True)
     if should_queue_quick_closed_notification:
         queue_quick_ticket_closed_notification(
             ticket,

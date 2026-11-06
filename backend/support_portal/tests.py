@@ -8983,7 +8983,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             services.update_admin_ticket("KBC-000017", {"status": "Closed", "chatState": "closed", "note": "Resolved"})
             persist_conversation_chat_duration.assert_called_once_with(17, 44)
 
-    def test_update_admin_ticket_auto_assigns_first_saver_when_ticket_is_unassigned(self):
+    def test_update_admin_ticket_does_not_assign_first_saver_when_ticket_is_unassigned(self):
         ticket = {
             "id": 17,
             "public_id": "KBC-000017",
@@ -9014,8 +9014,8 @@ class AdminTicketUpdateTests(SimpleTestCase):
         detail = {
             "ticket": {
                 "id": "KBC-000017",
-                "assignedAgentId": 9,
-                "assignedTeam": "Support Desk",
+                "assignedAgentId": None,
+                "assignedTeam": "Unassigned",
                 "status": "Open",
                 "statusReason": "",
                 "slaStatus": "Pending Review",
@@ -9042,14 +9042,9 @@ class AdminTicketUpdateTests(SimpleTestCase):
 
         self.assertEqual(response, detail)
         update_params = cursor.execute.call_args_list[0].args[1]
-        self.assertEqual(update_params[2], 9)
-        self.assertEqual(update_params[3], "Support Desk")
-        insert_history_event.assert_any_call(
-            17,
-            "assignment_changed",
-            {"id": 9, "role": "admin", "label": "Omar Helmy"},
-            {"fromAgentId": None, "toAgentId": 9, "toAgentName": "Omar Helmy"},
-        )
+        self.assertIsNone(update_params[2])
+        self.assertEqual(update_params[3], "Unassigned")
+        self.assertNotIn("assignment_changed", [call.args[1] for call in insert_history_event.call_args_list])
 
     def test_update_admin_ticket_rejects_support_only_actor_for_coverage_ticket(self):
         ticket = {
@@ -11823,7 +11818,7 @@ class AgentQueueTests(SimpleTestCase):
         mock_connection.cursor.assert_not_called()
         persist_agent_metadata.assert_not_called()
 
-    def test_save_chat_history_auto_assigns_pending_quick_ticket(self):
+    def test_save_chat_history_leaves_pending_quick_ticket_for_explicit_claim(self):
         ticket = {
             "id": 23,
             "public_id": "KBC-000023",
@@ -11874,11 +11869,9 @@ class AgentQueueTests(SimpleTestCase):
                 },
             )
 
-        try_auto_assign_quick_ticket.assert_called_once()
-        self.assertEqual(response["ticket"]["assignedAgentId"], 5)
-        self.assertEqual(response["ticket"]["assignedAgentName"], "Ahmed Hamamo")
-        self.assertEqual(response["ticket"]["assignedAgentUsername"], "ahmed")
-        self.assertEqual(response["ticket"]["assignedTeam"], "Support Desk")
+        try_auto_assign_quick_ticket.assert_not_called()
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
+        self.assertEqual(response["ticket"]["assignedTeam"], "")
 
     def test_save_chat_history_keeps_pending_coverage_quick_ticket_unassigned(self):
         ticket = {
@@ -11998,11 +11991,9 @@ class AgentQueueTests(SimpleTestCase):
             )
 
         clear_prepared_support_teams_call.assert_called_once()
-        try_auto_assign_quick_ticket.assert_called_once()
-        self.assertEqual(response["ticket"]["assignedAgentId"], 5)
-        self.assertEqual(response["ticket"]["assignedAgentName"], "Ahmed Hamamo")
-        self.assertEqual(response["ticket"]["assignedAgentUsername"], "ahmed")
-        self.assertEqual(response["ticket"]["assignedTeam"], "Support Desk")
+        try_auto_assign_quick_ticket.assert_not_called()
+        self.assertIsNone(response["ticket"]["assignedAgentId"])
+        self.assertEqual(response["ticket"]["assignedTeam"], "Unassigned")
 
     def test_save_chat_history_defaults_pending_reason_to_awaiting_resolution(self):
         ticket = {
@@ -12048,7 +12039,7 @@ class AgentQueueTests(SimpleTestCase):
         update_params = cursor.execute.call_args_list[0].args[1]
         self.assertEqual(update_params[1], "Awaiting resolution")
         self.assertEqual(response["ticket"]["statusReason"], "Awaiting resolution")
-        try_auto_assign_quick_ticket.assert_called_once()
+        try_auto_assign_quick_ticket.assert_not_called()
 
     def test_save_chat_history_only_persists_duration_when_chat_closes(self):
         ticket = {

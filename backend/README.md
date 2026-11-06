@@ -40,6 +40,13 @@ The existing `DATABASE_URL`, `SUPPORT_PORTAL_PASSWORD`, `N8N_BOOKING_WEBHOOK_URL
 
 For the admin console AI panel, you can optionally set `N8N_ADMIN_AI_WEBHOOK_URL` to route the AI Agent `Send` button to a dedicated workflow without changing the learner chatbot webhook.
 
+Ticket attachment metadata is stored in the database; the files themselves are stored in
+`backend/media/support_attachments`. Sharing a database with another environment does not
+copy its files. To preview existing attachments locally, copy the original attachment
+folder (preserving its subdirectories), or set `SUPPORT_ATTACHMENT_ROOT` in `.env.local`
+to the folder containing those files and restart Django. Relative paths are resolved
+from `backend`. This setting also controls where new attachments are saved.
+
 ## Management Commands
 
 ```powershell
