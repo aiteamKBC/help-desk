@@ -273,6 +273,12 @@ SUPPORT_NOTIFICATION_EVENT_LIVE_AGENT_UNAVAILABLE = "live_agent_unavailable"
 SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED = "ticket_created"
 SUPPORT_NOTIFICATION_EVENT_LEARNER_CREATED = "submitted_for_learner_created"
 SUPPORT_NOTIFICATION_EVENT_LEARNER_CLOSED = "submitted_for_learner_closed"
+# Requesters (learner, coach, employer, or any other role) must not receive an
+# automatic "ticket received" e-mail.  Operational/team notifications and the
+# explicit submitted-for-learner opt-in use different events and remain enabled.
+DISABLED_SUPPORT_NOTIFICATION_EVENTS = frozenset({
+    SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+})
 TICKET_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY = "ticket_created_operations_notified_at"
 LEARNING_PLAN_TICKET_TRANSFER_WEBHOOK_EVENT = "learning_plan_ticket_transferred"
 SUPPORT_NOTIFICATION_WEBHOOK_TIMEOUT_SECONDS = 8
@@ -6959,6 +6965,10 @@ def build_support_notification_webhook_payload(
     elif recipient_type == "ai_team_person":
         ai_team_email = normalize_email((ai_team_request or {}).get("personEmail"))
         recipients = [ai_team_email] if ai_team_email else []
+    elif event in DISABLED_SUPPORT_NOTIFICATION_EVENTS:
+        # Defence in depth: even if a disabled requester-confirmation event is
+        # built directly, never put the requester's address in its payload.
+        recipients = []
     else:
         recipients = [requester_email] if requester_email else []
 
@@ -7181,6 +7191,8 @@ def queue_support_notification_delivery(
     sent_metadata_key: str,
     attachments: list[dict[str, Any]] | None = None,
 ) -> None:
+    if event in DISABLED_SUPPORT_NOTIFICATION_EVENTS:
+        return
     if (not get_support_notification_webhook_url() and not graph_mail.is_graph_mail_configured()) or not is_support_notification_delivery_enabled():
         return
 
@@ -7214,16 +7226,10 @@ def should_notify_quick_ticket_submitted(
     next_status: Any,
     next_status_reason: Any,
 ) -> bool:
-    if is_coverage_ticket_record(ticket) or is_ai_team_ticket_record(ticket):
-        return False
-
-    metadata = normalize_json_object(ticket.get("metadata"))
-    if metadata.get(QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY):
-        return False
-
-    was_quick_ticket = sanitize_text(previous_status) == "Pending" and is_quick_ticket_status_reason(previous_status_reason)
-    is_now_quick_ticket = sanitize_text(next_status) == "Pending" and is_quick_ticket_status_reason(next_status_reason)
-    return is_now_quick_ticket and not was_quick_ticket
+    # Product policy: creating/submitting a ticket never sends a confirmation
+    # e-mail back to its requester, regardless of requester role.  Keep this
+    # function as the single call-site gate so older callers remain safe.
+    return False
 
 
 def should_notify_ai_team_ticket_submitted(
@@ -7255,18 +7261,15 @@ def should_notify_quick_ticket_closed(
     previous_status_reason: Any,
     next_status: Any,
 ) -> bool:
-    if is_coverage_ticket_record(ticket):
-        return False
-
     metadata = normalize_json_object(ticket.get("metadata"))
     if metadata.get(QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY):
         return False
 
     # Notify the requester whenever their ticket is closed -- for EVERY ticket
-    # type, not only chatbot "quick" tickets -- so whoever opened it (learner,
-    # coach, ...) always receives the "resolved / closed" e-mail. Coverage tickets
-    # and already-notified tickets are excluded above. previous_status_reason is
-    # kept in the signature for the call sites but no longer gates the e-mail.
+    # type, including Coverage -- so whoever opened it (learner, coach, employer,
+    # ...) receives the "resolved / closed" e-mail. Already-notified tickets are
+    # excluded above. previous_status_reason is kept in the signature for the
+    # call sites but no longer gates the e-mail.
     return (
         sanitize_text(previous_status) != "Closed"
         and sanitize_text(next_status) == "Closed"
@@ -8315,6 +8318,41 @@ def synchronize_coverage_tutor_workflow_ticket(
 
     if latest_response_changed:
         insert_history_event(ticket["id"], "coverage_tutor_response", None, derived_latest_response)
+
+    if status_changed and next_status == "Closed":
+        try:
+            queue_submitted_for_learner_notification(
+                ticket,
+                closed=True,
+                status=next_status,
+                status_reason=next_status_reason,
+                closed_at=sync_timestamp,
+            )
+        except Exception:
+            logger.warning(
+                "Could not queue the learner closure notification for %s",
+                ticket.get("public_id"),
+                exc_info=True,
+            )
+        if should_notify_quick_ticket_closed(
+            ticket,
+            previous_status=ticket.get("status"),
+            previous_status_reason=ticket.get("status_reason"),
+            next_status=next_status,
+        ):
+            try:
+                queue_quick_ticket_closed_notification(
+                    ticket,
+                    status=next_status,
+                    status_reason=next_status_reason,
+                    closed_at=sync_timestamp,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not queue the requester closure notification for %s",
+                    ticket.get("public_id"),
+                    exc_info=True,
+                )
 
     synchronized_ticket = dict(resolved_ticket)
     synchronized_ticket["status"] = next_status
@@ -18724,6 +18762,8 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             SELECT
               t.id,
               t.public_id,
+              t.category,
+              t.subject,
               t.status,
               t.status_reason,
               t.technical_subcategory,
@@ -18733,8 +18773,12 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
               t.assigned_agent_id,
               t.sla_status,
               t.created_at,
-              t.conversation_id
+              t.conversation_id,
+              l.full_name AS learner_name,
+              l.email AS learner_email
             FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
             WHERE t.public_id = %s
             LIMIT 1
             """,
@@ -18946,6 +18990,20 @@ def process_coverage_tutor_response(payload: dict[str, Any]) -> dict[str, Any]:
             queue_submitted_for_learner_notification(ticket, closed=True, status=next_status, status_reason=next_status_reason)
         except Exception:
             logger.warning("Could not queue the learner closure notification for %s", ticket_public_id, exc_info=True)
+        if should_notify_quick_ticket_closed(
+            ticket,
+            previous_status=ticket.get("status"),
+            previous_status_reason=ticket.get("status_reason"),
+            next_status=next_status,
+        ):
+            try:
+                queue_quick_ticket_closed_notification(
+                    ticket,
+                    status=next_status,
+                    status_reason=next_status_reason,
+                )
+            except Exception:
+                logger.warning("Could not queue the requester closure notification for %s", ticket_public_id, exc_info=True)
 
     detail = fetch_admin_ticket_detail(ticket_public_id)
     if not detail:
@@ -19209,6 +19267,8 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
             SELECT
               t.id,
               t.public_id,
+              t.category,
+              t.subject,
               t.status,
               t.status_reason,
               t.technical_subcategory,
@@ -19219,8 +19279,12 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
               t.is_archived,
               t.created_at,
               t.updated_at,
-              t.conversation_id
+              t.conversation_id,
+              l.full_name AS learner_name,
+              l.email AS learner_email
             FROM tickets t
+            JOIN learners l
+              ON l.id = t.learner_id
             WHERE t.public_id = %s
             LIMIT 1
             """,
@@ -19376,6 +19440,20 @@ def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> d
             queue_submitted_for_learner_notification(ticket, closed=True, status="Closed", status_reason=STATUS_REASON_CLOSED_BY_AGENT)
         except Exception:
             logger.warning("Could not queue the learner closure notification for %s", public_id, exc_info=True)
+        if should_notify_quick_ticket_closed(
+            ticket,
+            previous_status=ticket.get("status"),
+            previous_status_reason=ticket.get("status_reason"),
+            next_status="Closed",
+        ):
+            try:
+                queue_quick_ticket_closed_notification(
+                    ticket,
+                    status="Closed",
+                    status_reason=STATUS_REASON_CLOSED_BY_AGENT,
+                )
+            except Exception:
+                logger.warning("Could not queue the requester closure notification for %s", public_id, exc_info=True)
 
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:

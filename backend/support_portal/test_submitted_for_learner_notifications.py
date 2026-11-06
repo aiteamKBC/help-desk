@@ -36,14 +36,26 @@ class SubmittedForLearnerNotificationTests(SimpleTestCase):
         self.assertEqual(queue.call_args_list[0].kwargs["event"], "submitted_for_learner_created")
         self.assertEqual(queue.call_args_list[1].kwargs["event"], "submitted_for_learner_closed")
 
-    def test_opt_out_duplicate_and_missing_official_email_do_not_queue(self):
+    def test_opt_out_does_not_queue_creation_or_closure_email(self):
+        self.ticket["metadata"]["submitted_for_learner"]["notifyByEmail"] = False
+
+        with (
+            patch.object(services, "fetch_local_learner_by_id", return_value={"id": 42, "email": "official@example.com"}) as lookup,
+            patch.object(services, "queue_support_notification_delivery") as queue,
+        ):
+            services.queue_submitted_for_learner_notification(self.ticket)
+            services.queue_submitted_for_learner_notification(self.ticket, closed=True)
+
+        lookup.assert_not_called()
+        queue.assert_not_called()
+
+    def test_requester_email_is_not_duplicated_to_the_same_address(self):
         with (
             patch.object(services, "fetch_local_learner_by_id", return_value={"id": 42, "email": "submitter@example.com"}),
             patch.object(services, "queue_support_notification_delivery") as queue,
         ):
             services.queue_submitted_for_learner_notification(self.ticket)
-            self.ticket["metadata"]["submitted_for_learner"]["notifyByEmail"] = False
-            services.queue_submitted_for_learner_notification(self.ticket, closed=True)
+
         queue.assert_not_called()
 
     def test_rendered_mail_has_no_admin_ticket_link(self):

@@ -11240,7 +11240,7 @@ class AgentQueueTests(SimpleTestCase):
         self.assertEqual(apply_ticket_chat_history_sync.call_args.kwargs["ticket_public_id"], "KBC-000023")
         self.assertEqual(apply_ticket_chat_history_sync.call_args.kwargs["uploaded_files"], [uploaded_file])
 
-    def test_save_chat_history_queues_quick_ticket_submitted_notification(self):
+    def test_save_chat_history_does_not_email_requester_when_quick_ticket_is_submitted(self):
         ticket = {
             "id": 23,
             "public_id": "KBC-000023",
@@ -11283,9 +11283,7 @@ class AgentQueueTests(SimpleTestCase):
                 },
             )
 
-        queue_submitted.assert_called_once()
-        self.assertEqual(queue_submitted.call_args.kwargs["status"], "Pending")
-        self.assertEqual(queue_submitted.call_args.kwargs["status_reason"], services.STATUS_REASON_QUICK_TICKET)
+        queue_submitted.assert_not_called()
         queue_closed.assert_not_called()
 
     def test_save_chat_history_queues_ai_team_ticket_submitted_notification(self):
@@ -11505,6 +11503,22 @@ class AgentQueueTests(SimpleTestCase):
         SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification",
         SUPPORT_NOTIFICATION_DELIVERY_ENABLED=True,
     )
+    def test_queue_support_notification_delivery_blocks_requester_submission_email(self):
+        with patch.object(services.threading, "Thread") as thread_class:
+            services.queue_support_notification_delivery(
+                ticket_id=23,
+                ticket_public_id="KBC-000023",
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                payload={"recipientType": "requester", "recipients": ["omar@example.com"]},
+                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+            )
+
+        thread_class.assert_not_called()
+
+    @override_settings(
+        SUPPORT_NOTIFICATION_WEBHOOK_URL="https://example.test/support-notification",
+        SUPPORT_NOTIFICATION_DELIVERY_ENABLED=True,
+    )
     def test_queue_support_notification_delivery_starts_background_thread_when_enabled(self):
         thread = MagicMock()
 
@@ -11512,15 +11526,15 @@ class AgentQueueTests(SimpleTestCase):
             services.queue_support_notification_delivery(
                 ticket_id=23,
                 ticket_public_id="KBC-000023",
-                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                event=services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED,
                 payload={"recipientType": "requester", "requester": {"name": "Omar", "email": "omar@example.com"}},
-                sent_metadata_key=services.QUICK_TICKET_SUBMITTED_NOTIFICATION_SENT_AT_METADATA_KEY,
+                sent_metadata_key=services.QUICK_TICKET_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY,
             )
 
         thread_class.assert_called_once()
         self.assertEqual(
             thread_class.call_args.kwargs["name"],
-            "support-notification-quick_ticket_submitted-KBC-000023",
+            "support-notification-quick_ticket_closed-KBC-000023",
         )
         self.assertTrue(thread_class.call_args.kwargs["daemon"])
         thread.start.assert_called_once()
@@ -12907,6 +12921,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "connection", mock_connection),
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "insert_history_event") as insert_history_event,
+            patch.object(services, "queue_submitted_for_learner_notification"),
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_owner_closed,
         ):
             synchronized_ticket = services.synchronize_coverage_tutor_workflow_ticket(ticket)
 
@@ -12923,6 +12939,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(insert_history_event.call_count, 2)
         self.assertEqual(insert_history_event.call_args_list[0].args[1], "status_changed")
         self.assertEqual(insert_history_event.call_args_list[1].args[1], "coverage_tutor_response")
+        queue_owner_closed.assert_called_once()
+        self.assertEqual(queue_owner_closed.call_args.kwargs["status"], "Closed")
 
     def test_synchronize_coverage_tutor_workflow_ticket_keeps_partial_acceptance_pending(self):
         original_sessions = [
@@ -15035,6 +15053,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
             patch.object(services, "notify_coverage_tutor_response_mail_webhook") as notify_response_mail,
+            patch.object(services, "queue_submitted_for_learner_notification"),
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_owner_closed,
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000055"}}),
         ):
             response = services.process_coverage_tutor_response(
@@ -15057,6 +15077,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertEqual(persisted_cards[2]["requestStatus"], "requested")
         webhook_payload = notify_response_mail.call_args.args[1]
         self.assertEqual(webhook_payload["ticket"]["status"], "Closed")
+        queue_owner_closed.assert_called_once()
 
     def test_process_coverage_tutor_response_closes_legacy_full_details(self):
         inquiry = (
@@ -15523,6 +15544,8 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             patch.object(services, "resolve_next_sla_state", return_value=("On Track", False, None)),
             patch.object(services, "connection", mock_connection),
             patch.object(services, "insert_history_event"),
+            patch.object(services, "queue_submitted_for_learner_notification"),
+            patch.object(services, "queue_quick_ticket_closed_notification") as queue_owner_closed,
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000063"}}),
         ):
             response = services.confirm_coverage_tutor_session(
@@ -15539,6 +15562,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         self.assertTrue(persisted_card["locked"])
         self.assertTrue(persisted_card["confirmedAt"])
         self.assertEqual(persisted_card["confirmedByAgentId"], 7)
+        queue_owner_closed.assert_called_once()
 
     def test_confirm_coverage_tutor_session_uses_database_derived_reply_card(self):
         ticket = {
