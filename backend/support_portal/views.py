@@ -566,6 +566,7 @@ def admin_login(request):
 @require_GET
 def admin_microsoft_login(request):
     origin = normalize_frontend_origin(request.GET.get("origin"))
+    instance_id = normalize_request_session_instance_id(request.GET.get("instanceId")) or uuid4().hex
     configured_redirect_uri = normalize_login_redirect_uri(settings.AZURE_LOGIN_REDIRECT_URI)
 
     try:
@@ -583,6 +584,7 @@ def admin_microsoft_login(request):
             "state": state,
             "nonce": nonce,
             "redirectUri": redirect_uri,
+            "instanceId": instance_id,
         }
         request.session.set_expiry(settings.SUPPORT_ADMIN_SESSION_COOKIE_AGE)
 
@@ -626,7 +628,7 @@ def admin_microsoft_callback(request):
         if not code:
             raise ApiError(400, "Microsoft sign-in did not return an authorization code.")
 
-        instance_id = uuid4().hex
+        instance_id = normalize_request_session_instance_id(auth_session.get("instanceId")) or uuid4().hex
         response_payload = get_admin_microsoft_login_response(
             {
                 "code": code,

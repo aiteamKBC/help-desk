@@ -1110,7 +1110,9 @@ class AdminSessionViewTests(SimpleTestCase):
         self.assertEqual(payload["admin"]["instanceId"], "instance-1")
 
     def test_admin_microsoft_login_redirects_to_authorize_url_and_stores_oauth_state(self):
-        request = self.factory.get("/api/admin/microsoft/login?origin=http://127.0.0.1:3000")
+        request = self.factory.get(
+            "/api/admin/microsoft/login?origin=http://127.0.0.1:3000&instanceId=browser-instance-1"
+        )
         session = self.attach_session(request)
 
         with (
@@ -1131,6 +1133,10 @@ class AdminSessionViewTests(SimpleTestCase):
             session[views.ADMIN_MICROSOFT_AUTH_SESSION_KEY]["redirectUri"],
             "http://localhost:3000/api/admin/microsoft/callback",
         )
+        self.assertEqual(
+            session[views.ADMIN_MICROSOFT_AUTH_SESSION_KEY]["instanceId"],
+            "browser-instance-1",
+        )
         build_microsoft_admin_authorize_url.assert_called_once()
 
     def test_admin_microsoft_callback_stores_admin_session_and_redirects_to_dashboard(self):
@@ -1142,6 +1148,7 @@ class AdminSessionViewTests(SimpleTestCase):
                     "state": "state-1",
                     "nonce": "nonce-1",
                     "redirectUri": "http://localhost:3000/api/admin/microsoft/callback",
+                    "instanceId": "browser-instance-1",
                 }
             },
         )
@@ -1167,8 +1174,13 @@ class AdminSessionViewTests(SimpleTestCase):
         self.assertEqual(response["Location"], "/admin")
         self.assertTrue(session.cycle_key_called)
         self.assertEqual(session[views.ADMIN_SESSION_KEY]["username"], "omar1")
+        self.assertEqual(session[views.ADMIN_SESSION_KEY]["instanceId"], "browser-instance-1")
         self.assertNotIn(views.ADMIN_MICROSOFT_AUTH_SESSION_KEY, session)
         get_admin_microsoft_login_response.assert_called_once()
+        self.assertEqual(
+            get_admin_microsoft_login_response.call_args.args[0]["instanceId"],
+            "browser-instance-1",
+        )
 
     def test_admin_session_returns_authenticated_admin_from_server_session(self):
         request = self.factory.get("/api/admin/session")
