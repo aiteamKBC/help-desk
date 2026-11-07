@@ -7,12 +7,12 @@ import { componentTagger } from "lovable-tagger";
 
 const DEV_HOST = "127.0.0.1";
 const FRONTEND_PORT = 3000;
-const requestedBackendPort = Number(process.env.SUPPORT_BACKEND_PORT || 8000);
+const requestedBackendPort = Number(process.env.SUPPORT_BACKEND_PORT || 3001);
 const configuredBackendPort = Number.isInteger(requestedBackendPort)
   && requestedBackendPort > 0
   && requestedBackendPort < 65536
   ? requestedBackendPort
-  : 8000;
+  : 3001;
 const BACKEND_PORT_CANDIDATES = [configuredBackendPort];
 let backendUrl = `http://${DEV_HOST}:${configuredBackendPort}`;
 const BACKEND_ROOT = path.resolve(__dirname, "../backend");

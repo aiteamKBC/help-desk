@@ -8,10 +8,13 @@ import {
   ArrowRightLeft,
   Bell,
   CalendarDays,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
+  ChevronsUpDown,
   Clock,
   Download,
   ExternalLink,
@@ -76,6 +79,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -91,6 +95,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StatusBadge } from "@/components/support/StatusBadge";
+import { TicketStatusEditor } from "@/components/support/TicketStatusEditor";
 import {
   clearAdminSession,
   fetchVerifiedAdminSession,
@@ -317,6 +322,9 @@ interface TicketSummary {
   assignedAgentId: number | null;
   assignedAgentName: string;
   assignedAgentUsername: string;
+  assignedAgentEmail?: string;
+  assignedAt?: string | null;
+  resolvedBy?: { id?: number; name?: string; username?: string; email?: string; resolvedAt?: string };
   assignedTeam: string;
   chatId: string;
   chatIsActive: boolean;
@@ -688,6 +696,8 @@ const consolePollIntervalMs = 2500;
 const dashboardTicketPollIntervalMs = 10000;
 const dashboardAgentPollIntervalMs = 15000;
 const defaultDashboardPageSize = 50;
+const maximumVisibleDesktopTicketNotifications = 3;
+const activeAdminDesktopNotifications: Notification[] = [];
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
@@ -698,6 +708,24 @@ const teamDashboardViewPrefix = "team:";
 
 function isBrowserTabHidden() {
   return typeof document !== "undefined" && document.hidden;
+}
+
+function trackAdminDesktopNotification(notification: Notification) {
+  activeAdminDesktopNotifications.push(notification);
+
+  const removeNotification = () => {
+    const notificationIndex = activeAdminDesktopNotifications.indexOf(notification);
+    if (notificationIndex >= 0) {
+      activeAdminDesktopNotifications.splice(notificationIndex, 1);
+    }
+  };
+
+  notification.addEventListener("close", removeNotification, { once: true });
+  notification.addEventListener("error", removeNotification, { once: true });
+
+  while (activeAdminDesktopNotifications.length > maximumVisibleDesktopTicketNotifications) {
+    activeAdminDesktopNotifications.shift()?.close();
+  }
 }
 
 type TeamAccessInfo = {
@@ -936,9 +964,209 @@ type DashboardTicketFilter = "all" | "open" | "pending" | "closed" | "slaBreache
 type AdminTicketDashboardFilterParam = DashboardTicketFilter | "learningPlanOther";
 type DashboardSortOrder = "newest" | "oldest" | "priorityDesc" | "priorityAsc";
 type DashboardAssignedFilter = "all" | "me" | "unassigned" | `agent:${number}`;
-type DashboardDateFilter = "all" | "today" | "last7Days";
+type DashboardDatePreset =
+  | "all"
+  | "lastHour"
+  | "last24Hours"
+  | "today"
+  | "last7Days"
+  | "last30Days"
+  | "last3Months";
+type DashboardDateFilter = DashboardDatePreset | "custom";
+type DashboardTimeUnit = "hours" | "days" | "weeks" | "months";
+type DashboardCustomRange = { amount: number; unit: DashboardTimeUnit };
+const DASHBOARD_DATE_DEFAULT_CUSTOM_RANGE: DashboardCustomRange = { amount: 3, unit: "days" };
+// Quick-range presets shown as chips in the creative time filter.
+const DASHBOARD_DATE_PRESETS: { value: DashboardDatePreset; label: string }[] = [
+  { value: "all", label: "All Time" },
+  { value: "lastHour", label: "Last Hour" },
+  { value: "last24Hours", label: "Last 24 Hours" },
+  { value: "today", label: "Today" },
+  { value: "last7Days", label: "Last 7 Days" },
+  { value: "last30Days", label: "Last 30 Days" },
+  { value: "last3Months", label: "Last 3 Months" },
+];
+const DASHBOARD_TIME_UNITS: { value: DashboardTimeUnit; label: string }[] = [
+  { value: "hours", label: "Hours" },
+  { value: "days", label: "Days" },
+  { value: "weeks", label: "Weeks" },
+  { value: "months", label: "Months" },
+];
+const DASHBOARD_TIME_UNIT_SINGULAR: Record<DashboardTimeUnit, string> = {
+  hours: "Hour",
+  days: "Day",
+  weeks: "Week",
+  months: "Month",
+};
+function clampDashboardCustomAmount(amount: number): number {
+  if (!Number.isFinite(amount)) {
+    return 1;
+  }
+  return Math.min(Math.max(Math.floor(amount), 1), 999);
+}
+function formatDashboardCustomRangeLabel(range: DashboardCustomRange): string {
+  const amount = clampDashboardCustomAmount(range.amount);
+  const unitLabel = DASHBOARD_TIME_UNIT_SINGULAR[range.unit];
+  return `Last ${amount} ${unitLabel}${amount === 1 ? "" : "s"}`;
+}
+function getDashboardDateFilterLabel(filter: DashboardDateFilter, customRange: DashboardCustomRange): string {
+  if (filter === "custom") {
+    return formatDashboardCustomRangeLabel(customRange);
+  }
+  return DASHBOARD_DATE_PRESETS.find((preset) => preset.value === filter)?.label || "All Time";
+}
 type DashboardArchiveScope = "active" | "archived";
 type DashboardStatusFilterParam = "Open" | "Pending" | "Closed";
+
+// Clicking a ticket-table column header SORTS the loaded rows by that column
+// (it never hides rows). Maps the header label shown in the table to a sort key.
+type DashboardColumnSortKey =
+  | "ticket"
+  | "chatId"
+  | "requester"
+  | "category"
+  | "status"
+  | "statusReason"
+  | "assignedAgent"
+  | "created"
+  | "sla";
+const DASHBOARD_COLUMN_SORT_KEYS: Record<string, DashboardColumnSortKey> = {
+  "Chat ID": "chatId",
+  "Category": "category",
+  "Status": "status",
+  "Status Reason": "statusReason",
+  "Assigned Agent": "assignedAgent",
+  "Created": "created",
+  "SLA": "sla",
+};
+// Status is ordered Open -> Pending -> Closed, and SLA most-urgent first, so an
+// ascending sort surfaces the rows an admin most likely wants on top.
+const DASHBOARD_STATUS_SORT_ORDER: Record<string, number> = { Open: 0, Pending: 1, Closed: 2 };
+const DASHBOARD_SLA_SORT_ORDER: Record<string, number> = { Breached: 0, "Pending Review": 1, "On Track": 2 };
+
+type DashboardColumnSortState = { key: DashboardColumnSortKey; dir: "asc" | "desc"; value?: string };
+
+// Categorical columns are sorted by choosing a VALUE to bring to the top (rows
+// that do not match stay below, nothing is hidden) instead of an A->Z order.
+const DASHBOARD_COLUMN_VALUE_OPTIONS: Partial<Record<DashboardColumnSortKey, { value: string; label: string }[]>> = {
+  status: [
+    { value: "Open", label: "Open first" },
+    { value: "Pending", label: "Pending first" },
+    { value: "Closed", label: "Closed first" },
+  ],
+  sla: [
+    { value: "Breached", label: "Breached first" },
+    { value: "Pending Review", label: "Pending Review first" },
+    { value: "On Track", label: "On Track first" },
+  ],
+};
+
+function getTicketColumnRawValue(ticket: TicketSummary, key: DashboardColumnSortKey): string {
+  switch (key) {
+    case "category":
+      return ticket.category || "";
+    case "status":
+      return ticket.status || "";
+    case "sla":
+      return ticket.slaStatus || "";
+    default:
+      return "";
+  }
+}
+
+// Human-readable labels for each column's ascending / descending sort choice,
+// shown inside the column-header selection menu.
+function getDashboardColumnSortLabels(key: DashboardColumnSortKey): { asc: string; desc: string } {
+  switch (key) {
+    case "status":
+      return { asc: "Open first", desc: "Closed first" };
+    case "sla":
+      return { asc: "Breached first", desc: "On Track first" };
+    case "created":
+      return { asc: "Oldest first", desc: "Newest first" };
+    default:
+      return { asc: "A → Z", desc: "Z → A" };
+  }
+}
+
+function getTicketColumnSortComparable(ticket: TicketSummary, key: DashboardColumnSortKey): string | number {
+  switch (key) {
+    case "ticket":
+      return (ticket.id || "").toLowerCase();
+    case "chatId":
+      return (ticket.chatId || "").toLowerCase();
+    case "requester":
+      return (ticket.requesterName || ticket.learnerName || ticket.email || "").toLowerCase();
+    case "category":
+      return `${ticket.category || ""} ${ticket.technicalSubcategory || ""}`.trim().toLowerCase();
+    case "status":
+      return DASHBOARD_STATUS_SORT_ORDER[ticket.status] ?? 99;
+    case "statusReason":
+      return (ticket.statusReason || "").toLowerCase();
+    case "assignedAgent":
+      // Push unassigned tickets to the end of an ascending sort.
+      return (ticket.assignedAgentName || "￿").toLowerCase();
+    case "created":
+      return Date.parse(ticket.createdAt) || 0;
+    case "sla":
+      return DASHBOARD_SLA_SORT_ORDER[ticket.slaStatus] ?? 99;
+    default:
+      return 0;
+  }
+}
+
+function sortTicketsByColumn(
+  tickets: TicketSummary[],
+  sort: DashboardColumnSortState | null,
+): TicketSummary[] {
+  if (!sort) {
+    return tickets;
+  }
+  // Value-targeted sort (categorical columns): bring rows matching the chosen
+  // value to the top, keeping everything else below in its original order.
+  if (sort.value != null) {
+    const target = sort.value;
+    return tickets
+      .map((ticket, index) => ({ ticket, index }))
+      .sort((a, b) => {
+        const aMatch = doesTicketMatchColumnSortValue(a.ticket, sort.key, target) ? 0 : 1;
+        const bMatch = doesTicketMatchColumnSortValue(b.ticket, sort.key, target) ? 0 : 1;
+        if (aMatch !== bMatch) {
+          return aMatch - bMatch;
+        }
+        return a.index - b.index;
+      })
+      .map((entry) => entry.ticket);
+  }
+  const directionFactor = sort.dir === "asc" ? 1 : -1;
+  // Decorate with the original index so equal values keep their incoming order
+  // (stable sort), then sort a copy so the source array is left untouched.
+  return tickets
+    .map((ticket, index) => ({ ticket, index }))
+    .sort((a, b) => {
+      const aValue = getTicketColumnSortComparable(a.ticket, sort.key);
+      const bValue = getTicketColumnSortComparable(b.ticket, sort.key);
+      let comparison = 0;
+      if (typeof aValue === "number" && typeof bValue === "number") {
+        comparison = aValue - bValue;
+      } else {
+        comparison = String(aValue).localeCompare(String(bValue), undefined, { numeric: true, sensitivity: "base" });
+      }
+      if (comparison !== 0) {
+        return comparison * directionFactor;
+      }
+      return a.index - b.index;
+    })
+    .map((entry) => entry.ticket);
+}
+
+function doesTicketMatchColumnSortValue(ticket: TicketSummary, key: DashboardColumnSortKey, target: string) {
+  if (key === "category" && target.startsWith(`${teamDashboardViewPrefix}`)) {
+    return getTicketRoutingPolicy(ticket).key === getTeamKeyFromDashboardView(target);
+  }
+
+  return getTicketColumnRawValue(ticket, key) === target;
+}
 type DashboardTicketPageLoadOptions = { silent?: boolean; signal?: AbortSignal };
 type DashboardMetricsLoadOptions = { silent?: boolean; signal?: AbortSignal };
 type AdminView = "dashboard" | "adminDashboard" | "coverage" | "console" | "management" | `${typeof teamDashboardViewPrefix}${string}`;
@@ -1095,6 +1323,7 @@ const AgentDashboard = () => {
   const [activeTicketId, setActiveTicketId] = useState("");
   const [activeTicketTab, setActiveTicketTab] = useState<TicketDetailTab>("conversation");
   const [activeDetail, setActiveDetail] = useState<TicketDetailResponse | null>(null);
+  const [claimingTicketId, setClaimingTicketId] = useState("");
   const [consoleCaseScope, setConsoleCaseScope] = useState<"my" | "all">(initialConsoleDeepLink.scope);
   const [consoleQueueTab, setConsoleQueueTab] = useState<"open" | "closed">(initialConsoleDeepLink.queueTab);
   const [consoleSearch, setConsoleSearch] = useState("");
@@ -1124,13 +1353,39 @@ const AgentDashboard = () => {
   const standardActionNoteRef = useRef<HTMLTextAreaElement | null>(null);
   const [consoleAiInput, setConsoleAiInput] = useState("");
   const [dashboardTicketFilter, setDashboardTicketFilter] = useState<DashboardTicketFilter>("all");
+  const [dashboardColumnSort, setDashboardColumnSort] = useState<DashboardColumnSortState | null>(null);
   const [dashboardSortOrder, setDashboardSortOrder] = useState<DashboardSortOrder>(() => (
     getDefaultDashboardSortOrder(initialConsoleDeepLink.view === "coverage")
   ));
   const [dashboardAssignedFilter, setDashboardAssignedFilter] = useState<DashboardAssignedFilter>("all");
   const [dashboardDateFilter, setDashboardDateFilter] = useState<DashboardDateFilter>("all");
-  const { createdFrom: dashboardCreatedFrom, createdBefore: dashboardCreatedBefore } = getDashboardDateRange(dashboardDateFilter);
+  const [dashboardCustomRange, setDashboardCustomRange] = useState<DashboardCustomRange>(DASHBOARD_DATE_DEFAULT_CUSTOM_RANGE);
+  // Memoized so rolling ranges (hours / custom), which read the current clock,
+  // produce a STABLE value between renders. Recomputing every render would hand
+  // the data-loading effects a new createdFrom/createdBefore each time and spin
+  // them into an endless fetch loop. The window is re-based whenever the filter
+  // or the custom amount/unit changes.
+  const { createdFrom: dashboardCreatedFrom, createdBefore: dashboardCreatedBefore } = useMemo(
+    () => getDashboardDateRange(dashboardDateFilter, dashboardCustomRange),
+    [dashboardDateFilter, dashboardCustomRange],
+  );
+  const dashboardDateFilterLabel = getDashboardDateFilterLabel(dashboardDateFilter, dashboardCustomRange);
+  const applyDashboardCustomRange = (patch: Partial<DashboardCustomRange>) => {
+    setDashboardCustomRange((current) => ({
+      amount: clampDashboardCustomAmount(patch.amount ?? current.amount),
+      unit: patch.unit ?? current.unit,
+    }));
+    setDashboardDateFilter("custom");
+  };
   const [dashboardArchiveScope, setDashboardArchiveScope] = useState<DashboardArchiveScope>("active");
+  // Attachment preview popup opened from the table's "Attachment" column: shows
+  // the requester's note plus the images they submitted with the ticket.
+  const [attachmentPopupTicket, setAttachmentPopupTicket] = useState<TicketSummary | null>(null);
+  const [attachmentPopupDetail, setAttachmentPopupDetail] = useState<TicketDetailResponse | null>(null);
+  const [attachmentPopupLoading, setAttachmentPopupLoading] = useState(false);
+  const [attachmentPopupError, setAttachmentPopupError] = useState("");
+  const [attachmentPopupPreview, setAttachmentPopupPreview] = useState<AttachmentPreviewItem | null>(null);
+  const attachmentPopupTicketIdRef = useRef("");
   const [learningPlanTeamSection, setLearningPlanTeamSection] = useState<LearningPlanTeamSection>("coverage");
   const [dashboardSearch, setDashboardSearch] = useState("");
   const [dashboardPage, setDashboardPage] = useState(1);
@@ -1308,6 +1563,15 @@ const AgentDashboard = () => {
       value: buildTeamDashboardView(policy.key),
       policy,
     }));
+  const dashboardCategoryTeamOptions = [
+    ...(canViewSupportDashboard
+      ? [{ value: buildTeamDashboardView(getSupportTeamRoutingPolicy().key), label: "Support Dashboard" }]
+      : []),
+    ...(canViewLearningPlanTeam
+      ? [{ value: buildTeamDashboardView(getLearningPlanTeamRoutingPolicy().key), label: "Learning Plan Team" }]
+      : []),
+    ...customDashboardTeamTabs.map(({ value, policy }) => ({ value, label: policy.label })),
+  ];
   const isLearningPlanCoverageSection = isCoverageDashboardView && learningPlanTeamSection === "coverage";
   const defaultDashboardSortOrder = getDefaultDashboardSortOrder(isLearningPlanCoverageSection);
   const isDashboardLikeView = adminView === "dashboard" || adminView === "adminDashboard" || adminView === "coverage" || isCustomTeamDashboardView;
@@ -1775,6 +2039,7 @@ const AgentDashboard = () => {
         icon: "/kent-crest.svg",
         requireInteraction: true,
       });
+      trackAdminDesktopNotification(notification);
 
       notification.onclick = () => {
         notification.close();
@@ -2065,6 +2330,8 @@ const AgentDashboard = () => {
     : shouldShowDashboardTableSkeleton
       ? emptyTicketSummaryList
       : visibleDashboardTickets;
+  // A column-header selection re-orders the loaded rows without hiding any of them.
+  const dashboardSortedDisplayedTickets = sortTicketsByColumn(dashboardDisplayedTickets, dashboardColumnSort);
   const shouldShowDashboardRelatedPersonColumn = (
     isLearningPlanCoverageSection
     || dashboardDisplayedTickets.some(shouldShowDashboardRelatedPersonSummary)
@@ -2088,6 +2355,7 @@ const AgentDashboard = () => {
         ...(shouldShowDashboardAssignedAgentColumn ? ["Assigned Agent"] : []),
         "Created",
         "SLA",
+        "Attachment",
         "Actions",
       ]
     : [
@@ -2101,15 +2369,16 @@ const AgentDashboard = () => {
         ...(shouldShowDashboardAssignedAgentColumn ? ["Assigned Agent"] : []),
         "Created",
         "SLA",
+        "Attachment",
         "Actions",
       ];
   const dashboardCompactColumnWidths = shouldShowDashboardRelatedPersonColumn
     ? shouldShowDashboardAssignedAgentColumn
-      ? ["13%", "15%", "18%", "11%", "10%", "11%", "8%", "7%", "7%"]
-      : ["13%", "17%", "25%", "12%", "11%", "9%", "6%", "7%"]
+      ? ["12%", "14%", "16%", "10%", "10%", "10%", "8%", "7%", "6%", "7%"]
+      : ["12%", "16%", "22%", "11%", "11%", "9%", "6%", "6%", "7%"]
     : shouldShowDashboardAssignedAgentColumn
-      ? ["16%", "18%", "13%", "11%", "18%", "8%", "7%", "9%"]
-      : ["18%", "20%", "15%", "12%", "11%", "8%", "16%"];
+      ? ["15%", "17%", "12%", "11%", "16%", "8%", "7%", "6%", "8%"]
+      : ["16%", "19%", "14%", "11%", "11%", "8%", "7%", "14%"];
   const dashboardDisplayedTableCountLabel = activeServerDashboardPagination
     ? getServerDashboardTableCountLabel(
         activeServerDashboardPagination,
@@ -2136,7 +2405,7 @@ const AgentDashboard = () => {
   const dashboardEmptyMessage = normalizedDashboardSearch
     ? "No matching tickets found for this search."
     : dashboardDateFilter !== "all"
-      ? `No tickets match the current filters ${dashboardDateFilter === "today" ? "for today" : "in the last 7 days"}.`
+      ? `No tickets match the current filters ${dashboardDateFilter === "today" ? "for today" : `in the ${dashboardDateFilterLabel.toLowerCase()}`}.`
     : dashboardArchiveScope === "archived"
       ? (
         isCoverageDashboardView
@@ -2980,7 +3249,12 @@ const AgentDashboard = () => {
       return;
     }
 
-    for (const ticket of newSupportQueueTickets) {
+    // The API can surface a large backlog of unacknowledged tickets at once.
+    // Only alert for the newest three, and create them oldest-to-newest so the
+    // newest ticket finishes at the top of the native notification stack.
+    for (const ticket of newSupportQueueTickets
+      .slice(0, maximumVisibleDesktopTicketNotifications)
+      .reverse()) {
       const pendingSupportQueueNotification = ticket.pendingSupportQueueNotification;
       if (!pendingSupportQueueNotification) {
         continue;
@@ -4275,6 +4549,40 @@ const AgentDashboard = () => {
     }
 
     return payload;
+  }
+
+  async function openAttachmentPopup(ticket: TicketSummary) {
+    attachmentPopupTicketIdRef.current = ticket.id;
+    setAttachmentPopupTicket(ticket);
+    setAttachmentPopupDetail(null);
+    setAttachmentPopupError("");
+    setAttachmentPopupLoading(true);
+
+    try {
+      const payload = await fetchTicketDetail(ticket.id);
+      if (attachmentPopupTicketIdRef.current !== ticket.id) {
+        return;
+      }
+      setAttachmentPopupDetail(payload);
+    } catch (error) {
+      if (attachmentPopupTicketIdRef.current !== ticket.id) {
+        return;
+      }
+      setAttachmentPopupError(error instanceof Error ? error.message : "We could not load the attachments right now.");
+    } finally {
+      if (attachmentPopupTicketIdRef.current === ticket.id) {
+        setAttachmentPopupLoading(false);
+      }
+    }
+  }
+
+  function closeAttachmentPopup() {
+    attachmentPopupTicketIdRef.current = "";
+    setAttachmentPopupTicket(null);
+    setAttachmentPopupDetail(null);
+    setAttachmentPopupError("");
+    setAttachmentPopupLoading(false);
+    setAttachmentPopupPreview(null);
   }
 
   async function openChatbotHistoryDialog(ticketId: string) {
@@ -6353,6 +6661,54 @@ const AgentDashboard = () => {
     });
   }
 
+  async function updateDashboardTicketStatus(ticket: TicketSummary, status: TicketSummary["status"], note: string) {
+    if (!hasFullAdminAccess || ticket.isArchived) {
+      throw new Error("This ticket cannot be edited here.");
+    }
+    const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticket.id)}`, {
+      method: "PATCH",
+      headers: buildAdminJsonHeaders(),
+      body: JSON.stringify({ status, note, ...(status === "Closed" ? { statusReason: "Closed via Agent" } : {}) }),
+    });
+    const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+    if (!response.ok || !payload?.ticket) {
+      if (response.status === 401 || response.status === 403) {
+        await reconcileAdminAuthorizationFailure();
+      }
+      throw new Error(payload?.message || "We could not update the ticket right now.");
+    }
+    syncDetailAcrossViews(payload);
+    void loadDashboardTicketPage({ silent: true });
+    void loadDashboardMetrics({ silent: true });
+    toast.success(`Ticket ${ticket.id} changed to ${payload.ticket.status}`);
+  }
+
+  async function claimTicket(ticket: TicketSummary) {
+    if (claimingTicketId || ticket.assignedAgentId || ticket.status === "Closed" || ticket.isArchived) return;
+    setClaimingTicketId(ticket.id);
+    try {
+      const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticket.id)}`, {
+        method: "PATCH",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({ claim: true }),
+      });
+      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
+      if (!response.ok || !payload?.ticket) {
+        if (response.status === 401 || response.status === 403) await reconcileAdminAuthorizationFailure();
+        throw new Error(payload?.message || "Could not claim this ticket.");
+      }
+      syncDetailAcrossViews(payload);
+      void loadDashboardTicketPage({ silent: true });
+      void loadDashboardMetrics({ silent: true });
+      toast.success(`You claimed ${ticket.id}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not claim this ticket.");
+      void loadDashboardTicketPage({ silent: true });
+    } finally {
+      setClaimingTicketId("");
+    }
+  }
+
   async function saveTicket(overrides?: {
     status?: TicketSummary["status"];
     statusReason?: string;
@@ -6368,6 +6724,7 @@ const AgentDashboard = () => {
       return;
     }
 
+    const previousStatus = activeDetail.ticket.status;
     const nextStatus = overrides?.status ?? draftStatus;
     const nextNote = (overrides?.note ?? notes).trim();
     const standardDocumentationToSave = isActiveStandardDocumentationTicket
@@ -6443,6 +6800,12 @@ const AgentDashboard = () => {
 
       setActiveDetail(payload);
       syncDrafts(payload);
+      // A plain "Save Changes" (no status change) keeps the internal note the
+      // agent just typed, so they can Close the ticket right after without
+      // retyping it. syncDrafts clears the note, so restore it here.
+      if (nextStatus === previousStatus && nextNote) {
+        setNotes(nextNote);
+      }
       if (standardDocumentationToSave) {
         revokeDocumentationDraftObjectUrls(standardDocumentationToSave);
         setStandardDocumentationDraftsByTicketId((currentDrafts) => {
@@ -6738,28 +7101,104 @@ const AgentDashboard = () => {
                       </SelectContent>
                     </Select>
                   </div>
-                  <div className="w-full sm:w-[170px]">
-                    <Select
-                      value={dashboardDateFilter}
-                      onValueChange={(value) => setDashboardDateFilter(value as DashboardDateFilter)}
-                    >
-                      <SelectTrigger
-                        aria-label="Filter tickets by creation date"
-                        title="Ticket creation date in your local time"
-                        className={cn(
-                          "gap-2 [&>span]:flex-1 [&>span]:text-left [&>svg]:shrink-0",
-                          dashboardDateFilter !== "all" && "border-primary/50 bg-primary/5 text-primary",
-                        )}
-                      >
-                        <CalendarDays className="h-4 w-4 text-primary" aria-hidden="true" />
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All Time</SelectItem>
-                        <SelectItem value="today">Today</SelectItem>
-                        <SelectItem value="last7Days">Last 7 Days</SelectItem>
-                      </SelectContent>
-                    </Select>
+                  <div className="w-full sm:w-[190px]">
+                    <Popover>
+                      <PopoverTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label="Filter tickets by creation date"
+                          title="Ticket creation date in your local time"
+                          className={cn(
+                            "flex h-10 w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background transition-colors hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                            dashboardDateFilter !== "all" && "border-primary/50 bg-primary/5 text-primary",
+                          )}
+                        >
+                          <CalendarDays className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+                          <span className="flex-1 truncate text-left">{dashboardDateFilterLabel}</span>
+                          <ChevronDown className="h-4 w-4 shrink-0 opacity-60" aria-hidden="true" />
+                        </button>
+                      </PopoverTrigger>
+                      <PopoverContent align="end" className="w-72 p-3">
+                        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                          Quick ranges
+                        </div>
+                        <div className="mt-2 grid grid-cols-2 gap-1.5">
+                          {DASHBOARD_DATE_PRESETS.map((preset) => (
+                            <button
+                              key={preset.value}
+                              type="button"
+                              onClick={() => setDashboardDateFilter(preset.value)}
+                              className={cn(
+                                "rounded-lg border px-2.5 py-1.5 text-left text-xs font-medium transition-colors hover:border-primary/50 hover:bg-primary/5",
+                                dashboardDateFilter === preset.value
+                                  ? "border-primary bg-primary/10 text-primary"
+                                  : "border-border text-foreground",
+                              )}
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="mt-3 border-t pt-3">
+                          <div className="flex items-center justify-between">
+                            <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                              Custom range
+                            </div>
+                            {dashboardDateFilter === "custom" ? (
+                              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                                {dashboardDateFilterLabel}
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="mt-2 flex items-center gap-2">
+                            <span className="text-sm text-muted-foreground">Last</span>
+                            <div className="flex items-center rounded-md border">
+                              <button
+                                type="button"
+                                aria-label="Decrease amount"
+                                onClick={() => applyDashboardCustomRange({ amount: dashboardCustomRange.amount - 1 })}
+                                className="px-2.5 py-1 text-base leading-none text-muted-foreground transition-colors hover:text-primary"
+                              >
+                                −
+                              </button>
+                              <input
+                                type="number"
+                                min={1}
+                                max={999}
+                                value={dashboardCustomRange.amount}
+                                onChange={(event) => applyDashboardCustomRange({ amount: Number(event.target.value) })}
+                                className="w-12 border-x bg-transparent px-1 py-1 text-center text-sm outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                              />
+                              <button
+                                type="button"
+                                aria-label="Increase amount"
+                                onClick={() => applyDashboardCustomRange({ amount: dashboardCustomRange.amount + 1 })}
+                                className="px-2.5 py-1 text-base leading-none text-muted-foreground transition-colors hover:text-primary"
+                              >
+                                +
+                              </button>
+                            </div>
+                          </div>
+                          <div className="mt-2 grid grid-cols-4 gap-1">
+                            {DASHBOARD_TIME_UNITS.map((unit) => (
+                              <button
+                                key={unit.value}
+                                type="button"
+                                onClick={() => applyDashboardCustomRange({ unit: unit.value })}
+                                className={cn(
+                                  "rounded-md border px-1.5 py-1 text-xs font-medium transition-colors hover:border-primary/50 hover:bg-primary/5",
+                                  dashboardDateFilter === "custom" && dashboardCustomRange.unit === unit.value
+                                    ? "border-primary bg-primary/10 text-primary"
+                                    : "border-border text-foreground",
+                                )}
+                              >
+                                {unit.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </PopoverContent>
+                    </Popover>
                   </div>
                   <div className="w-full sm:w-[170px]">
                     <Select
@@ -6949,13 +7388,95 @@ const AgentDashboard = () => {
                           useCompactDashboardTable ? "whitespace-normal" : "whitespace-nowrap",
                         )}
                       >
-                        {heading}
+                        {(() => {
+                          const sortKey = DASHBOARD_COLUMN_SORT_KEYS[heading];
+                          if (!sortKey) {
+                            return heading;
+                          }
+                          const isActive = dashboardColumnSort?.key === sortKey;
+                          const activeDir = isActive && dashboardColumnSort?.value == null
+                            ? dashboardColumnSort?.dir
+                            : undefined;
+                          const SortIcon = !isActive
+                            ? ChevronsUpDown
+                            : activeDir === "asc"
+                              ? ChevronUp
+                              : ChevronDown;
+                          const valueOptions = sortKey === "category"
+                            ? dashboardCategoryTeamOptions
+                            : DASHBOARD_COLUMN_VALUE_OPTIONS[sortKey];
+                          const labels = getDashboardColumnSortLabels(sortKey);
+                          return (
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button
+                                  type="button"
+                                  title={`Sort by ${heading}`}
+                                  className={cn(
+                                    "inline-flex items-center gap-1 font-medium transition-colors hover:text-foreground focus-visible:outline-none",
+                                    isActive && "text-primary",
+                                  )}
+                                >
+                                  {heading}
+                                  <SortIcon className={cn("h-3.5 w-3.5", isActive ? "opacity-90" : "opacity-40")} aria-hidden />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="start" className="w-52">
+                                {valueOptions ? (
+                                  valueOptions.map((option) => {
+                                    const optionActive = isActive && dashboardColumnSort?.value === option.value;
+                                    return (
+                                      <DropdownMenuItem
+                                        key={option.value}
+                                        onClick={() => setDashboardColumnSort({ key: sortKey, dir: "asc", value: option.value })}
+                                        className="flex items-center justify-between gap-2"
+                                      >
+                                        <span>{option.label}</span>
+                                        {optionActive ? <Check className="h-4 w-4 text-primary" aria-hidden /> : null}
+                                      </DropdownMenuItem>
+                                    );
+                                  })
+                                ) : (
+                                  <>
+                                    <DropdownMenuItem
+                                      onClick={() => setDashboardColumnSort({ key: sortKey, dir: "asc" })}
+                                      className="flex items-center justify-between gap-2"
+                                    >
+                                      <span className="inline-flex items-center gap-1.5">
+                                        <ChevronUp className="h-3.5 w-3.5 opacity-70" aria-hidden />
+                                        {labels.asc}
+                                      </span>
+                                      {activeDir === "asc" ? <Check className="h-4 w-4 text-primary" aria-hidden /> : null}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() => setDashboardColumnSort({ key: sortKey, dir: "desc" })}
+                                      className="flex items-center justify-between gap-2"
+                                    >
+                                      <span className="inline-flex items-center gap-1.5">
+                                        <ChevronDown className="h-3.5 w-3.5 opacity-70" aria-hidden />
+                                        {labels.desc}
+                                      </span>
+                                      {activeDir === "desc" ? <Check className="h-4 w-4 text-primary" aria-hidden /> : null}
+                                    </DropdownMenuItem>
+                                  </>
+                                )}
+                                <DropdownMenuItem
+                                  onClick={() => setDashboardColumnSort(null)}
+                                  className="flex items-center justify-between gap-2"
+                                >
+                                  <span className="text-muted-foreground">Default order</span>
+                                  {!isActive ? <Check className="h-4 w-4 text-primary" aria-hidden /> : null}
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          );
+                        })()}
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {dashboardDisplayedTickets.map((ticket) => {
+                  {dashboardSortedDisplayedTickets.map((ticket) => {
                     const requesterColumnSummary = getDashboardRequesterColumnSummary(
                       ticket,
                       { preferCoverageInquiry: isLearningPlanCoverageSection },
@@ -7105,14 +7626,20 @@ const AgentDashboard = () => {
                         </td>
                         {useCompactDashboardTable ? (
                           <td className={dashboardCellClassName}>
-                            <StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} />
+                            <TicketStatusEditor ticketId={ticket.id} status={ticket.status} label={getDisplayedTicketStatus(ticket)}
+                              disabled={!hasFullAdminAccess || Boolean(ticket.isArchived)}
+                              onConfirm={(status, note) => updateDashboardTicketStatus(ticket, status, note)} />
                             <div className="mt-2 text-xs text-muted-foreground">
                               {getDisplayedTicketStatusReason(ticket)}
                             </div>
                           </td>
                         ) : (
                           <>
-                            <td className={dashboardCellClassName}><StatusBadge status={ticket.status} label={getDisplayedTicketStatus(ticket)} /></td>
+                            <td className={dashboardCellClassName}>
+                              <TicketStatusEditor ticketId={ticket.id} status={ticket.status} label={getDisplayedTicketStatus(ticket)}
+                                disabled={!hasFullAdminAccess || Boolean(ticket.isArchived)}
+                                onConfirm={(status, note) => updateDashboardTicketStatus(ticket, status, note)} />
+                            </td>
                             <td className={cn(dashboardCellClassName, "text-muted-foreground")}>{getDisplayedTicketStatusReason(ticket)}</td>
                           </>
                         )}
@@ -7127,6 +7654,17 @@ const AgentDashboard = () => {
                               latestEscalationClosure={ticket.latestEscalationClosure}
                               latestTransferDecision={ticket.latestTransferDecision}
                             />
+                            {!ticket.assignedAgentId && ticket.status !== "Closed" && !ticket.isArchived && canUseTicketReceiving ? (
+                              <div className="mt-1" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+                                <Button type="button" size="sm" variant="outline" disabled={Boolean(claimingTicketId)}
+                                  aria-label={`Claim ticket ${ticket.id}`} onClick={() => void claimTicket(ticket)}>
+                                  {claimingTicketId === ticket.id ? "Claiming..." : "Claim ticket"}
+                                </Button>
+                              </div>
+                            ) : null}
+                            {ticket.status === "Closed" && ticket.resolvedBy?.name ? (
+                              <div className="mt-1 text-xs text-muted-foreground">Resolved by {ticket.resolvedBy.name}</div>
+                            ) : null}
                           </td>
                         ) : null}
                         <td className={cn(dashboardCellClassName, useCompactDashboardTable ? "text-xs align-middle" : "whitespace-nowrap")}>
@@ -7153,6 +7691,24 @@ const AgentDashboard = () => {
                               </div>
                             ) : null}
                           </div>
+                        </td>
+                        <td className={dashboardCellClassName} onClick={(event) => event.stopPropagation()}>
+                          <button
+                            type="button"
+                            onClick={() => void openAttachmentPopup(ticket)}
+                            title="View the requester's note and images"
+                            aria-label={`View note and images for ticket ${ticket.id}`}
+                            className={cn(
+                              "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors",
+                              ticket.evidenceCount > 0
+                                ? "border-primary/30 bg-primary/5 text-primary hover:bg-primary/10"
+                                : "border-input bg-background text-muted-foreground hover:bg-secondary/40",
+                              useCompactDashboardTable && "w-full justify-center",
+                            )}
+                          >
+                            <Paperclip className="h-3.5 w-3.5" />
+                            <span>{ticket.evidenceCount > 0 ? ticket.evidenceCount : "View"}</span>
+                          </button>
                         </td>
                         <td className={dashboardCellClassName} onClick={(event) => event.stopPropagation()}>
                           <div className={cn("flex items-center justify-end gap-2", useCompactDashboardTable && "flex-col items-stretch")}>
@@ -9018,6 +9574,12 @@ const AgentDashboard = () => {
                       </div>
                       <div>
                         <Label className="mb-1.5 block">Assign Agent</Label>
+                        {!activeDetail.ticket.assignedAgentId && activeDetail.ticket.status !== "Closed" && canUseTicketReceiving && !activeTicketIsArchived ? (
+                          <Button type="button" size="sm" className="mb-2" disabled={Boolean(claimingTicketId)}
+                            onClick={() => void claimTicket(activeDetail.ticket)}>
+                            {claimingTicketId === activeDetail.ticket.id ? "Claiming..." : "Claim this ticket"}
+                          </Button>
+                        ) : null}
                         {canAssignActiveTicket ? (
                           <>
                             <Select value={draftAgentId} onValueChange={setDraftAgentId}>
@@ -9099,6 +9661,16 @@ const AgentDashboard = () => {
                       ) : null}
                       <InfoCard label="Requester Role" value={formatRequesterRoleLabel(activeDetail.ticket.requesterRole)} />
                       <InfoCard label="Assigned Team" value={activeDetail.ticket.assignedTeam} />
+                      <InfoCard label="Current owner" value={activeDetail.ticket.assignedAgentId ? activeDetail.ticket.assignedAgentName : "Awaiting pickup"} />
+                      {activeDetail.ticket.assignedAgentEmail ? <InfoCard label="Owner e-mail" value={activeDetail.ticket.assignedAgentEmail} /> : null}
+                      {activeDetail.ticket.assignedAt ? <InfoCard label="Picked up at" value={formatDateTime(activeDetail.ticket.assignedAt)} /> : null}
+                      {activeDetail.ticket.status === "Closed" && activeDetail.ticket.resolvedBy?.name ? (
+                        <>
+                          <InfoCard label="Resolved by" value={activeDetail.ticket.resolvedBy.name} />
+                          {activeDetail.ticket.resolvedBy.email ? <InfoCard label="Resolver e-mail" value={activeDetail.ticket.resolvedBy.email} /> : null}
+                          {activeDetail.ticket.resolvedBy.resolvedAt ? <InfoCard label="Resolved at" value={formatDateTime(activeDetail.ticket.resolvedBy.resolvedAt)} /> : null}
+                        </>
+                      ) : null}
                       <InfoCard label="Category" value={formatCategoryLabel(activeDetail.ticket.category, activeDetail.ticket.technicalSubcategory)} />
                       <InfoCard label="Status Reason" value={getDisplayedTicketStatusReason(activeDetail.ticket)} />
                       <InfoCard label="Created" value={formatDateTime(activeDetail.ticket.createdAt)} />
@@ -9238,6 +9810,111 @@ const AgentDashboard = () => {
           )}
         </SheetContent>
       </Sheet>
+
+      <Dialog open={Boolean(attachmentPopupTicket)} onOpenChange={(open) => !open && closeAttachmentPopup()}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Paperclip className="h-4 w-4" />
+              Attachment
+              {attachmentPopupTicket ? (
+                <span className="font-mono text-sm text-muted-foreground">{attachmentPopupTicket.id}</span>
+              ) : null}
+            </DialogTitle>
+            <DialogDescription>
+              The note and images the requester submitted with this ticket.
+            </DialogDescription>
+          </DialogHeader>
+
+          {attachmentPopupLoading ? (
+            <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+              <LoaderCircle className="h-4 w-4 animate-spin" /> Loading attachments...
+            </div>
+          ) : attachmentPopupError ? (
+            <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+              {attachmentPopupError}
+            </div>
+          ) : attachmentPopupDetail ? (
+            (() => {
+              const requesterAttachments = getRequesterEvidenceAttachments(attachmentPopupDetail.attachments);
+              const noteText = attachmentPopupDetail.ticket.inquiry?.trim();
+              return (
+                <div className="max-h-[70vh] space-y-4 overflow-y-auto">
+                  <section>
+                    <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Note
+                    </div>
+                    <div className="whitespace-pre-wrap rounded-xl border bg-secondary/40 p-3 text-sm leading-6">
+                      {noteText || "No note was submitted."}
+                    </div>
+                  </section>
+                  <section>
+                    <div className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Images &amp; files{requesterAttachments.length > 0 ? ` (${requesterAttachments.length})` : ""}
+                    </div>
+                    {requesterAttachments.length === 0 ? (
+                      <div className="rounded-xl border bg-background p-3 text-sm text-muted-foreground">
+                        No images or files were attached to this ticket.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                        {requesterAttachments.map((file) => {
+                          const isImage = (file.mimeType || "").startsWith("image/");
+                          return (
+                            <button
+                              key={file.id}
+                              type="button"
+                              onClick={() => {
+                                if (!file.storageUrl) {
+                                  return;
+                                }
+                                setAttachmentPopupPreview({
+                                  id: file.id,
+                                  name: file.name,
+                                  mimeType: file.mimeType,
+                                  size: file.size,
+                                  source: file.storageUrl,
+                                });
+                              }}
+                              disabled={!file.storageUrl}
+                              title={file.name}
+                              className="group flex flex-col overflow-hidden rounded-xl border bg-background text-left transition-colors hover:border-primary/40 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <div className="flex h-28 items-center justify-center overflow-hidden bg-secondary/40">
+                                {isImage && file.storageUrl ? (
+                                  <AttachmentThumbnail
+                                    src={file.storageUrl}
+                                    alt={file.name}
+                                  />
+                                ) : (
+                                  <FileText className="h-8 w-8 text-muted-foreground" />
+                                )}
+                              </div>
+                              <div className="min-w-0 p-2">
+                                <div className="truncate text-xs font-medium" title={file.name}>
+                                  {file.name}
+                                </div>
+                                <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                                  {formatBytes(file.size)}
+                                </div>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </section>
+                </div>
+              );
+            })()
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      <AttachmentPreviewDialog
+        attachment={attachmentPopupPreview}
+        onClose={() => setAttachmentPopupPreview(null)}
+      />
 
       <AlertDialog
         open={Boolean(ticketPendingArchive)}
@@ -10549,9 +11226,25 @@ const AdminNotificationLogCard = ({
 }) => {
   const tone = getActivityEventTone(item.eventType);
   const detail = getAdminNotificationLogDetail(item);
+  const canOpenTicket = Boolean(item.ticketId);
 
   return (
-    <div className="rounded-2xl border bg-background px-3 py-3 shadow-soft">
+    <div
+      role={canOpenTicket ? "button" : undefined}
+      tabIndex={canOpenTicket ? 0 : undefined}
+      onClick={canOpenTicket ? () => void onOpenTicket(item.ticketId) : undefined}
+      onKeyDown={canOpenTicket ? (event) => {
+        if (event.key !== "Enter" && event.key !== " ") {
+          return;
+        }
+        event.preventDefault();
+        void onOpenTicket(item.ticketId);
+      } : undefined}
+      className={cn(
+        "rounded-2xl border bg-background px-3 py-3 shadow-soft",
+        canOpenTicket && "cursor-pointer transition-colors hover:bg-secondary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
+      )}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <span className={cn(
@@ -10587,7 +11280,10 @@ const AdminNotificationLogCard = ({
         <Button
           size="sm"
           variant="outline"
-          onClick={() => void onOpenTicket(item.ticketId)}
+          onClick={(event) => {
+            event.stopPropagation();
+            void onOpenTicket(item.ticketId);
+          }}
         >
           Open Ticket
         </Button>
@@ -15048,6 +15744,28 @@ function getSmartPreviewDownloadName(fileName: string) {
   return `${safeFileName.slice(0, extensionIndex)}-smart-preview.png`;
 }
 
+const AttachmentThumbnail = ({ src, alt }: { src: string; alt: string }) => {
+  const [failedSource, setFailedSource] = useState<string | null>(null);
+
+  if (failedSource === src) {
+    return (
+      <span className="flex flex-col items-center gap-2 p-3 text-center text-xs text-muted-foreground">
+        <FileText className="h-7 w-7" />
+        Image unavailable
+      </span>
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      alt={alt}
+      onError={() => setFailedSource(src)}
+      className="h-full w-full object-contain transition-transform group-hover:scale-105"
+    />
+  );
+};
+
 const AttachmentPreviewDialog = ({
   attachment,
   onClose,
@@ -15097,7 +15815,11 @@ const AttachmentPreviewDialog = ({
         });
 
         if (!response.ok) {
-          throw new Error("Attachment preview request failed.");
+          throw new Error(response.status === 404
+            ? "This attachment file is missing from this server. Restore the original file to the attachment storage folder to view it."
+            : response.status === 401 || response.status === 403
+              ? "Please sign in with an account that has access to this attachment."
+              : "We could not load this attachment preview. Please try again.");
         }
 
         const blob = await response.blob();
@@ -15109,7 +15831,7 @@ const AttachmentPreviewDialog = ({
           return;
         }
 
-        setPreviewError("We could not load this attachment preview. You can still try downloading it.");
+        setPreviewError(error instanceof Error ? error.message : "We could not load this attachment preview. Please try again.");
       } finally {
         if (!abortController.signal.aborted) {
           setIsLoadingPreview(false);
@@ -17081,15 +17803,58 @@ function hasTicketAccess(agent: Pick<AdminAgent, "accountScope" | "role" | "lega
     || hasAnyPreloadedTeamAccess(agent);
 }
 
-function getDashboardDateRange(filter: DashboardDateFilter) {
+function getDashboardCustomRangeBounds(range: DashboardCustomRange) {
+  const now = new Date();
+  const amount = clampDashboardCustomAmount(range.amount);
+  // "Last N …" rolls back from the current moment. Hours/days/weeks are exact
+  // durations; months step back by calendar month so each month keeps its length.
+  let start: Date;
+  if (range.unit === "hours") {
+    start = new Date(now.getTime() - amount * 60 * 60 * 1000);
+  } else if (range.unit === "days") {
+    start = new Date(now.getTime() - amount * 24 * 60 * 60 * 1000);
+  } else if (range.unit === "weeks") {
+    start = new Date(now.getTime() - amount * 7 * 24 * 60 * 60 * 1000);
+  } else {
+    start = new Date(now.getFullYear(), now.getMonth() - amount, now.getDate(), now.getHours(), now.getMinutes());
+  }
+  const end = new Date(now.getTime() + 60 * 1000);
+  return { createdFrom: start.toISOString(), createdBefore: end.toISOString() };
+}
+
+function getDashboardDateRange(filter: DashboardDateFilter, customRange: DashboardCustomRange) {
   if (filter === "all") {
     return { createdFrom: "", createdBefore: "" };
   }
 
+  if (filter === "custom") {
+    return getDashboardCustomRangeBounds(customRange);
+  }
+
+  const now = new Date();
+
+  // Hour-grained windows roll back from the current moment (not the calendar day).
+  const rollingHours: Partial<Record<DashboardDateFilter, number>> = {
+    lastHour: 1,
+    last24Hours: 24,
+  };
+  const hoursBack = rollingHours[filter];
+  if (hoursBack) {
+    const rollingStart = new Date(now.getTime() - hoursBack * 60 * 60 * 1000);
+    const rollingEnd = new Date(now.getTime() + 60 * 1000);
+    return { createdFrom: rollingStart.toISOString(), createdBefore: rollingEnd.toISOString() };
+  }
+
   // Calendar boundaries match the local dates displayed in the Created column,
   // including days that are shorter or longer due to daylight saving changes.
-  const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - (filter === "last7Days" ? 6 : 0));
+  const calendarDaysBack: Partial<Record<DashboardDateFilter, number>> = {
+    today: 0,
+    last7Days: 6,
+    last30Days: 29,
+  };
+  const start = filter === "last3Months"
+    ? new Date(now.getFullYear(), now.getMonth() - 3, now.getDate())
+    : new Date(now.getFullYear(), now.getMonth(), now.getDate() - (calendarDaysBack[filter] ?? 0));
   const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
   return { createdFrom: start.toISOString(), createdBefore: end.toISOString() };
 }
@@ -18525,7 +19290,7 @@ function getAssignedAgentBadgeLabel(
     return `Assigned from ${latestTransferDecision.fromAgentName} to ${currentAssignedAgentName}`;
   }
 
-  return `Assigned to ${currentAssignedAgentName}`;
+  return currentAssignedAgentName === "Unassigned" ? "Awaiting pickup" : `Assigned to ${currentAssignedAgentName}`;
 }
 
 function humanizeEvent(value: string) {
@@ -18762,9 +19527,13 @@ function getActivityEventSummary(item: HistoryItem) {
       }
       break;
     case "assignment_changed":
-      if (assignedAgentName) {
-        return `Assigned to ${assignedAgentName}`;
+      if (fromAgentName && assignedAgentName) {
+        return `Reassigned from ${fromAgentName} to ${assignedAgentName}`;
       }
+      if (assignedAgentName) {
+        return `Picked up by ${assignedAgentName}`;
+      }
+      if (fromAgentName) return `${fromAgentName} released the ticket`;
       break;
     case "team_transferred":
       if (getActivityPayloadTextValue(item.payload.fromTeam) || getActivityPayloadTextValue(item.payload.toTeam)) {
@@ -19156,11 +19925,11 @@ function getRequesterRoleBadgeLabel(role: string | null | undefined, source?: st
     return "Employer";
   }
 
-  if (normalizedRole === "user" && normalizedSource === "kbc_users_data") {
+  if ((!normalizedRole || normalizedRole === "user") && ["kbc_users_data", "legacy_kbc_users_data", "lms_learners"].includes(normalizedSource)) {
     return "Learner";
   }
 
-  return "";
+  return formatRequesterRoleLabel(normalizedRole);
 }
 
 function RequesterRoleBadge({

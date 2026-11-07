@@ -22,7 +22,7 @@ class CombinedNotificationTests(SimpleTestCase):
         }
         for event, recipient_type, recipients in (
             (services.SUPPORT_NOTIFICATION_EVENT_TICKET_CREATED, "operations", ["support@example.com"]),
-            (services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED, "requester", ["learner@example.com"]),
+            (services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED, "requester", []),
             (services.SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED, "ai_team_person", ["reviewer@example.com"]),
         ):
             with self.subTest(event=event):
@@ -30,6 +30,38 @@ class CombinedNotificationTests(SimpleTestCase):
                 self.assertEqual(payload["recipientType"], recipient_type)
                 self.assertEqual(payload["recipients"], recipients)
                 self.assertEqual(payload["ticket"]["id"], "KBC-000024")
+
+    def test_requester_ticket_created_email_is_disabled_for_every_role(self):
+        for requester_role in ("user", "learner", "coach", "tutor", "employer"):
+            with self.subTest(requester_role=requester_role):
+                payload = services.build_support_notification_webhook_payload(
+                    services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_SUBMITTED,
+                    {
+                        "public_id": "KBC-000025",
+                        "learner_email": f"{requester_role}@example.com",
+                        "metadata": {"requester_role": requester_role},
+                    },
+                )
+
+                self.assertEqual(payload["recipientType"], "requester")
+                self.assertEqual(payload["recipients"], [])
+
+    def test_requester_ticket_closed_email_remains_enabled_for_every_role(self):
+        for requester_role in ("user", "learner", "coach", "tutor", "employer"):
+            with self.subTest(requester_role=requester_role):
+                requester_email = f"{requester_role}@example.com"
+                payload = services.build_support_notification_webhook_payload(
+                    services.SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED,
+                    {
+                        "public_id": "KBC-000026",
+                        "learner_email": requester_email,
+                        "metadata": {"requester_role": requester_role},
+                    },
+                    status="Closed",
+                )
+
+                self.assertEqual(payload["recipientType"], "requester")
+                self.assertEqual(payload["recipients"], [requester_email])
 
     def test_multipart_retry_preserves_evidence_and_ticket_delivery_key(self):
         payload = {

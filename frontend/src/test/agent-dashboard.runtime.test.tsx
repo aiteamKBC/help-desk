@@ -489,6 +489,102 @@ function buildRuntimeTicketDetail(ticketId: string) {
 }
 
 describe("AgentDashboard runtime", () => {
+  it("claims an unassigned ticket only after the explicit claim action", async () => {
+    let detail = buildRuntimeTicketDetail("KBC-000001");
+    detail = { ...detail, ticket: { ...detail.ticket, assignedAgentId: null, assignedAgentName: "Unassigned", assignedAgentUsername: "" } };
+    const patches: Record<string, unknown>[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/admin/tickets/KBC-000001" && init?.method === "PATCH") {
+        patches.push(JSON.parse(String(init.body)));
+        detail = { ...detail, ticket: { ...detail.ticket, assignedAgentId: 27, assignedAgentName: "Ayman Badewi", assignedAgentUsername: "ayman.badewi" } };
+        return new Response(JSON.stringify(detail), { status: 200 });
+      }
+      if (url.startsWith("/api/admin/tickets") && !url.includes("/metrics")) {
+        return new Response(JSON.stringify({ tickets: [detail.ticket] }), { status: 200 });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    const claim = await screen.findByRole("button", { name: "Claim ticket KBC-000001" });
+    expect(patches).toHaveLength(0);
+    fireEvent.click(claim);
+    await waitFor(() => expect(patches).toEqual([{ claim: true }]));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Claim ticket KBC-000001" })).not.toBeInTheDocument());
+    expect(screen.getByText("Assigned to Ayman Badewi")).toBeInTheDocument();
+  });
+
+  it("confirms a status change directly from the table and updates the row without opening ticket details", async () => {
+    let detail = buildRuntimeTicketDetail("KBC-000001");
+    const patches: Record<string, unknown>[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/admin/tickets/KBC-000001" && init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body));
+        patches.push(body);
+        detail = { ...detail, ticket: { ...detail.ticket, status: body.status, statusReason: body.statusReason } };
+        return new Response(JSON.stringify(detail), { status: 200 });
+      }
+      if (url.startsWith("/api/admin/tickets") && !url.includes("/metrics")) {
+        return new Response(JSON.stringify({ tickets: [detail.ticket] }), { status: 200 });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    const trigger = await screen.findByRole("button", { name: "Change status for KBC-000001" });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("button", { name: "Closed", exact: true }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Reason for status change" }), { target: { value: "Issue resolved" } });
+    expect(patches).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm change" }));
+    await waitFor(() => expect(patches).toEqual([{ status: "Closed", statusReason: "Closed via Agent", note: "Issue resolved" }]));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Change status for KBC-000001" })).toHaveTextContent("Closed"));
+    expect(screen.queryByRole("heading", { name: "Ticket KBC-000001" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["user", "kbc_users_data", "Learner"],
+    ["user", "lms_learners", "Learner"],
+    ["user", "legacy_kbc_users_data", "Learner"],
+    ["coach", "microsoft_entra", "Coach"],
+    ["tutor", "microsoft_entra", "Tutor"],
+    ["employer", "microsoft_entra", "Employer"],
+    ["user", "microsoft_entra", "User"],
+    ["", "", "User"],
+  ])("keeps the %s/%s requester badge (%s) and searched row after opening a ticket", async (role, source, label) => {
+    const detail = buildRuntimeTicketDetail("KBC-000001");
+    const ticket = { ...detail.ticket, requesterRole: role, requesterSource: source, subject: "Unique searchable subject" };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/admin/tickets/KBC-000001") {
+        return new Response(JSON.stringify({ ...detail, ticket }), { status: 200 });
+      }
+      if (url.startsWith("/api/admin/tickets") && !url.includes("/metrics")) {
+        return new Response(JSON.stringify({ tickets: [ticket] }), { status: 200 });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    const row = (await screen.findByText(ticket.id)).closest("tr")!;
+    expect(within(row).getByText(label, { exact: true })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), {
+      target: { value: ticket.subject },
+    });
+    const searchedRow = (await screen.findByText(ticket.id)).closest("tr")!;
+    fireEvent.click(searchedRow);
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByRole("heading", { name: `Ticket ${ticket.id}` });
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    const remainingRow = screen.getByText(ticket.id).closest("tr")!;
+    expect(within(remainingRow).getByText(label, { exact: true })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /Search by requester name/ })).toHaveValue(ticket.subject);
+  });
+
   beforeEach(() => {
     window.sessionStorage.clear();
     window.localStorage.clear();
@@ -594,8 +690,9 @@ describe("AgentDashboard runtime", () => {
     render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
     await screen.findByText("KBC-000101");
     const selectPeriod = async (name: string) => {
-      fireEvent.keyDown(screen.getByRole("combobox", { name: "Filter tickets by creation date" }), { key: "ArrowDown" });
-      fireEvent.click(await screen.findByRole("option", { name }));
+      fireEvent.click(screen.getByRole("button", { name: "Filter tickets by creation date" }));
+      fireEvent.click(await screen.findByRole("button", { name, exact: true }));
+      fireEvent.keyDown(screen.getByRole("button", { name, exact: true }), { key: "Escape" });
     };
     const expectOpenCount = (count: string) => {
       expect(within(screen.getByRole("button", { name: /Open Tickets/ })).getByText(count, { exact: true })).toBeInTheDocument();
@@ -628,7 +725,7 @@ describe("AgentDashboard runtime", () => {
     fireEvent.change(screen.getByRole("textbox", { name: /Search by requester name/ }), { target: { value: "" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
-    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
+    expect(screen.getByRole("button", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
     expect(await screen.findByText("KBC-000103")).toBeInTheDocument();
     expect(screen.getByText("KBC-000104")).toBeInTheDocument();
     await waitFor(() => expectOpenCount("4"));
@@ -640,7 +737,7 @@ describe("AgentDashboard runtime", () => {
     expect(screen.queryByText("KBC-000106")).not.toBeInTheDocument();
     expectOpenCount("1");
     fireEvent.click(screen.getByRole("button", { name: "Back to Active" }));
-    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
+    expect(screen.getByRole("button", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
     await waitFor(() => expectOpenCount("4"));
   }, 15000);
 
@@ -671,8 +768,9 @@ describe("AgentDashboard runtime", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Next" }));
     await screen.findByText("Page 2 of 2");
 
-    fireEvent.keyDown(screen.getByRole("combobox", { name: "Filter tickets by creation date" }), { key: "ArrowDown" });
-    fireEvent.click(await screen.findByRole("option", { name: "Today" }));
+    fireEvent.click(screen.getByRole("button", { name: "Filter tickets by creation date" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Today", exact: true }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Today", exact: true }), { key: "Escape" });
     await screen.findByText("No tickets match the current filters for today.");
     const expectedFrom = new Date(2026, 5, 14).toISOString();
     const expectedBefore = new Date(2026, 5, 15).toISOString();
@@ -689,7 +787,7 @@ describe("AgentDashboard runtime", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reset Filters" }));
     await screen.findByText("Page 1 of 2");
-    expect(screen.getByRole("combobox", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
+    expect(screen.getByRole("button", { name: "Filter tickets by creation date" })).toHaveTextContent("All Time");
   }, 15000);
 
   it("renders the admin dashboard with live payload data", async () => {
@@ -819,36 +917,43 @@ describe("AgentDashboard runtime", () => {
 
   it("shows dynamic teams as isolated dashboard tabs", async () => {
     const originalFetch = globalThis.fetch;
-    const curriculumTicket = {
+    const dynamicTeams = [
+      { id: 7, key: "curriculum", label: "Curriculum Team", ticketId: "KBC-000006", subcategory: "Curriculum" },
+      { id: 8, key: "ai_team", label: "Ai Team", ticketId: "KBC-000007", subcategory: "AI Team" },
+      { id: 9, key: "enrolment_team", label: "Enrolment Team", ticketId: "KBC-000008", subcategory: "Enrolment" },
+      { id: 10, key: "operation_team", label: "Operation Team", ticketId: "KBC-000009", subcategory: "Operation" },
+      { id: 11, key: "quality_team", label: "Quality team", ticketId: "KBC-000010", subcategory: "Quality" },
+    ];
+    const dynamicTeamTickets = dynamicTeams.map((team, index) => ({
       ...dashboardPayload.tickets.tickets[0],
-      id: "KBC-000006",
-      learnerName: "Curriculum Learner",
-      requesterName: "Curriculum Learner",
-      email: "curriculum.learner@kentbusinesscollege.com",
-      inquiryPreview: "Curriculum team request",
-      assignedTeam: "Curriculum Team",
-      chatId: "CHAT-000006",
-      createdAt: "2026-06-14T13:00:00.000Z",
-      updatedAt: "2026-06-14T13:00:00.000Z",
-    };
+      id: team.ticketId,
+      learnerName: `${team.label} Learner`,
+      requesterName: `${team.label} Learner`,
+      email: `${team.key}@kentbusinesscollege.com`,
+      inquiryPreview: `${team.label} request`,
+      technicalSubcategory: team.subcategory,
+      assignedTeam: team.label,
+      chatId: `CHAT-${team.ticketId.slice(4)}`,
+      createdAt: `2026-06-14T${13 + index}:00:00.000Z`,
+      updatedAt: `2026-06-14T${13 + index}:00:00.000Z`,
+    }));
+    const allDashboardTickets = [...dashboardPayload.tickets.tickets, ...dynamicTeamTickets];
 
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
 
       if (url.includes("/api/admin/teams")) {
         return new Response(JSON.stringify({
-          teams: [
-            {
-              id: 7,
-              key: "curriculum",
-              name: "Curriculum Team",
-              assignedTeam: "Curriculum Team",
-              label: "Curriculum Team",
-              description: "Route this ticket to the curriculum queue.",
-              receiverAccessMetadataKey: "team_access:curriculum",
-              isActive: true,
-            },
-          ],
+          teams: dynamicTeams.map((team) => ({
+            id: team.id,
+            key: team.key,
+            name: team.label,
+            assignedTeam: team.label,
+            label: team.label,
+            description: `Route this ticket to the ${team.label} queue.`,
+            receiverAccessMetadataKey: `team_access:${team.key}`,
+            isActive: true,
+          })),
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -856,15 +961,29 @@ describe("AgentDashboard runtime", () => {
       }
 
       if (url.includes("/api/admin/tickets/metrics")) {
-        return new Response(JSON.stringify(buildDashboardMetricsPayload([...dashboardPayload.tickets.tickets, curriculumTicket])), {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload(allDashboardTickets)), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
       }
 
       if (url.includes("/api/admin/tickets")) {
+        const requestedTeamKey = new URL(url, "http://localhost").searchParams.get("team");
+        const requestedDynamicTeamIndex = dynamicTeams.findIndex((team) => team.key === requestedTeamKey);
+        const responseTickets = requestedDynamicTeamIndex >= 0
+          ? [dynamicTeamTickets[requestedDynamicTeamIndex]]
+          : allDashboardTickets;
         return new Response(JSON.stringify({
-          tickets: [...dashboardPayload.tickets.tickets, curriculumTicket],
+          tickets: responseTickets,
+          pagination: {
+            page: 1,
+            pageSize: 50,
+            total: responseTickets.length,
+            totalPages: 1,
+            hasNext: false,
+            hasPrevious: false,
+            isPaginated: true,
+          },
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -875,12 +994,62 @@ describe("AgentDashboard runtime", () => {
     }) as typeof fetch;
 
     render(
-      <MemoryRouter initialEntries={["/admin"]}>
+      <MemoryRouter initialEntries={["/admin?view=admin"]}>
         <AgentDashboard />
       </MemoryRouter>,
     );
 
     const curriculumTab = await screen.findByRole("tab", { name: /^Curriculum Team$/i });
+    await screen.findByRole("tabpanel", { name: /Admin Dashboard/i });
+
+    fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(await screen.findByRole("menuitem", { name: "Support Dashboard" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Learning Plan Team" })).toBeInTheDocument();
+    for (const team of dynamicTeams) {
+      expect(screen.getByRole("menuitem", { name: team.label })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole("menuitem", { name: "Technical first" })).not.toBeInTheDocument();
+
+    for (const [index, team] of dynamicTeams.entries()) {
+      if (index > 0) {
+        fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+          button: 0,
+          ctrlKey: false,
+        });
+      }
+      fireEvent.click(await screen.findByRole("menuitem", { name: team.label }));
+      await waitFor(() => {
+        const adminPanel = screen.getByRole("tabpanel", { name: /Admin Dashboard/i });
+        const ticketRows = Array.from(adminPanel.querySelectorAll("tbody tr"));
+        expect(ticketRows[0]).toHaveTextContent(team.ticketId);
+      });
+    }
+
+    fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Support Dashboard" }));
+    await waitFor(() => {
+      const adminPanel = screen.getByRole("tabpanel", { name: /Admin Dashboard/i });
+      const ticketRows = Array.from(adminPanel.querySelectorAll("tbody tr"));
+      expect(ticketRows[0]).toHaveTextContent("KBC-000001");
+    });
+
+    fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Learning Plan Team" }));
+    await waitFor(() => {
+      const adminPanel = screen.getByRole("tabpanel", { name: /Admin Dashboard/i });
+      const ticketRows = Array.from(adminPanel.querySelectorAll("tbody tr"));
+      expect(ticketRows[0]).toHaveTextContent("KBC-000002");
+    });
+
     fireEvent.mouseDown(curriculumTab, {
       button: 0,
       ctrlKey: false,
@@ -1239,5 +1408,134 @@ describe("AgentDashboard runtime", () => {
     expect(patchRequests[0].body.status).toBe("Closed");
     expect(patchRequests[0].body.statusReason).toBe("Closed via Agent");
     expect(patchRequests[0].body.note).toBe("Closing this coverage ticket after manual review.");
+  });
+
+  it("keeps the internal note after Save Changes so Close reuses it without retyping", async () => {
+    const originalFetch = globalThis.fetch;
+    const patchRequests: Array<{ body: Record<string, unknown> }> = [];
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.endsWith("/api/admin/tickets/KBC-000001") && (!init?.method || init.method === "GET")) {
+        return new Response(JSON.stringify(buildRuntimeTicketDetail("KBC-000001")), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.endsWith("/api/admin/tickets/KBC-000001") && init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body || "{}")) as Record<string, unknown>;
+        patchRequests.push({ body });
+        const detail = buildRuntimeTicketDetail("KBC-000001");
+        return new Response(JSON.stringify({
+          ...detail,
+          ticket: {
+            ...detail.ticket,
+            status: (body.status as string) || detail.ticket.status,
+            updatedAt: "2026-06-20T16:00:00.000Z",
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    // Open the ticket from the dashboard table.
+    await screen.findByText("KBC-000001");
+    const ticketRow = screen.getAllByRole("button")
+      .find((candidate) => candidate.tagName === "TR" && /KBC-000001/.test(candidate.textContent || ""));
+    expect(ticketRow).toBeTruthy();
+    fireEvent.click(ticketRow as HTMLElement);
+
+    const noteField = await screen.findByPlaceholderText(/Add an internal note before closing/i);
+
+    // Type the note once and Save.
+    fireEvent.change(noteField, { target: { value: "Resolved and verified with the learner." } });
+    fireEvent.click(screen.getByRole("button", { name: /Save Changes/i }));
+
+    await waitFor(() => {
+      expect(patchRequests).toHaveLength(1);
+    });
+    expect(patchRequests[0].body.note).toBe("Resolved and verified with the learner.");
+
+    // The note must still be in the field (not cleared) so Close can reuse it.
+    await waitFor(() => {
+      expect((noteField as HTMLTextAreaElement).value).toBe("Resolved and verified with the learner.");
+    });
+
+    // Close WITHOUT retyping the note (the footer button, not the sheet's X).
+    const closeButton = screen.getAllByRole("button", { name: /Close/i })
+      .find((candidate) => !candidate.className.includes("absolute"));
+    expect(closeButton).toBeTruthy();
+    fireEvent.click(closeButton as HTMLElement);
+
+    await waitFor(() => {
+      expect(patchRequests).toHaveLength(2);
+    });
+    expect(patchRequests[1].body.status).toBe("Closed");
+    expect(patchRequests[1].body.note).toBe("Resolved and verified with the learner.");
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("opens the Attachment column popup with the requester's note and images", async () => {
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+      if (url.endsWith("/api/admin/tickets/KBC-000001") && (!init?.method || init.method === "GET")) {
+        const detail = buildRuntimeTicketDetail("KBC-000001");
+        return new Response(JSON.stringify({
+          ...detail,
+          ticket: { ...detail.ticket, inquiry: "A learner can't submit her assignment" },
+          attachments: [
+            {
+              id: 501,
+              name: "screenshot.png",
+              mimeType: "image/png",
+              size: 2048,
+              storageUrl: "/media/support_attachments/screenshot.png",
+              metadata: {},
+              createdAt: "2026-06-14T10:00:00.000Z",
+            },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    render(
+      <MemoryRouter initialEntries={["/admin"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("KBC-000001");
+
+    // Click the Attachment column button for the ticket (not the row itself).
+    const attachmentButton = await screen.findByRole("button", {
+      name: /View note and images for ticket KBC-000001/i,
+    });
+    fireEvent.click(attachmentButton);
+
+    const dialog = await screen.findByRole("dialog");
+    // The requester's note shows in the popup.
+    await waitFor(() => {
+      expect(within(dialog).getByText("A learner can't submit her assignment")).toBeInTheDocument();
+    });
+    // The attached image is listed by name and rendered as a thumbnail.
+    expect(within(dialog).getByText("screenshot.png")).toBeInTheDocument();
+    expect(within(dialog).getByAltText("screenshot.png")).toBeInTheDocument();
+
+    globalThis.fetch = originalFetch;
   });
 });
