@@ -7,7 +7,7 @@ import { SupportCampusHero } from "@/components/support/SupportCampusHero";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import {
   adminPortalReturnQueryParam,
-  createAdminSessionInstanceId,
+  getOrCreateAdminBrowserInstanceId,
   setAdminSession,
 } from "@/lib/adminSession";
 import "./EmailVerification.css";
@@ -36,6 +36,7 @@ const AdminLogin = () => {
   const [showPass, setShowPass] = useState(false);
   const [error, setError] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [browserInstanceId] = useState(() => getOrCreateAdminBrowserInstanceId());
   const microsoftPortalOrigin = typeof window !== "undefined"
     ? (() => {
         const { protocol, hostname, port, origin } = window.location;
@@ -46,8 +47,8 @@ const AdminLogin = () => {
       })()
     : "";
   const microsoftLoginUrl = microsoftPortalOrigin
-    ? `${microsoftPortalOrigin}/api/admin/microsoft/login?origin=${encodeURIComponent(microsoftPortalOrigin)}`
-    : "/api/admin/microsoft/login";
+    ? `${microsoftPortalOrigin}/api/admin/microsoft/login?origin=${encodeURIComponent(microsoftPortalOrigin)}&instanceId=${encodeURIComponent(browserInstanceId)}`
+    : `/api/admin/microsoft/login?instanceId=${encodeURIComponent(browserInstanceId)}`;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -79,7 +80,7 @@ const AdminLogin = () => {
     setIsSubmitting(true);
 
     try {
-      const instanceId = createAdminSessionInstanceId();
+      const instanceId = browserInstanceId;
       const response = await fetch("/api/admin/login", {
         method: "POST",
         headers: buildCsrfHeaders({

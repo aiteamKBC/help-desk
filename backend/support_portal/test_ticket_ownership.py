@@ -20,8 +20,8 @@ class TicketOwnershipTests(SimpleTestCase):
             "inquiry": "Help needed", "is_archived": False,
         }
         self.actor = {
-            "id": 9, "username": "omar", "full_name": "Omar Helmy",
-            "email": "omar@example.com", "role": "agent", "account_scope": "staff",
+            "id": 9, "username": "example.agent", "full_name": "Example Agent",
+            "email": "example.agent@example.com", "role": "agent", "account_scope": "staff",
             "is_active": True, "metadata": {"legacy_support_access": True},
         }
         self.cursor = MagicMock()
@@ -51,7 +51,7 @@ class TicketOwnershipTests(SimpleTestCase):
             patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000017"}}),
             patch.object(services, "queue_quick_ticket_closed_notification"),
         ):
-            result = services.update_admin_ticket("KBC-000017", {**payload, "actorUsername": "omar"})
+            result = services.update_admin_ticket("KBC-000017", {**payload, "actorUsername": "example.agent"})
         return result, history
 
     def test_claim_records_real_account_email_and_time(self):
@@ -59,7 +59,7 @@ class TicketOwnershipTests(SimpleTestCase):
         values = next(call.args[1] for call in self.cursor.execute.call_args_list if "UPDATE tickets" in call.args[0])
         self.assertEqual(values[2], 9)
         ownership = json.loads(values[5])["assigned_agent_record"]
-        self.assertEqual(ownership["email"], "omar@example.com")
+        self.assertEqual(ownership["email"], "example.agent@example.com")
         self.assertEqual(ownership["assignmentSource"], "claim")
         self.assertTrue(ownership["assignedAt"])
         self.assertIn("assignment_changed", [call.args[1] for call in history.call_args_list])
@@ -94,7 +94,7 @@ class TicketOwnershipTests(SimpleTestCase):
         self.assertEqual(values[2], 4)
         self.assertEqual(metadata["assigned_agent_record"]["id"], 4)
         self.assertEqual(metadata["resolved_by"]["id"], 9)
-        self.assertEqual(metadata["resolved_by"]["email"], "omar@example.com")
+        self.assertEqual(metadata["resolved_by"]["email"], "example.agent@example.com")
 
     def test_team_transfer_clears_owner_and_preserves_history(self):
         self.ticket["assigned_agent_id"] = 4

@@ -277,6 +277,18 @@ def _row_text(label: str, value: str) -> tuple[str, str]:
     return label, escape((value or "").strip())
 
 
+def default_closure_message() -> str:
+    return (
+        "Your support ticket has been resolved and closed by our team. "
+        "We hope everything is now sorted out for you."
+    )
+
+
+def _closure_message_html(payload: dict[str, Any], fallback: str) -> str:
+    custom_message = str((payload.get("closureEmail") or {}).get("message") or "").strip()
+    return escape(custom_message or fallback).replace("\n", "<br>")
+
+
 def _common_rows(ticket: dict[str, Any], payload: dict[str, Any], *, include_status: bool = True) -> list[tuple[str, str]]:
     cat = ticket.get("category") or ""
     sub = ticket.get("technicalSubcategory") or ""
@@ -293,11 +305,11 @@ def _common_rows(ticket: dict[str, Any], payload: dict[str, Any], *, include_sta
 def _render_closed(payload: dict[str, Any]) -> tuple[str, str]:
     t = payload.get("ticket") or {}
     name = (payload.get("requester") or {}).get("name") or "there"
-    subject = f"Your support ticket {t.get('id')} has been closed"
+    closure_email = payload.get("closureEmail") or {}
+    subject = str(closure_email.get("subject") or f"Your support ticket {t.get('id')} has been closed").strip()
     intro = (
         f"Hi {escape(name.strip() or 'there')},<br><br>"
-        "Your support ticket has been <b>resolved and closed</b> by our team. "
-        "We hope everything is now sorted out for you."
+        f"{_closure_message_html(payload, default_closure_message())}"
     )
     rows = _common_rows(t, payload)
     note = (
@@ -317,8 +329,10 @@ def _render_submitted_for_learner(payload: dict[str, Any]) -> tuple[str, str]:
     submitted_by = escape((requester.get("name") or "a member of staff").strip())
     closed = payload.get("event") == "submitted_for_learner_closed"
     state = "has been resolved and closed" if closed else "has been received"
-    subject = f"Support ticket {ticket.get('id')} {state}"
-    intro = f"Hi {name},<br><br>A support ticket submitted for you by {submitted_by} {state}."
+    closure_email = payload.get("closureEmail") or {}
+    subject = str(closure_email.get("subject") or f"Support ticket {ticket.get('id')} {state}").strip()
+    default_message = f"A support ticket submitted for you by {submitted_by} {state}."
+    intro = f"Hi {name},<br><br>{_closure_message_html(payload, default_message) if closed else default_message}"
     rows = _common_rows(ticket, payload)
     note = "If you have questions about this ticket, please contact the person who submitted it or the support team."
     return subject, _base_email(title="Ticket closed" if closed else "Ticket received", intro_html=intro, rows=rows, cta=None, note_html=note)
