@@ -7,11 +7,13 @@ import {
   CalendarClock,
   FileText,
   Headphones,
+  MessageSquareMore,
   PhoneCall,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
+import { SupportMasterHeader } from "@/components/support/SupportMasterHeader";
 import {
   type Ticket,
 } from "@/context/SupportContext";
@@ -25,6 +27,7 @@ import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/support
 import { setTicketBookingProgress } from "@/lib/supportTicketProgress";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
+import "./SupportOptions.css";
 
 interface SupportOptionAction {
   id: string;
@@ -335,7 +338,7 @@ const SupportOptions = () => {
       description: ticket.liveChatRequested
         ? "Continue to the chat and stay connected while the support team picks up your request."
         : "Open chat and request a live support admin directly from the conversation.",
-      icon: Headphones,
+      icon: MessageSquareMore,
       onClick: () => handleContinueToChat("live-chat"),
       disabled: isCreatingTicket,
       statusText: isCreatingTicket ? "Creating ticket..." : ticket.liveChatRequested ? "Resume" : "Request now",
@@ -405,7 +408,6 @@ const SupportOptions = () => {
   const actionDescription = showTeamsCall
     ? "Everything is in one focused panel. Choose chatbot, live chat, booking, direct ticket submission, or a Microsoft Teams call."
     : "Everything is in one focused panel. Choose chatbot, live chat, booking, or direct ticket submission.";
-  const supportActionsGridClassName = "mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-12 xl:auto-rows-fr";
   const ticketSummaryItems = [
     {
       label: "Requester",
@@ -432,98 +434,69 @@ const SupportOptions = () => {
       value: ticket.id ? (ticket.status || "Open") : "Not submitted yet",
     },
   ];
-  const ticketSummaryGridClassName = ticketSummaryItems.length >= 5
-    ? "grid gap-3 sm:grid-cols-2 xl:grid-cols-5"
-    : "grid gap-3 sm:grid-cols-2 xl:grid-cols-4";
-
-  const getSupportActionCardLayout = (actionId: string, index: number) => {
-    if (!showTeamsCall) {
-      return "xl:col-span-6";
-    }
-
-    if (actionId === "teams-call") {
-      return "md:col-span-2 xl:col-span-6";
-    }
-
-    if (index < 3) {
-      return "xl:col-span-4";
-    }
-
-    return "xl:col-span-6";
-  };
-
   return (
-    <SupportLayout>
-      <StepIndicator current={3} />
-      <div className="mx-auto max-w-6xl">
-        <div className="relative overflow-hidden rounded-[32px] border border-primary/10 bg-[radial-gradient(circle_at_top_right,rgba(98,73,238,0.14),transparent_32%),linear-gradient(135deg,#ffffff_0%,#ffffff_58%,rgba(98,73,238,0.055)_100%)] p-6 shadow-card md:p-8 lg:p-10">
-          <div className="pointer-events-none absolute -right-24 top-20 h-64 w-64 rounded-full bg-primary/10 blur-3xl" />
-          <div className="pointer-events-none absolute bottom-0 right-10 h-28 w-72 rounded-full bg-sky-200/25 blur-3xl" />
+    <SupportLayout showHeader={false} fullWidth mainClassName="support-options-main">
+      <SupportMasterHeader />
 
-          <div className="relative flex items-start justify-between gap-4">
-            <div className="inline-flex items-center gap-2 rounded-full border border-primary/15 bg-white/75 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80 shadow-soft backdrop-blur">
-              <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
-              Support Options
+      <div className="support-options-body">
+        <div className="support-options-steps">
+          <StepIndicator current={3} finalLabel="Open" />
+        </div>
+
+        <div className="support-options-shell">
+          <div className="support-options-heading">
+            <div className="support-options-heading__text">
+              <span className="support-options-eyebrow">Support Options</span>
+              <h1>{pageTitle}</h1>
+              <p>{pageDescription}</p>
             </div>
-            <Button variant="ghost" onClick={() => navigate("/support/inquiry")} className="shrink-0 rounded-full bg-white/60 hover:bg-white">
-              <ArrowLeft className="w-4 h-4 mr-2" /> Back
+            <Button variant="ghost" onClick={() => navigate("/support/inquiry")} className="support-options-back">
+              <ArrowLeft aria-hidden="true" /> Back
             </Button>
           </div>
 
-          <div className="relative mt-6">
-            <h1 className="text-2xl font-bold tracking-tight text-primary md:text-3xl">
-              {pageTitle}
-            </h1>
-            <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground md:text-base">
-              {pageDescription}
-            </p>
-
-            <div className="mt-5 rounded-[26px] border border-primary/10 bg-white/72 p-3 shadow-soft backdrop-blur md:p-4">
-              <div className={ticketSummaryGridClassName}>
-                {ticketSummaryItems.map((item) => (
-                  <div key={item.label} className="min-w-0 rounded-2xl border border-primary/10 bg-white/85 px-4 py-3">
-                    <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                      {item.label}
-                    </div>
-                    <div className="mt-1 truncate text-sm font-semibold text-foreground" title={item.value}>
-                      {item.value}
-                    </div>
-                  </div>
-                ))}
+          <div
+            className={cn(
+              "support-options-summary",
+              ticketSummaryItems.length >= 5 && "support-options-summary--five",
+            )}
+          >
+            {ticketSummaryItems.map((item) => (
+              <div key={item.label} className="support-options-summary__item">
+                <div className="support-options-summary__label">{item.label}</div>
+                <div className="support-options-summary__value" title={item.value}>
+                  {item.value}
+                </div>
               </div>
-            </div>
+            ))}
           </div>
 
-          <section className="relative mt-7 rounded-[28px] border border-primary/12 bg-card/90 p-5 shadow-soft backdrop-blur md:p-6">
-            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-              <div className="flex items-start gap-4">
-                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-soft">
-                  {showTeamsCall ? <PhoneCall className="h-6 w-6" /> : <Bot className="h-6 w-6" />}
+          <section className="support-options-panel">
+            <div className="support-options-panel__header">
+              <div className="support-options-panel__intro">
+                <div className="support-options-panel__icon" aria-hidden="true">
+                  <Headphones />
                 </div>
                 <div>
-                  <h2 className="text-xl font-semibold text-foreground">
-                    {actionTitle}
-                  </h2>
-                  <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-                    {actionDescription}
-                  </p>
+                  <h2>{actionTitle}</h2>
+                  <p>{actionDescription}</p>
                 </div>
               </div>
-              <div className="rounded-full border border-primary/10 bg-primary/[0.05] px-4 py-2 text-xs font-semibold text-primary">
+              <div className="support-options-panel__count">
                 {showTeamsCall ? "5 support paths" : "4 support paths"}
               </div>
             </div>
 
             {showTeamsCall && (
-              <div className="mt-5 rounded-[24px] border border-primary/15 bg-primary/[0.04] px-4 py-4">
-                <div className="text-sm font-semibold text-foreground">
+              <div className="support-options-notice">
+                <div className="support-options-notice__title">
                   {hasPreparedTeamsCall
                     ? "Teams hand-off is already assigned"
                     : teamsCallTargetLabel
                       ? "Teams target is ready"
                       : "Direct Teams support is available"}
                 </div>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                <p>
                   {hasPreparedTeamsCall
                     ? `This ticket is already assigned to ${teamsCallTargetLabel || "the support admin"} and ready for your Teams call.`
                     : teamsCallTargetLabel
@@ -533,10 +506,14 @@ const SupportOptions = () => {
               </div>
             )}
 
-            <div className={supportActionsGridClassName}>
+            <div
+              className={cn(
+                "support-options-grid",
+                showTeamsCall ? "support-options-grid--five" : "support-options-grid--four",
+              )}
+            >
               {supportActions.map((action, index) => {
                 const Icon = action.icon;
-                const isTeamsCallAction = action.id === "teams-call";
 
                 return (
                   <button
@@ -544,42 +521,27 @@ const SupportOptions = () => {
                     type="button"
                     onClick={() => void action.onClick()}
                     disabled={action.disabled}
-                    className={cn(
-                      "group relative flex min-h-[168px] w-full flex-col justify-between overflow-hidden rounded-[24px] border border-primary/12 bg-gradient-to-br from-white via-white to-primary/[0.045] p-5 text-left shadow-soft outline-none transition-all duration-500 ease-out hover:-translate-y-1 hover:scale-[1.015] hover:border-primary/35 hover:bg-primary/[0.035] hover:shadow-[0_24px_70px_rgba(98,73,238,0.18)] focus-visible:-translate-y-1 focus-visible:scale-[1.015] focus-visible:border-primary/45 focus-visible:ring-4 focus-visible:ring-primary/15 active:translate-y-0 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:scale-100",
-                      getSupportActionCardLayout(action.id, index),
-                      isTeamsCallAction && "border-primary/20 from-white via-primary/[0.03] to-primary/[0.08]",
-                    )}
+                    className="support-options-card"
+                    data-action={action.id}
                   >
-                    <span className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_18%,rgba(98,73,238,0.14),transparent_28%),linear-gradient(120deg,transparent_0%,rgba(255,255,255,0.75)_48%,transparent_62%)] opacity-0 transition-opacity duration-500 group-hover:opacity-100 group-focus-visible:opacity-100" />
-                    <span className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-primary/15 blur-2xl opacity-0 transition-all duration-700 group-hover:right-0 group-hover:top-0 group-hover:opacity-100 group-focus-visible:right-0 group-focus-visible:top-0 group-focus-visible:opacity-100" />
-                    <span className="flex items-start justify-between gap-4">
-                      <span className="relative flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/[0.08] text-primary ring-1 ring-primary/10 transition-all duration-500 group-hover:rotate-3 group-hover:scale-110 group-hover:bg-primary group-hover:text-primary-foreground group-hover:shadow-[0_14px_32px_rgba(98,73,238,0.28)] group-focus-visible:rotate-3 group-focus-visible:scale-110 group-focus-visible:bg-primary group-focus-visible:text-primary-foreground">
-                        <Icon className="h-5 w-5" />
+                    <span className="support-options-card__top">
+                      <span className="support-options-card__icon" aria-hidden="true">
+                        <Icon />
                       </span>
-                      <span className="relative rounded-full border border-primary/10 bg-white/80 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground transition-colors duration-500 group-hover:border-primary/25 group-hover:text-primary">
+                      <span className="support-options-card__title">{action.title}</span>
+                      <span className="support-options-card__badge" aria-hidden="true">
                         {String(index + 1).padStart(2, "0")}
                       </span>
                     </span>
 
-                    <span className="relative mt-5 block">
-                      <span className="block text-base font-semibold text-foreground">
-                        {action.title}
-                      </span>
-                      <span className="mt-2 block text-sm leading-6 text-muted-foreground">
-                        {action.description}
-                      </span>
-                    </span>
+                    <span className="support-options-card__desc">{action.description}</span>
 
-                    <span className="relative mt-5 flex items-center justify-between gap-3 text-primary">
-                      {action.statusText && (
-                        <span className="text-sm font-semibold">
-                          {action.statusText}
-                        </span>
-                      )}
-                      <span className="ml-auto flex h-9 w-9 items-center justify-center rounded-full bg-primary/[0.08] transition-all duration-500 group-hover:translate-x-1 group-hover:bg-primary group-hover:text-primary-foreground group-hover:shadow-[0_10px_24px_rgba(98,73,238,0.24)] group-focus-visible:translate-x-1 group-focus-visible:bg-primary group-focus-visible:text-primary-foreground">
-                        <ArrowRight className="h-4 w-4 transition-transform duration-500 group-hover:translate-x-0.5 group-focus-visible:translate-x-0.5" />
+                    {action.statusText && (
+                      <span className="support-options-card__action">
+                        {action.statusText}
+                        <ArrowRight aria-hidden="true" />
                       </span>
-                    </span>
+                    )}
                   </button>
                 );
               })}

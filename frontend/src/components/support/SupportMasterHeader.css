@@ -1,0 +1,140 @@
+.support-master-header {
+  /* Everything scales from two values: the header height and the page content
+     width (kept in sync with --si-content in InquiryDetails.css). */
+  --smh-h: clamp(184px, 10vw, 240px);
+  --smh-content: min(clamp(1100px, 74vw, 1560px), calc(100vw - 64px));
+  /* The portrait photo (1086x1448) is drawn 2.5x the header height. */
+  --smh-photo-h: calc(var(--smh-h) * 2.5);
+  --smh-photo-w: calc(var(--smh-h) * 1.875);
+  /* Crest sits ~0.52 header-heights into the photo; align it with the content edge. */
+  --smh-photo-left: max(0px, calc((100vw - var(--smh-content)) / 2 - var(--smh-h) * .52));
+
+  position: relative;
+  height: var(--smh-h);
+  overflow: hidden;
+  background:
+    radial-gradient(120% 140% at 18% 0%, rgba(120, 140, 255, .5) 0%, transparent 55%),
+    linear-gradient(100deg, #4d3ad8 0%, #3a1fc4 38%, #2a12a0 70%, #1c0a6e 100%);
+}
+
+/* Soft, blurred extension of the campus photo that fills the space to the left
+   of the logo, so the photo blends in from the page edge instead of floating. */
+.support-master-header::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: -16px;
+  bottom: -16px;
+  left: -16px;
+  width: calc(var(--smh-photo-left) + var(--smh-photo-w) * .6 + 16px);
+  /* Top of the photo only (sky + roofline): the crest starts ~28% down, so it never shows twice. */
+  background: url("/support-campus.png") center 0% / cover no-repeat;
+  filter: blur(5px) saturate(1.05);
+  opacity: .6;
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 55%, transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0%, #000 55%, transparent 100%);
+}
+
+.support-master-header__photo,
+.support-master-header__tint {
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  bottom: 0;
+}
+
+/* Sharp campus photo with the crest; faded on both sides into the header. */
+.support-master-header__photo {
+  left: var(--smh-photo-left);
+  width: var(--smh-photo-w);
+  background-image: url("/support-campus.png");
+  background-repeat: no-repeat;
+  background-position: 0 calc(var(--smh-h) * -.565);
+  background-size: var(--smh-photo-w) var(--smh-photo-h);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 14%, #000 70%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 14%, #000 70%, transparent 100%);
+}
+
+.support-master-header__tint {
+  left: 0;
+  right: 0;
+  background:
+    linear-gradient(180deg, rgba(24, 8, 89, 0) 55%, rgba(24, 8, 89, .25) 100%),
+    linear-gradient(
+      90deg,
+      rgba(55, 25, 161, 0) 0%,
+      rgba(55, 25, 161, 0) calc(var(--smh-photo-left) + var(--smh-photo-w) * .8),
+      rgba(49, 22, 151, .55) calc(var(--smh-photo-left) + var(--smh-photo-w) * 1.5),
+      rgba(24, 8, 89, .7) 100%
+    );
+}
+
+.support-master-header__admin {
+  position: absolute;
+  z-index: 3;
+  top: calc(var(--smh-h) * .26);
+  right: calc((100vw - var(--smh-content)) / 2);
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 0 20px;
+  border: 1px solid rgba(255, 255, 255, .7);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .96);
+  color: #15132f;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 18px;
+  box-shadow: 0 10px 24px rgba(21, 10, 77, .22);
+  backdrop-filter: blur(8px);
+  transition: border-color .2s ease, color .2s ease, background-color .2s ease;
+}
+
+.support-master-header__admin:hover {
+  border-color: #a58cf5;
+  background: #fff;
+  color: #5425e6;
+}
+
+.support-master-header__admin svg {
+  width: 16px;
+  height: 16px;
+  color: #4a22e0;
+}
+
+.support-master-header__wave {
+  position: absolute;
+  z-index: 2;
+  right: 0;
+  bottom: -1px;
+  left: 0;
+  display: block;
+  width: 100%;
+  height: 56px;
+  pointer-events: none;
+}
+
+@media (max-width: 900px) {
+  .support-master-header { --smh-h: 160px; --smh-content: calc(100vw - 48px); --smh-photo-left: 0px; }
+  .support-master-header::before { display: none; }
+  .support-master-header__admin { top: 32px; right: 24px; }
+}
+
+@media (max-width: 640px) {
+  .support-master-header { --smh-h: 144px; }
+  .support-master-header__admin {
+    top: 20px;
+    right: 16px;
+    min-height: 36px;
+    padding: 0 14px;
+    font-size: 13px;
+  }
+  .support-master-header__admin svg { width: 15px; height: 15px; }
+  .support-master-header__wave { height: 40px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .support-master-header__admin { transition: none; }
+}
