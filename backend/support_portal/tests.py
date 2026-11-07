@@ -10775,6 +10775,83 @@ class AgentQueueTests(SimpleTestCase):
         self.assertEqual(persisted_agent_metadata["console_status"], "Available")
         self.assertEqual(persisted_agent_metadata["last_live_chat_assigned_at"], comparison_now.isoformat())
 
+    def test_assign_waiting_live_chat_tickets_does_not_reclaim_transferred_team_ticket(self):
+        comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+        available_agent = {
+            "id": 2,
+            "username": "available-agent",
+            "full_name": "Available Agent",
+            "metadata": {
+                "session_active": True,
+                "session_last_seen_at": comparison_now.isoformat(),
+                "console_status": "Available",
+                "queue_joined_at": comparison_now.isoformat(),
+            },
+        }
+        transferred_ticket = {
+            "id": 63,
+            "public_id": "KBC-000063",
+            "status": "Open",
+            "metadata": {"live_chat_requested": True},
+            "created_at": comparison_now - timedelta(minutes=10),
+            "conversation_id": 86,
+            "assigned_agent_id": None,
+            "assigned_team": "Operation Team",
+            "conversation_status": "open",
+            "conversation_metadata": {"live_chat_requested": True},
+        }
+        support_ticket = {
+            **transferred_ticket,
+            "id": 64,
+            "public_id": "KBC-000064",
+            "created_at": comparison_now - timedelta(minutes=5),
+            "conversation_id": 87,
+            "assigned_team": "Unassigned",
+        }
+
+        with (
+            patch.object(services, "run_query", side_effect=[[available_agent], [transferred_ticket, support_ticket]]),
+            patch.object(services, "assign_ticket_to_agent", return_value=True) as assign_ticket_to_agent,
+            patch.object(services, "persist_agent_metadata"),
+        ):
+            assigned_ticket_ids = services.assign_waiting_live_chat_tickets(comparison_now)
+
+        self.assertEqual(assigned_ticket_ids, [64])
+        assign_ticket_to_agent.assert_called_once_with(support_ticket, available_agent, comparison_now)
+
+    def test_live_chat_assignment_does_not_overwrite_concurrent_team_transfer(self):
+        comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+        ticket = {
+            "id": 63,
+            "public_id": "KBC-000063",
+            "status": "Open",
+            "assigned_agent_id": None,
+            "assigned_team": "Support Desk",
+            "metadata": {"live_chat_requested": True},
+            "conversation_id": 86,
+            "conversation_status": "open",
+            "conversation_metadata": {"live_chat_requested": True},
+            "created_at": comparison_now - timedelta(minutes=10),
+        }
+        agent = {"id": 2, "username": "available-agent", "full_name": "Available Agent"}
+        cursor = MagicMock()
+        cursor.rowcount = 0
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "insert_history_event") as insert_history_event,
+        ):
+            assigned = services.assign_ticket_to_agent(ticket, agent, comparison_now)
+
+        self.assertFalse(assigned)
+        cursor.execute.assert_called_once()
+        insert_history_event.assert_not_called()
+        self.assertIsNone(ticket["assigned_agent_id"])
+
     def test_assign_waiting_live_chat_tickets_keeps_waiting_when_only_busy_agents_exist(self):
         comparison_now = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
         busy_agent = {
