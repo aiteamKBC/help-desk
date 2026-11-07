@@ -13186,6 +13186,8 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
         raise ApiError(403, "Your Microsoft account must provide a valid email address.")
 
     legacy_auth_user_id = int(legacy_user.get("id") or 0)
+    if is_removed_support_identity(normalized_email, legacy_user.get("username"), legacy_auth_user_id):
+        raise ApiError(403, "This support account has been removed.")
     legacy_full_name = sanitize_text(legacy_user.get("full_name")) or sanitize_text(legacy_user.get("username"))
     legacy_role = build_support_staff_role_from_legacy_auth_user(legacy_user)
     metadata_patch = {
@@ -13352,6 +13354,8 @@ def sync_support_staff_account_from_entra_directory_user(
     entra_object_id = sanitize_text(profile.get("id") or profile.get("oid") or profile.get("sub"))
     if not entra_object_id:
         raise ApiError(403, "Your Microsoft account must provide a directory object id.")
+    if is_removed_support_identity(normalized_email, entra_object_id, *candidate_emails):
+        raise ApiError(403, "This support account has been removed.")
 
     full_name = (
         sanitize_text(profile.get("displayName"))
@@ -15212,6 +15216,9 @@ def extract_microsoft_login_email_candidates(profile: dict[str, Any]) -> list[st
 def _login_support_access_agent_from_entra(profile: dict[str, Any], normalized_email: str) -> dict[str, Any]:
     """Login path for staff who have KBC auth access but no Entra admin role."""
     candidate_emails = list(dict.fromkeys([normalized_email, *extract_microsoft_login_email_candidates(profile)]))
+    entra_object_id = sanitize_text(profile.get("id") or profile.get("oid") or profile.get("sub"))
+    if is_removed_support_identity(entra_object_id, *candidate_emails):
+        raise ApiError(403, "This support account has been removed.")
     agent = None
     for email in candidate_emails:
         candidate = fetch_staff_support_account_by_email(email)
@@ -15452,6 +15459,8 @@ def search_entra_agents(q: str) -> dict[str, Any]:
         entra_id = sanitize_text(user.get("id") or "")
         if not mail and not upn:
             continue
+        if is_removed_support_identity(mail, upn, entra_id):
+            continue
         username = (upn.split("@")[0] if upn else mail.split("@")[0]).lower()
         existing_account = (
             existing_accounts_by_entra_id.get(entra_id)
@@ -15576,6 +15585,8 @@ def add_entra_agent(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not is_valid_email(email):
         raise ApiError(400, "Invalid email address.")
+    if is_removed_support_identity(email, username, entra_id):
+        raise ApiError(409, "This person was removed from the support system.")
 
     if requested_team_key:
         requested_team_key = normalize_support_team_key(requested_team_key)
@@ -15739,10 +15750,40 @@ def _remove_django_support_access(email: str) -> None:
             kbc_conn.close()
 
 
+def build_removed_support_identity_fingerprints(*values: Any) -> list[str]:
+    secret = str(settings.SECRET_KEY).encode("utf-8")
+    fingerprints = {
+        hmac.new(secret, sanitize_text(value).strip().lower().encode("utf-8"), hashlib.sha256).hexdigest()
+        for value in values
+        if sanitize_text(value).strip()
+    }
+    return sorted(fingerprints)
+
+
+def is_removed_support_identity(*values: Any) -> bool:
+    candidate_fingerprints = set(build_removed_support_identity_fingerprints(*values))
+    if not candidate_fingerprints:
+        return False
+    removed_accounts = run_query(
+        """
+        SELECT metadata
+        FROM support_accounts
+        WHERE account_scope = %s
+          AND COALESCE(metadata->>'agent_removed_at', '') <> ''
+        """,
+        [ACCOUNT_SCOPE_STAFF],
+    )
+    for account in removed_accounts:
+        stored = normalize_json_object(account.get("metadata")).get("removed_identity_fingerprints")
+        if isinstance(stored, list) and candidate_fingerprints.intersection(map(sanitize_text, stored)):
+            return True
+    return False
+
+
 def remove_agent(account_id: int) -> None:
     with transaction.atomic():
         agent = run_query_one(
-            "SELECT id, email, metadata FROM support_accounts WHERE id = %s AND account_scope = %s LIMIT 1 FOR UPDATE",
+            "SELECT id, username, full_name, email, metadata FROM support_accounts WHERE id = %s AND account_scope = %s LIMIT 1 FOR UPDATE",
             [account_id, ACCOUNT_SCOPE_STAFF],
         )
         if not agent:
@@ -15750,6 +15791,29 @@ def remove_agent(account_id: int) -> None:
 
         metadata = normalize_json_object(agent.get("metadata"))
         email = normalize_email(agent.get("email") or "")
+        identity_values = [
+            agent.get("username"),
+            agent.get("full_name"),
+            agent.get("email"),
+            metadata.get("entra_object_id"),
+            metadata.get("entra_user_principal_name"),
+            metadata.get("entra_email"),
+            metadata.get("legacy_auth_user_id"),
+            metadata.get("legacy_auth_email"),
+        ]
+        existing_fingerprints = metadata.get("removed_identity_fingerprints")
+        removed_identity_fingerprints = set(build_removed_support_identity_fingerprints(*identity_values))
+        if isinstance(existing_fingerprints, list):
+            removed_identity_fingerprints.update(filter(None, map(sanitize_text, existing_fingerprints)))
+        metadata["removed_identity_fingerprints"] = sorted(removed_identity_fingerprints)
+        for identity_key in (
+            "entra_object_id",
+            "entra_user_principal_name",
+            "entra_email",
+            "legacy_auth_user_id",
+            "legacy_auth_email",
+        ):
+            metadata.pop(identity_key, None)
         metadata.update({
             "legacy_support_access": False,
             "legacy_operations_access": False,
@@ -15764,13 +15828,16 @@ def remove_agent(account_id: int) -> None:
         run_query(
             """
             UPDATE support_accounts
-            SET is_active = FALSE,
+            SET username = %s,
+                full_name = %s,
+                email = NULL,
+                is_active = FALSE,
                 role = %s,
                 metadata = %s::jsonb,
                 updated_at = NOW()
             WHERE id = %s AND account_scope = %s
             """,
-            [ROLE_AGENT, json.dumps(metadata), account_id, ACCOUNT_SCOPE_STAFF],
+            [f"removed-agent-{account_id}", "Former agent", ROLE_AGENT, json.dumps(metadata), account_id, ACCOUNT_SCOPE_STAFF],
         )
         run_query(
             "UPDATE support_account_team_access SET can_receive_tickets = FALSE WHERE account_id = %s",

@@ -6467,9 +6467,11 @@ class SupportDirectoryTests(SimpleTestCase):
         self.assertIn("UPDATE support_accounts", update_sql)
         self.assertIn("is_active = FALSE", update_sql)
         self.assertIn("role = %s", update_sql)
-        self.assertEqual(update_params[0], services.ROLE_AGENT)
+        self.assertEqual(update_params[0], "removed-agent-31")
+        self.assertEqual(update_params[1], "Former agent")
+        self.assertEqual(update_params[2], services.ROLE_AGENT)
         self.assertNotIn("DELETE FROM support_accounts", update_sql)
-        saved_metadata = json.loads(update_params[1])
+        saved_metadata = json.loads(update_params[3])
         self.assertNotIn("manually_added_agent", saved_metadata)
         self.assertFalse(saved_metadata["legacy_support_access"])
         self.assertFalse(saved_metadata["legacy_admin_access"])
@@ -6654,6 +6656,7 @@ class SupportStaffSyncTests(SimpleTestCase):
         }
         removed_account = {"id": 601, "metadata": {"agent_removed_at": "2026-06-03T08:51:54+00:00"}}
         with (
+            patch.object(services, "is_removed_support_identity", return_value=False),
             patch.object(services, "fetch_staff_support_account_by_legacy_auth_user_id", return_value=removed_account),
             patch.object(services, "connection") as mock_connection,
         ):
@@ -6671,6 +6674,7 @@ class SupportStaffSyncTests(SimpleTestCase):
         }
         removed_account = {"id": 601, "metadata": {"agent_removed_at": "2026-06-03T08:51:54+00:00"}}
         with (
+            patch.object(services, "is_removed_support_identity", return_value=False),
             patch.object(services, "fetch_staff_support_account_by_entra_object_id", return_value=removed_account),
             patch.object(services, "connection") as mock_connection,
         ):
@@ -6771,6 +6775,7 @@ class SupportStaffSyncTests(SimpleTestCase):
         }
 
         with (
+            patch.object(services, "is_removed_support_identity", return_value=False),
             patch.object(services, "fetch_support_team_by_key", return_value=team),
             patch.object(services, "_ensure_django_support_access", return_value=424) as ensure_django_support_access,
             patch.object(services, "run_query_one", side_effect=[None, None, new_account]) as run_query_one,
