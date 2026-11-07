@@ -917,36 +917,43 @@ describe("AgentDashboard runtime", () => {
 
   it("shows dynamic teams as isolated dashboard tabs", async () => {
     const originalFetch = globalThis.fetch;
-    const curriculumTicket = {
+    const dynamicTeams = [
+      { id: 7, key: "curriculum", label: "Curriculum Team", ticketId: "KBC-000006", subcategory: "Curriculum" },
+      { id: 8, key: "ai_team", label: "Ai Team", ticketId: "KBC-000007", subcategory: "AI Team" },
+      { id: 9, key: "enrolment_team", label: "Enrolment Team", ticketId: "KBC-000008", subcategory: "Enrolment" },
+      { id: 10, key: "operation_team", label: "Operation Team", ticketId: "KBC-000009", subcategory: "Operation" },
+      { id: 11, key: "quality_team", label: "Quality team", ticketId: "KBC-000010", subcategory: "Quality" },
+    ];
+    const dynamicTeamTickets = dynamicTeams.map((team, index) => ({
       ...dashboardPayload.tickets.tickets[0],
-      id: "KBC-000006",
-      learnerName: "Curriculum Learner",
-      requesterName: "Curriculum Learner",
-      email: "curriculum.learner@kentbusinesscollege.com",
-      inquiryPreview: "Curriculum team request",
-      assignedTeam: "Curriculum Team",
-      chatId: "CHAT-000006",
-      createdAt: "2026-06-14T13:00:00.000Z",
-      updatedAt: "2026-06-14T13:00:00.000Z",
-    };
+      id: team.ticketId,
+      learnerName: `${team.label} Learner`,
+      requesterName: `${team.label} Learner`,
+      email: `${team.key}@kentbusinesscollege.com`,
+      inquiryPreview: `${team.label} request`,
+      technicalSubcategory: team.subcategory,
+      assignedTeam: team.label,
+      chatId: `CHAT-${team.ticketId.slice(4)}`,
+      createdAt: `2026-06-14T${13 + index}:00:00.000Z`,
+      updatedAt: `2026-06-14T${13 + index}:00:00.000Z`,
+    }));
+    const allDashboardTickets = [...dashboardPayload.tickets.tickets, ...dynamicTeamTickets];
 
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
 
       if (url.includes("/api/admin/teams")) {
         return new Response(JSON.stringify({
-          teams: [
-            {
-              id: 7,
-              key: "curriculum",
-              name: "Curriculum Team",
-              assignedTeam: "Curriculum Team",
-              label: "Curriculum Team",
-              description: "Route this ticket to the curriculum queue.",
-              receiverAccessMetadataKey: "team_access:curriculum",
-              isActive: true,
-            },
-          ],
+          teams: dynamicTeams.map((team) => ({
+            id: team.id,
+            key: team.key,
+            name: team.label,
+            assignedTeam: team.label,
+            label: team.label,
+            description: `Route this ticket to the ${team.label} queue.`,
+            receiverAccessMetadataKey: `team_access:${team.key}`,
+            isActive: true,
+          })),
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -954,15 +961,29 @@ describe("AgentDashboard runtime", () => {
       }
 
       if (url.includes("/api/admin/tickets/metrics")) {
-        return new Response(JSON.stringify(buildDashboardMetricsPayload([...dashboardPayload.tickets.tickets, curriculumTicket])), {
+        return new Response(JSON.stringify(buildDashboardMetricsPayload(allDashboardTickets)), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
       }
 
       if (url.includes("/api/admin/tickets")) {
+        const requestedTeamKey = new URL(url, "http://localhost").searchParams.get("team");
+        const requestedDynamicTeamIndex = dynamicTeams.findIndex((team) => team.key === requestedTeamKey);
+        const responseTickets = requestedDynamicTeamIndex >= 0
+          ? [dynamicTeamTickets[requestedDynamicTeamIndex]]
+          : allDashboardTickets;
         return new Response(JSON.stringify({
-          tickets: [...dashboardPayload.tickets.tickets, curriculumTicket],
+          tickets: responseTickets,
+          pagination: {
+            page: 1,
+            pageSize: 50,
+            total: responseTickets.length,
+            totalPages: 1,
+            hasNext: false,
+            hasPrevious: false,
+            isPaginated: true,
+          },
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -973,12 +994,62 @@ describe("AgentDashboard runtime", () => {
     }) as typeof fetch;
 
     render(
-      <MemoryRouter initialEntries={["/admin"]}>
+      <MemoryRouter initialEntries={["/admin?view=admin"]}>
         <AgentDashboard />
       </MemoryRouter>,
     );
 
     const curriculumTab = await screen.findByRole("tab", { name: /^Curriculum Team$/i });
+    await screen.findByRole("tabpanel", { name: /Admin Dashboard/i });
+
+    fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(await screen.findByRole("menuitem", { name: "Support Dashboard" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Learning Plan Team" })).toBeInTheDocument();
+    for (const team of dynamicTeams) {
+      expect(screen.getByRole("menuitem", { name: team.label })).toBeInTheDocument();
+    }
+    expect(screen.queryByRole("menuitem", { name: "Technical first" })).not.toBeInTheDocument();
+
+    for (const [index, team] of dynamicTeams.entries()) {
+      if (index > 0) {
+        fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+          button: 0,
+          ctrlKey: false,
+        });
+      }
+      fireEvent.click(await screen.findByRole("menuitem", { name: team.label }));
+      await waitFor(() => {
+        const adminPanel = screen.getByRole("tabpanel", { name: /Admin Dashboard/i });
+        const ticketRows = Array.from(adminPanel.querySelectorAll("tbody tr"));
+        expect(ticketRows[0]).toHaveTextContent(team.ticketId);
+      });
+    }
+
+    fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Support Dashboard" }));
+    await waitFor(() => {
+      const adminPanel = screen.getByRole("tabpanel", { name: /Admin Dashboard/i });
+      const ticketRows = Array.from(adminPanel.querySelectorAll("tbody tr"));
+      expect(ticketRows[0]).toHaveTextContent("KBC-000001");
+    });
+
+    fireEvent.pointerDown(screen.getByTitle("Sort by Category"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Learning Plan Team" }));
+    await waitFor(() => {
+      const adminPanel = screen.getByRole("tabpanel", { name: /Admin Dashboard/i });
+      const ticketRows = Array.from(adminPanel.querySelectorAll("tbody tr"));
+      expect(ticketRows[0]).toHaveTextContent("KBC-000002");
+    });
+
     fireEvent.mouseDown(curriculumTab, {
       button: 0,
       ctrlKey: false,

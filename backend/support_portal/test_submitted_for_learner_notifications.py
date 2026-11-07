@@ -64,4 +64,8 @@ class SubmittedForLearnerNotificationTests(SimpleTestCase):
         subject, html = graph_mail.render_notification_email(payload)
         self.assertIn("KBC-000012", subject)
         self.assertIn("resolved and closed", html)
+        self.assertIn("Student Support Centre", html)
+        self.assertIn("Ticket details", html)
+        self.assertIn(">Resolved<", html)
+        self.assertNotIn("KBC-000012", html)
         self.assertNotIn("/admin", html)

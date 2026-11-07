@@ -696,6 +696,8 @@ const consolePollIntervalMs = 2500;
 const dashboardTicketPollIntervalMs = 10000;
 const dashboardAgentPollIntervalMs = 15000;
 const defaultDashboardPageSize = 50;
+const maximumVisibleDesktopTicketNotifications = 3;
+const activeAdminDesktopNotifications: Notification[] = [];
 const documentationWorkflowStatuses = ["Closed", "Pending"] as const;
 const defaultPendingDocumentationStatusReason = "Awaiting resolution";
 const emptyTicketSummaryList: TicketSummary[] = [];
@@ -706,6 +708,24 @@ const teamDashboardViewPrefix = "team:";
 
 function isBrowserTabHidden() {
   return typeof document !== "undefined" && document.hidden;
+}
+
+function trackAdminDesktopNotification(notification: Notification) {
+  activeAdminDesktopNotifications.push(notification);
+
+  const removeNotification = () => {
+    const notificationIndex = activeAdminDesktopNotifications.indexOf(notification);
+    if (notificationIndex >= 0) {
+      activeAdminDesktopNotifications.splice(notificationIndex, 1);
+    }
+  };
+
+  notification.addEventListener("close", removeNotification, { once: true });
+  notification.addEventListener("error", removeNotification, { once: true });
+
+  while (activeAdminDesktopNotifications.length > maximumVisibleDesktopTicketNotifications) {
+    activeAdminDesktopNotifications.shift()?.close();
+  }
 }
 
 type TeamAccessInfo = {
@@ -1029,11 +1049,6 @@ type DashboardColumnSortState = { key: DashboardColumnSortKey; dir: "asc" | "des
 // Categorical columns are sorted by choosing a VALUE to bring to the top (rows
 // that do not match stay below, nothing is hidden) instead of an A->Z order.
 const DASHBOARD_COLUMN_VALUE_OPTIONS: Partial<Record<DashboardColumnSortKey, { value: string; label: string }[]>> = {
-  category: [
-    { value: "Technical", label: "Technical first" },
-    { value: "Learning", label: "Learning first" },
-    { value: "Others", label: "Others first" },
-  ],
   status: [
     { value: "Open", label: "Open first" },
     { value: "Pending", label: "Pending first" },
@@ -1114,8 +1129,8 @@ function sortTicketsByColumn(
     return tickets
       .map((ticket, index) => ({ ticket, index }))
       .sort((a, b) => {
-        const aMatch = getTicketColumnRawValue(a.ticket, sort.key) === target ? 0 : 1;
-        const bMatch = getTicketColumnRawValue(b.ticket, sort.key) === target ? 0 : 1;
+        const aMatch = doesTicketMatchColumnSortValue(a.ticket, sort.key, target) ? 0 : 1;
+        const bMatch = doesTicketMatchColumnSortValue(b.ticket, sort.key, target) ? 0 : 1;
         if (aMatch !== bMatch) {
           return aMatch - bMatch;
         }
@@ -1143,6 +1158,14 @@ function sortTicketsByColumn(
       return a.index - b.index;
     })
     .map((entry) => entry.ticket);
+}
+
+function doesTicketMatchColumnSortValue(ticket: TicketSummary, key: DashboardColumnSortKey, target: string) {
+  if (key === "category" && target.startsWith(`${teamDashboardViewPrefix}`)) {
+    return getTicketRoutingPolicy(ticket).key === getTeamKeyFromDashboardView(target);
+  }
+
+  return getTicketColumnRawValue(ticket, key) === target;
 }
 type DashboardTicketPageLoadOptions = { silent?: boolean; signal?: AbortSignal };
 type DashboardMetricsLoadOptions = { silent?: boolean; signal?: AbortSignal };
@@ -1540,6 +1563,15 @@ const AgentDashboard = () => {
       value: buildTeamDashboardView(policy.key),
       policy,
     }));
+  const dashboardCategoryTeamOptions = [
+    ...(canViewSupportDashboard
+      ? [{ value: buildTeamDashboardView(getSupportTeamRoutingPolicy().key), label: "Support Dashboard" }]
+      : []),
+    ...(canViewLearningPlanTeam
+      ? [{ value: buildTeamDashboardView(getLearningPlanTeamRoutingPolicy().key), label: "Learning Plan Team" }]
+      : []),
+    ...customDashboardTeamTabs.map(({ value, policy }) => ({ value, label: policy.label })),
+  ];
   const isLearningPlanCoverageSection = isCoverageDashboardView && learningPlanTeamSection === "coverage";
   const defaultDashboardSortOrder = getDefaultDashboardSortOrder(isLearningPlanCoverageSection);
   const isDashboardLikeView = adminView === "dashboard" || adminView === "adminDashboard" || adminView === "coverage" || isCustomTeamDashboardView;
@@ -2007,6 +2039,7 @@ const AgentDashboard = () => {
         icon: "/kent-crest.svg",
         requireInteraction: true,
       });
+      trackAdminDesktopNotification(notification);
 
       notification.onclick = () => {
         notification.close();
@@ -3216,7 +3249,12 @@ const AgentDashboard = () => {
       return;
     }
 
-    for (const ticket of newSupportQueueTickets) {
+    // The API can surface a large backlog of unacknowledged tickets at once.
+    // Only alert for the newest three, and create them oldest-to-newest so the
+    // newest ticket finishes at the top of the native notification stack.
+    for (const ticket of newSupportQueueTickets
+      .slice(0, maximumVisibleDesktopTicketNotifications)
+      .reverse()) {
       const pendingSupportQueueNotification = ticket.pendingSupportQueueNotification;
       if (!pendingSupportQueueNotification) {
         continue;
@@ -7364,7 +7402,9 @@ const AgentDashboard = () => {
                             : activeDir === "asc"
                               ? ChevronUp
                               : ChevronDown;
-                          const valueOptions = DASHBOARD_COLUMN_VALUE_OPTIONS[sortKey];
+                          const valueOptions = sortKey === "category"
+                            ? dashboardCategoryTeamOptions
+                            : DASHBOARD_COLUMN_VALUE_OPTIONS[sortKey];
                           const labels = getDashboardColumnSortLabels(sortKey);
                           return (
                             <DropdownMenu>

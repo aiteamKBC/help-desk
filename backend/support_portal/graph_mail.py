@@ -127,11 +127,25 @@ def send_graph_mail(
 # Kent-branded templates                                                      #
 # --------------------------------------------------------------------------- #
 _BRAND = "#4f46e5"
-_BRAND_DARK = "#4338ca"
 _INK = "#0f172a"
 _MUTED = "#64748b"
 _BORDER = "#e2e8f0"
 _SOFT = "#f8fafc"
+_CANVAS = "#f3f5f9"
+
+
+def _email_visual_theme(title: str) -> tuple[str, str, str, str]:
+    """Return badge label, foreground, background and border for the hero."""
+    normalized_title = (title or "").strip().lower()
+    if "closed" in normalized_title:
+        return "Resolved", "#047857", "#ecfdf5", "#a7f3d0"
+    if "unavailable" in normalized_title:
+        return "Action required", "#b45309", "#fffbeb", "#fde68a"
+    if "new" in normalized_title or "ai team" in normalized_title:
+        return "New request", "#6d28d9", "#f5f3ff", "#ddd6fe"
+    if "received" in normalized_title:
+        return "Request received", "#4338ca", "#eef2ff", "#c7d2fe"
+    return "Ticket update", "#0369a1", "#f0f9ff", "#bae6fd"
 
 
 def _portal_base() -> str:
@@ -148,60 +162,115 @@ def _ticket_url(payload: dict[str, Any]) -> str:
     return (payload.get("ticket") or {}).get("dashboardUrl") or f"{_portal_base()}/admin"
 
 
-def _ticket_link_html(public_id: str, url: str) -> str:
-    pid = escape(public_id or "-")
-    if not url:
-        return f'<span style="color:{_INK};font-weight:700">{pid}</span>'
-    return f'<a href="{escape(url)}" style="color:{_BRAND};font-weight:700;text-decoration:none">{pid}</a>'
-
-
 def _button(text: str, url: str) -> str:
     if not url:
         return ""
     return (
-        f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0 4px">'
-        f'<tr><td style="border-radius:8px;background:{_BRAND}">'
-        f'<a href="{escape(url)}" style="display:inline-block;padding:11px 22px;color:#ffffff;'
-        f'font-size:14px;font-weight:600;text-decoration:none;border-radius:8px">{escape(text)}</a>'
+        f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0 0">'
+        f'<tr><td style="border-radius:10px;background:{_BRAND};box-shadow:0 7px 16px rgba(79,70,229,.22)">'
+        f'<a href="{escape(url)}" style="display:inline-block;padding:13px 22px;color:#ffffff;'
+        f'font-size:14px;line-height:18px;font-weight:700;text-decoration:none;border-radius:10px">'
+        f'{escape(text)} &nbsp;&rarr;</a>'
         f'</td></tr></table>'
     )
 
 
 def _base_email(*, title: str, intro_html: str, rows: list[tuple[str, str]], cta: tuple[str, str] | None, note_html: str) -> str:
+    visible_rows = [(label, value_html) for label, value_html in rows if value_html]
     detail = "".join(
         f'<tr>'
-        f'<td style="padding:7px 0;color:{_MUTED};font-size:13px;width:130px;vertical-align:top">{escape(label)}</td>'
-        f'<td style="padding:7px 0;color:{_INK};font-size:14px;font-weight:600">{value_html}</td>'
+        f'<td class="detail-label" style="padding:13px 18px;color:{_MUTED};font-size:12px;line-height:18px;'
+        f'font-weight:700;letter-spacing:.35px;text-transform:uppercase;width:32%;vertical-align:top;'
+        f'{"border-bottom:1px solid " + _BORDER if index < len(visible_rows) - 1 else ""}">{escape(label)}</td>'
+        f'<td class="detail-value" style="padding:13px 18px;color:{_INK};font-size:14px;line-height:20px;'
+        f'font-weight:600;word-break:break-word;vertical-align:top;'
+        f'{"border-bottom:1px solid " + _BORDER if index < len(visible_rows) - 1 else ""}">{value_html}</td>'
         f'</tr>'
-        for label, value_html in rows
-        if value_html
+        for index, (label, value_html) in enumerate(visible_rows)
     )
+    badge_label, accent, accent_soft, accent_border = _email_visual_theme(title)
     cta_html = _button(*cta) if cta else ""
+    note_block = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        f'style="margin-top:22px;background:{_SOFT};border:1px solid {_BORDER};border-radius:12px">'
+        f'<tr><td style="padding:14px 16px;color:{_MUTED};font-size:13px;line-height:20px">'
+        f'<span style="color:{_INK};font-weight:700">Need anything else?</span><br>{note_html}'
+        f'</td></tr></table>'
+        if note_html else ""
+    )
     return f"""\
 <!doctype html>
-<html><body style="margin:0;background:#eef2f7;padding:28px 12px;font-family:Segoe UI,Roboto,Arial,sans-serif">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
-    <table role="presentation" width="560" cellpadding="0" cellspacing="0"
-           style="max-width:560px;width:100%;background:#ffffff;border:1px solid {_BORDER};border-radius:16px;overflow:hidden">
-      <tr><td style="background:{_BRAND};background-image:linear-gradient(135deg,{_BRAND},{_BRAND_DARK});padding:22px 30px">
-        <div style="color:#ffffff;font-size:19px;font-weight:700;letter-spacing:.2px">Kent Business College</div>
-        <div style="color:#c7d2fe;font-size:12px;margin-top:3px;text-transform:uppercase;letter-spacing:1px">Student Support</div>
-      </td></tr>
-      <tr><td style="padding:30px">
-        <div style="color:{_INK};font-size:19px;font-weight:700;margin-bottom:12px">{escape(title)}</div>
-        <div style="color:{_INK};font-size:14px;line-height:1.65;margin-bottom:20px">{intro_html}</div>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
-               style="border-top:1px solid {_BORDER};border-bottom:1px solid {_BORDER};margin-bottom:4px">{detail}</table>
-        {cta_html}
-        <div style="color:{_MUTED};font-size:13px;line-height:1.65;margin-top:18px">{note_html}</div>
-      </td></tr>
-      <tr><td style="padding:16px 30px;background:{_SOFT};border-top:1px solid {_BORDER}">
-        <div style="color:{_MUTED};font-size:12px">Kent Business College &middot; Student Support Team</div>
-        <div style="color:#94a3b8;font-size:11px;margin-top:4px">This is an automated message &mdash; please do not reply to this address.</div>
-      </td></tr>
-    </table>
-  </td></tr></table>
-</body></html>"""
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <title>{escape(title)}</title>
+  <style>
+    @media only screen and (max-width:620px) {{
+      .email-shell {{ padding:16px 8px !important; }}
+      .email-card {{ border-radius:16px !important; }}
+      .brand-cell {{ padding:18px 20px !important; }}
+      .hero-cell {{ padding:25px 20px 22px !important; }}
+      .content-cell {{ padding:22px 20px 26px !important; }}
+      .footer-cell {{ padding:17px 20px !important; }}
+      .detail-label, .detail-value {{ display:block !important;width:auto !important; }}
+      .detail-label {{ padding:12px 14px 2px !important;border-bottom:0 !important; }}
+      .detail-value {{ padding:0 14px 12px !important; }}
+    }}
+  </style>
+</head>
+<body style="margin:0;padding:0;background:{_CANVAS};font-family:'Segoe UI',Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">{escape(title)} from Kent Business College Support.</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="{_CANVAS}" style="background:{_CANVAS}">
+    <tr><td class="email-shell" align="center" style="padding:36px 12px">
+      <table class="email-card" role="presentation" width="620" cellpadding="0" cellspacing="0"
+             style="max-width:620px;width:100%;background:#ffffff;border:1px solid {_BORDER};border-radius:20px;overflow:hidden;box-shadow:0 14px 40px rgba(15,23,42,.08)">
+        <tr>
+          <td class="brand-cell" style="padding:20px 28px;background:#ffffff;border-bottom:1px solid {_BORDER}">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+              <td width="46" style="vertical-align:middle">
+                <div style="width:42px;height:42px;line-height:42px;text-align:center;border-radius:12px;background:{_BRAND};color:#ffffff;font-size:13px;font-weight:800;letter-spacing:.5px">KBC</div>
+              </td>
+              <td style="padding-left:11px;vertical-align:middle">
+                <div style="color:{_INK};font-size:15px;line-height:20px;font-weight:800">Kent Business College</div>
+                <div style="color:{_MUTED};font-size:12px;line-height:18px">Student Support Centre</div>
+              </td>
+              <td align="right" style="vertical-align:middle">
+                <span style="display:inline-block;padding:6px 10px;border-radius:999px;background:#f8fafc;border:1px solid {_BORDER};color:{_MUTED};font-size:10px;line-height:12px;font-weight:800;letter-spacing:.7px;text-transform:uppercase">Support</span>
+              </td>
+            </tr></table>
+          </td>
+        </tr>
+        <tr>
+          <td class="hero-cell" style="padding:31px 30px 27px;background:{accent_soft};border-bottom:1px solid {accent_border}">
+            <span style="display:inline-block;padding:6px 10px;border-radius:999px;background:#ffffff;border:1px solid {accent_border};color:{accent};font-size:11px;line-height:14px;font-weight:800;letter-spacing:.5px;text-transform:uppercase">{escape(badge_label)}</span>
+            <div style="margin-top:14px;color:{_INK};font-size:26px;line-height:33px;font-weight:800;letter-spacing:-.4px">{escape(title)}</div>
+          </td>
+        </tr>
+        <tr>
+          <td class="content-cell" style="padding:28px 30px 32px">
+            <div style="color:#334155;font-size:15px;line-height:24px;margin-bottom:24px">{intro_html}</div>
+            <div style="margin-bottom:9px;color:{_MUTED};font-size:11px;line-height:15px;font-weight:800;letter-spacing:.9px;text-transform:uppercase">Ticket details</div>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                   style="background:#ffffff;border:1px solid {_BORDER};border-radius:12px;overflow:hidden">{detail}</table>
+            {cta_html}
+            {note_block}
+          </td>
+        </tr>
+        <tr>
+          <td class="footer-cell" style="padding:18px 30px;background:{_INK}">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+              <td style="color:#cbd5e1;font-size:11px;line-height:17px">&copy; Kent Business College<br><span style="color:#94a3b8">Student Support Team</span></td>
+              <td align="right" style="color:#94a3b8;font-size:10px;line-height:16px">Automated notification<br>Please do not reply</td>
+            </tr></table>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
 
 
 def _row_text(label: str, value: str) -> tuple[str, str]:
@@ -209,12 +278,10 @@ def _row_text(label: str, value: str) -> tuple[str, str]:
 
 
 def _common_rows(ticket: dict[str, Any], payload: dict[str, Any], *, include_status: bool = True) -> list[tuple[str, str]]:
-    public_id = ticket.get("id") or "-"
     cat = ticket.get("category") or ""
     sub = ticket.get("technicalSubcategory") or ""
     category_label = f"{cat} / {sub}".strip(" /") if (cat or sub) else ""
     rows = [
-        ("Ticket", _ticket_link_html(public_id, _ticket_url(payload))),
         _row_text("Subject", ticket.get("subject") or "-"),
         _row_text("Category", category_label),
     ]
