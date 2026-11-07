@@ -34,6 +34,7 @@ urlpatterns = [
     path("admin/tickets/metrics", views.admin_ticket_metrics, name="admin-ticket-metrics"),
     path("admin/notifications", views.admin_notifications, name="admin-notifications"),
     path("admin/tickets/<str:public_id>/archive", views.admin_ticket_archive, name="admin-ticket-archive"),
+    path("admin/tickets/<str:public_id>/closure-email-draft", views.admin_ticket_closure_email_draft, name="admin-ticket-closure-email-draft"),
     path("admin/tickets/<str:public_id>/delete-permanently", views.admin_ticket_permanent_delete, name="admin-ticket-permanent-delete"),
     path("admin/tickets/<str:public_id>/attachments/<int:attachment_id>/download", views.admin_ticket_attachment_download, name="admin-ticket-attachment-download"),
     path("admin/tickets/<str:public_id>/chat-attachments/<str:client_attachment_id>/download", views.admin_ticket_chat_attachment_download, name="admin-ticket-chat-attachment-download"),

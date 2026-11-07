@@ -5,6 +5,8 @@ import AdminLogin from "@/pages/support/AdminLogin";
 
 describe("AdminLogin", () => {
   beforeEach(() => {
+    localStorage.clear();
+    localStorage.setItem("support_admin_browser_instance", "browser-instance-1");
     vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("offline"))));
   });
 
@@ -23,7 +25,7 @@ describe("AdminLogin", () => {
     const teamsLink = screen.getByRole("link", { name: /sign in with microsoft teams/i });
     expect(teamsLink).toHaveAttribute(
       "href",
-      "http://localhost:3000/api/admin/microsoft/login?origin=http%3A%2F%2Flocalhost%3A3000",
+      "http://localhost:3000/api/admin/microsoft/login?origin=http%3A%2F%2Flocalhost%3A3000&instanceId=browser-instance-1",
     );
   });
 

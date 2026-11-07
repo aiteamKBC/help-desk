@@ -28,6 +28,7 @@ interface AdminSessionResponse {
 }
 
 const storageKey = "support_admin_session";
+const browserInstanceStorageKey = "support_admin_browser_instance";
 const adminPortalReturnStorageKey = "support_admin_portal_return";
 export const adminPortalReturnQueryParam = "adminPortalReturn";
 
@@ -37,6 +38,21 @@ export function createAdminSessionInstanceId() {
   }
 
   return `support-session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function getOrCreateAdminBrowserInstanceId() {
+  if (typeof window === "undefined") {
+    return createAdminSessionInstanceId();
+  }
+
+  const existingInstanceId = localStorage.getItem(browserInstanceStorageKey)?.trim();
+  if (existingInstanceId) {
+    return existingInstanceId;
+  }
+
+  const instanceId = createAdminSessionInstanceId();
+  localStorage.setItem(browserInstanceStorageKey, instanceId);
+  return instanceId;
 }
 
 export function getAdminSession(): AdminSession | null {

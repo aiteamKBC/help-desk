@@ -1110,7 +1110,9 @@ class AdminSessionViewTests(SimpleTestCase):
         self.assertEqual(payload["admin"]["instanceId"], "instance-1")
 
     def test_admin_microsoft_login_redirects_to_authorize_url_and_stores_oauth_state(self):
-        request = self.factory.get("/api/admin/microsoft/login?origin=http://127.0.0.1:3000")
+        request = self.factory.get(
+            "/api/admin/microsoft/login?origin=http://127.0.0.1:3000&instanceId=browser-instance-1"
+        )
         session = self.attach_session(request)
 
         with (
@@ -1131,6 +1133,10 @@ class AdminSessionViewTests(SimpleTestCase):
             session[views.ADMIN_MICROSOFT_AUTH_SESSION_KEY]["redirectUri"],
             "http://localhost:3000/api/admin/microsoft/callback",
         )
+        self.assertEqual(
+            session[views.ADMIN_MICROSOFT_AUTH_SESSION_KEY]["instanceId"],
+            "browser-instance-1",
+        )
         build_microsoft_admin_authorize_url.assert_called_once()
 
     def test_admin_microsoft_callback_stores_admin_session_and_redirects_to_dashboard(self):
@@ -1142,6 +1148,7 @@ class AdminSessionViewTests(SimpleTestCase):
                     "state": "state-1",
                     "nonce": "nonce-1",
                     "redirectUri": "http://localhost:3000/api/admin/microsoft/callback",
+                    "instanceId": "browser-instance-1",
                 }
             },
         )
@@ -1167,8 +1174,13 @@ class AdminSessionViewTests(SimpleTestCase):
         self.assertEqual(response["Location"], "/admin")
         self.assertTrue(session.cycle_key_called)
         self.assertEqual(session[views.ADMIN_SESSION_KEY]["username"], "omar1")
+        self.assertEqual(session[views.ADMIN_SESSION_KEY]["instanceId"], "browser-instance-1")
         self.assertNotIn(views.ADMIN_MICROSOFT_AUTH_SESSION_KEY, session)
         get_admin_microsoft_login_response.assert_called_once()
+        self.assertEqual(
+            get_admin_microsoft_login_response.call_args.args[0]["instanceId"],
+            "browser-instance-1",
+        )
 
     def test_admin_session_returns_authenticated_admin_from_server_session(self):
         request = self.factory.get("/api/admin/session")
@@ -6434,7 +6446,7 @@ class SupportDirectoryTests(SimpleTestCase):
     def test_remove_agent_turns_off_support_access(self):
         agent = {
             "id": 31,
-            "email": "omar.badr@kentbusinesscollege.com",
+            "email": "former.agent@kentbusinesscollege.com",
             "metadata": {
                 "legacy_support_access": True,
                 "session_active": True,
@@ -6443,22 +6455,82 @@ class SupportDirectoryTests(SimpleTestCase):
         }
 
         with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
             patch.object(services, "run_query_one", return_value=agent),
-            patch.object(services, "run_query") as run_query,
+            patch.object(services, "run_query", return_value=[]) as run_query,
             patch.object(services, "_remove_django_support_access") as remove_django_support_access,
         ):
             services.remove_agent(31)
 
-        update_sql = run_query.call_args.args[0]
-        update_params = run_query.call_args.args[1]
+        update_sql = run_query.call_args_list[0].args[0]
+        update_params = run_query.call_args_list[0].args[1]
         self.assertIn("UPDATE support_accounts", update_sql)
+        self.assertIn("is_active = FALSE", update_sql)
+        self.assertIn("role = %s", update_sql)
+        self.assertEqual(update_params[0], "removed-agent-31")
+        self.assertEqual(update_params[1], "Former agent")
+        self.assertEqual(update_params[2], services.ROLE_AGENT)
         self.assertNotIn("DELETE FROM support_accounts", update_sql)
-        saved_metadata = json.loads(update_params[0])
+        saved_metadata = json.loads(update_params[3])
         self.assertNotIn("manually_added_agent", saved_metadata)
         self.assertFalse(saved_metadata["legacy_support_access"])
+        self.assertFalse(saved_metadata["legacy_admin_access"])
+        self.assertFalse(saved_metadata["entra_directory_admin_access"])
         self.assertFalse(saved_metadata["session_active"])
         self.assertEqual(saved_metadata["console_status"], "Off")
-        remove_django_support_access.assert_called_once_with("omar.badr@kentbusinesscollege.com")
+        self.assertIn("can_receive_tickets = FALSE", run_query.call_args_list[1].args[0])
+        remove_django_support_access.assert_called_once_with("former.agent@kentbusinesscollege.com")
+
+    def test_remove_agent_releases_open_ticket_and_cancels_pending_call(self):
+        agent = {"id": 31, "email": "former.agent@kentbusinesscollege.com", "metadata": {}}
+        ticket = {
+            "id": 42,
+            "public_id": "KBC-000042",
+            "category": "Technical",
+            "technical_subcategory": "AI Team",
+            "status": "Open",
+            "status_reason": "",
+            "assigned_team": "Ai Team",
+            "conversation_id": 73,
+            "conversation_status": "open",
+            "metadata": {
+                "pending_teams_call_notification": {"toAgentId": 31},
+                "teams_call_requested": True,
+                "assigned_agent_record": {"id": 31},
+            },
+        }
+        cursor = MagicMock()
+        cursor_context = MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        mock_connection = MagicMock()
+        mock_connection.cursor.return_value = cursor_context
+
+        with (
+            patch.object(services.transaction, "atomic", return_value=nullcontext()),
+            patch.object(services, "run_query_one", return_value=agent),
+            patch.object(services, "run_query", side_effect=[[], [], [ticket]]),
+            patch.object(services, "connection", mock_connection),
+            patch.object(services, "get_pending_teams_call_notification", return_value={"toAgentId": 31}),
+            patch.object(services, "build_ticket_state_persistence", side_effect=lambda metadata, _ticket, **_kwargs: (metadata, {})) as build_state,
+            patch.object(services, "get_ticket_state_column_params", return_value=[None] * 7),
+            patch.object(services, "insert_history_event") as history_event,
+            patch.object(services, "_remove_django_support_access"),
+        ):
+            services.remove_agent(31)
+
+        updated_metadata = build_state.call_args.args[0]
+        self.assertNotIn("pending_teams_call_notification", updated_metadata)
+        self.assertNotIn("teams_call_requested", updated_metadata)
+        self.assertNotIn("assigned_agent_record", updated_metadata)
+        self.assertIsNone(build_state.call_args.args[1]["assigned_agent_id"])
+        self.assertEqual(build_state.call_args.args[1]["assigned_team"], "Ai Team")
+        self.assertIn("assigned_agent_id = NULL", cursor.execute.call_args_list[0].args[0])
+        self.assertIn("UPDATE conversations", cursor.execute.call_args_list[1].args[0])
+        history_event.assert_called_once_with(42, "assignment_changed", None, {
+            "fromAgentId": 31,
+            "toAgentId": None,
+            "assignmentSource": "offboarding",
+        })
 
     def test_list_agents_returns_only_current_support_access_staff_profiles(self):
         legacy_user = {
@@ -6574,6 +6646,44 @@ class SupportDirectoryTests(SimpleTestCase):
 
 
 class SupportStaffSyncTests(SimpleTestCase):
+    def test_removed_staff_account_is_not_reactivated_by_legacy_login(self):
+        legacy_user = {
+            "id": 368,
+            "username": "former.agent",
+            "email": "former.agent@kentbusinesscollege.com",
+            "full_name": "Former Agent",
+            "is_superuser": True,
+        }
+        removed_account = {"id": 601, "metadata": {"agent_removed_at": "2026-06-03T08:51:54+00:00"}}
+        with (
+            patch.object(services, "is_removed_support_identity", return_value=False),
+            patch.object(services, "fetch_staff_support_account_by_legacy_auth_user_id", return_value=removed_account),
+            patch.object(services, "connection") as mock_connection,
+        ):
+            with self.assertRaises(services.ApiError) as error:
+                services.sync_support_staff_account_from_legacy_auth_user(legacy_user)
+
+        self.assertEqual(error.exception.status_code, 403)
+        mock_connection.cursor.assert_not_called()
+
+    def test_removed_staff_account_is_not_reactivated_by_entra_login(self):
+        profile = {
+            "id": "former-agent-entra-id",
+            "mail": "former.agent@kentbusinesscollege.com",
+            "displayName": "Former Agent",
+        }
+        removed_account = {"id": 601, "metadata": {"agent_removed_at": "2026-06-03T08:51:54+00:00"}}
+        with (
+            patch.object(services, "is_removed_support_identity", return_value=False),
+            patch.object(services, "fetch_staff_support_account_by_entra_object_id", return_value=removed_account),
+            patch.object(services, "connection") as mock_connection,
+        ):
+            with self.assertRaises(services.ApiError) as error:
+                services.sync_support_staff_account_from_entra_directory_user(profile, [], "admin")
+
+        self.assertEqual(error.exception.status_code, 403)
+        mock_connection.cursor.assert_not_called()
+
     def test_sync_support_staff_account_preserves_existing_console_session_metadata(self):
         legacy_user = {
             "id": 368,
@@ -6665,6 +6775,7 @@ class SupportStaffSyncTests(SimpleTestCase):
         }
 
         with (
+            patch.object(services, "is_removed_support_identity", return_value=False),
             patch.object(services, "fetch_support_team_by_key", return_value=team),
             patch.object(services, "_ensure_django_support_access", return_value=424) as ensure_django_support_access,
             patch.object(services, "run_query_one", side_effect=[None, None, new_account]) as run_query_one,
@@ -9004,7 +9115,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
         actor_row = {
             "id": 9,
             "username": "omar",
-            "full_name": "Omar Helmy",
+            "full_name": "Example Agent",
             "role": "admin",
             "email": "omar@example.com",
             "account_scope": "staff",
@@ -9198,7 +9309,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
         selected_agent = {
             "id": 9,
             "username": "omar",
-            "full_name": "Omar Helmy",
+            "full_name": "Example Agent",
             "role": "agent",
             "email": "omar@example.com",
             "account_scope": "staff",
@@ -9245,7 +9356,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             17,
             "assignment_changed",
             {"id": 1, "role": "admin", "label": "Support Manager"},
-            {"fromAgentId": 5, "toAgentId": 9, "toAgentName": "Omar Helmy"},
+            {"fromAgentId": 5, "toAgentId": 9, "toAgentName": "Example Agent"},
         )
 
     def test_update_admin_ticket_allows_learning_plan_assignment_to_operations_receiver(self):
@@ -9478,7 +9589,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "conversation_id": None,
             "conversation_metadata": {},
             "assigned_agent_username": "omar",
-            "assigned_agent_name": "Omar Helmy",
+            "assigned_agent_name": "Example Agent",
             "inquiry": "Help needed",
         }
         actor_row = {
@@ -9588,12 +9699,12 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "learner_source": "legacy_portal",
             "learner_metadata": {},
             "assigned_agent_username": "omar",
-            "assigned_agent_name": "Omar Helmy",
+            "assigned_agent_name": "Example Agent",
         }
         actor_row = {
             "id": 5,
             "username": "omar",
-            "full_name": "Omar Helmy",
+            "full_name": "Example Agent",
             "role": "agent",
             "email": "omar@example.com",
             "account_scope": "staff",
@@ -9644,7 +9755,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
         insert_history_event.assert_any_call(
             17,
             "team_transferred",
-            {"id": 5, "role": "agent", "label": "Omar Helmy"},
+            {"id": 5, "role": "agent", "label": "Example Agent"},
             {
                 "fromTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
                 "toTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
@@ -9749,13 +9860,13 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "conversation_id": None,
             "conversation_metadata": {},
             "assigned_agent_username": "omar",
-            "assigned_agent_name": "Omar Helmy",
+            "assigned_agent_name": "Example Agent",
             "inquiry": "Help needed",
         }
         actor_row = {
             "id": 5,
             "username": "omar",
-            "full_name": "Omar Helmy",
+            "full_name": "Example Agent",
             "role": "agent",
             "email": "omar@example.com",
             "account_scope": "staff",
@@ -9802,7 +9913,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
                 "requester_source": "legacy_portal",
                 services.PENDING_TRANSFER_REQUEST_METADATA_KEY: {
                     "fromAgentId": 5,
-                    "fromAgentName": "Omar Helmy",
+                    "fromAgentName": "Example Agent",
                     "fromAgentUsername": "omar",
                     "toAgentId": 9,
                     "toAgentName": "Ahmed Hamamo",
@@ -9813,7 +9924,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
                 services.LATEST_TRANSFER_DECISION_METADATA_KEY: {
                     "status": "rejected",
                     "fromAgentId": 5,
-                    "fromAgentName": "Omar Helmy",
+                    "fromAgentName": "Example Agent",
                     "fromAgentUsername": "omar",
                     "toAgentId": 9,
                     "toAgentName": "Ahmed Hamamo",
@@ -9837,7 +9948,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "learner_source": "legacy_portal",
             "learner_metadata": {},
             "assigned_agent_username": "omar",
-            "assigned_agent_name": "Omar Helmy",
+            "assigned_agent_name": "Example Agent",
         }
         actor_row = {
             "id": 1,
@@ -9967,7 +10078,7 @@ class AdminTicketUpdateTests(SimpleTestCase):
             "learner_source": "legacy_portal",
             "learner_metadata": {},
             "assigned_agent_username": "omar",
-            "assigned_agent_name": "Omar Helmy",
+            "assigned_agent_name": "Example Agent",
         }
         actor_row = {
             "id": 1,
@@ -10036,7 +10147,7 @@ class AdminTicketPermanentDeleteTests(SimpleTestCase):
         actor_row = {
             "id": 9,
             "username": "omar",
-            "full_name": "Omar Helmy",
+            "full_name": "Example Agent",
             "role": "admin",
         }
 
@@ -11881,7 +11992,7 @@ class AgentQueueTests(SimpleTestCase):
         stale_available_agent = {
             "id": 7,
             "username": "omar",
-            "full_name": "Omar Helmy",
+            "full_name": "Example Agent",
             "role": "superadmin",
             "account_scope": "staff",
             "metadata": {
@@ -13449,7 +13560,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             "status_reason": "Quick Ticket",
             "priority": "Normal",
             "assigned_agent_id": 5,
-            "assigned_agent_name": "Omar Helmy",
+            "assigned_agent_name": "Example Agent",
             "assigned_agent_username": "omar",
             "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
             "conversation_id": None,
@@ -13472,7 +13583,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                     "transferredByName": "Support Manager",
                     "transferredByUsername": "manager",
                     "assignedAgentId": 5,
-                    "assignedAgentName": "Omar Helmy",
+                    "assignedAgentName": "Example Agent",
                     "assignedAgentUsername": "omar",
                     "note": "Please continue with learning plan workflow.",
                 },
@@ -13497,7 +13608,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
         )
         self.assertEqual(
             summary["pendingLearningPlanTransferNotification"]["assignedAgentName"],
-            "Omar Helmy",
+            "Example Agent",
         )
 
     def test_submit_coverage_tutor_request_sends_webhook_and_persists_request_metadata(self):
@@ -15554,7 +15665,7 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
                     "transferredByName": "Support Manager",
                     "transferredByUsername": "manager",
                     "assignedAgentId": 5,
-                    "assignedAgentName": "Omar Helmy",
+                    "assignedAgentName": "Example Agent",
                     "assignedAgentUsername": "omar",
                     "note": "Please continue with learning plan workflow.",
                 },
@@ -15763,7 +15874,7 @@ class BookingContextTests(SimpleTestCase):
                         "createdByAgentName": "Ahmed Hamamo",
                         "createdByAgentUsername": "ahmed",
                         "updatedByAgentId": 8,
-                        "updatedByAgentName": "Omar Helmy",
+                        "updatedByAgentName": "Example Agent",
                         "updatedByAgentUsername": "omar",
                         "presentationFiles": [
                             {
@@ -15821,7 +15932,7 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(normalized_documentation["coverageCards"][0]["coachEmail"], "mona.adel@kentbusinesscollege.com")
         self.assertEqual(normalized_documentation["coverageCards"][0]["requestStatus"], "requested")
         self.assertEqual(normalized_documentation["coverageCards"][0]["createdByAgentName"], "Ahmed Hamamo")
-        self.assertEqual(normalized_documentation["coverageCards"][0]["updatedByAgentName"], "Omar Helmy")
+        self.assertEqual(normalized_documentation["coverageCards"][0]["updatedByAgentName"], "Example Agent")
         self.assertEqual(len(normalized_documentation["coverageCards"][0]["presentationFiles"]), 1)
         self.assertEqual(len(normalized_documentation["coverageCards"][0]["sessionFiles"]), 1)
         self.assertEqual(normalized_documentation["coverageCards"][0]["sessionFiles"][0]["attachments"][0]["name"], "session.pdf")
@@ -15872,7 +15983,7 @@ class BookingContextTests(SimpleTestCase):
                         "createdByAgentName": "Ahmed Hamamo",
                         "createdByAgentUsername": "ahmed",
                         "updatedByAgentId": 8,
-                        "updatedByAgentName": "Omar Helmy",
+                        "updatedByAgentName": "Example Agent",
                         "updatedByAgentUsername": "omar",
                         "attachments": [
                             {
@@ -15906,7 +16017,7 @@ class BookingContextTests(SimpleTestCase):
         self.assertEqual(persisted_card["createdAt"], "2026-06-09T10:00:00Z")
         self.assertEqual(persisted_card["updatedAt"], "2026-06-09T10:05:00Z")
         self.assertEqual(persisted_card["createdByAgentName"], "Ahmed Hamamo")
-        self.assertEqual(persisted_card["updatedByAgentName"], "Omar Helmy")
+        self.assertEqual(persisted_card["updatedByAgentName"], "Example Agent")
         self.assertEqual(len(persisted_card["attachments"]), 1)
         self.assertEqual(persisted_card["attachments"][0]["name"], "case-notes.pdf")
         self.assertEqual(persisted_card["attachments"][0]["attachmentId"], 77)
@@ -15924,15 +16035,15 @@ class BookingContextTests(SimpleTestCase):
                 ]
             },
             {},
-            {"id": 9, "username": "omar", "full_name": "Omar Helmy"},
+            {"id": 9, "username": "omar", "full_name": "Example Agent"},
         )
 
         stamped_card = stamped_documentation["documentationCards"][0]
         self.assertEqual(stamped_card["createdByAgentId"], 9)
-        self.assertEqual(stamped_card["createdByAgentName"], "Omar Helmy")
+        self.assertEqual(stamped_card["createdByAgentName"], "Example Agent")
         self.assertEqual(stamped_card["createdByAgentUsername"], "omar")
         self.assertEqual(stamped_card["updatedByAgentId"], 9)
-        self.assertEqual(stamped_card["updatedByAgentName"], "Omar Helmy")
+        self.assertEqual(stamped_card["updatedByAgentName"], "Example Agent")
         self.assertEqual(stamped_card["updatedByAgentUsername"], "omar")
 
     def test_attach_uploaded_documentation_card_files_assigns_uploaded_rows_to_cards(self):
@@ -16116,13 +16227,13 @@ class BookingContextTests(SimpleTestCase):
         stamped_documentation = services.stamp_documentation_card_actors(
             legacy_documentation,
             legacy_documentation,
-            {"id": 9, "username": "omar", "full_name": "Omar Helmy"},
+            {"id": 9, "username": "omar", "full_name": "Example Agent"},
         )
 
         stamped_card = stamped_documentation["documentationCards"][0]
         self.assertIsNone(stamped_card["createdByAgentId"])
         self.assertEqual(stamped_card["updatedByAgentId"], 9)
-        self.assertEqual(stamped_card["updatedByAgentName"], "Omar Helmy")
+        self.assertEqual(stamped_card["updatedByAgentName"], "Example Agent")
         self.assertNotEqual(stamped_card["updatedAt"], "2026-06-17T10:00:00Z")
 
     def test_get_support_booking_url_returns_configured_value(self):

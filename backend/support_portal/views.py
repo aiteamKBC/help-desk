@@ -53,6 +53,7 @@ from .services import (
     get_ticket_chat_attachment_file,
     list_admin_notifications,
     get_admin_ticket_detail_response,
+    get_admin_ticket_closure_email_draft,
     get_coverage_options_response,
     get_open_assigned_live_chat_agent_ids,
     heartbeat_agent_session,
@@ -358,7 +359,7 @@ def parse_admin_ticket_update_request(request) -> tuple[dict, list]:
     if content_type.startswith("multipart/form-data") or content_type.startswith("application/x-www-form-urlencoded"):
         payload: dict[str, object] = {}
         for key, value in request.POST.items():
-            if key == "documentation":
+            if key in {"documentation", "closureNotification"}:
                 try:
                     payload[key] = json.loads(value) if value else {}
                 except json.JSONDecodeError as error:
@@ -565,6 +566,7 @@ def admin_login(request):
 @require_GET
 def admin_microsoft_login(request):
     origin = normalize_frontend_origin(request.GET.get("origin"))
+    instance_id = normalize_request_session_instance_id(request.GET.get("instanceId")) or uuid4().hex
     configured_redirect_uri = normalize_login_redirect_uri(settings.AZURE_LOGIN_REDIRECT_URI)
 
     try:
@@ -582,6 +584,7 @@ def admin_microsoft_login(request):
             "state": state,
             "nonce": nonce,
             "redirectUri": redirect_uri,
+            "instanceId": instance_id,
         }
         request.session.set_expiry(settings.SUPPORT_ADMIN_SESSION_COOKIE_AGE)
 
@@ -625,7 +628,7 @@ def admin_microsoft_callback(request):
         if not code:
             raise ApiError(400, "Microsoft sign-in did not return an authorization code.")
 
-        instance_id = uuid4().hex
+        instance_id = normalize_request_session_instance_id(auth_session.get("instanceId")) or uuid4().hex
         response_payload = get_admin_microsoft_login_response(
             {
                 "code": code,
@@ -849,6 +852,15 @@ def admin_ticket_detail(request, public_id: str):
                 uploaded_files=uploaded_files,
             )
         )
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_GET
+def admin_ticket_closure_email_draft(request, public_id: str):
+    try:
+        actor, _session_payload = require_request_admin_session(request)
+        return JsonResponse(get_admin_ticket_closure_email_draft(public_id, actor))
     except Exception as error:
         return handle_api_error(error)
 
