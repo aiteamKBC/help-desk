@@ -11,7 +11,7 @@ const supportSteps = [
   { label: "Status", path: "/support/status", number: 4 },
 ];
 
-export const StepIndicator = ({ current }: { current: number }) => {
+export const StepIndicator = ({ current, finalLabel = "Status" }: { current: number; finalLabel?: string }) => {
   const navigate = useNavigate();
   const { ticket, bookingSummary } = useSupport();
   const steps = supportSteps;
@@ -23,7 +23,7 @@ export const StepIndicator = ({ current }: { current: number }) => {
       return 4;
     }
 
-    // An Open ticket counts as having reached the status step too — the
+    // An Open ticket also counts as having reached the status step.
     // learner can keep chatting with the team from this page while it is open.
     if (ticket.id) {
       return ticket.status === "Open" ? 4 : 3;
@@ -65,6 +65,8 @@ export const StepIndicator = ({ current }: { current: number }) => {
                       navigate(step.path);
                     }
                   }}
+                  aria-label={idx === steps.length ? finalLabel : step.label}
+                  aria-current={isActive ? "step" : undefined}
                   disabled={!isClickable}
                   className={cn(
                     "flex h-10 w-10 items-center justify-center rounded-full border text-[13px] font-semibold transition-all sm:h-9 sm:w-9 sm:text-sm",
@@ -94,7 +96,7 @@ export const StepIndicator = ({ current }: { current: number }) => {
                     ? "Completed"
                     : idx === steps.length && ticket.id
                       ? ticket.status
-                      : step.label}
+                      : idx === steps.length ? finalLabel : step.label}
                 </span>
               </div>
               {i < steps.length - 1 && (

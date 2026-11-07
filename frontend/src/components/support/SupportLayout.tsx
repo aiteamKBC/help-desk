@@ -15,6 +15,7 @@ export const SupportLayout = ({
   right,
   fullWidth = false,
   showHeader = true,
+  landing = false,
   mainClassName,
 }: {
   children: ReactNode;
@@ -22,6 +23,7 @@ export const SupportLayout = ({
   right?: ReactNode;
   fullWidth?: boolean;
   showHeader?: boolean;
+  landing?: boolean;
   mainClassName?: string;
 }) => {
   const location = useLocation();
@@ -93,7 +95,7 @@ export const SupportLayout = ({
   }, [isAdminArea, location.pathname, location.search]);
 
   return (
-    <div className="min-h-screen gradient-soft">
+    <div className={cn("min-h-screen gradient-soft", landing && "support-landing")}>
       {effectiveShowHeader ? (
         isAdminArea ? (
           <header className="sticky top-0 z-30 border-b border-black/5 bg-white">

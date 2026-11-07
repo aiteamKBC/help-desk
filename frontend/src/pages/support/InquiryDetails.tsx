@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
+import { SupportMasterHeader } from "@/components/support/SupportMasterHeader";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
   SELECTABLE_TECHNICAL_SUBCATEGORIES,
@@ -49,6 +50,7 @@ import {
 import { isSubmittedSupportFlowLocked } from "@/lib/supportFlow";
 import { persistTicketDraft, submitTicketDirectlyForReview } from "@/lib/supportTicketDraft";
 import { toast } from "sonner";
+import "./InquiryDetails.css";
 
 const textExtensions = new Set([
   ".txt",
@@ -799,29 +801,35 @@ const InquiryDetails = () => {
           : `${coverageSessionDates.length} session dates selected`;
 
   return (
-    <SupportLayout>
-      <StepIndicator current={2} />
-      <div className="mx-auto max-w-4xl">
-        <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.03] p-5 shadow-card sm:p-6 md:p-8">
-          <div className="mb-1 flex flex-wrap items-center gap-3">
-            <h1 className="text-2xl font-bold text-primary">
-              {isReadOnlyReview ? "Review Support Inquiry" : "Create Support Inquiry"}
-            </h1>
-            {isReadOnlyReview ? (
-              <span className="rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-primary">
-                Submitted - read only
-              </span>
-            ) : null}
-          </div>
-          <p className="mb-6 text-sm text-muted-foreground">
-            {isReadOnlyReview
-              ? "This ticket has already been submitted. You can review the saved details, but they cannot be edited here."
-              : pageDescription}
-          </p>
+    <SupportLayout showHeader={false} fullWidth mainClassName="support-inquiry-main">
+      <SupportMasterHeader />
 
-          <div className="space-y-5">
+      <div className="support-inquiry-body">
+        <div className="support-inquiry-steps">
+          <StepIndicator current={2} finalLabel="Open" />
+        </div>
+        <div className="support-inquiry-shell">
+          <div className="support-inquiry-heading">
+            <div className="mb-1 flex flex-wrap items-center gap-3">
+              <h1>
+              {isReadOnlyReview ? "Review Support Inquiry" : "Create Support Inquiry"}
+              </h1>
+              {isReadOnlyReview ? (
+                <span className="rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-primary">
+                  Submitted - read only
+                </span>
+              ) : null}
+            </div>
+            <p>
+              {isReadOnlyReview
+                ? "This ticket has already been submitted. You can review the saved details, but they cannot be edited here."
+                : pageDescription}
+            </p>
+          </div>
+
+          <div className="support-inquiry-card space-y-5">
             {canSubmitForLearner && (
-              <div className="space-y-3 rounded-2xl border border-primary/10 bg-white/70 p-4 shadow-sm">
+              <div className="support-inquiry-requester space-y-3 rounded-2xl border p-4">
                 <div>
                   <Label>Who is this request for?</Label>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
@@ -1034,26 +1042,54 @@ const InquiryDetails = () => {
               </div>
             )}
 
-            <div className="space-y-2">
-              <Label>Inquiry Category</Label>
-              <Select
-                value={technicalSubcategory}
-                onValueChange={(value) => {
-                  if (!isReadOnlyReview) {
-                    setTechnicalSubcategory(value as TechnicalSubcategory);
-                  }
-                }}
-                disabled={isReadOnlyReview}
-              >
-                <SelectTrigger className="h-11">
-                  <SelectValue placeholder="Select a category" />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableInquiryPlatforms.map((item) => (
-                    <SelectItem key={item} value={item}>{formatTechnicalSubcategoryLabel(item)}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+            <div className="support-inquiry-primary-fields">
+              <div className="space-y-2">
+                <Label>Inquiry Category</Label>
+                <Select
+                  value={technicalSubcategory}
+                  onValueChange={(value) => {
+                    if (!isReadOnlyReview) {
+                      setTechnicalSubcategory(value as TechnicalSubcategory);
+                    }
+                  }}
+                  disabled={isReadOnlyReview}
+                >
+                  <SelectTrigger className="h-11">
+                    <SelectValue placeholder="Select a category" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availableInquiryPlatforms.map((item) => (
+                      <SelectItem key={item} value={item}>{formatTechnicalSubcategoryLabel(item)}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-end justify-between gap-3">
+                  <Label htmlFor="ticket-subject">Subject</Label>
+                  <span className="text-xs text-muted-foreground">
+                    {subject.length}/{SUBJECT_MAX_LENGTH}
+                  </span>
+                </div>
+                <Input
+                  id="ticket-subject"
+                  required
+                  maxLength={SUBJECT_MAX_LENGTH}
+                  value={subject}
+                  onChange={(event) => {
+                    if (!isReadOnlyReview) {
+                      setSubject(event.target.value);
+                    }
+                  }}
+                  placeholder="Write a short title for this issue..."
+                  readOnly={isReadOnlyReview}
+                  className="h-11 rounded-xl"
+                />
+                <p className="support-inquiry-subject-help text-xs leading-5 text-muted-foreground">
+                  Keep this as a short title. Add the full explanation in Issue Details below.
+                </p>
+              </div>
             </div>
 
             {isAiTeamFlow ? (
@@ -1091,32 +1127,6 @@ const InquiryDetails = () => {
                 </div>
               </div>
             ) : null}
-
-            <div className="space-y-2">
-              <div className="flex items-end justify-between gap-3">
-                <Label htmlFor="ticket-subject">Subject</Label>
-                <span className="text-xs text-muted-foreground">
-                  {subject.length}/{SUBJECT_MAX_LENGTH}
-                </span>
-              </div>
-              <Input
-                id="ticket-subject"
-                required
-                maxLength={SUBJECT_MAX_LENGTH}
-                value={subject}
-                onChange={(event) => {
-                  if (!isReadOnlyReview) {
-                    setSubject(event.target.value);
-                  }
-                }}
-                placeholder="Write a short title for this issue..."
-                readOnly={isReadOnlyReview}
-                className="h-11 rounded-xl"
-              />
-              <p className="text-xs leading-5 text-muted-foreground">
-                Keep this as a short title. Add the full explanation in Issue Details below.
-              </p>
-            </div>
 
             {isCoverageFlow ? (
               <div className="space-y-5 rounded-2xl border border-primary/10 bg-primary/[0.03] p-4">
@@ -1375,7 +1385,7 @@ const InquiryDetails = () => {
               </div>
             )}
 
-            <div className="space-y-2">
+            <div className="support-inquiry-evidence space-y-2">
               <Label className="flex items-center gap-2">
                 <Paperclip className="w-4 h-4" /> Supporting evidence
               </Label>
@@ -1447,7 +1457,7 @@ const InquiryDetails = () => {
               ) : null}
             </div>
 
-            <div className="flex flex-col-reverse gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="support-inquiry-actions flex flex-col-reverse gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
               {isReadOnlyReview ? (
                 <Button
                   onClick={() => navigate("/support/status")}
@@ -1472,9 +1482,8 @@ const InquiryDetails = () => {
               ) : null}
             </div>
           </div>
+          </div>
         </div>
-
-      </div>
 
       <Dialog open={!!previewFile} onOpenChange={(open) => !open && setPreviewFile(null)}>
         <DialogContent className="max-w-4xl p-3 sm:p-4">

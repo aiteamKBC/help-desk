@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Mail, AlertTriangle, ArrowRight, ListChecks, MessageSquarePlus } from "lucide-react";
+import { Mail, AlertTriangle, ArrowRight, Headphones } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -12,7 +12,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { KentCrestMark } from "@/components/support/KentCrestMark";
+import "./EmailVerification.css";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
   type RequesterRole,
@@ -87,7 +87,7 @@ const EmailVerification = () => {
   const { ticket, setTicket, clearBookingSummary } = useSupport();
   const prefillEmail = searchParams.get("email")?.trim().toLowerCase() || "";
   const ssoToken = searchParams.get("token")?.trim() || "";
-  const [email, setEmail] = useState(ticket.email || prefillEmail);
+  const [email, setEmail] = useState(ticket.email || prefillEmail || "ayman.badewi@kentbusinesscollege.com");
   const autoSubmittedRef = useRef(false);
   const [errorTitle, setErrorTitle] = useState("Invalid Email");
   const [errorMessage, setErrorMessage] = useState("Please enter a valid email address.");
@@ -298,63 +298,121 @@ const EmailVerification = () => {
   };
 
   return (
-    <SupportLayout>
-      <StepIndicator current={1} />
-      <div className="mx-auto max-w-[22rem] sm:max-w-md">
-        <div className="rounded-2xl border bg-card p-6 shadow-card sm:p-8">
-          <div className="mb-6 flex flex-col items-center sm:mb-7">
-            <KentCrestMark
-              variant="full"
-              frame="plain"
-              className="h-[56px] w-full max-w-[220px] sm:h-[60px] sm:max-w-[248px]"
-              imageClassName="object-contain"
+    <SupportLayout landing mainClassName="support-landing-main">
+      <aside className="support-hero" aria-label="Kent Business College">
+        <div className="support-hero-wave" aria-hidden="true">
+          <svg
+            className="support-wave-ribbons"
+            viewBox="0 0 1712 913"
+            preserveAspectRatio="none"
+            focusable="false"
+          >
+            <defs>
+              <clipPath id="support-campus-clip" clipPathUnits="userSpaceOnUse">
+                <path d="M0 0H665C718 68 751 151 749 233C746 361 705 482 644 596C578 719 475 820 342 873C253 909 167 913 82 913H0Z" />
+              </clipPath>
+              <linearGradient id="support-purple-ribbon" gradientUnits="userSpaceOnUse" x1="490" y1="120" x2="415" y2="913">
+                <stop offset="0" stopColor="#5310ff" />
+                <stop offset="0.52" stopColor="#4810f2" />
+                <stop offset="1" stopColor="#5a00f5" />
+              </linearGradient>
+              <linearGradient id="support-lavender-ribbon" gradientUnits="userSpaceOnUse" x1="470" y1="913" x2="810" y2="65">
+                <stop offset="0" stopColor="#5c18f4" />
+                <stop offset="0.52" stopColor="#9a74f7" />
+                <stop offset="1" stopColor="#c8b5fb" />
+              </linearGradient>
+              <linearGradient id="support-lavender-soft" gradientUnits="userSpaceOnUse" x1="560" y1="850" x2="860" y2="90">
+                <stop offset="0" stopColor="#cbb2fa" stopOpacity="0.9" />
+                <stop offset="1" stopColor="#e9e1fd" stopOpacity="0.72" />
+              </linearGradient>
+              <linearGradient id="support-photo-shade" gradientUnits="userSpaceOnUse" x1="0" y1="330" x2="0" y2="913">
+                <stop offset="0.12" stopColor="#2410a8" stopOpacity="0" />
+                <stop offset="0.58" stopColor="#2710b6" stopOpacity="0.23" />
+                <stop offset="1" stopColor="#25108f" stopOpacity="0.48" />
+              </linearGradient>
+            </defs>
+            <path
+              className="support-wave-corner-band"
+              d="M1270 0C1325 85 1425 140 1550 172C1635 194 1690 245 1712 310V0Z"
+              fill="#e8dfff"
+              fillOpacity="0.55"
             />
-            <div className="mt-3 inline-flex items-center gap-2 rounded-full border border-primary/10 bg-primary/[0.04] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-primary/80 sm:text-[11px] sm:tracking-[0.18em]">
-              <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
-              Support Portal
-            </div>
+            <path
+              className="support-wave-corner"
+              d="M1300 0C1350 70 1440 120 1560 150C1640 170 1690 215 1712 270V0Z"
+              fill="#fbfaff"
+              fillOpacity="0.85"
+            />
+            <path
+              className="support-wave-layer support-wave-layer-soft"
+              d="M0 0H850C816 75 804 159 801 248C796 386 767 506 719 621C674 727 634 817 647 866C653 887 664 902 680 913H0Z"
+              fill="url(#support-lavender-soft)"
+            />
+            <path
+              className="support-wave-layer support-wave-layer-lavender"
+              d="M0 0H793C777 74 775 155 771 240C765 370 733 490 679 607C628 718 574 811 559 863C553 883 554 900 562 913H0Z"
+              fill="url(#support-lavender-ribbon)"
+            />
+            <path
+              className="support-wave-layer support-wave-layer-purple"
+              d="M0 0H690C741 70 770 153 766 239C760 369 716 492 651 607C579 733 487 831 390 874C370 884 353 897 343 913H0Z"
+              fill="url(#support-purple-ribbon)"
+            />
+            <g className="support-wave-photo" clipPath="url(#support-campus-clip)">
+              <image
+                href="/support-campus.png"
+                x="-32"
+                y="-12"
+                width="790"
+                height="925"
+                preserveAspectRatio="xMidYMin slice"
+              />
+              <rect width="790" height="913" fill="url(#support-photo-shade)" />
+            </g>
+          </svg>
+        </div>
+        <div className="support-hero-copy">
+          <h2>Support,<br />made simple.</h2>
+          <p>Get the help you need, when you need it.</p>
+        </div>
+      </aside>
+
+      <section className="support-entry" aria-labelledby="support-request-title">
+        <div className="support-entry-content">
+          <div className="support-entry-steps">
+            <StepIndicator current={1} finalLabel="Open" />
           </div>
-          <div className="mb-5 text-center sm:mb-6">
-            <h1 className="text-[1.8rem] font-semibold leading-tight tracking-[-0.03em] text-foreground sm:text-[2rem]">
-              Support Request
-            </h1>
+          <div className="support-entry-heading">
+            <h1 id="support-request-title">Support Request</h1>
+            <p id="email-description">
+              {isSubmitting && ssoToken
+                ? "Verifying your account, please wait..."
+                : <>Enter your registered email address to continue.<br className="support-description-break" /> For learners, this is usually your Aptem email.</>}
+            </p>
           </div>
-          <p className="mx-auto mb-6 max-w-[320px] text-center text-sm leading-6 text-muted-foreground sm:mb-7 sm:text-[15px] sm:leading-7">
-            {isSubmitting && ssoToken
-              ? "Verifying your account, please wait..."
-              : "Enter your registered email address to continue. For learners, this is usually your Aptem email."}
-          </p>
-          <form onSubmit={handleNext} className="space-y-4 sm:space-y-5">
-            <div>
-              <div className="relative">
-                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  id="email"
-                  type="email"
-                  placeholder="Enter your registered email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  className="h-12 pl-9 text-[15px]"
-                  autoFocus
-                  required
-                />
-              </div>
+          <form onSubmit={handleNext} className="support-entry-form">
+            <div className="support-email-field">
+              <label htmlFor="email" className="sr-only">Registered email address</label>
+              <Mail aria-hidden="true" />
+              <Input
+                id="email"
+                type="email"
+                autoComplete="email"
+                aria-describedby="email-description"
+                placeholder="Enter your registered email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoFocus
+                required
+              />
             </div>
-            <Button
-              type="submit"
-              className="h-11 w-full border-0 text-sm font-semibold gradient-primary"
-              disabled={isSubmitting}
-            >
+            <Button type="submit" className="support-next-button" disabled={isSubmitting}>
               {isSubmitting ? "Checking..." : "Next"}
-              {!isSubmitting && <ArrowRight className="ml-2 h-4 w-4" />}
+              {!isSubmitting && <ArrowRight aria-hidden="true" />}
             </Button>
           </form>
-          <p className="mt-5 text-center text-[11px] leading-5 text-muted-foreground sm:mt-6 sm:text-xs">
-            Your role will be identified automatically from your registered account.
-          </p>
         </div>
-      </div>
-
+      </section>
       <Dialog open={errorOpen} onOpenChange={setErrorOpen}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
@@ -375,17 +433,21 @@ const EmailVerification = () => {
       </Dialog>
 
       <Dialog open={existingRequestOpen} onOpenChange={setExistingRequestOpen}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle className="text-center">Support Dashboard</DialogTitle>
-            <DialogDescription className="text-center">
+        <DialogContent
+          className="support-dashboard-modal"
+          overlayClassName="bg-[#0b1026]/40 backdrop-blur-[1px]"
+        >
+          <DialogHeader className="support-dashboard-header">
+            <Headphones className="support-dashboard-icon" aria-hidden="true" strokeWidth={1.8} />
+            <DialogTitle>Support Dashboard</DialogTitle>
+            <DialogDescription>
               Choose what you want to do for this email.
             </DialogDescription>
           </DialogHeader>
 
-          <DialogFooter className="flex-col gap-2 sm:flex-col">
+          <DialogFooter className="support-dashboard-actions">
             <Button
-              className="w-full border-0 gradient-primary"
+              className="support-dashboard-primary"
               onClick={() => startNewTicket(
                 email.trim().toLowerCase(),
                 requesterProfile?.learnerName || "",
@@ -393,18 +455,16 @@ const EmailVerification = () => {
                 requesterProfile?.requesterSource || "",
               )}
             >
-              <MessageSquarePlus className="mr-2 h-4 w-4" />
               Start New Ticket
             </Button>
             <Button
               variant="outline"
-              className="w-full"
+              className="support-dashboard-secondary"
               onClick={() => {
                 setExistingRequestOpen(false);
                 navigate("/support/my-tickets");
               }}
             >
-              <ListChecks className="mr-2 h-4 w-4" />
               My Tickets
             </Button>
           </DialogFooter>
