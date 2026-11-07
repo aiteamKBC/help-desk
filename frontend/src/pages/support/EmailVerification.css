@@ -259,91 +259,126 @@
 
 .support-next-button svg { width: 12px; height: 12px; }
 
+/*
+ * Support Dashboard modal. Sizing, padding, radius, background and shadow live as
+ * Tailwind classes on <DialogContent> so tailwind-merge replaces the shadcn
+ * defaults; everything else is scoped under the modal so it outranks the Button
+ * variant utilities (bg-primary, hover:bg-accent, h-10 ...).
+ */
 .support-dashboard-modal {
-  width: calc(100% - 32px);
-  max-width: 496px;
-  gap: 24px;
-  padding: 32px;
-  border: 0;
-  border-radius: 12px;
-  background: #fff;
-  box-shadow: 0 24px 64px rgba(13, 11, 54, .18), 0 4px 16px rgba(13, 11, 54, .08);
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+  color: #111433;
 }
 
 .support-dashboard-modal > button {
-  top: 16px;
-  right: 16px;
+  top: 14px;
+  right: 14px;
   display: inline-flex;
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   align-items: center;
   justify-content: center;
-  border-radius: 12px;
-  color: #4e4b65;
+  border-radius: 8px;
+  color: #8a87a3;
   opacity: 1;
+  transition: background-color .15s ease, color .15s ease;
 }
 
-.support-dashboard-modal > button:hover { background: #f3efff; color: #4219cb; }
-.support-dashboard-modal > button svg { width: 18px; height: 18px; }
+.support-dashboard-modal > button:hover { background: #f1ecff; color: #4a1fc9; }
+.support-dashboard-modal > button svg { width: 16px; height: 16px; stroke-width: 1.75; }
 
 .support-dashboard-header {
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 8px;
   text-align: center;
 }
 
-.support-dashboard-header > :not([hidden]) ~ :not([hidden]) { margin-top: 0; }
-
 .support-dashboard-icon {
-  width: 48px;
-  height: 48px;
-  margin-bottom: 8px;
-  color: #5b34f2;
+  display: inline-flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+  border: 1px solid #e6defd;
+  border-radius: 999px;
+  background: #f3efff;
+  color: #5722e8;
 }
 
-.support-dashboard-header h2 {
+.support-dashboard-icon svg { width: 16px; height: 16px; }
+
+.support-dashboard-modal .support-dashboard-header h2 {
   color: #111433;
   font-size: 28px;
-  font-weight: 700;
-  line-height: 32px;
-  letter-spacing: -.025em;
+  font-weight: 600;
+  line-height: 34px;
+  letter-spacing: -.02em;
 }
 
-.support-dashboard-header p { color: #64647a; font-size: 14px; line-height: 18px; }
+.support-dashboard-modal .support-dashboard-header > p:not(.support-dashboard-email) {
+  margin-top: 8px;
+  color: #5f5d78;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.support-dashboard-email {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: #f1ecff;
+  color: #3d3a5c;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 18px;
+}
+
+.support-dashboard-email svg { flex: none; width: 12px; height: 12px; color: #5722e8; }
+.support-dashboard-email span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .support-dashboard-actions {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
 }
-
-.support-dashboard-actions > :not([hidden]) ~ :not([hidden]) { margin-left: 0; }
 
 .support-dashboard-actions button {
   width: 100%;
-  height: 48px;
+  height: 44px;
+  padding: 0 16px;
+  border: 1px solid transparent;
   border-radius: 12px;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 14px;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  transition: background-color .15s ease, border-color .15s ease, color .15s ease;
 }
 
-.support-dashboard-primary {
-  border: 1px solid #5b34f2;
-  background: #5b34f2;
+.support-dashboard-actions .support-dashboard-primary {
+  border-color: #5722e8;
+  background: #5722e8;
   color: #fff;
-  box-shadow: 0 8px 18px rgba(91, 52, 242, .18);
+  box-shadow: 0 4px 12px rgba(87, 34, 232, .16);
 }
 
-.support-dashboard-primary:hover { border-color: #4d28df; background: #4d28df; }
+.support-dashboard-actions .support-dashboard-primary:hover { border-color: #4a1bcf; background: #4a1bcf; color: #fff; }
 
-.support-dashboard-secondary {
-  border-color: #b9a9f7;
+.support-dashboard-actions .support-dashboard-secondary {
+  border-color: #d8ccfb;
   background: #fff;
-  color: #24175e;
+  color: #4a1fc9;
 }
 
-.support-dashboard-secondary:hover { border-color: #5b34f2; background: #f7f5ff; color: #4219cb; }
+.support-dashboard-actions .support-dashboard-secondary:hover { border-color: #b9a6f6; background: #f7f4ff; color: #4a1fc9; }
+
+.support-dashboard-actions button:focus-visible { outline: 2px solid #5722e8; outline-offset: 2px; box-shadow: none; }
 
 @media (max-width: 1100px) {
   .support-landing main.support-landing-main { grid-template-columns: 40% 60%; }
@@ -461,7 +496,6 @@
   .support-entry-steps > div > div { min-width: 0; }
   .support-entry-steps .bg-border { margin-right: 5px; margin-left: 5px; }
   .support-description-break { display: none; }
-  .support-dashboard-modal { padding: 32px 24px 24px; }
 }
 
 @media (max-width: 430px) {

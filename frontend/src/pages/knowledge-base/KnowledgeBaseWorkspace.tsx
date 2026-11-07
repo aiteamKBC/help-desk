@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { LoaderCircle, Search } from "lucide-react";
+import { AlertCircle, CheckCircle2, Eraser, FilePlus2, LoaderCircle, Plus, Save, Search } from "lucide-react";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { AttachmentPanel } from "@/components/knowledge-base/AttachmentPanel";
 import { Badge } from "@/components/ui/badge";
@@ -44,16 +44,16 @@ type DraftIdentity = {
   path?: string;
 };
 
-const workspaceCardClassName = "rounded-[28px] border border-slate-200/90 bg-white shadow-card";
+const workspaceCardClassName = "rounded-2xl border bg-card shadow-[0_1px_3px_rgba(23,21,43,0.05)]";
 
 function statusClassName(tone: StatusTone) {
   if (tone === "success") {
-    return "border-emerald-200 bg-emerald-50/90 text-emerald-700";
+    return "border-[#C9E8D2] bg-[#E8F6EC] text-[#237A45]";
   }
   if (tone === "error") {
     return "border-rose-200 bg-rose-50 text-rose-700";
   }
-  return "border-emerald-100 bg-emerald-50/80 text-emerald-700";
+  return "border-[#C9E8D2] bg-[#E8F6EC]/70 text-[#237A45]";
 }
 
 function articleFromIndexItem(item: KnowledgeBaseArticleIndexItem): KnowledgeBaseArticleData {
@@ -349,333 +349,343 @@ const KnowledgeBaseWorkspace = () => {
     setSearchQuery("");
   };
 
+  const tabClassName = (active: boolean) =>
+    cn(
+      "rounded-full px-4 py-2 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+      active ? "bg-primary text-primary-foreground shadow-[0_6px_16px_-10px_rgba(91,33,232,0.7)]" : "text-muted-foreground hover:bg-secondary hover:text-primary",
+    );
+  const fieldLabelClassName = "block text-[13px] font-medium text-foreground";
+  const fieldControlClassName = "rounded-xl border-input bg-card text-sm text-foreground shadow-none placeholder:text-muted-foreground/80";
+
   return (
     <SupportLayout fullWidth mainClassName="px-0 py-0 sm:px-0 md:px-0 xl:px-0">
-      <div className="fixed inset-x-0 top-[74px] z-20 flex w-full flex-col gap-4 border-y border-slate-200/80 bg-white/92 px-4 py-4 shadow-[0_18px_34px_-28px_rgba(15,23,42,0.38)] backdrop-blur-md sm:top-[84px] sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-[max(2rem,calc((100vw-1120px)/2+2rem))] lg:py-5">
-        <div className="min-w-0">
-          <h1 className="text-[2.1rem] font-semibold tracking-tight text-slate-950">Knowledge Base</h1>
-          <p className="mt-2 max-w-2xl text-[15px] leading-6 text-slate-500">Search, open, and edit technical support articles.</p>
+      <div className="mx-auto w-full max-w-[1160px] px-4 pb-14 pt-8 sm:px-6 lg:px-8">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+          <div className="min-w-0">
+            <h1 className="text-[28px] font-semibold leading-9 tracking-tight text-foreground">Knowledge Base</h1>
+            <p className="mt-1 text-sm text-muted-foreground">Search, open, and edit technical support articles.</p>
+          </div>
+
+          <div className="inline-flex w-fit shrink-0 gap-1 rounded-full border bg-card p-1 shadow-[0_1px_2px_rgba(23,21,43,0.04)]">
+            <button
+              type="button"
+              aria-pressed={view === "center"}
+              onClick={() => setView("center")}
+              className={tabClassName(view === "center")}
+            >
+              Knowledge Base
+            </button>
+            <button
+              type="button"
+              aria-pressed={view === "builder"}
+              onClick={() => {
+                setView("builder");
+                setAreBuilderToolsVisible(true);
+              }}
+              className={tabClassName(view === "builder")}
+            >
+              Article Creation
+            </button>
+          </div>
         </div>
 
-        <div className="inline-flex w-fit self-start rounded-full border border-slate-200 bg-slate-100/95 p-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.92)] lg:self-auto">
-          <button
-            type="button"
-            onClick={() => setView("center")}
-            className={cn(
-              "rounded-full px-5 py-2.5 text-sm font-semibold transition-all",
-              view === "center"
-                ? "bg-primary text-primary-foreground shadow-[0_10px_22px_-14px_rgba(79,70,229,0.78)]"
-                : "text-slate-700 hover:bg-white hover:text-slate-900",
-            )}
-          >
-            Knowledge Base
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setView("builder");
-              setAreBuilderToolsVisible(true);
-            }}
-            className={cn(
-              "rounded-full px-5 py-2.5 text-sm font-semibold transition-all",
-              view === "builder"
-                ? "bg-primary text-primary-foreground shadow-[0_10px_22px_-14px_rgba(79,70,229,0.78)]"
-                : "text-slate-700 hover:bg-white hover:text-slate-900",
-            )}
-          >
-            Article Creation
-          </button>
-        </div>
-      </div>
-
-      <div aria-hidden="true" className="mb-[70px] h-[182px] sm:h-[174px] lg:h-[152px]" />
-
-      <div className="relative overflow-x-hidden">
-        <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
-          <div className="absolute left-1/2 top-6 h-[320px] w-[860px] -translate-x-1/2 rounded-full bg-[radial-gradient(circle_at_center,rgba(111,91,204,0.12),rgba(255,255,255,0))]" />
-          <div className="absolute bottom-0 left-1/2 h-[420px] w-[980px] -translate-x-1/2 rounded-full bg-[radial-gradient(circle_at_center,rgba(148,163,184,0.10),rgba(255,255,255,0))]" />
-        </div>
-
-        <div className="relative mx-auto w-full max-w-[1120px] px-4 pb-14 pt-0 sm:px-6 lg:px-8">
-          <div>
-            {view === "center" ? (
-              <Card className={cn(workspaceCardClassName, "overflow-hidden")}>
-                <CardHeader className="space-y-5 pb-5">
-                  <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                    <div>
-                      <CardTitle className="text-[2rem] font-semibold tracking-tight text-slate-950">Knowledge Center</CardTitle>
-                      <CardDescription className="mt-3 max-w-3xl text-base leading-7 text-slate-500">
-                        Open existing articles and search by title, keywords, inquiry, summary, steps, or resources.
-                      </CardDescription>
-                    </div>
+        <div className="mt-6">
+          {view === "center" ? (
+            <Card className={workspaceCardClassName}>
+              <CardHeader className="space-y-5 p-5 pb-4 sm:p-6 sm:pb-5">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <CardTitle className="text-xl font-semibold tracking-tight text-foreground">Knowledge Center</CardTitle>
+                    <CardDescription className="mt-1 text-sm leading-6 text-muted-foreground">
+                      Open existing articles and search by title, keywords, inquiry, summary, steps, or resources.
+                    </CardDescription>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
                     <Badge
                       variant="secondary"
-                      className="rounded-full border border-primary/10 bg-primary/10 px-3 py-1 text-sm font-semibold text-primary"
+                      className="h-8 rounded-full border bg-secondary px-3 text-xs font-medium text-primary hover:bg-secondary"
                     >
                       {articles.length} article{articles.length === 1 ? "" : "s"} indexed
                     </Badge>
+                    <Button type="button" className="h-8 gap-1.5 rounded-lg px-3 text-sm font-medium" onClick={startNewArticle}>
+                      <Plus className="h-4 w-4" aria-hidden />
+                      New
+                    </Button>
                   </div>
+                </div>
 
-                  <form
-                    className="space-y-3"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      applySearch();
-                    }}
-                  >
-                    <label htmlFor="kb-search" className="block text-base font-semibold text-slate-950">
-                      Search articles
-                    </label>
-                    <div className="flex flex-col gap-3 md:flex-row md:items-center">
-                      <div className="relative flex-1">
-                        <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                        <Input
-                          id="kb-search"
-                          value={searchInput}
-                          onChange={(event) => setSearchInput(event.target.value)}
-                          placeholder="Search by keyword or title, for example MFA, Teams, Aptem"
-                          className="h-12 rounded-2xl border-slate-200 bg-white pl-11 text-sm shadow-none"
-                        />
-                      </div>
-                      <div className="flex gap-2">
-                        <Button type="submit" className="h-11 rounded-2xl px-5 font-semibold">
-                          Search
-                        </Button>
-                        <Button type="button" variant="secondary" className="h-11 rounded-2xl px-5 font-semibold" onClick={clearSearch}>
-                          Clear
-                        </Button>
-                      </div>
+                <form
+                  className="space-y-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    applySearch();
+                  }}
+                >
+                  <label htmlFor="kb-search" className={fieldLabelClassName}>
+                    Search articles
+                  </label>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <div className="relative flex-1">
+                      <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        id="kb-search"
+                        value={searchInput}
+                        onChange={(event) => setSearchInput(event.target.value)}
+                        placeholder="Search by keyword or title, for example MFA, Teams, Aptem"
+                        className={cn(fieldControlClassName, "h-11 pl-10")}
+                      />
                     </div>
-                  </form>
-                </CardHeader>
-
-                <CardContent className="space-y-4">
-                  {isLoadingArticles ? (
-                    <div className="flex min-h-[220px] items-center justify-center rounded-[24px] border border-dashed border-slate-200 bg-slate-50 text-slate-500">
-                      <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
-                      Loading articles...
-                    </div>
-                  ) : null}
-
-                  {!isLoadingArticles && !filteredArticles.length ? (
-                    <div className="rounded-[24px] border border-dashed border-slate-200 bg-slate-50 px-5 py-12 text-center text-slate-500">
-                      No matching articles found.
-                    </div>
-                  ) : null}
-
-                  {!isLoadingArticles ? (
-                    <div className="grid gap-4">
-                      {filteredArticles.map((item) => {
-                        const createdAt = formatKnowledgeBaseDate(item.createdAt || item.exportedAt);
-                        const updatedAt = formatKnowledgeBaseDate(item.updatedAt);
-                        const isRemoving = isRemovingArticle === item.fileName;
-
-                        return (
-                          <article
-                            key={item.id}
-                            className="rounded-[24px] border border-slate-200/90 bg-white px-4 py-4 shadow-soft sm:px-5"
-                          >
-                            <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                              <div className="min-w-0 flex-1">
-                                <h3 className="text-[1.85rem] font-semibold tracking-tight text-slate-950">
-                                  {item.title || "Untitled article"}
-                                </h3>
-                                <p className="mt-2 text-sm leading-6 text-slate-500">
-                                  <span className="font-semibold text-slate-900">Keywords:</span>{" "}
-                                  {item.keywords || "No keywords"}
-                                </p>
-                                <div className="mt-2 text-xs leading-6 text-slate-500">
-                                  {item.fileName}
-                                  {createdAt ? ` | Created: ${createdAt}` : ""}
-                                  {updatedAt ? ` | Edited: ${updatedAt}` : ""}
-                                </div>
-                              </div>
-
-                              <div className="flex flex-wrap gap-2 lg:justify-end">
-                                <Button
-                                  type="button"
-                                  className="h-9 rounded-xl px-4 font-semibold"
-                                  onClick={() => navigate(buildKnowledgeBaseArticleUrl(item.fileName), { state: { article: item } })}
-                                >
-                                  Open
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="secondary"
-                                  className="h-9 rounded-xl border border-slate-200 bg-slate-100 px-4 font-semibold text-slate-800 hover:bg-slate-200"
-                                  onClick={() => editIndexedArticle(item)}
-                                >
-                                  Edit
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  className="h-9 rounded-xl bg-rose-50 px-4 font-semibold text-rose-600 hover:bg-rose-100 hover:text-rose-700"
-                                  onClick={() => archiveArticle(item)}
-                                  disabled={isRemoving}
-                                >
-                                  {isRemoving ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Remove"}
-                                </Button>
-                              </div>
-                            </div>
-                          </article>
-                        );
-                      })}
-                    </div>
-                  ) : null}
-                </CardContent>
-              </Card>
-            ) : (
-              <div className="grid gap-6 xl:grid-cols-[250px_minmax(0,1fr)]">
-                {areBuilderToolsVisible ? (
-                  <aside className="xl:sticky xl:top-[172px] xl:self-start">
-                    <Card className={cn(workspaceCardClassName, "overflow-hidden")}>
-                      <CardHeader className="pb-4">
-                        <div className="flex items-center justify-between gap-3">
-                          <CardTitle className="text-lg font-semibold text-slate-950">Article tools</CardTitle>
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            size="sm"
-                            className="h-8 rounded-full px-3 text-xs font-semibold"
-                            onClick={() => setAreBuilderToolsVisible(false)}
-                          >
-                            Hide
-                          </Button>
-                        </div>
-                      </CardHeader>
-
-                      <CardContent className="space-y-4">
-                        <div className="grid gap-2">
-                          <Button type="button" className="h-11 rounded-2xl font-semibold" onClick={startNewArticle}>
-                            New article
-                          </Button>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            className="h-11 rounded-2xl bg-rose-50 font-semibold text-rose-600 hover:bg-rose-100 hover:text-rose-700"
-                            onClick={() => clearDraft()}
-                          >
-                             Clear form
-                          </Button>
-                        </div>
-
-                        <div className={cn("rounded-2xl border px-4 py-3 text-sm", statusClassName(statusTone))}>
-                          <div className="font-semibold">{statusMessage}</div>
-                          <div className="mt-1 text-xs opacity-80">Version: {KNOWLEDGE_BASE_APP_VERSION}</div>
-                        </div>
-                      </CardContent>
-                    </Card>
-                  </aside>
-                ) : null}
-
-                <section className="space-y-5">
-                  {!areBuilderToolsVisible ? (
-                    <div className="flex justify-start">
+                    <div className="flex gap-2">
+                      <Button type="submit" className="h-11 flex-1 rounded-xl px-5 text-sm font-medium sm:flex-none">
+                        Search
+                      </Button>
                       <Button
                         type="button"
-                        variant="secondary"
-                        className="h-10 rounded-full border border-slate-200 bg-white px-4 font-semibold text-slate-700 hover:bg-slate-50"
-                        onClick={() => setAreBuilderToolsVisible(true)}
+                        variant="outline"
+                        className="h-11 flex-1 rounded-xl border-input bg-card px-5 text-sm font-medium text-foreground hover:bg-secondary hover:text-primary sm:flex-none"
+                        onClick={clearSearch}
                       >
-                        Show article tools
+                        Clear
                       </Button>
                     </div>
-                  ) : null}
+                  </div>
+                </form>
+              </CardHeader>
 
-                  <Card className={cn(workspaceCardClassName, "overflow-hidden")}>
-                    <CardHeader className="pb-5">
-                      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-                        <div>
-                          <CardTitle className="text-[1.9rem] font-semibold tracking-tight text-slate-950">Article Creation</CardTitle>
-                        </div>
-                        <Button type="button" className="h-11 rounded-2xl px-5 font-semibold" onClick={saveDraft} disabled={isSavingArticle}>
-                          {isSavingArticle ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Save article"}
+              <CardContent className="space-y-3 p-5 pt-0 sm:p-6 sm:pt-0">
+                {isLoadingArticles ? (
+                  <div className="flex min-h-[200px] items-center justify-center rounded-xl border border-dashed bg-secondary/60 text-sm text-muted-foreground">
+                    <LoaderCircle className="mr-2 h-4 w-4 animate-spin" />
+                    Loading articles...
+                  </div>
+                ) : null}
+
+                {!isLoadingArticles && !filteredArticles.length ? (
+                  <div className="rounded-xl border border-dashed bg-secondary/60 px-5 py-10 text-center text-sm text-muted-foreground">
+                    No matching articles found.
+                  </div>
+                ) : null}
+
+                {!isLoadingArticles ? (
+                  <div className="grid gap-3">
+                    {filteredArticles.map((item) => {
+                      const createdAt = formatKnowledgeBaseDate(item.createdAt || item.exportedAt);
+                      const updatedAt = formatKnowledgeBaseDate(item.updatedAt);
+                      const isRemoving = isRemovingArticle === item.fileName;
+
+                      return (
+                        <article
+                          key={item.id}
+                          className="rounded-xl border bg-card px-4 py-4 transition-colors hover:border-primary/25 hover:bg-secondary sm:px-5"
+                        >
+                          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between md:gap-6">
+                            <div className="min-w-0 flex-1">
+                              <h3 className="text-base font-medium leading-6 text-foreground">
+                                {item.title || "Untitled article"}
+                              </h3>
+                              <p className="mt-1.5 text-sm leading-6 text-muted-foreground">
+                                <span className="font-medium text-foreground">Keywords:</span>{" "}
+                                {item.keywords || "No keywords"}
+                              </p>
+                              <div className="mt-1.5 flex flex-col gap-0.5 text-xs leading-5 text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2">
+                                <span className="break-all">{item.fileName}</span>
+                                {createdAt ? <><span aria-hidden className="hidden text-border sm:inline">|</span><span>Created: {createdAt}</span></> : null}
+                                {updatedAt ? <><span aria-hidden className="hidden text-border sm:inline">|</span><span>Edited: {updatedAt}</span></> : null}
+                              </div>
+                            </div>
+
+                            <div className="flex shrink-0 flex-wrap gap-2">
+                              <Button
+                                type="button"
+                                className="h-8 rounded-lg px-4 text-[13px] font-medium"
+                                onClick={() => navigate(buildKnowledgeBaseArticleUrl(item.fileName), { state: { article: item } })}
+                              >
+                                Open
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                className="h-8 rounded-lg border-input bg-card px-4 text-[13px] font-medium text-foreground hover:bg-secondary hover:text-primary"
+                                onClick={() => editIndexedArticle(item)}
+                              >
+                                Edit
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                className="h-8 min-w-[76px] rounded-lg border-rose-200 bg-card px-4 text-[13px] font-medium text-rose-600 hover:border-rose-300 hover:bg-rose-50 hover:text-rose-700"
+                                onClick={() => archiveArticle(item)}
+                                disabled={isRemoving}
+                              >
+                                {isRemoving ? <LoaderCircle className="h-4 w-4 animate-spin" /> : "Remove"}
+                              </Button>
+                            </div>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </CardContent>
+            </Card>
+          ) : (
+            <div className={cn("grid gap-5", areBuilderToolsVisible && "lg:grid-cols-[248px_minmax(0,1fr)]")}>
+              {areBuilderToolsVisible ? (
+                <aside className="lg:sticky lg:top-6 lg:self-start">
+                  <Card className={workspaceCardClassName}>
+                    <CardHeader className="p-4 pb-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <CardTitle className="text-sm font-semibold text-foreground">Article tools</CardTitle>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 rounded-full border-input bg-secondary px-3 text-xs font-medium text-primary hover:border-primary/30 hover:bg-secondary hover:text-primary"
+                          onClick={() => setAreBuilderToolsVisible(false)}
+                        >
+                          Hide
                         </Button>
                       </div>
                     </CardHeader>
 
-                    <CardContent className="grid gap-4 md:grid-cols-2">
-                      <div className="space-y-2">
-                        <label className="text-sm font-semibold text-slate-950" htmlFor="kb-title">
-                          Article title
-                        </label>
-                        <Input
-                          id="kb-title"
-                          value={draft.title}
-                          onChange={(event) => setDraft((currentDraft) => ({ ...currentDraft, title: event.target.value }))}
-                          placeholder="Example: Reset Microsoft Authenticator"
-                          className="h-12 rounded-2xl border-slate-200 bg-white shadow-none"
-                        />
+                    <CardContent className="space-y-3 p-4 pt-0">
+                      <div className="grid gap-2">
+                        <Button type="button" className="h-9 gap-2 rounded-lg text-[13px] font-medium" onClick={startNewArticle}>
+                          <FilePlus2 className="h-4 w-4" aria-hidden />
+                          New article
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="h-9 gap-2 rounded-lg border-input bg-secondary text-[13px] font-medium text-primary hover:border-primary/30 hover:bg-secondary hover:text-primary"
+                          onClick={() => clearDraft()}
+                        >
+                          <Eraser className="h-4 w-4" aria-hidden />
+                          Clear form
+                        </Button>
                       </div>
 
-                      <div className="space-y-2">
-                        <label className="text-sm font-semibold text-slate-950" htmlFor="kb-keywords">
-                          Keywords
-                        </label>
-                        <Input
-                          id="kb-keywords"
-                          value={draft.keywords}
-                          onChange={(event) => setDraft((currentDraft) => ({ ...currentDraft, keywords: event.target.value }))}
-                          placeholder="authenticator, MFA, reset, phone"
-                          className="h-12 rounded-2xl border-slate-200 bg-white shadow-none"
-                        />
+                      <div role="status" className={cn("rounded-lg border px-3 py-2.5", statusClassName(statusTone))}>
+                        <div className="flex items-start gap-1.5 text-[13px] font-medium">
+                          {statusTone === "error"
+                            ? <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+                            : <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />}
+                          <span>{statusMessage}</span>
+                        </div>
+                        <div className="mt-1 break-words text-xs opacity-80">Version: {KNOWLEDGE_BASE_APP_VERSION}</div>
                       </div>
                     </CardContent>
                   </Card>
+                </aside>
+              ) : null}
 
-                  {KNOWLEDGE_BASE_SECTIONS.map((section) => (
-                    <Card key={section.key} className={cn(workspaceCardClassName, "shadow-soft")}>
-                      <CardHeader className="pb-4">
-                        <div className="flex items-start justify-between gap-4">
-                          <div>
-                            <CardTitle className="text-[1.75rem] font-semibold tracking-tight text-slate-950">
-                              {section.heading}
-                            </CardTitle>
-                          </div>
-                          <Badge
-                            variant="secondary"
-                            className="rounded-full border border-primary/10 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary"
-                          >
-                            {section.badge}
-                          </Badge>
-                        </div>
-                      </CardHeader>
+              <section className="min-w-0 space-y-4">
+                {!areBuilderToolsVisible ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-8 rounded-full border-input bg-card px-4 text-[13px] font-medium text-primary hover:bg-secondary hover:text-primary"
+                    onClick={() => setAreBuilderToolsVisible(true)}
+                  >
+                    Show article tools
+                  </Button>
+                ) : null}
 
-                      <CardContent>
-                        <label className="mb-2 block text-sm font-semibold text-slate-950" htmlFor={`kb-${section.key}`}>
-                          {section.label}
-                        </label>
-                        <Textarea
-                          id={`kb-${section.key}`}
-                          value={draft.sections[section.key]}
-                          onChange={(event) => updateSectionText(section.key, event.target.value)}
-                          placeholder={section.placeholder}
-                          className={cn(
-                            "min-h-[150px] resize-y rounded-2xl border-slate-200 bg-white text-sm leading-6 shadow-none",
-                            section.key !== "inquiry" && "font-mono text-[13px]",
-                          )}
-                        />
-                        <AttachmentPanel
-                          attachments={draft.attachments[section.key]}
-                          onAddFiles={(files) => addFilesToSection(section.key, files)}
-                          onAddLink={() => addLinkToSection(section.key)}
-                          onOpenAttachment={(attachment) => openAttachment(attachment)}
-                          onRemoveAttachment={(attachmentId) =>
-                            updateAttachments(section.key, (currentAttachments) =>
-                              currentAttachments.filter((attachment) => attachment.id !== attachmentId),
-                            )
-                          }
-                        />
-                      </CardContent>
-                    </Card>
-                  ))}
-                </section>
-              </div>
-            )}
+                <Card className={workspaceCardClassName}>
+                  <CardHeader className="p-5 pb-4 sm:p-6 sm:pb-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0">
+                        <CardTitle className="text-xl font-semibold tracking-tight text-foreground">Article Creation</CardTitle>
+                        <CardDescription className="mt-1 text-xs text-muted-foreground">
+                          Fill in the title, keywords and each section to build a new support article.
+                        </CardDescription>
+                      </div>
+                      <Button
+                        type="button"
+                        className="h-9 min-w-[124px] shrink-0 gap-2 rounded-lg px-4 text-[13px] font-medium"
+                        onClick={saveDraft}
+                        disabled={isSavingArticle}
+                      >
+                        {isSavingArticle ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <><Save className="h-4 w-4" aria-hidden />Save article</>}
+                      </Button>
+                    </div>
+                  </CardHeader>
 
-            <div className="pt-10 text-center text-xs text-slate-500">Internal knowledge base.</div>
-          </div>
+                  <CardContent className="grid gap-4 p-5 pt-0 sm:p-6 sm:pt-0 md:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <label className={fieldLabelClassName} htmlFor="kb-title">
+                        Article title
+                      </label>
+                      <Input
+                        id="kb-title"
+                        value={draft.title}
+                        onChange={(event) => setDraft((currentDraft) => ({ ...currentDraft, title: event.target.value }))}
+                        placeholder="Example: Reset Microsoft Authenticator"
+                        className={cn(fieldControlClassName, "h-11")}
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className={fieldLabelClassName} htmlFor="kb-keywords">
+                        Keywords
+                      </label>
+                      <Input
+                        id="kb-keywords"
+                        value={draft.keywords}
+                        onChange={(event) => setDraft((currentDraft) => ({ ...currentDraft, keywords: event.target.value }))}
+                        placeholder="authenticator, MFA, reset, phone"
+                        className={cn(fieldControlClassName, "h-11")}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {KNOWLEDGE_BASE_SECTIONS.map((section) => (
+                  <Card key={section.key} className={workspaceCardClassName}>
+                    <CardHeader className="p-5 pb-3 sm:p-6 sm:pb-3">
+                      <div className="flex items-center justify-between gap-4">
+                        <CardTitle className="text-lg font-semibold tracking-tight text-foreground">
+                          {section.heading}
+                        </CardTitle>
+                        <Badge
+                          variant="secondary"
+                          className="shrink-0 rounded-full border bg-secondary px-2.5 py-0.5 text-xs font-medium text-primary hover:bg-secondary"
+                        >
+                          {section.badge}
+                        </Badge>
+                      </div>
+                    </CardHeader>
+
+                    <CardContent className="p-5 pt-0 sm:p-6 sm:pt-0">
+                      <label className={cn(fieldLabelClassName, "mb-1.5")} htmlFor={`kb-${section.key}`}>
+                        {section.label}
+                      </label>
+                      <Textarea
+                        id={`kb-${section.key}`}
+                        value={draft.sections[section.key]}
+                        onChange={(event) => updateSectionText(section.key, event.target.value)}
+                        placeholder={section.placeholder}
+                        className={cn(fieldControlClassName, "min-h-[140px] resize-y leading-6")}
+                      />
+                      <AttachmentPanel
+                        attachments={draft.attachments[section.key]}
+                        onAddFiles={(files) => addFilesToSection(section.key, files)}
+                        onAddLink={() => addLinkToSection(section.key)}
+                        onOpenAttachment={(attachment) => openAttachment(attachment)}
+                        onRemoveAttachment={(attachmentId) =>
+                          updateAttachments(section.key, (currentAttachments) =>
+                            currentAttachments.filter((attachment) => attachment.id !== attachmentId),
+                          )
+                        }
+                      />
+                    </CardContent>
+                  </Card>
+                ))}
+              </section>
+            </div>
+          )}
+
+          <div className="pt-10 text-center text-xs text-muted-foreground">Internal knowledge base.</div>
         </div>
       </div>
     </SupportLayout>

@@ -2,12 +2,14 @@ import { Link, useLocation } from "react-router-dom";
 import { ReactNode, useEffect, useState } from "react";
 import { BookOpen, Menu, ShieldCheck, UserRound, X } from "lucide-react";
 import { KentCrestMark } from "@/components/support/KentCrestMark";
+import { SupportMasterHeader, supportMasterHeaderPillClassName } from "@/components/support/SupportMasterHeader";
 import {
   adminPortalReturnQueryParam,
   canReturnToAdminDashboard,
   syncAdminPortalReturnFromSearch,
 } from "@/lib/adminSession";
 import { cn } from "@/lib/utils";
+import "./SupportLayout.css";
 
 export const SupportLayout = ({
   children,
@@ -29,6 +31,8 @@ export const SupportLayout = ({
   const location = useLocation();
   const isKnowledgeBaseArea = location.pathname.startsWith("/knowledge-base");
   const isAdminDashboardArea = location.pathname === "/admin" || location.pathname === "/agent";
+  // The admin dashboard and the Knowledge Base share the approved campus header and theme.
+  const usesMasterHeader = isAdminDashboardArea || isKnowledgeBaseArea;
   const isAdminArea =
     location.pathname.startsWith("/admin") ||
     location.pathname.startsWith("/agent") ||
@@ -46,13 +50,6 @@ export const SupportLayout = ({
         ? "border-primary/18 bg-primary/10 text-primary"
         : "border-primary/12 bg-white text-foreground hover:border-primary/25 hover:bg-primary/5 hover:text-primary",
     );
-  const knowledgeBaseLink = (
-    <Link to="/knowledge-base" className={internalLinkClassName(isKnowledgeBaseArea)}>
-      <BookOpen className="h-4 w-4 text-primary" />
-      <span className="sm:hidden">KB</span>
-      <span className="hidden sm:inline">Knowledge Base</span>
-    </Link>
-  );
   const adminDashboardLink = isKnowledgeBaseArea ? (
     <Link to="/admin" className={internalLinkClassName(false)}>
       <ShieldCheck className="h-4 w-4 text-primary" />
@@ -88,6 +85,51 @@ export const SupportLayout = ({
     </Link>
   ) : null;
 
+  // The admin dashboard uses the approved Support Portal header; only the
+  // route-specific navigation pills differ.
+  const adminDashboardHeaderActions = (
+    <>
+      {left}
+      <Link to="/knowledge-base" className={supportMasterHeaderPillClassName}>
+        <BookOpen aria-hidden="true" />
+        <span>Knowledge Base</span>
+      </Link>
+      <Link
+        to={{
+          pathname: "/",
+          search: `?${adminPortalReturnQueryParam}=1`,
+        }}
+        className={supportMasterHeaderPillClassName}
+      >
+        <UserRound aria-hidden="true" />
+        <span>Support Portal</span>
+      </Link>
+      {right}
+    </>
+  );
+  const knowledgeBaseHeaderActions = (
+    <>
+      {left}
+      <Link to="/admin" className={supportMasterHeaderPillClassName}>
+        <ShieldCheck aria-hidden="true" />
+        <span className="sm:hidden">Admin</span>
+        <span className="hidden sm:inline">Admin Dashboard</span>
+      </Link>
+      <Link
+        to={{
+          pathname: "/",
+          search: `?${adminPortalReturnQueryParam}=1`,
+        }}
+        className={supportMasterHeaderPillClassName}
+      >
+        <UserRound aria-hidden="true" />
+        <span className="sm:hidden">Portal</span>
+        <span className="hidden sm:inline">Support Portal</span>
+      </Link>
+      {right}
+    </>
+  );
+
   useEffect(() => {
     syncAdminPortalReturnFromSearch(location.search);
     setShowAdminReturnLink(!isAdminArea && canReturnToAdminDashboard());
@@ -95,9 +137,20 @@ export const SupportLayout = ({
   }, [isAdminArea, location.pathname, location.search]);
 
   return (
-    <div className={cn("min-h-screen gradient-soft", landing && "support-landing")}>
+    <div
+      className={cn(
+        "min-h-screen",
+        usesMasterHeader
+          ? "support-admin-theme font-[Inter,ui-sans-serif,system-ui,-apple-system,'Segoe_UI',sans-serif]"
+          : "gradient-soft",
+        isKnowledgeBaseArea && "support-kb-theme",
+        landing && "support-landing",
+      )}
+    >
       {effectiveShowHeader ? (
-        isAdminArea ? (
+        usesMasterHeader ? (
+          <SupportMasterHeader variant="banner" actions={isKnowledgeBaseArea ? knowledgeBaseHeaderActions : adminDashboardHeaderActions} />
+        ) : isAdminArea ? (
           <header className="sticky top-0 z-30 border-b border-black/5 bg-white">
             <div className={cn("sm:hidden", adminHeaderShellClassName)}>
               <div className="flex min-h-[74px] items-center justify-between gap-3">
@@ -127,7 +180,6 @@ export const SupportLayout = ({
                 <div className="border-t border-black/5 pb-3 pt-3">
                   <div className="flex flex-col gap-2 [&_a]:w-full [&_a]:justify-start">
                     {left}
-                    {isAdminDashboardArea ? knowledgeBaseLink : null}
                     {adminDashboardLink}
                     {adminPortalLink}
                     {right}
@@ -162,7 +214,6 @@ export const SupportLayout = ({
               ) : null}
 
               <div className="ml-auto flex items-center gap-2">
-                {isAdminDashboardArea ? knowledgeBaseLink : null}
                 {adminDashboardLink}
                 {adminPortalLink}
                 {right}
