@@ -171,9 +171,6 @@ const InquiryDetails = () => {
   const [learnerSearch, setLearnerSearch] = useState("");
   const [learnerResults, setLearnerResults] = useState<SubmittedForLearner[]>([]);
   const [selectedSubmittedForLearner, setSelectedSubmittedForLearner] = useState<SubmittedForLearner | null>(ticket.submittedForLearner);
-  const [submittedForNotificationEmail, setSubmittedForNotificationEmail] = useState(
-    ticket.submittedForLearner?.notificationEmail || ticket.submittedForLearner?.email || "",
-  );
   const [notifySubmittedForLearner, setNotifySubmittedForLearner] = useState(ticket.notifySubmittedForLearner);
   const [isSearchingLearners, setIsSearchingLearners] = useState(false);
   const [learnerSearchError, setLearnerSearchError] = useState("");
@@ -229,7 +226,7 @@ const InquiryDetails = () => {
   const isAiTeamFlow = technicalSubcategory === "AI Team" && !isLearnerSource;
   const isCoverageFlow = canUseCoverage && isCoverageSubcategory(technicalSubcategory);
   const hasSubmittedForLearner = requestFor !== "learner" || Boolean(selectedSubmittedForLearner);
-  const trimmedSubmittedForNotificationEmail = submittedForNotificationEmail.trim();
+  const trimmedSubmittedForNotificationEmail = selectedSubmittedForLearner?.email?.trim() || "";
   const hasValidSubmittedForNotificationEmail = !notifySubmittedForLearner
     || (Boolean(selectedSubmittedForLearner) && isValidEmailFormat(trimmedSubmittedForNotificationEmail));
   const trimmedAiTeamPersonName = aiTeamPersonName.trim();
@@ -329,7 +326,6 @@ const InquiryDetails = () => {
     if (!canSubmitForLearner) {
       setRequestFor("self");
       setSelectedSubmittedForLearner(null);
-      setSubmittedForNotificationEmail("");
       setNotifySubmittedForLearner(false);
       setLearnerSearch("");
       setLearnerResults([]);
@@ -662,7 +658,7 @@ const InquiryDetails = () => {
         ? selectedSubmittedForLearner
           ? {
               ...selectedSubmittedForLearner,
-              notificationEmail: trimmedSubmittedForNotificationEmail || selectedSubmittedForLearner.email,
+               notificationEmail: selectedSubmittedForLearner.email,
             }
           : null
         : null;
@@ -842,7 +838,6 @@ const InquiryDetails = () => {
                     setRequestFor(nextRequestFor);
                     if (nextRequestFor === "self") {
                       setSelectedSubmittedForLearner(null);
-                      setSubmittedForNotificationEmail("");
                       setNotifySubmittedForLearner(false);
                       setLearnerSearch("");
                       setLearnerResults([]);
@@ -921,7 +916,6 @@ const InquiryDetails = () => {
                               if (isReadOnlyReview) return;
 
                               setSelectedSubmittedForLearner(null);
-                              setSubmittedForNotificationEmail("");
                               setNotifySubmittedForLearner(false);
                               setLearnerSearch("");
                             }}
@@ -973,7 +967,6 @@ const InquiryDetails = () => {
                                   if (isReadOnlyReview) return;
 
                                   setSelectedSubmittedForLearner(learner);
-                                  setSubmittedForNotificationEmail(learner.notificationEmail || learner.email);
                                   setLearnerResults([]);
                                   setLearnerSearch("");
                                 }}
@@ -995,26 +988,21 @@ const InquiryDetails = () => {
                     {selectedSubmittedForLearner ? (
                       <div className="space-y-2 rounded-2xl border border-primary/10 bg-white px-4 py-3">
                         <div className="flex items-center justify-between gap-3">
-                          <Label htmlFor="submitted-for-notification-email">Notification email</Label>
+                          <Label htmlFor="submitted-for-notification-email">Official learner email</Label>
                           <span className="rounded-full border border-primary/10 bg-primary/[0.05] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.16em] text-primary">
-                            Ticket only
+                            Learner record
                           </span>
                         </div>
                         <Input
                           id="submitted-for-notification-email"
                           type="email"
-                          value={submittedForNotificationEmail}
-                          onChange={(event) => {
-                            if (!isReadOnlyReview) {
-                              setSubmittedForNotificationEmail(event.target.value);
-                            }
-                          }}
+                          value={selectedSubmittedForLearner.email || ""}
                           placeholder={selectedSubmittedForLearner.email}
-                          readOnly={isReadOnlyReview}
+                          readOnly
                           className="h-11 rounded-xl"
                         />
                         <p className="text-xs leading-5 text-muted-foreground">
-                          This does not update the learner official record. It is used only if learner notification is enabled for this ticket.
+                          Notifications are sent to this email from the learner record.
                         </p>
                         {notifySubmittedForLearner && !hasValidSubmittedForNotificationEmail ? (
                           <p className="text-xs font-medium text-destructive">
@@ -1024,23 +1012,20 @@ const InquiryDetails = () => {
                       </div>
                     ) : null}
 
-                    <label className="flex cursor-not-allowed items-start gap-3 rounded-2xl border border-primary/10 bg-white px-4 py-3 text-sm opacity-75"
+                    <label className="flex cursor-pointer items-start gap-3 rounded-2xl border border-primary/10 bg-white px-4 py-3 text-sm"
                     >
                       <Checkbox
                         checked={notifySubmittedForLearner}
-                        disabled
+                        disabled={isReadOnlyReview || !selectedSubmittedForLearner || !isValidEmailFormat(selectedSubmittedForLearner.email || "")}
                         onCheckedChange={(checked) => setNotifySubmittedForLearner(Boolean(checked))}
                         className="mt-1"
                       />
                       <span>
                         <span className="flex flex-wrap items-center gap-2 font-semibold text-foreground">
                           Notify learner by email
-                          <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700">
-                            Coming soon
-                          </span>
                         </span>
                         <span className="mt-1 block text-xs leading-5 text-muted-foreground">
-                          Off by default. If selected, the learner receives an email after the ticket is submitted.
+                          Off by default. If selected, the learner receives an email when the ticket is submitted and when it is closed.
                         </span>
                       </span>
                     </label>
