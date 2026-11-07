@@ -539,7 +539,13 @@ describe("AgentDashboard runtime", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Reason for status change" }), { target: { value: "Issue resolved" } });
     expect(patches).toHaveLength(0);
     fireEvent.click(screen.getByRole("button", { name: "Confirm change" }));
-    await waitFor(() => expect(patches).toEqual([{ status: "Closed", statusReason: "Closed via Agent", note: "Issue resolved" }]));
+    fireEvent.click(await screen.findByRole("button", { name: "Close ticket without email" }));
+    await waitFor(() => expect(patches).toEqual([{
+      status: "Closed",
+      statusReason: "Closed via Agent",
+      note: "Issue resolved",
+      closureNotification: { send: false, subject: "", message: "" },
+    }]));
     await waitFor(() => expect(screen.getByRole("button", { name: "Change status for KBC-000001" })).toHaveTextContent("Closed"));
     expect(screen.queryByRole("heading", { name: "Ticket KBC-000001" })).not.toBeInTheDocument();
   });
@@ -1394,12 +1400,12 @@ describe("AgentDashboard runtime", () => {
     const workspaceFooter = saveTicketButton.parentElement;
     expect(workspaceFooter).not.toBeNull();
     fireEvent.click(within(workspaceFooter as HTMLElement).getByRole("button", { name: /^Close$/i }));
-    expect(await screen.findByText("Close Coverage Ticket")).toBeInTheDocument();
+    expect(await screen.findByText("Close Ticket KBC-000002")).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText("Internal note"), {
+    fireEvent.change(screen.getByLabelText("Internal note *"), {
       target: { value: "Closing this coverage ticket after manual review." },
     });
-    fireEvent.click(screen.getByRole("button", { name: /Close Ticket/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Close ticket without email" }));
 
     await waitFor(() => {
       expect(patchRequests).toHaveLength(1);
@@ -1475,6 +1481,7 @@ describe("AgentDashboard runtime", () => {
       .find((candidate) => !candidate.className.includes("absolute"));
     expect(closeButton).toBeTruthy();
     fireEvent.click(closeButton as HTMLElement);
+    fireEvent.click(await screen.findByRole("button", { name: "Close ticket without email" }));
 
     await waitFor(() => {
       expect(patchRequests).toHaveLength(2);

@@ -22,7 +22,12 @@ it("requires an explicit change, note and confirmation without opening the ticke
   fireEvent.keyDown(note, { key: " " });
   expect(onConfirm).not.toHaveBeenCalled();
   fireEvent.click(confirm);
-  await waitFor(() => expect(onConfirm).toHaveBeenCalledWith("Closed", "Resolved with the requester"));
+  fireEvent.click(await screen.findByRole("button", { name: "Close ticket without email" }));
+  await waitFor(() => expect(onConfirm).toHaveBeenCalledWith("Closed", "Resolved with the requester", {
+    send: false,
+    subject: "",
+    message: "",
+  }));
   await waitFor(() => expect(screen.queryByRole("button", { name: "Confirm change" })).not.toBeInTheDocument());
   expect(onRowClick).not.toHaveBeenCalled();
   expect(onRowKeyDown).not.toHaveBeenCalled();

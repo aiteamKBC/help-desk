@@ -96,6 +96,7 @@ import {
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { StatusBadge } from "@/components/support/StatusBadge";
 import { TicketStatusEditor } from "@/components/support/TicketStatusEditor";
+import { CloseTicketDialog, type ClosureNotificationInput } from "@/components/support/CloseTicketDialog";
 import {
   clearAdminSession,
   fetchVerifiedAdminSession,
@@ -1417,6 +1418,7 @@ const AgentDashboard = () => {
   const [draftAgentId, setDraftAgentId] = useState("unassigned");
   const [draftSlaStatus, setDraftSlaStatus] = useState<TicketSummary["slaStatus"]>("Pending Review");
   const [notes, setNotes] = useState("");
+  const [standardCloseDialogOpen, setStandardCloseDialogOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isAgentsLoading, setIsAgentsLoading] = useState(true);
   const [isOpening, setIsOpening] = useState(false);
@@ -5258,6 +5260,7 @@ const AgentDashboard = () => {
     successMessage?: string;
     errorMessage?: string;
     showSuccessToast?: boolean;
+    closureNotification?: ClosureNotificationInput;
   }) {
     if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
       return null;
@@ -5278,6 +5281,7 @@ const AgentDashboard = () => {
         ...(options?.statusReason ? { statusReason: options.statusReason } : {}),
         ...(options?.note ? { note: options.note } : {}),
         ...(options?.slaStatus ? { slaStatus: options.slaStatus } : {}),
+        ...(options?.closureNotification ? { closureNotification: options.closureNotification } : {}),
       };
       if (options && "assignedAgentId" in options) {
         requestBody.assignedAgentId = options.assignedAgentId;
@@ -5329,7 +5333,7 @@ const AgentDashboard = () => {
     });
   }
 
-  async function closeActiveCoverageTicket() {
+  async function closeActiveCoverageTicket(closureNotification: ClosureNotificationInput) {
     if (!activeDetail || !isCoverageTicket(activeDetail.ticket)) {
       return false;
     }
@@ -5355,7 +5359,8 @@ const AgentDashboard = () => {
       note: closeNote,
       assignedAgentId: nextAssignedAgentId,
       slaStatus: effectiveDraftSlaStatus,
-      successMessage: "Ticket closed",
+      closureNotification,
+      successMessage: closureNotification.send ? "Ticket closed. Email queued." : "Ticket closed without email.",
       errorMessage: "We could not close the coverage ticket right now.",
     });
 
@@ -6661,14 +6666,14 @@ const AgentDashboard = () => {
     });
   }
 
-  async function updateDashboardTicketStatus(ticket: TicketSummary, status: TicketSummary["status"], note: string) {
+  async function updateDashboardTicketStatus(ticket: TicketSummary, status: TicketSummary["status"], note: string, closureNotification?: ClosureNotificationInput) {
     if (!hasFullAdminAccess || ticket.isArchived) {
       throw new Error("This ticket cannot be edited here.");
     }
     const response = await fetch(`/api/admin/tickets/${encodeURIComponent(ticket.id)}`, {
       method: "PATCH",
       headers: buildAdminJsonHeaders(),
-      body: JSON.stringify({ status, note, ...(status === "Closed" ? { statusReason: "Closed via Agent" } : {}) }),
+      body: JSON.stringify({ status, note, ...(status === "Closed" ? { statusReason: "Closed via Agent", closureNotification } : {}) }),
     });
     const payload = (await response.json().catch(() => null)) as DetailResponse | null;
     if (!response.ok || !payload?.ticket) {
@@ -6715,13 +6720,14 @@ const AgentDashboard = () => {
     slaStatus?: TicketSummary["slaStatus"];
     note?: string;
     successMessage?: string;
+    closureNotification?: ClosureNotificationInput;
   }) {
     if (!activeDetail) {
-      return;
+      return false;
     }
     if (activeDetail.ticket.isArchived) {
       toast.error("Restore this ticket before editing it.");
-      return;
+      return false;
     }
 
     const previousStatus = activeDetail.ticket.status;
@@ -6740,7 +6746,7 @@ const AgentDashboard = () => {
     if (nextStatus !== activeDetail.ticket.status && !nextNote) {
       standardActionNoteRef.current?.focus();
       toast.error("Add an internal note before changing the ticket status.");
-      return;
+      return false;
     }
 
     setIsSaving(true);
@@ -6751,6 +6757,7 @@ const AgentDashboard = () => {
         ...(overrides?.statusReason ? { statusReason: overrides.statusReason } : {}),
         slaStatus: overrides?.slaStatus ?? effectiveDraftSlaStatus,
         note: nextNote,
+        ...(overrides?.closureNotification ? { closureNotification: overrides.closureNotification } : {}),
         ...(serializedStandardDocumentationToSave ? { documentation: serializedStandardDocumentationToSave } : {}),
       };
 
@@ -6765,7 +6772,7 @@ const AgentDashboard = () => {
       if (serializedStandardDocumentationToSave && documentationUploadFiles.length > 0) {
         const formData = new FormData();
         Object.entries(requestBody).forEach(([key, value]) => {
-          if (key === "documentation") {
+          if (key === "documentation" || key === "closureNotification") {
             formData.append(key, JSON.stringify(value));
             return;
           }
@@ -6792,10 +6799,10 @@ const AgentDashboard = () => {
 
       if (!response.ok || !payload?.ticket) {
         if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
-          return;
+          return false;
         }
         toast.error(payload?.message || "We could not update the ticket right now.");
-        return;
+        return false;
       }
 
       setActiveDetail(payload);
@@ -6819,8 +6826,10 @@ const AgentDashboard = () => {
         ticket.id === payload.ticket.id ? payload.ticket : ticket
       )));
       toast.success(overrides?.successMessage || "Changes saved");
+      return true;
     } catch {
       toast.error("We could not connect to the server. Please try again.");
+      return false;
     } finally {
       setIsSaving(false);
     }
@@ -7628,7 +7637,7 @@ const AgentDashboard = () => {
                           <td className={dashboardCellClassName}>
                             <TicketStatusEditor ticketId={ticket.id} status={ticket.status} label={getDisplayedTicketStatus(ticket)}
                               disabled={!hasFullAdminAccess || Boolean(ticket.isArchived)}
-                              onConfirm={(status, note) => updateDashboardTicketStatus(ticket, status, note)} />
+                              onConfirm={(status, note, closureNotification) => updateDashboardTicketStatus(ticket, status, note, closureNotification)} />
                             <div className="mt-2 text-xs text-muted-foreground">
                               {getDisplayedTicketStatusReason(ticket)}
                             </div>
@@ -7638,7 +7647,7 @@ const AgentDashboard = () => {
                             <td className={dashboardCellClassName}>
                               <TicketStatusEditor ticketId={ticket.id} status={ticket.status} label={getDisplayedTicketStatus(ticket)}
                                 disabled={!hasFullAdminAccess || Boolean(ticket.isArchived)}
-                                onConfirm={(status, note) => updateDashboardTicketStatus(ticket, status, note)} />
+                                onConfirm={(status, note, closureNotification) => updateDashboardTicketStatus(ticket, status, note, closureNotification)} />
                             </td>
                             <td className={cn(dashboardCellClassName, "text-muted-foreground")}>{getDisplayedTicketStatusReason(ticket)}</td>
                           </>
@@ -9782,15 +9791,25 @@ const AgentDashboard = () => {
                 <Button
                   variant="outline"
                   className="w-full sm:w-auto"
-                  onClick={() => void saveTicket({
-                    status: "Closed",
-                    statusReason: "Closed via Agent",
-                    successMessage: "Ticket closed",
-                  })}
+                  onClick={() => setStandardCloseDialogOpen(true)}
                   disabled={isSaving || activeTicketIsArchived}
                 >
                   <X className="h-4 w-4 mr-2" /> Close
                 </Button>
+                <CloseTicketDialog
+                  open={standardCloseDialogOpen}
+                  onOpenChange={setStandardCloseDialogOpen}
+                  ticketId={activeDetail.ticket.id}
+                  note={notes}
+                  onNoteChange={setNotes}
+                  isSaving={isSaving}
+                  onConfirm={(closureNotification) => saveTicket({
+                    status: "Closed",
+                    statusReason: "Closed via Agent",
+                    successMessage: closureNotification.send ? "Ticket closed. Email queued." : "Ticket closed without email.",
+                    closureNotification,
+                  })}
+                />
                 <Button
                   className="w-full gradient-primary border-0 sm:w-auto"
                   onClick={() => void saveTicket({ successMessage: "Changes saved" })}
@@ -11625,6 +11644,7 @@ const ConsoleChatBubble = ({
 };
 
 const CoverageCloseTicketButton = ({
+  ticketId,
   note,
   onNoteChange,
   onCloseTicket,
@@ -11632,27 +11652,15 @@ const CoverageCloseTicketButton = ({
   disabled = false,
   className,
 }: {
+  ticketId: string;
   note: string;
   onNoteChange: (value: string) => void;
-  onCloseTicket: () => Promise<boolean>;
+  onCloseTicket: (notification: ClosureNotificationInput) => Promise<boolean>;
   isSaving: boolean;
   disabled?: boolean;
   className?: string;
 }) => {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
-  const trimmedNote = note.trim();
-
-  const handleConfirmClose = async () => {
-    if (!trimmedNote) {
-      return;
-    }
-
-    const didClose = await onCloseTicket();
-    if (didClose) {
-      setIsDialogOpen(false);
-    }
-  };
-
   return (
     <>
       <Button
@@ -11664,54 +11672,9 @@ const CoverageCloseTicketButton = ({
       >
         <X className="h-4 w-4 mr-2" /> Close
       </Button>
-      <Dialog open={isDialogOpen} onOpenChange={(open) => {
-        if (!isSaving) {
-          setIsDialogOpen(open);
-        }
-      }}
-      >
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Close Coverage Ticket</DialogTitle>
-            <DialogDescription>
-              Add an internal note before closing this coverage ticket.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <Label htmlFor="coverage-close-note" className="text-sm font-semibold">
-              Internal note
-            </Label>
-            <Textarea
-              id="coverage-close-note"
-              rows={4}
-              autoFocus
-              value={note}
-              onChange={(event) => onNoteChange(event.target.value)}
-              placeholder="Add an internal note before closing this coverage ticket..."
-              className="rounded-2xl bg-white"
-            />
-            <p className={cn("text-xs", trimmedNote ? "text-muted-foreground" : "text-destructive")}>
-              {trimmedNote
-                ? "This note will be saved in the activity log for support staff."
-                : "A note is required before the close action can be applied."}
-            </p>
-          </div>
-          <DialogFooter className="gap-2 sm:justify-end">
-            <Button variant="outline" onClick={() => setIsDialogOpen(false)} disabled={isSaving}>
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={() => void handleConfirmClose()}
-              disabled={!trimmedNote || isSaving}
-            >
-              {isSaving ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <X className="h-4 w-4 mr-2" />}
-              Close Ticket
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <CloseTicketDialog open={isDialogOpen} onOpenChange={setIsDialogOpen}
+        ticketId={ticketId} note={note} onNoteChange={onNoteChange}
+        isSaving={isSaving} onConfirm={onCloseTicket} />
     </>
   );
 };
@@ -11756,7 +11719,7 @@ const CoverageTicketDetailsPanel = ({
   slaStatuses: TicketSummary["slaStatus"][];
   canSubmitStatusChange: boolean;
   onCancel: () => void;
-  onCloseTicket: () => Promise<boolean>;
+  onCloseTicket: (notification: ClosureNotificationInput) => Promise<boolean>;
   onSaveDetails: () => void;
 }) => (
   <div className="space-y-5">
@@ -11872,6 +11835,7 @@ const CoverageTicketDetailsPanel = ({
         {!readOnly ? (
           <>
             <CoverageCloseTicketButton
+              ticketId={ticket.id}
               note={notes}
               onNoteChange={onNotesChange}
               onCloseTicket={onCloseTicket}
@@ -11957,7 +11921,7 @@ const CoverageTicketWorkspace = ({
   onCancel: () => void;
   onSave: () => void;
   onSaveDetails: () => void;
-  onCloseTicket: () => Promise<boolean>;
+  onCloseTicket: (notification: ClosureNotificationInput) => Promise<boolean>;
   onArchiveToggle: () => void;
   onSubmitTutorChoiceCard: (cardId: string) => void;
   onUploadPresentationFiles: (
@@ -14065,6 +14029,7 @@ const CoverageTicketWorkspace = ({
           {!readOnly ? (
             <>
               <CoverageCloseTicketButton
+                ticketId={ticket.id}
                 note={notes}
                 onNoteChange={onNotesChange}
                 onCloseTicket={onCloseTicket}
@@ -19318,6 +19283,8 @@ const activityEventLabels: Record<string, string> = {
   coverage_sla_alert: "Coverage SLA Alert",
   follow_up_ticket_created: "Follow-up Ticket Created",
   internal_note: "Internal Note",
+  closure_email_requested: "Closure Email Queued",
+  closure_email_skipped: "Closure Email Skipped",
   documentation_attachment_added: "Documentation Attachment Added",
   documentation_card_created: "Documentation Card Created",
   documentation_card_updated: "Documentation Card Updated",
@@ -19613,6 +19580,10 @@ function getActivityEventSummary(item: HistoryItem) {
       return tutor ? `Coverage session confirmed with ${tutor}` : "Coverage session confirmed";
     case "internal_note":
       return "Internal note recorded";
+    case "closure_email_requested":
+      return "Closure email requested by the resolving agent";
+    case "closure_email_skipped":
+      return "Ticket closed without a requester email";
     default:
       break;
   }

@@ -6900,6 +6900,7 @@ def build_support_notification_webhook_payload(
     status_reason: str | None = None,
     requested_at: Any = None,
     closed_at: Any = None,
+    closure_email: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     public_base_url = get_support_portal_public_base_url("")
     dashboard_url = f"{public_base_url}/admin" if public_base_url else ""
@@ -7009,6 +7010,12 @@ def build_support_notification_webhook_payload(
     }
     if ai_team_request:
         payload["aiTeamPerson"] = ai_team_request
+    if closure_email:
+        payload["closureEmail"] = {
+            "id": sanitize_text(closure_email.get("id")),
+            "subject": sanitize_text(closure_email.get("subject")),
+            "message": sanitize_text(closure_email.get("message")),
+        }
     if event == SUPPORT_NOTIFICATION_EVENT_AI_TEAM_TICKET_SUBMITTED:
         payload["ticket"]["inquiry"] = sanitize_text(ticket.get("inquiry"))
 
@@ -7082,6 +7089,7 @@ def send_support_notification_webhook(
             sanitize_text(payload.get("event")),
             sanitize_text(payload.get("ticketId") or normalize_json_object(payload.get("ticket")).get("id")),
             sanitize_text(payload.get("recipientType")),
+            sanitize_text(normalize_json_object(payload.get("closureEmail")).get("id")),
         ) if part
     )
     request_headers = {"X-Support-Delivery-Key": delivery_key} if delivery_key else None
@@ -7313,13 +7321,17 @@ def queue_ai_team_ticket_submitted_notification(ticket: dict[str, Any], *, statu
     )
 
 
-def queue_quick_ticket_closed_notification(ticket: dict[str, Any], *, status: str, status_reason: str, closed_at: Any = None) -> None:
+def queue_quick_ticket_closed_notification(
+    ticket: dict[str, Any], *, status: str, status_reason: str, closed_at: Any = None,
+    closure_email: dict[str, Any] | None = None,
+) -> None:
     payload = build_support_notification_webhook_payload(
         SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED,
         ticket,
         status=status,
         status_reason=status_reason,
         closed_at=closed_at or datetime.now(timezone.utc),
+        closure_email=closure_email,
     )
     queue_support_notification_delivery(
         ticket_id=int(ticket["id"]),
@@ -7333,6 +7345,8 @@ def queue_quick_ticket_closed_notification(ticket: dict[str, Any], *, status: st
 def queue_submitted_for_learner_notification(
     ticket: dict[str, Any], *, closed: bool = False, status: str | None = None,
     status_reason: str | None = None, closed_at: Any = None,
+    closure_email: dict[str, Any] | None = None,
+    force: bool = False,
 ) -> None:
     metadata = normalize_json_object(ticket.get("metadata"))
     learner = normalize_json_object(metadata.get(SUBMITTED_FOR_LEARNER_METADATA_KEY))
@@ -7340,7 +7354,7 @@ def queue_submitted_for_learner_notification(
         return
     event = SUPPORT_NOTIFICATION_EVENT_LEARNER_CLOSED if closed else SUPPORT_NOTIFICATION_EVENT_LEARNER_CREATED
     sent_key = LEARNER_CLOSED_NOTIFICATION_SENT_AT_METADATA_KEY if closed else LEARNER_CREATED_NOTIFICATION_SENT_AT_METADATA_KEY
-    if metadata.get(sent_key):
+    if metadata.get(sent_key) and not force:
         return
     # Resolve the address again from the learner record, so stored ticket metadata
     # and client-provided fields cannot redirect a notification.
@@ -7351,6 +7365,7 @@ def queue_submitted_for_learner_notification(
         return
     payload = build_support_notification_webhook_payload(
         event, ticket, status=status, status_reason=status_reason, closed_at=closed_at,
+        closure_email=closure_email,
     )
     payload["recipientType"] = "submitted_for_learner"
     payload["recipients"] = [recipient]
@@ -10456,6 +10471,9 @@ def is_active_staff_support_account(account: dict[str, Any] | None) -> bool:
     if not is_active:
         return False
 
+    if normalize_json_object(account.get("metadata")).get("agent_removed_at"):
+        return False
+
     account_scope = normalize_account_scope(account.get("account_scope"), fallback_role=account.get("role"))
     if account_scope != ACCOUNT_SCOPE_STAFF:
         return False
@@ -13187,6 +13205,8 @@ def sync_support_staff_account_from_legacy_auth_user(legacy_user: dict[str, Any]
         or fetch_staff_admin_account_by_email(normalized_email)
     )
     if existing_account:
+        if normalize_json_object(existing_account.get("metadata")).get("agent_removed_at"):
+            raise ApiError(403, "This support account has been removed.")
         updated_metadata = normalize_json_object(existing_account.get("metadata"))
         updated_metadata.update(metadata_patch)
         email_owner = find_agent_account_by_email(normalized_email, exclude_agent_id=int(existing_account["id"]))
@@ -13354,6 +13374,8 @@ def sync_support_staff_account_from_entra_directory_user(
         or fetch_staff_admin_account_by_email(normalized_email)
     )
     if existing_account:
+        if normalize_json_object(existing_account.get("metadata")).get("agent_removed_at"):
+            raise ApiError(403, "This support account has been removed.")
         updated_metadata = normalize_json_object(existing_account.get("metadata"))
         updated_metadata.update(metadata_patch)
         email_owner = find_agent_account_by_email(normalized_email, exclude_agent_id=int(existing_account["id"]))
@@ -15320,7 +15342,7 @@ def get_admin_microsoft_login_response(payload: dict[str, Any]) -> dict[str, Any
 
 
 def list_agents(*, include_inactive: bool = True, refresh_legacy: bool = True) -> dict[str, Any]:
-    where_clause = "WHERE account_scope = %s"
+    where_clause = "WHERE account_scope = %s AND COALESCE(metadata->>'agent_removed_at', '') = ''"
     query_params: list[Any] = [ACCOUNT_SCOPE_STAFF]
     if not include_inactive:
         where_clause += " AND is_active = TRUE"
@@ -15718,29 +15740,105 @@ def _remove_django_support_access(email: str) -> None:
 
 
 def remove_agent(account_id: int) -> None:
-    agent = run_query_one(
-        "SELECT id, email, metadata FROM support_accounts WHERE id = %s AND account_scope = %s LIMIT 1",
-        [account_id, ACCOUNT_SCOPE_STAFF],
-    )
-    if not agent:
-        raise ApiError(404, "Agent not found.")
+    with transaction.atomic():
+        agent = run_query_one(
+            "SELECT id, email, metadata FROM support_accounts WHERE id = %s AND account_scope = %s LIMIT 1 FOR UPDATE",
+            [account_id, ACCOUNT_SCOPE_STAFF],
+        )
+        if not agent:
+            raise ApiError(404, "Agent not found.")
 
-    metadata = normalize_json_object(agent.get("metadata"))
-    email = normalize_email(agent.get("email") or "")
-    metadata["legacy_support_access"] = False
-    metadata["session_active"] = False
-    metadata["console_status"] = DEFAULT_AGENT_CONSOLE_STATUS
-    metadata["agent_removed_at"] = datetime.now(timezone.utc).isoformat()
-    metadata.pop("manually_added_agent", None)
-    run_query(
-        """
-        UPDATE support_accounts
-        SET metadata = %s::jsonb,
-            updated_at = NOW()
-        WHERE id = %s AND account_scope = %s
-        """,
-        [json.dumps(metadata), account_id, ACCOUNT_SCOPE_STAFF],
-    )
+        metadata = normalize_json_object(agent.get("metadata"))
+        email = normalize_email(agent.get("email") or "")
+        metadata.update({
+            "legacy_support_access": False,
+            "legacy_operations_access": False,
+            "legacy_admin_access": False,
+            "entra_directory_admin_access": False,
+            "team_access_keys": [],
+            "session_active": False,
+            "console_status": DEFAULT_AGENT_CONSOLE_STATUS,
+            "agent_removed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        metadata.pop("manually_added_agent", None)
+        run_query(
+            """
+            UPDATE support_accounts
+            SET is_active = FALSE,
+                role = %s,
+                metadata = %s::jsonb,
+                updated_at = NOW()
+            WHERE id = %s AND account_scope = %s
+            """,
+            [ROLE_AGENT, json.dumps(metadata), account_id, ACCOUNT_SCOPE_STAFF],
+        )
+        run_query(
+            "UPDATE support_account_team_access SET can_receive_tickets = FALSE WHERE account_id = %s",
+            [account_id],
+        )
+
+        assigned_tickets = run_query(
+            """
+            SELECT t.id, t.public_id, t.category, t.technical_subcategory,
+                   t.status, t.status_reason, t.assigned_team, t.metadata,
+                   t.conversation_id, c.status AS conversation_status,
+                   c.metadata AS conversation_metadata
+            FROM tickets t
+            LEFT JOIN conversations c ON c.id = t.conversation_id
+            WHERE t.assigned_agent_id = %s AND t.status <> 'Closed'
+            FOR UPDATE OF t
+            """,
+            [account_id],
+        )
+        for ticket in assigned_tickets:
+            ticket_metadata = normalize_json_object(ticket.get("metadata"))
+            pending_call = get_pending_teams_call_notification(ticket_metadata)
+            if pending_call and parse_assigned_agent_id(pending_call.get("toAgentId")) == account_id:
+                ticket_metadata.pop(PENDING_TEAMS_CALL_NOTIFICATION_METADATA_KEY, None)
+                ticket_metadata.pop(TEAMS_CALL_REQUESTED_METADATA_KEY, None)
+            ticket_metadata.pop("assigned_agent_record", None)
+            ticket_metadata, ticket_state_columns = build_ticket_state_persistence(
+                ticket_metadata,
+                {**ticket, "assigned_agent_id": None},
+                chat_state=ticket.get("conversation_status"),
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET assigned_agent_id = NULL,
+                        metadata = %s::jsonb,
+                        ticket_type = %s,
+                        workflow_stage = %s,
+                        queue_scope = %s,
+                        dashboard_bucket = %s,
+                        can_show_conversation = %s,
+                        can_receive_chat = %s,
+                        resolution_reason = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    [json.dumps(ticket_metadata), *get_ticket_state_column_params(ticket_state_columns), ticket["id"]],
+                )
+                if ticket.get("conversation_id"):
+                    cursor.execute(
+                        """
+                        UPDATE conversations
+                        SET metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                        WHERE id = %s
+                        """,
+                        [json.dumps({
+                            "assigned_agent_id": None,
+                            "assigned_agent_username": None,
+                            "assigned_agent_name": None,
+                        }), ticket["conversation_id"]],
+                    )
+            insert_history_event(
+                int(ticket["id"]),
+                "assignment_changed",
+                None,
+                {"fromAgentId": account_id, "toAgentId": None, "assignmentSource": "offboarding"},
+            )
     if email:
         _remove_django_support_access(email)
 
@@ -17223,6 +17321,63 @@ def get_admin_ticket_detail_response(public_id: str, actor: dict[str, Any] | Non
         raise ApiError(404, "Ticket not found.")
 
     return detail
+
+
+def get_admin_ticket_closure_email_draft(public_id: str, actor: dict[str, Any] | None = None) -> dict[str, Any]:
+    detail_response = get_admin_ticket_detail_response(public_id, actor)
+    ticket = normalize_json_object(detail_response.get("ticket"))
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
+
+    requester_email = normalize_email(ticket.get("email"))
+    recipients: list[dict[str, str]] = []
+    if is_valid_email(requester_email):
+        recipients.append({
+            "type": "requester",
+            "name": sanitize_text(ticket.get("requesterName") or ticket.get("learnerName")) or requester_email,
+            "email": requester_email,
+        })
+
+    submitted_for = normalize_json_object(ticket.get("submittedForLearner"))
+    submitted_email = normalize_email(submitted_for.get("notificationEmail") or submitted_for.get("email"))
+    if (
+        normalize_bool(submitted_for.get("notifyByEmail"))
+        and is_valid_email(submitted_email)
+        and submitted_email != requester_email
+    ):
+        recipients.append({
+            "type": "submitted_for_learner",
+            "name": sanitize_text(submitted_for.get("fullName")) or submitted_email,
+            "email": submitted_email,
+        })
+
+    message = graph_mail.default_closure_message()
+    subject = f"Your support ticket {ticket.get('id')} has been closed"
+    preview_payload = {
+        "event": SUPPORT_NOTIFICATION_EVENT_QUICK_TICKET_CLOSED,
+        "recipientType": "requester",
+        "recipients": [requester_email] if requester_email else [],
+        "requester": {
+            "name": sanitize_text(ticket.get("requesterName") or ticket.get("learnerName")) or requester_email,
+            "email": requester_email,
+        },
+        "ticket": {
+            "id": ticket.get("id"),
+            "subject": ticket.get("subject") or "",
+            "category": ticket.get("category") or "",
+            "technicalSubcategory": ticket.get("technicalSubcategory") or "",
+            "status": "Closed",
+        },
+        "closureEmail": {"subject": subject, "message": message},
+    }
+    rendered_subject, preview_html = graph_mail.render_notification_email(preview_payload)
+    return {
+        "available": bool(recipients),
+        "recipients": recipients,
+        "subject": rendered_subject,
+        "message": message,
+        "previewHtml": preview_html,
+    }
 
 
 def request_support_teams_call(public_id: str) -> dict[str, Any]:
@@ -19982,6 +20137,7 @@ def resolve_support_teams_call_notification_target(targets: list[str] | None = N
             SELECT id, username, full_name, email, role
             FROM support_accounts
             WHERE is_active = TRUE
+              AND COALESCE(metadata->>'agent_removed_at', '') = ''
               AND account_scope = %s
               AND role = ANY(%s)
               AND (
@@ -20018,6 +20174,7 @@ def resolve_support_teams_call_notification_target(targets: list[str] | None = N
             SELECT id, username, full_name, email, role
             FROM support_accounts
             WHERE is_active = TRUE
+              AND COALESCE(metadata->>'agent_removed_at', '') = ''
               AND account_scope = %s
               AND role = ANY(%s)
             ORDER BY id ASC
@@ -20552,6 +20709,15 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
     requested_escalation_note = sanitize_text(payload.get("escalationNote"))
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
     note = sanitize_text(payload.get("note"))
+    closure_notification = normalize_json_object(payload.get("closureNotification"))
+    send_closure_email = normalize_bool(closure_notification.get("send"))
+    closure_email_subject = sanitize_text(closure_notification.get("subject"))
+    closure_email_message = sanitize_text(closure_notification.get("message"))
+    closure_email = {
+        "id": str(uuid4()) if send_closure_email else "",
+        "subject": closure_email_subject,
+        "message": closure_email_message,
+    }
     has_assigned_agent_input = "assignedAgentId" in payload
     is_claim_request = payload.get("claim") is True
     if is_claim_request and (has_assigned_agent_input or requested_assigned_team is not None or requested_status is not None):
@@ -20568,6 +20734,15 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
 
     if requested_sla_status is not None and requested_sla_status not in ALLOWED_SLA_STATUSES:
         raise ApiError(400, "Invalid SLA status.")
+
+    if send_closure_email and requested_status != "Closed":
+        raise ApiError(400, "A closure email can only be sent while closing a ticket.")
+    if send_closure_email and not closure_email_message:
+        raise ApiError(400, "Add a message before sending the closure email.")
+    if len(closure_email_subject) > 200:
+        raise ApiError(400, "The closure email subject is too long.")
+    if len(closure_email_message) > 5000:
+        raise ApiError(400, "The closure email message is too long.")
 
     if uploaded_documentation_files and requested_documentation is None:
         raise ApiError(400, "Documentation payload is required when uploading documentation attachments.")
@@ -21161,12 +21336,22 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 },
             )
 
-        should_queue_admin_quick_closed_notification = should_notify_quick_ticket_closed(
-            ticket,
-            previous_status=ticket.get("status"),
-            previous_status_reason=ticket.get("status_reason"),
-            next_status=next_status,
+        should_queue_admin_quick_closed_notification = (
+            send_closure_email
+            and sanitize_text(ticket.get("status")) != "Closed"
+            and next_status == "Closed"
         )
+        if sanitize_text(ticket.get("status")) != "Closed" and next_status == "Closed":
+            insert_history_event(
+                ticket["id"],
+                "closure_email_requested" if send_closure_email else "closure_email_skipped",
+                actor,
+                {
+                    "send": send_closure_email,
+                    "subject": closure_email_subject if send_closure_email else "",
+                    "message": closure_email_message if send_closure_email else "",
+                },
+            )
 
         follow_up_public_id = ""
         if should_create_follow_up_ticket:
@@ -21183,9 +21368,12 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
                 requested_inquiry=requested_follow_up_inquiry,
             )
 
-    if sanitize_text(ticket.get("status")) != "Closed" and next_status == "Closed":
+    if send_closure_email and sanitize_text(ticket.get("status")) != "Closed" and next_status == "Closed":
         try:
-            queue_submitted_for_learner_notification(ticket, closed=True, status=next_status, status_reason=next_status_reason)
+            queue_submitted_for_learner_notification(
+                ticket, closed=True, status=next_status, status_reason=next_status_reason,
+                closure_email=closure_email, force=True,
+            )
         except Exception:
             logger.warning("Could not queue the learner closure notification for %s", ticket.get("public_id"), exc_info=True)
     if should_queue_admin_quick_closed_notification:
@@ -21193,6 +21381,7 @@ def update_admin_ticket(public_id: str, payload: dict[str, Any], *, uploaded_fil
             ticket,
             status=next_status,
             status_reason=next_status_reason,
+            closure_email=closure_email,
         )
     if learning_plan_transfer_webhook_ticket_id and learning_plan_transfer_webhook_payload:
         notify_learning_plan_ticket_transfer(
