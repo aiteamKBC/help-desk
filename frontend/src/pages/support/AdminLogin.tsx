@@ -1,11 +1,17 @@
 import { useEffect, useState } from "react";
 import { useNavigate, Link, useLocation } from "react-router-dom";
-import { Lock, ShieldCheck, Eye, EyeOff, Building2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, Building2, Eye, EyeOff, Lock, UserRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { SupportCampusHero } from "@/components/support/SupportCampusHero";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { createAdminSessionInstanceId, setAdminSession } from "@/lib/adminSession";
+import {
+  adminPortalReturnQueryParam,
+  createAdminSessionInstanceId,
+  setAdminSession,
+} from "@/lib/adminSession";
+import "./EmailVerification.css";
+import "./AdminLogin.css";
 import { buildCsrfHeaders } from "@/lib/csrf";
 import { toast } from "sonner";
 
@@ -109,22 +115,32 @@ const AdminLogin = () => {
   };
 
   return (
-    <SupportLayout>
-      <div className="max-w-md mx-auto">
-        <div className="bg-card rounded-2xl border shadow-card p-8">
-          <div className="text-center mb-6">
-            <div className="mx-auto h-12 w-12 rounded-2xl gradient-primary flex items-center justify-center shadow-card mb-3">
-              <ShieldCheck className="h-6 w-6 text-primary-foreground" />
-            </div>
-            <h1 className="text-2xl font-bold">Admin Login</h1>
-            <p className="text-muted-foreground text-sm mt-1">
-              Sign in to access the admin dashboard.
-            </p>
+    <SupportLayout landing showHeader={false} mainClassName="support-landing-main admin-login-main">
+      {/* Same destination as the Support Portal link the admin header rendered before. */}
+      <Link
+        to={{ pathname: "/", search: `?${adminPortalReturnQueryParam}=1` }}
+        className="admin-login-portal"
+      >
+        <ArrowLeft aria-hidden="true" />
+        <span>Support Portal</span>
+      </Link>
+
+      <SupportCampusHero
+        title={<>Admin access,<br />made simple.</>}
+        subtitle="Secure sign in for the support team."
+      />
+
+      <section className="support-entry admin-login-entry" aria-labelledby="admin-login-title">
+        <div className="admin-login-content">
+          <div className="admin-login-heading">
+            <h1 id="admin-login-title">Admin Login</h1>
+            <p>Sign in to access the admin dashboard.</p>
           </div>
 
-          <form onSubmit={(event) => void handleSubmit(event)} className="space-y-4">
-            <div>
-              <Label htmlFor="username" className="mb-1.5 block">Username</Label>
+          <form onSubmit={(event) => void handleSubmit(event)} className="admin-login-form">
+            <div className="admin-login-field">
+              <label htmlFor="username" className="sr-only">Username</label>
+              <UserRound aria-hidden="true" />
               <Input
                 id="username"
                 value={username}
@@ -134,76 +150,65 @@ const AdminLogin = () => {
                 }}
                 placeholder="admin"
                 autoComplete="username"
-                className="h-11"
               />
             </div>
-            <div>
-              <Label htmlFor="password" className="mb-1.5 block">Password</Label>
-              <div className="relative">
-                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                <Input
-                  id="password"
-                  type={showPass ? "text" : "password"}
-                  value={password}
-                  onChange={(event) => {
-                    setPassword(event.target.value);
-                    setError("");
-                  }}
-                  placeholder="Enter your password"
-                  autoComplete="current-password"
-                  className="h-11 pl-9 pr-10"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPass((currentValue) => !currentValue)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                  aria-label={showPass ? "Hide password" : "Show password"}
-                >
-                  {showPass ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
-              </div>
+            <div className="admin-login-field admin-login-field--password">
+              <label htmlFor="password" className="sr-only">Password</label>
+              <Lock aria-hidden="true" />
+              <Input
+                id="password"
+                type={showPass ? "text" : "password"}
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  setError("");
+                }}
+                placeholder="Enter your password"
+                autoComplete="current-password"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPass((currentValue) => !currentValue)}
+                className="admin-login-toggle"
+                aria-label={showPass ? "Hide password" : "Show password"}
+              >
+                {showPass ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}
+              </button>
             </div>
 
             {error && (
-              <div className="text-sm text-destructive bg-destructive/10 border border-destructive/20 rounded-lg px-3 py-2">
+              <div className="admin-login-error" role="alert">
                 {error}
               </div>
             )}
 
-            <Button type="submit" className="w-full gradient-primary border-0 h-11" disabled={isSubmitting}>
+            <Button type="submit" className="admin-login-submit" disabled={isSubmitting}>
               {isSubmitting ? "Signing In..." : "Sign In"}
+              {!isSubmitting && <ArrowRight aria-hidden="true" />}
             </Button>
 
-            <div className="relative py-1">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-border/70" />
-              </div>
-              <div className="relative flex justify-center text-[11px] uppercase tracking-[0.28em] text-muted-foreground">
-                <span className="bg-card px-3">or continue with</span>
-              </div>
+            <div className="admin-login-divider">
+              <span>or continue with</span>
             </div>
 
-            <Button asChild variant="outline" className="w-full h-11 border-primary/20 text-foreground hover:bg-primary/5">
+            <Button asChild variant="outline" className="admin-login-teams">
               <a href={microsoftLoginUrl}>
-                <Building2 className="h-4 w-4 text-primary" />
+                <Building2 aria-hidden="true" />
                 Sign in with Microsoft Teams
               </a>
             </Button>
 
-            <div className="text-xs text-center text-muted-foreground pt-2">
-              Use an active support username and the password configured on the server.
-            </div>
-            <div className="text-xs text-center text-muted-foreground">
-              Use your Kent Microsoft work account for direct admin access.
+            <div className="admin-login-notes">
+              <p>Use an active support username and the password configured on the server.</p>
+              <p>Use your Kent Microsoft work account for direct admin access.</p>
+              <p>
+                Need support access?{" "}
+                <Link to="/support">Go to Support</Link>
+              </p>
             </div>
           </form>
         </div>
-
-        <p className="text-center text-xs text-muted-foreground mt-4">
-          Need support access?{" "}
-          <Link to="/support" className="text-primary hover:underline">Go to Support</Link>
-        </p>
-      </div>
+      </section>
     </SupportLayout>
   );
 };

@@ -1,7 +1,20 @@
+/* Header height is a root token so layouts that sit under the header (e.g. the
+   admin dashboard's fixed-height workspace) can size against it. */
+:root { --support-master-header-h: clamp(184px, 10vw, 240px); }
+
+/* Admin banner header (approved artwork, 2172 x 224): its height follows the
+   artwork's own ratio, with a usable minimum below the large breakpoint. */
+:root { --support-banner-header-h: max(112px, calc(100vw * 224 / 2172)); }
+@media (min-width: 640px) { :root { --support-banner-header-h: max(140px, calc(100vw * 224 / 2172)); } }
+@media (min-width: 1024px) { :root { --support-banner-header-h: calc(100vw * 224 / 2172); } }
+
+@media (max-width: 900px) { :root { --support-master-header-h: 160px; } }
+@media (max-width: 640px) { :root { --support-master-header-h: 144px; } }
+
 .support-master-header {
   /* Everything scales from two values: the header height and the page content
      width (kept in sync with --si-content in InquiryDetails.css). */
-  --smh-h: clamp(184px, 10vw, 240px);
+  --smh-h: var(--support-master-header-h);
   --smh-content: min(clamp(1100px, 74vw, 1560px), calc(100vw - 64px));
   /* The portrait photo (1086x1448) is drawn 2.5x the header height. */
   --smh-photo-h: calc(var(--smh-h) * 2.5);
@@ -69,39 +82,47 @@
     );
 }
 
-.support-master-header__admin {
+.support-master-header__actions {
   position: absolute;
   z-index: 3;
   top: calc(var(--smh-h) * .26);
   right: calc((100vw - var(--smh-content)) / 2);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.support-master-header__pill {
   display: inline-flex;
-  min-height: 42px;
+  min-height: 36px;
   align-items: center;
   justify-content: center;
-  gap: 10px;
-  padding: 0 20px;
+  gap: 8px;
+  padding: 0 16px;
   border: 1px solid rgba(255, 255, 255, .7);
   border-radius: 999px;
   background: rgba(255, 255, 255, .96);
-  color: #15132f;
-  font-size: 14px;
+  color: #17152b;
+  font-size: 13px;
   font-weight: 500;
   line-height: 18px;
-  box-shadow: 0 10px 24px rgba(21, 10, 77, .22);
+  box-shadow: 0 4px 12px rgba(21, 10, 77, .14);
   backdrop-filter: blur(8px);
   transition: border-color .2s ease, color .2s ease, background-color .2s ease;
 }
 
-.support-master-header__admin:hover {
+.support-master-header__pill:hover,
+.support-master-header__pill[aria-current="page"] {
   border-color: #a58cf5;
   background: #fff;
   color: #5425e6;
 }
 
-.support-master-header__admin svg {
-  width: 16px;
-  height: 16px;
-  color: #4a22e0;
+.support-master-header__pill svg {
+  width: 15px;
+  height: 15px;
+  color: #5b21e8;
+  stroke-width: 1.75;
 }
 
 .support-master-header__wave {
@@ -116,25 +137,103 @@
   pointer-events: none;
 }
 
+/* Back wave ~20% softer: its colour is moved 20% toward the page background
+   (effective #C3B4F3 -> #CDC1F6) rather than made more transparent, which would
+   let the dark purple through. The front wave matches the
+   page background so the header melts into whichever page uses it. */
+.support-master-header__wave-back { fill: #cdc1f6; }
+.support-master-header__wave-front { fill: var(--support-page-bg, #eeeafd); }
+.support-master-header__wave-gold {
+  fill: none;
+  stroke: #d6a84d;
+  stroke-width: 1.5px;
+  stroke-opacity: .85;
+  vector-effect: non-scaling-stroke;
+}
+
 @media (max-width: 900px) {
-  .support-master-header { --smh-h: 160px; --smh-content: calc(100vw - 48px); --smh-photo-left: 0px; }
+  .support-master-header { --smh-content: calc(100vw - 48px); --smh-photo-left: 0px; }
   .support-master-header::before { display: none; }
-  .support-master-header__admin { top: 32px; right: 24px; }
+  .support-master-header__actions { top: 32px; right: 24px; }
 }
 
 @media (max-width: 640px) {
-  .support-master-header { --smh-h: 144px; }
-  .support-master-header__admin {
-    top: 20px;
-    right: 16px;
-    min-height: 36px;
+  .support-master-header__actions { top: 20px; right: 16px; gap: 8px; }
+  .support-master-header__pill {
+    min-height: 34px;
     padding: 0 14px;
-    font-size: 13px;
+    font-size: 12px;
   }
-  .support-master-header__admin svg { width: 15px; height: 15px; }
+  .support-master-header__pill svg { width: 15px; height: 15px; }
   .support-master-header__wave { height: 40px; }
 }
 
+/* ---------- Banner variant (admin dashboard + Knowledge Base) ----------
+ * The approved artwork already contains the building, crest, sky, waves, gold
+ * line and lavender lower edge; it is drawn at its own 2172 x 224 ratio and
+ * anchored left, so nothing is distorted. Only the pills are drawn in code. */
+.support-master-header--banner {
+  height: var(--support-banner-header-h);
+  background: var(--support-page-bg, #f2efff);
+}
+
+.support-master-header--banner::before { display: none; }
+
+.support-master-header__banner {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: left center;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Pill geometry measured from the approved reference (1:1 capture at 1901px):
+   36px tall, 53px from the top (27%), 15px apart, 88px (4.63vw) from the
+   right edge; 19px / 17px side padding, 17px icon, 8px icon gap, 13px text. */
+.support-master-header--banner .support-master-header__actions {
+  top: 27%;
+  right: 4.63vw;
+  gap: 15px;
+}
+
+.support-master-header--banner .support-master-header__pill {
+  min-height: 36px;
+  gap: 8px;
+  padding: 0 17px 0 19px;
+  border: 0;
+  background: #fbfaff;
+  color: #17152b;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.support-master-header--banner .support-master-header__pill:hover,
+.support-master-header--banner .support-master-header__pill[aria-current="page"] {
+  background: #f3eeff;
+  color: #17152b;
+}
+
+.support-master-header--banner .support-master-header__pill svg { width: 17px; height: 17px; }
+
+/* Below the large breakpoint the banner keeps a minimum height, so compact
+   pills keep clear of the crest. */
+@media (max-width: 1023px) {
+  .support-master-header--banner .support-master-header__actions { top: 26%; right: 24px; gap: 8px; }
+  .support-master-header--banner .support-master-header__pill { min-height: 32px; gap: 6px; padding: 0 12px; font-size: 12px; }
+  .support-master-header--banner .support-master-header__pill svg { width: 14px; height: 14px; }
+}
+
+@media (max-width: 639px) {
+  .support-master-header--banner .support-master-header__actions { top: 26%; right: 16px; gap: 6px; }
+  .support-master-header--banner .support-master-header__pill { min-height: 28px; gap: 4px; padding: 0 10px; font-size: 11px; }
+  .support-master-header--banner .support-master-header__pill svg { width: 13px; height: 13px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .support-master-header__admin { transition: none; }
+  .support-master-header__pill { transition: none; }
 }

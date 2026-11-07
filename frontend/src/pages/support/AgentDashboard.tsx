@@ -945,6 +945,35 @@ function hasPreloadedTeamAccess(
   return getPreloadedTeamAccessKeys(account).includes(normalizedTeamKey);
 }
 
+type TeamAccessFields = Pick<AdminAgent, "legacySupportAccess" | "legacyOperationsAccess" | "teamAccess" | "teamAccessKeys">;
+
+function pickTeamAccessFields(agent: AdminAgent): TeamAccessFields {
+  return {
+    legacySupportAccess: agent.legacySupportAccess,
+    legacyOperationsAccess: agent.legacyOperationsAccess,
+    teamAccess: agent.teamAccess,
+    teamAccessKeys: agent.teamAccessKeys,
+  };
+}
+
+// The access state the server will return after a successful toggle, so the
+// switch can reflect the click immediately (canReceiveTeamTickets reads both
+// the legacy receiver flag and the preloaded team keys).
+function withOptimisticTeamAccess(agent: AdminAgent, policy: TeamRoutingPolicy, enabled: boolean): AdminAgent {
+  const normalizedKey = normalizeTeamPolicyKey(policy.key);
+  const nextAgent: AdminAgent = { ...agent };
+  if (policy.receiverAccessKey) {
+    nextAgent[policy.receiverAccessKey] = enabled;
+  }
+  if (!enabled && normalizedKey) {
+    nextAgent.teamAccessKeys = (agent.teamAccessKeys || []).filter((key) => normalizeTeamPolicyKey(key) !== normalizedKey);
+    nextAgent.teamAccess = (agent.teamAccess || []).filter((item) => normalizeTeamPolicyKey(item.key) !== normalizedKey);
+  } else if (enabled && normalizedKey && !policy.receiverAccessKey) {
+    nextAgent.teamAccessKeys = [...(agent.teamAccessKeys || []), policy.key];
+  }
+  return nextAgent;
+}
+
 function hasAnyPreloadedTeamAccess(account?: Pick<TeamAccessCarrier, "teamAccess" | "teamAccessKeys"> | null) {
   return getPreloadedTeamAccessKeys(account).length > 0;
 }
@@ -1431,38 +1460,6 @@ const AgentDashboard = () => {
     () => (typeof window !== "undefined" && "Notification" in window ? window.Notification.permission : "unsupported"),
   );
   const [showNotificationBlockedDialog, setShowNotificationBlockedDialog] = useState(false);
-  const requestDesktopNotificationPermission = async () => {
-    if (!browserDesktopNotificationsSupported()) {
-      return;
-    }
-    // Once the browser recorded a "denied" verdict, requestPermission() just
-    // returns "denied" without showing the native prompt again. The only path
-    // back is the site-settings dialog in the browser's URL bar.
-    if (window.Notification.permission === "denied") {
-      setShowNotificationBlockedDialog(true);
-      return;
-    }
-    try {
-      const result = await window.Notification.requestPermission();
-      setNotificationPermission(result);
-      if (result === "granted") {
-        try {
-          const probe = new window.Notification("Desktop notifications enabled", {
-            body: "You will now be alerted when new support tickets arrive, even on other tabs.",
-            tag: "support-admin:permission-granted",
-            icon: "/kent-crest.svg",
-          });
-          probe.onclick = () => probe.close();
-        } catch {
-          // Ignore browser notification failures.
-        }
-      } else if (result === "denied") {
-        setShowNotificationBlockedDialog(true);
-      }
-    } catch {
-      // Ignore rejected prompts.
-    }
-  };
   const [activeTransferRequestTicketId, setActiveTransferRequestTicketId] = useState("");
   const [transferReason, setTransferReason] = useState("");
   const [teamTransferTicketId, setTeamTransferTicketId] = useState("");
@@ -2281,7 +2278,7 @@ const AgentDashboard = () => {
     : dashboardActiveTableTitle;
   const isArchiveMode = dashboardArchiveScope === "archived";
   const useCompactDashboardTable = true;
-  const dashboardCellClassName = useCompactDashboardTable ? "px-3 py-3 align-middle" : "px-4 py-3";
+  const dashboardCellClassName = useCompactDashboardTable ? "px-3 py-3.5 align-middle" : "px-4 py-3.5";
   const hasDashboardViewOverrides = (
     dashboardTicketFilter !== "all"
     || dashboardDateFilter !== "all"
@@ -2374,11 +2371,16 @@ const AgentDashboard = () => {
       ];
   const dashboardCompactColumnWidths = shouldShowDashboardRelatedPersonColumn
     ? shouldShowDashboardAssignedAgentColumn
-      ? ["12%", "14%", "16%", "10%", "10%", "10%", "8%", "7%", "6%", "7%"]
-      : ["12%", "16%", "22%", "11%", "11%", "9%", "6%", "6%", "7%"]
+      ? ["10%", "11%", "10%", "10%", "11.5%", "9.5%", "9%", "8%", "9.5%", "11.5%"]
+      : ["11%", "13%", "12%", "11%", "12.5%", "10%", "8.5%", "10%", "12%"]
     : shouldShowDashboardAssignedAgentColumn
-      ? ["15%", "17%", "12%", "11%", "16%", "8%", "7%", "6%", "8%"]
-      : ["16%", "19%", "14%", "11%", "11%", "8%", "7%", "14%"];
+      ? ["11%", "15%", "11%", "12.5%", "11%", "10%", "8.5%", "9%", "12%"]
+      : ["13%", "18%", "12%", "13%", "11%", "10%", "10%", "13%"];
+  const dashboardTableMinWidthClassName = dashboardCompactColumnWidths.length >= 10
+    ? "min-w-[1040px]"
+    : dashboardCompactColumnWidths.length === 9
+      ? "min-w-[940px]"
+      : "min-w-[860px]";
   const dashboardDisplayedTableCountLabel = activeServerDashboardPagination
     ? getServerDashboardTableCountLabel(
         activeServerDashboardPagination,
@@ -4407,7 +4409,7 @@ const AgentDashboard = () => {
     }
   }
 
-  async function toggleTicketAccess(agent: AdminAgent, accessKind: TicketAccessKind, nextValue: boolean) {
+  async function toggleTicketAccess(agent: AdminAgent, accessKind: TicketAccessKind, nextValue: boolean): Promise<boolean> {
     const payloadKey = accessKind === "support" ? "supportAccess" : "operationsAccess";
     const accessLabel = accessKind === "support" ? "Support" : "Learning Plan";
     setTogglingAccessIds((prev) => new Set(prev).add(agent.id));
@@ -4420,7 +4422,7 @@ const AgentDashboard = () => {
       const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
       if (!response.ok) {
         toast.error(payload?.message || `Could not update ${accessLabel.toLowerCase()} access.`);
-        return;
+        return false;
       }
       const updatedAgent = payload?.agent;
       if (updatedAgent) {
@@ -4428,8 +4430,10 @@ const AgentDashboard = () => {
       }
       void refreshAgentsOnly(true);
       toast.success(`${accessLabel} access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
+      return true;
     } catch {
       toast.error(`Could not update ${accessLabel.toLowerCase()} access.`);
+      return false;
     } finally {
       setTogglingAccessIds((prev) => {
         const next = new Set(prev);
@@ -4440,22 +4444,36 @@ const AgentDashboard = () => {
   }
 
   async function toggleSupportAccess(agent: AdminAgent, nextValue: boolean) {
-    await toggleTicketAccess(agent, "support", nextValue);
+    return toggleTicketAccess(agent, "support", nextValue);
   }
 
   async function toggleOperationsAccess(agent: AdminAgent, nextValue: boolean) {
-    await toggleTicketAccess(agent, "operations", nextValue);
+    return toggleTicketAccess(agent, "operations", nextValue);
   }
 
+  // Saving access can take a few seconds (the backend also syncs the legacy
+  // directory), so the switch flips immediately and rolls back if the save fails.
   async function toggleTeamAccess(agent: AdminAgent, policy: TeamRoutingPolicy, nextValue: boolean) {
+    const previousAccess = pickTeamAccessFields(agent);
+    setAgents((prev) => prev.map((currentAgent) => (
+      currentAgent.id === agent.id ? withOptimisticTeamAccess(currentAgent, policy, nextValue) : currentAgent
+    )));
+
+    const saved = await saveTeamAccess(agent, policy, nextValue);
+    if (!saved) {
+      setAgents((prev) => prev.map((currentAgent) => (
+        currentAgent.id === agent.id ? { ...currentAgent, ...previousAccess } : currentAgent
+      )));
+    }
+  }
+
+  async function saveTeamAccess(agent: AdminAgent, policy: TeamRoutingPolicy, nextValue: boolean): Promise<boolean> {
     if (policy.key === supportTeamRoutingPolicy.key) {
-      await toggleSupportAccess(agent, nextValue);
-      return;
+      return toggleSupportAccess(agent, nextValue);
     }
 
     if (policy.key === learningPlanTeamRoutingPolicy.key) {
-      await toggleOperationsAccess(agent, nextValue);
-      return;
+      return toggleOperationsAccess(agent, nextValue);
     }
 
     setTogglingAccessIds((prev) => new Set(prev).add(agent.id));
@@ -4471,7 +4489,7 @@ const AgentDashboard = () => {
       const payload = (await response.json().catch(() => null)) as { agent?: AdminAgent; message?: string } | null;
       if (!response.ok) {
         toast.error(payload?.message || `Could not update ${policy.label.toLowerCase()} access.`);
-        return;
+        return false;
       }
 
       if (payload?.agent) {
@@ -4479,8 +4497,10 @@ const AgentDashboard = () => {
       }
       void refreshAgentsOnly(true);
       toast.success(`${policy.label} access ${nextValue ? "enabled" : "disabled"} for ${agent.fullName || agent.username}.`);
+      return true;
     } catch {
       toast.error(`Could not update ${policy.label.toLowerCase()} access.`);
+      return false;
     } finally {
       setTogglingAccessIds((prev) => {
         const next = new Set(prev);
@@ -6849,8 +6869,8 @@ const AgentDashboard = () => {
     return (
       <div className="space-y-5">
         {isCoverageDashboardView ? (
-          <div className="rounded-2xl border bg-card/95 p-2 shadow-soft">
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <div>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2" role="group" aria-label="Learning Plan Team sections">
               {([
                 {
                   value: "coverage" as LearningPlanTeamSection,
@@ -6875,16 +6895,17 @@ const AgentDashboard = () => {
                       setDashboardTicketFilter("all");
                     }
                   }}
+                  aria-pressed={learningPlanTeamSection === section.value}
                   className={cn(
-                    "rounded-2xl border px-4 py-3 text-left transition-colors",
+                    "rounded-2xl border bg-card px-5 py-4 text-left shadow-soft transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
                     learningPlanTeamSection === section.value
-                      ? "border-primary bg-primary/6 shadow-sm"
-                      : "border-border/70 bg-background hover:border-primary/30 hover:bg-secondary/20",
+                      ? "border-primary/45 ring-1 ring-primary/10"
+                      : "border-border hover:border-primary/25",
                   )}
                 >
                   <div className="flex items-center justify-between gap-3">
-                    <div className="text-sm font-semibold text-foreground">{section.label}</div>
-                    <div className="rounded-full border bg-background px-2.5 py-1 text-xs font-semibold text-muted-foreground">
+                    <div className="text-sm font-medium text-foreground">{section.label}</div>
+                    <div className="rounded-full border bg-secondary px-2.5 py-0.5 text-xs font-medium text-muted-foreground">
                       {shouldShowDashboardMetricsSkeleton ? (
                         <Skeleton className="h-3.5 w-6 rounded-full" />
                       ) : (
@@ -6899,8 +6920,8 @@ const AgentDashboard = () => {
           </div>
         ) : null}
         <div className={cn(
-          "grid grid-cols-1 gap-4",
-          isCoverageDashboardView ? "sm:grid-cols-2 xl:grid-cols-4" : "sm:grid-cols-2 xl:grid-cols-7",
+          "grid grid-cols-1 gap-3 sm:grid-cols-2",
+          dashboardKpiGridColumnsClassName(visibleKpis.length + (isCoverageDashboardView ? 0 : 1)),
         )}>
           {visibleKpis.map((kpi) => (
             <button
@@ -6910,24 +6931,24 @@ const AgentDashboard = () => {
                 currentFilter === kpi.filter ? "all" : kpi.filter
               ))}
               className={cn(
-                "bg-card rounded-2xl border shadow-soft p-5 text-left transition-colors",
+                "flex flex-col justify-start rounded-[14px] border bg-card p-4 text-left shadow-[0_2px_8px_rgba(40,20,100,0.04)] transition-colors",
                 dashboardTicketFilter === kpi.filter
-                  ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                  : "hover:border-primary/40 hover:bg-secondary/20",
+                  ? "border-[#C4B5FD] bg-[#FBFAFF] ring-1 ring-primary/15"
+                  : "hover:border-[#C4B5FD] hover:bg-[#FBFAFF]",
               )}
             >
-              <div className={cn("h-9 w-9 rounded-lg flex items-center justify-center mb-3", kpi.color)}>
-                <kpi.icon className="h-5 w-5" />
+              <div className={cn("mb-2.5 flex h-8 w-8 items-center justify-center rounded-lg", kpi.color)}>
+                <kpi.icon className="h-[17px] w-[17px]" strokeWidth={1.75} />
               </div>
-              <div className="flex items-center gap-2 text-2xl font-bold">
+              <div className="flex items-center gap-2 text-[22px] font-semibold leading-7 text-foreground">
                 {shouldShowDashboardMetricsSkeleton ? (
                   <Skeleton className="h-7 w-12" />
                 ) : (
                   kpi.value
                 )}
               </div>
-              <div className="text-xs text-muted-foreground">{kpi.label}</div>
-              <div className="mt-2 text-[11px] font-medium text-primary">
+              <div className="mt-0.5 text-[13px] font-medium text-muted-foreground">{kpi.label}</div>
+              <div className="mt-1.5 text-[11px] font-medium text-primary">
                 {dashboardTicketFilter === kpi.filter ? `Showing ${kpi.label.toLowerCase()}` : `Click to view ${kpi.label.toLowerCase()}`}
               </div>
             </button>
@@ -6939,24 +6960,24 @@ const AgentDashboard = () => {
                 currentFilter === "quickResolution" ? "all" : "quickResolution"
               ))}
               className={cn(
-                "bg-card rounded-2xl border shadow-soft p-5 text-left transition-colors",
+                "flex flex-col justify-start rounded-[14px] border bg-card p-4 text-left shadow-[0_2px_8px_rgba(40,20,100,0.04)] transition-colors",
                 dashboardTicketFilter === "quickResolution"
-                  ? "border-primary bg-primary/5 ring-1 ring-primary/20"
-                  : "hover:border-primary/40 hover:bg-secondary/20",
+                  ? "border-[#C4B5FD] bg-[#FBFAFF] ring-1 ring-primary/15"
+                  : "hover:border-[#C4B5FD] hover:bg-[#FBFAFF]",
               )}
             >
-              <div className="mb-3 flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <FileText className="h-5 w-5" />
+              <div className="mb-2.5 flex h-8 w-8 items-center justify-center rounded-lg bg-[#F3EEFF] text-primary">
+                <FileText className="h-[17px] w-[17px]" strokeWidth={1.75} />
               </div>
-              <div className="flex items-center gap-2 text-2xl font-bold">
+              <div className="flex items-center gap-2 text-[22px] font-semibold leading-7 text-foreground">
                 {shouldShowDashboardMetricsSkeleton ? (
                   <Skeleton className="h-7 w-12" />
                 ) : (
                   dashboardMetrics.quickResolution
                 )}
               </div>
-              <div className="text-xs text-muted-foreground">Quick Tickets</div>
-              <div className="mt-2 text-[11px] font-medium text-primary">
+              <div className="mt-0.5 text-[13px] font-medium text-muted-foreground">Quick Tickets</div>
+              <div className="mt-1.5 text-[11px] font-medium text-primary">
                 {dashboardTicketFilter === "quickResolution" ? "Showing only quick tickets" : "Click to view quick tickets"}
               </div>
             </button>
@@ -6979,7 +7000,7 @@ const AgentDashboard = () => {
               <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="font-semibold">{dashboardTableTitle}</h2>
+                    <h2 className="text-lg font-semibold">{dashboardTableTitle}</h2>
                     {isArchiveMode ? (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-800">
                         <Archive className="h-3.5 w-3.5" />
@@ -7034,7 +7055,7 @@ const AgentDashboard = () => {
                   ) : null}
                 </div>
               </div>
-              <div className="flex w-full flex-col gap-3 xl:flex-row xl:flex-wrap xl:items-center">
+              <div className="admin-dashboard-filters flex w-full flex-col gap-2.5 xl:flex-row xl:flex-wrap xl:items-center">
                   <div className={cn(
                     "inline-flex rounded-xl border p-1 transition-colors",
                     isArchiveMode
@@ -7307,7 +7328,6 @@ const AgentDashboard = () => {
                 </div>
               </div>
             </div>
-          </div>
 
           {error ? (
             <div className="p-5 text-sm text-destructive bg-destructive/5 border-b border-destructive/10">
@@ -7320,8 +7340,8 @@ const AgentDashboard = () => {
           ) : null}
 
           {isDashboardTableLoading ? (
-            <div className="overflow-hidden" aria-busy="true" aria-live="polite">
-              <table className="w-full table-fixed text-sm">
+            <div className="overflow-x-auto" aria-busy="true" aria-live="polite">
+              <table className={cn("w-full table-fixed text-[13px] text-foreground", dashboardTableMinWidthClassName)}>
                 {useCompactDashboardTable ? (
                   <colgroup>
                     {dashboardCompactColumnWidths.map((width, columnIndex) => (
@@ -7329,15 +7349,15 @@ const AgentDashboard = () => {
                     ))}
                   </colgroup>
                 ) : null}
-                <thead className="bg-secondary/50 text-muted-foreground">
+                <thead className="border-b border-[#EEEAF8] bg-[#F5F2FF] text-[11px] uppercase tracking-[0.04em] text-muted-foreground">
                   <tr className="text-left">
                     {dashboardTableHeadings.map((heading) => (
                       <th
                         key={heading}
+                        title={heading}
                         className={cn(
                           dashboardCellClassName,
-                          "font-medium",
-                          useCompactDashboardTable ? "whitespace-normal" : "whitespace-nowrap",
+                          "py-3 align-middle font-semibold leading-4",
                         )}
                       >
                         {heading}
@@ -7345,7 +7365,7 @@ const AgentDashboard = () => {
                     ))}
                   </tr>
                 </thead>
-                <tbody className="divide-y">
+                <tbody className="divide-y divide-[#EEEAF8]">
                   {Array.from({ length: 7 }).map((_, rowIndex) => (
                     <tr key={`dashboard-skeleton-${rowIndex}`} className="bg-background/70">
                       {dashboardTableHeadings.map((heading, columnIndex) => (
@@ -7368,8 +7388,8 @@ const AgentDashboard = () => {
               {dashboardEmptyMessage}
             </div>
           ) : (
-            <div className="overflow-hidden">
-              <table className="w-full table-fixed text-sm">
+            <div className="overflow-x-auto">
+              <table className={cn("w-full table-fixed text-[13px] text-foreground", dashboardTableMinWidthClassName)}>
                 {useCompactDashboardTable ? (
                   <colgroup>
                     {dashboardCompactColumnWidths.map((width, columnIndex) => (
@@ -7377,15 +7397,15 @@ const AgentDashboard = () => {
                     ))}
                   </colgroup>
                 ) : null}
-                <thead className="bg-secondary/50 text-muted-foreground">
+                <thead className="border-b border-[#EEEAF8] bg-[#F5F2FF] text-[11px] uppercase tracking-[0.04em] text-muted-foreground">
                   <tr className="text-left">
                     {dashboardTableHeadings.map((heading) => (
                       <th
                         key={heading}
+                        title={heading}
                         className={cn(
                           dashboardCellClassName,
-                          "font-medium",
-                          useCompactDashboardTable ? "whitespace-normal" : "whitespace-nowrap",
+                          "py-3 align-middle font-semibold leading-4",
                         )}
                       >
                         {(() => {
@@ -7413,12 +7433,12 @@ const AgentDashboard = () => {
                                   type="button"
                                   title={`Sort by ${heading}`}
                                   className={cn(
-                                    "inline-flex items-center gap-1 font-medium transition-colors hover:text-foreground focus-visible:outline-none",
+                                    "inline-flex max-w-full items-center gap-1 text-left font-semibold uppercase leading-4 transition-colors hover:text-foreground focus-visible:outline-none",
                                     isActive && "text-primary",
                                   )}
                                 >
-                                  {heading}
-                                  <SortIcon className={cn("h-3.5 w-3.5", isActive ? "opacity-90" : "opacity-40")} aria-hidden />
+                                  <span className="min-w-0">{heading}</span>
+                                  <SortIcon className={cn("h-3 w-3 shrink-0", isActive ? "opacity-90" : "opacity-40")} aria-hidden />
                                 </button>
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="start" className="w-52">
@@ -7475,7 +7495,7 @@ const AgentDashboard = () => {
                     ))}
                   </tr>
                 </thead>
-                <tbody className="divide-y">
+                <tbody className="divide-y divide-[#EEEAF8]">
                   {dashboardSortedDisplayedTickets.map((ticket) => {
                     const requesterColumnSummary = getDashboardRequesterColumnSummary(
                       ticket,
@@ -7510,13 +7530,13 @@ const AgentDashboard = () => {
                           void openTicket(ticket.id);
                         }}
                         className={cn(
-                          "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-secondary/20",
+                          "cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:ring-inset hover:bg-[#F7F4FF]",
                           getTicketTransferRowClassName(ticket),
                         )}
                       >
                         {useCompactDashboardTable ? (
                           <td className={dashboardCellClassName}>
-                            <div className="font-mono font-medium whitespace-nowrap">{ticket.id}</div>
+                            <div className="whitespace-nowrap font-medium tabular-nums text-foreground">{ticket.id}</div>
                             <div
                               className={cn(
                                 "mt-1 truncate text-xs text-muted-foreground",
@@ -7569,7 +7589,7 @@ const AgentDashboard = () => {
                               <div className="min-w-0 overflow-hidden">
                                 <div
                                   className={cn(
-                                    "truncate font-semibold",
+                                    "truncate font-medium",
                                     relatedPersonSummary.isMuted ? "text-muted-foreground" : "text-foreground",
                                   )}
                                   title={relatedPersonSummary.primaryTooltip || relatedPersonSummary.primaryText}
@@ -7720,7 +7740,7 @@ const AgentDashboard = () => {
                                 disabled={archiveActionTicketId === ticket.id || deleteActionTicketId === ticket.id}
                                 isLoading={teamTransferTicketId === ticket.id}
                                 onTransfer={(nextAssignedTeam) => void handleTeamTransfer(ticket, nextAssignedTeam)}
-                                className={useCompactDashboardTable ? "w-full justify-center px-3" : undefined}
+                                className={useCompactDashboardTable ? "w-full justify-center rounded-[9px] px-2.5 text-xs font-medium" : undefined}
                               />
                             ) : null}
                             <Button
@@ -7731,7 +7751,7 @@ const AgentDashboard = () => {
                                 isArchivedTicket(ticket),
                                 cn(
                                   "h-8 rounded-full",
-                                  useCompactDashboardTable ? "w-full justify-center px-3 text-xs" : "whitespace-nowrap",
+                                  useCompactDashboardTable ? "w-full justify-center rounded-[9px] px-2.5 text-xs font-medium" : "whitespace-nowrap",
                                 ),
                               )}
                               onClick={(event) => {
@@ -7810,6 +7830,7 @@ const AgentDashboard = () => {
               </div>
             </div>
           ) : null}
+        </div>
       </div>
     );
   }
@@ -8140,7 +8161,7 @@ const AgentDashboard = () => {
       const Icon = selectedTeamPolicy ? getManagementTeamIcon(selectedTeamPolicy) : Settings2;
 
       return (
-        <div key={`${tab}-${agent.id}`} className="flex items-center justify-between gap-4 px-4 py-3.5 sm:px-5">
+        <div key={`${tab}-${agent.id}`} className="flex items-center justify-between gap-4 px-4 py-3.5 transition-colors hover:bg-secondary/50 sm:px-5">
           <div className="flex min-w-0 items-center gap-3">
             <div className={cn(
               "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl",
@@ -8169,6 +8190,8 @@ const AgentDashboard = () => {
               <Switch
                 checked={hasTabAccess}
                 disabled={isToggling}
+                aria-busy={isToggling || undefined}
+                className="disabled:cursor-progress disabled:opacity-100"
                 onCheckedChange={(checked) => void toggleTeamAccess(agent, selectedTeamPolicy, checked)}
                 aria-label={`Toggle ${selectedTeamPolicy.label} access for ${agent.fullName || agent.username}`}
               />
@@ -8186,13 +8209,13 @@ const AgentDashboard = () => {
   return (
     <SupportLayout
       fullWidth
-      showHeader={!isConsoleView}
       right={undefined}
-      mainClassName={isConsoleView
-        ? "h-[100dvh] overflow-hidden px-0 py-0 md:px-0 md:py-0"
-        : !isStackedAdminLayout
-          ? "h-[calc(100dvh-84px)] overflow-hidden py-4"
-          : undefined}
+      mainClassName={!isStackedAdminLayout
+        ? "h-[calc(100dvh-var(--support-banner-header-h))] overflow-hidden py-4 md:px-6 md:py-4 xl:px-6"
+        : isConsoleView
+          // Stacked (tablet/mobile): the header scrolls away and the console fills the screen below it.
+          ? "h-[100dvh] overflow-hidden px-0 py-0 md:px-0 md:py-0"
+          : "pb-6 pt-4 md:pb-8 md:pt-4"}
     >
       <Tabs
         value={adminView}
@@ -8230,7 +8253,7 @@ const AgentDashboard = () => {
         }}
         className={cn(
           "min-h-0",
-          isConsoleView
+          isConsoleView && isStackedAdminLayout
             ? "h-full min-h-[100dvh]"
             : isStackedAdminLayout
               ? "h-auto"
@@ -8240,12 +8263,12 @@ const AgentDashboard = () => {
         <div className={cn("flex min-h-0 gap-4", isStackedAdminLayout ? "h-auto flex-col" : "h-full flex-row")}>
           <aside
             className={cn(
-              "flex shrink-0 flex-col overflow-hidden rounded-3xl border bg-card/95 shadow-card transition-all duration-300",
+              "flex shrink-0 flex-col overflow-hidden rounded-[14px] border bg-card shadow-[0_2px_8px_rgba(40,20,100,0.04)] transition-all duration-300",
               isStackedAdminLayout
-                ? "w-full p-4"
+                ? "w-full p-3"
                 : useCompactAdminSidebar
                   ? "h-full w-[88px] p-3"
-                  : "h-full w-[320px] p-4",
+                  : "h-full w-[320px] p-3",
             )}
           >
             <div className={cn(
@@ -8266,20 +8289,6 @@ const AgentDashboard = () => {
                   >
                     <ChevronRight className="h-4 w-4" />
                   </Button>
-                  {notificationPermission !== "granted" && notificationPermission !== "unsupported" ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => void requestDesktopNotificationPermission()}
-                      aria-label={notificationPermission === "denied" ? "Browser notifications blocked - click for instructions" : "Enable desktop notifications"}
-                      title={notificationPermission === "denied" ? "Browser notifications blocked - click to see how to unblock" : "Enable desktop notifications"}
-                      className="relative h-11 w-11 rounded-2xl border border-amber-300 bg-amber-50 text-amber-700 shadow-sm hover:bg-amber-100"
-                    >
-                      <Bell className="h-4 w-4" />
-                      <span className="absolute -right-1 -top-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">!</span>
-                    </Button>
-                  ) : null}
                   <DropdownMenu open={isTransferNotificationsOpen} onOpenChange={setIsTransferNotificationsOpen}>
                     <DropdownMenuTrigger asChild>
                       <Button variant="ghost" size="icon" className="relative h-11 w-11 rounded-2xl border bg-background/90">
@@ -8340,20 +8349,6 @@ const AgentDashboard = () => {
                     </div>
                   </div>
                   <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-2">
-                    {notificationPermission !== "granted" && notificationPermission !== "unsupported" ? (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => void requestDesktopNotificationPermission()}
-                        aria-label={notificationPermission === "denied" ? "Browser notifications blocked - click for instructions" : "Enable desktop notifications"}
-                        title={notificationPermission === "denied" ? "Browser notifications blocked - click to see how to unblock" : "Enable desktop notifications"}
-                        className="relative h-8 w-8 rounded-full border border-amber-300 bg-amber-50 text-amber-700 shadow-sm hover:bg-amber-100"
-                      >
-                        <Bell className="h-4 w-4" />
-                        <span className="absolute -right-0.5 -top-0.5 inline-flex h-3 w-3 items-center justify-center rounded-full bg-amber-500 text-[8px] font-bold text-white">!</span>
-                      </Button>
-                    ) : null}
                     <DropdownMenu open={isTransferNotificationsOpen} onOpenChange={setIsTransferNotificationsOpen}>
                       <DropdownMenuTrigger asChild>
                         <Button
@@ -8418,7 +8413,7 @@ const AgentDashboard = () => {
 
             <div className="mt-4 flex min-h-0 flex-1 flex-col gap-3">
               <div className={cn(
-                "min-h-0 flex-1 space-y-3 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+                "min-h-0 flex-1 space-y-3 overflow-y-auto [scrollbar-color:hsl(var(--border))_transparent] [scrollbar-width:thin]",
                 useCompactAdminSidebar ? "pr-0" : "pr-1",
               )}>
               <div className={cn(
@@ -8523,15 +8518,15 @@ const AgentDashboard = () => {
               ) : null}
 
               <TabsList className={cn(
-                "grid h-auto w-full grid-cols-1 gap-2 bg-transparent p-0",
+                "grid h-auto w-full grid-cols-1 gap-1.5 bg-transparent p-0",
                 useCompactAdminSidebar && "justify-items-center",
               )}>
                 {canViewAdminDashboard ? (
                   <TabsTrigger
                     value="adminDashboard"
                     className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                      ADMIN_SIDEBAR_TRIGGER_CLASS_NAME,
+                      useCompactAdminSidebar ? "w-9 justify-center px-0" : "justify-start gap-3",
                     )}
                   >
                     <LayoutDashboard className="h-4 w-4 shrink-0" />
@@ -8542,8 +8537,8 @@ const AgentDashboard = () => {
                   <TabsTrigger
                     value="dashboard"
                     className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                      ADMIN_SIDEBAR_TRIGGER_CLASS_NAME,
+                      useCompactAdminSidebar ? "w-9 justify-center px-0" : "justify-start gap-3",
                     )}
                   >
                     <Headphones className="h-4 w-4 shrink-0" />
@@ -8554,8 +8549,8 @@ const AgentDashboard = () => {
                   <TabsTrigger
                     value="coverage"
                     className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                      ADMIN_SIDEBAR_TRIGGER_CLASS_NAME,
+                      useCompactAdminSidebar ? "w-9 justify-center px-0" : "justify-start gap-3",
                     )}
                   >
                     <FileText className="h-4 w-4 shrink-0" />
@@ -8567,8 +8562,8 @@ const AgentDashboard = () => {
                     key={value}
                     value={value}
                     className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                      ADMIN_SIDEBAR_TRIGGER_CLASS_NAME,
+                      useCompactAdminSidebar ? "w-9 justify-center px-0" : "justify-start gap-3",
                     )}
                   >
                     <Users className="h-4 w-4 shrink-0" />
@@ -8579,8 +8574,8 @@ const AgentDashboard = () => {
                   <TabsTrigger
                     value="console"
                     className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                      ADMIN_SIDEBAR_TRIGGER_CLASS_NAME,
+                      useCompactAdminSidebar ? "w-9 justify-center px-0" : "justify-start gap-3",
                     )}
                   >
                     <MessageSquareText className="h-4 w-4 shrink-0" />
@@ -8662,8 +8657,8 @@ const AgentDashboard = () => {
                   <TabsTrigger
                     value="management"
                     className={cn(
-                      "h-12 rounded-2xl border bg-background px-3 text-sm font-medium data-[state=active]:border-primary data-[state=active]:bg-primary/8 data-[state=active]:text-primary",
-                      useCompactAdminSidebar ? "w-12 justify-center px-0" : "justify-start gap-3",
+                      ADMIN_SIDEBAR_TRIGGER_CLASS_NAME,
+                      useCompactAdminSidebar ? "w-9 justify-center px-0" : "justify-start gap-3",
                     )}
                   >
                     <Settings2 className="h-4 w-4 shrink-0" />
@@ -8701,25 +8696,25 @@ const AgentDashboard = () => {
           <div className={cn("flex min-w-0 w-full flex-1 flex-col", isStackedAdminLayout ? "overflow-visible" : "overflow-hidden")}>
 
           {canViewAdminDashboard ? (
-            <TabsContent value="adminDashboard" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+            <TabsContent value="adminDashboard" className="mt-0 min-h-0 w-full flex-1 space-y-4 overflow-y-auto pr-1">
               {renderDashboardWorkspace()}
             </TabsContent>
           ) : null}
 
           {canViewSupportDashboard ? (
-            <TabsContent value="dashboard" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+            <TabsContent value="dashboard" className="mt-0 min-h-0 w-full flex-1 space-y-4 overflow-y-auto pr-1">
               {renderDashboardWorkspace()}
             </TabsContent>
           ) : null}
 
           {canViewLearningPlanTeam ? (
-            <TabsContent value="coverage" className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+            <TabsContent value="coverage" className="mt-0 min-h-0 w-full flex-1 space-y-4 overflow-y-auto pr-1">
               {renderDashboardWorkspace()}
             </TabsContent>
           ) : null}
 
           {customDashboardTeamTabs.map(({ value }) => (
-            <TabsContent key={value} value={value} className="mt-0 min-h-0 w-full flex-1 space-y-5 overflow-y-auto pr-1 sm:space-y-6">
+            <TabsContent key={value} value={value} className="mt-0 min-h-0 w-full flex-1 space-y-4 overflow-y-auto pr-1">
               {renderDashboardWorkspace()}
             </TabsContent>
           ))}
@@ -8783,19 +8778,19 @@ const AgentDashboard = () => {
                 </div>
 
                 <Tabs value={managementAccessTab} onValueChange={(value) => setManagementAccessTab(value as ManagementAccessTab)}>
-                  <div className="border-b px-4 py-3 sm:px-5">
-                    <TabsList className="flex h-auto w-full flex-wrap gap-2 rounded-2xl bg-muted/40 p-1">
+                  <div className="border-b px-4 sm:px-5">
+                    <TabsList className="flex h-auto w-full flex-nowrap justify-start gap-1 overflow-x-auto rounded-none bg-transparent p-0 [scrollbar-width:thin]">
                       {managementTeamTabs.map(({ value, policy }) => (
-                        <TabsTrigger key={value} value={value} className="min-w-[180px] flex-1 justify-between gap-2 rounded-xl px-3 py-2 text-sm">
-                          <span className="truncate">{getManagementTeamTabLabel(policy)}</span>
-                          <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">
+                        <TabsTrigger key={value} value={value} className={MANAGEMENT_TAB_TRIGGER_CLASS_NAME}>
+                          <span className="whitespace-nowrap">{getManagementTeamTabLabel(policy)}</span>
+                          <span className="rounded-full bg-secondary px-2 py-0.5 text-xs font-normal text-muted-foreground">
                             {managementTeamAccessCounts.get(policy.key) || 0}
                           </span>
                         </TabsTrigger>
                       ))}
-                      <TabsTrigger value="admins" className="justify-between gap-2 rounded-xl px-3 py-2 text-sm">
-                        <span>Admins</span>
-                        <span className="rounded-full bg-background px-2 py-0.5 text-xs text-muted-foreground">{adminAccessCount}</span>
+                      <TabsTrigger value="admins" className={MANAGEMENT_TAB_TRIGGER_CLASS_NAME}>
+                        <span className="whitespace-nowrap">Admins</span>
+                        <span className="rounded-full bg-secondary px-2 py-0.5 text-xs font-normal text-muted-foreground">{adminAccessCount}</span>
                       </TabsTrigger>
                     </TabsList>
                   </div>
@@ -8899,9 +8894,10 @@ const AgentDashboard = () => {
               <div className="flex h-full flex-col">
                 <div className="flex flex-wrap items-center gap-3">
                   <div className={cn(
-                    "rounded-xl border px-4 py-2 text-sm font-medium",
-                    hasCurrentAdminOpenConsoleQueue ? "border-destructive/20 bg-destructive/10 text-destructive" : "border-emerald-200 bg-emerald-50 text-emerald-700",
+                    "inline-flex h-7 items-center gap-1.5 rounded-full border px-3 text-xs font-medium",
+                    hasCurrentAdminOpenConsoleQueue ? "border-red-200 bg-red-50 text-red-700" : "border-[#C9E8D2] bg-[#E8F6EC] text-[#237A45]",
                   )}>
+                    <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden />
                     {hasCurrentAdminOpenConsoleQueue ? "Cases Available" : "No case available"}
                   </div>
                   {consoleDurationStart && consoleDurationLabel ? (
@@ -8919,10 +8915,10 @@ const AgentDashboard = () => {
                   ) : null}
                 </div>
 
-                <div className="mt-4 grid min-h-0 flex-1 gap-4 xl:grid-cols-[240px_minmax(0,1fr)]">
-                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-sky-200/80 bg-sky-50/30 shadow-soft">
-                    <div className="border-b border-sky-200/80 bg-sky-50/55 px-4 py-4">
-                      <div className="text-sm font-semibold">Cases</div>
+                <div className="mt-4 grid min-h-0 flex-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+                  <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border bg-secondary/40 shadow-soft">
+                    <div className="border-b bg-card px-4 py-4">
+                      <div className="text-[15px] font-medium text-foreground">Cases</div>
                       <div className="text-xs text-muted-foreground">
                         Review all cases, and work from your own queue in My Cases.
                       </div>
@@ -9259,19 +9255,19 @@ const AgentDashboard = () => {
                     </div>
                   </div>
                 ) : (
-                  <div className="flex min-h-[420px] items-center justify-center rounded-2xl border border-dashed border-slate-300/80 bg-slate-50/40 px-8 text-center">
+                  <div className="flex min-h-[420px] items-center justify-center rounded-2xl border bg-secondary/30 px-8 text-center">
                     <div className="max-w-xl">
                       {hasCurrentAdminOpenConsoleQueue ? (
-                        <div className="mx-auto max-w-sm rounded-3xl border border-red-200 bg-red-50/80 px-8 py-8 shadow-soft">
-                          <div className="text-3xl font-semibold uppercase tracking-[0.12em] text-red-600">Chats Available</div>
-                          <div className="mt-3 text-sm leading-6 text-red-800/80">
+                        <div className="mx-auto max-w-sm rounded-2xl border border-t-2 border-t-red-400 bg-card px-8 py-7 shadow-soft">
+                          <div className="text-2xl font-semibold text-foreground">Chats Available</div>
+                          <div className="mt-2 text-sm leading-6 text-muted-foreground">
                             Open a chat from the sidebar to start working on the next available learner case.
                           </div>
                         </div>
                       ) : (
-                        <div className="mx-auto max-w-sm rounded-3xl border border-emerald-200 bg-emerald-50/80 px-8 py-8 shadow-soft">
-                          <div className="text-3xl font-semibold uppercase tracking-[0.12em] text-emerald-600">No Chats</div>
-                          <div className="mt-3 text-sm leading-6 text-emerald-800/80">
+                        <div className="mx-auto max-w-sm rounded-2xl border border-t-2 border-t-[#5DBB7F] bg-card px-8 py-7 shadow-soft">
+                          <div className="text-2xl font-semibold text-foreground">No Chats</div>
+                          <div className="mt-2 text-sm leading-6 text-muted-foreground">
                             {consoleAvailabilityEmptyMessage}
                           </div>
                         </div>
@@ -10387,8 +10383,8 @@ const ConsoleQueueList = ({
   if (tickets.length === 0) {
     return (
       <div className={cn(
-        "rounded-2xl border px-4 py-5 text-sm font-medium",
-        emptyTone === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-destructive/20 bg-destructive/10 text-destructive",
+        "rounded-xl border px-3 py-2.5 text-xs font-medium",
+        emptyTone === "success" ? "border-[#C9E8D2] bg-[#E8F6EC]/60 text-[#237A45]" : "border-red-200 bg-red-50/70 text-red-700",
       )}>
         {emptyMessage}
       </div>
@@ -16108,7 +16104,7 @@ const TeamTransferMenu = ({
             "h-8 whitespace-nowrap rounded-full",
             isAssignedToLearningPlan
               ? "border-amber-300 bg-amber-50 text-amber-900 shadow-sm hover:border-amber-400 hover:bg-amber-100 hover:text-amber-950"
-              : "border-slate-200 bg-background text-slate-900 hover:border-primary/25 hover:bg-primary/5 hover:text-primary",
+              : "border-[#DDD6FE] bg-[#F7F5FF] text-[#33265A] hover:border-[#C4B5FD] hover:bg-[#F0E9FF] hover:text-primary",
             className,
           )}
           disabled={disabled || isLoading || availableTeamOptions.length === 0}
@@ -16310,7 +16306,7 @@ function getArchiveActionButtonClassName(isArchived: boolean, className?: string
   return cn(
     isArchived
       ? "border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm hover:border-emerald-300 hover:bg-emerald-100 hover:text-emerald-800"
-      : "border-slate-200 bg-slate-100/80 text-slate-700 shadow-sm hover:border-indigo-200 hover:bg-indigo-50 hover:text-indigo-700",
+      : "border-[#DDD6FE] bg-[#F7F5FF] text-[#33265A] hover:border-[#C4B5FD] hover:bg-[#F0E9FF] hover:text-primary",
     className,
   );
 }
@@ -19210,17 +19206,30 @@ function formatTicketHeaderCategoryLabel(category: string, technicalSubcategory:
   return formatCategoryLabel(category, technicalSubcategory);
 }
 
+const ADMIN_SIDEBAR_TRIGGER_CLASS_NAME = "h-9 rounded-[9px] border border-transparent bg-transparent px-3 text-[13px] font-medium text-foreground/80 shadow-none transition-colors hover:bg-[#F7F4FF] hover:text-foreground data-[state=active]:border-[#C4B5FD] data-[state=active]:bg-[#F0E9FF] data-[state=active]:font-medium data-[state=active]:text-primary data-[state=active]:shadow-none";
+
+const MANAGEMENT_TAB_TRIGGER_CLASS_NAME = "shrink-0 gap-2 rounded-none border-b-2 border-transparent bg-transparent px-3 py-3 text-sm font-medium text-muted-foreground shadow-none hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none";
+
+// Static class names so Tailwind generates them.
+const DASHBOARD_KPI_GRID_COLUMNS: Record<number, string> = {
+  3: "xl:grid-cols-3",
+  4: "xl:grid-cols-4",
+  5: "xl:grid-cols-5",
+  6: "xl:grid-cols-6",
+  7: "xl:grid-cols-7",
+  8: "xl:grid-cols-8",
+};
+
+function dashboardKpiGridColumnsClassName(cardCount: number) {
+  return DASHBOARD_KPI_GRID_COLUMNS[cardCount] || "xl:grid-cols-7";
+}
+
 function getTicketTransferRowClassName(
   ticket: Pick<TicketSummary, "pendingTransferRequest" | "latestTransferDecision" | "status" | "statusReason" | "slaStatus"> & Partial<Pick<TicketSummary, "ticketState" | "isQuickTicket">>,
 ) {
-  if (ticket.slaStatus === "Breached") {
-    return "bg-red-50/70 hover:bg-red-50";
-  }
-
-  if (isQuickResolutionTicket(ticket)) {
-    return "bg-violet-50/70 hover:bg-violet-50";
-  }
-
+  // SLA state is shown in the SLA column ("Breached"), not as a row colour.
+  // Quick tickets are labelled under the status pill; they are too common to
+  // tint the whole row (most AI Team tickets are quick tickets).
   if (isDashboardEscalationTicket(ticket)) {
     return "bg-amber-50/70 hover:bg-amber-50";
   }
@@ -19233,19 +19242,8 @@ function getTicketTransferRowClassName(
     return "bg-sky-50/70 hover:bg-sky-50";
   }
 
-  if (ticket.status === "Closed") {
-    return "bg-emerald-50/70 hover:bg-emerald-50";
-  }
-
-  if (ticket.status === "Pending") {
-    return "bg-warning/10 hover:bg-warning/15";
-  }
-
-  if (ticket.status === "Open") {
-    return "bg-info/10 hover:bg-info/15";
-  }
-
-  return "hover:bg-secondary/30";
+  // Ticket status is shown by the status pill; rows are not tinted by status.
+  return "hover:bg-[#F7F4FF]";
 }
 
 function getAssignedAgentBadgeLabel(
@@ -20130,9 +20128,9 @@ function getTicketSlaDetailSummary(ticket: Pick<
 }
 
 function slaStatusClassName(value: TicketSummary["slaStatus"]) {
-  if (value === "Breached") return "inline-flex items-center rounded-full bg-rose-600 px-2.5 py-1 text-white";
-  if (value === "On Track") return "text-success";
-  return "text-warning";
+  if (value === "Breached") return "inline-flex items-center rounded-full border border-[#FBD0DA] bg-[#FFF1F3] px-2 py-0.5 text-[#BE123C]";
+  if (value === "On Track") return "text-[#16803C]";
+  return "text-[#B86A0A]";
 }
 
 export default AgentDashboard;
