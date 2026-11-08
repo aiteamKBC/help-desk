@@ -33,6 +33,7 @@ urlpatterns = [
     path("admin/tickets", views.admin_tickets, name="admin-tickets"),
     path("admin/tickets/metrics", views.admin_ticket_metrics, name="admin-ticket-metrics"),
     path("admin/notifications", views.admin_notifications, name="admin-notifications"),
+    path("admin/notifications/dismiss", views.admin_notifications_dismiss, name="admin-notifications-dismiss"),
     path("admin/tickets/<str:public_id>/archive", views.admin_ticket_archive, name="admin-ticket-archive"),
     path("admin/tickets/<str:public_id>/closure-email-draft", views.admin_ticket_closure_email_draft, name="admin-ticket-closure-email-draft"),
     path("admin/tickets/<str:public_id>/delete-permanently", views.admin_ticket_permanent_delete, name="admin-ticket-permanent-delete"),

@@ -136,6 +136,9 @@ SUPPORT_NOTIFICATION_WEBHOOK_URL = get_env(
     "N8N_SUPPORT_NOTIFICATION_WEBHOOK_URL",
     get_env("SUPPORT_NOTIFICATION_WEBHOOK_URL", ""),
 )
+# Archived-ticket retention cleanup (purge_expired_archived_tickets --execute).
+# Off unless explicitly enabled for an environment after the policy is approved.
+ARCHIVED_TICKET_RETENTION_PURGE_ENABLED = get_env_bool("ARCHIVED_TICKET_RETENTION_PURGE_ENABLED", False)
 SUPPORT_NOTIFICATION_DELIVERY_ENABLED = get_env_bool(
     "SUPPORT_NOTIFICATION_DELIVERY_ENABLED",
     not IS_TESTING,

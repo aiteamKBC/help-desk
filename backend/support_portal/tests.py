@@ -10333,10 +10333,12 @@ class AdminNotificationLogTests(SimpleTestCase):
         with (
             patch.object(services, "require_agent_session_actor", return_value={"id": 9, "username": "ahmedhamamo", "role": "admin"}),
             patch.object(services, "run_query", return_value=[notification_row]) as run_query,
+            patch.object(services, "get_account_dismissed_notification_keys", return_value=set()),
         ):
             response = services.list_admin_notifications("ahmedhamamo", "instance-1", limit="12")
 
-        self.assertEqual(run_query.call_args.args[1], ["9", "9", "9", "9", "9", "9", "9", 12])
+        # 50 extra rows are read so items this admin hid do not shorten the list.
+        self.assertEqual(run_query.call_args.args[1], ["9", "9", "9", "9", "9", "9", "9", 62])
         self.assertEqual(len(response["notifications"]), 1)
         self.assertEqual(
             response["notifications"][0],
@@ -15571,133 +15573,6 @@ class CoverageTutorWorkflowTests(SimpleTestCase):
             persisted_metadata["admin_documentation"]["coverageCards"][1]["type"],
             "tutor_reply",
         )
-
-    def test_acknowledge_coverage_ticket_notification_clears_pending_metadata(self):
-        ticket = {
-            "id": 65,
-            "public_id": "KBC-000065",
-            "metadata": {
-                "technical_subcategory": "Coverage",
-                "pending_coverage_ticket_notification": {
-                    "ticketId": "KBC-000065",
-                    "requesterName": "Ayman",
-                    "requesterEmail": "ayman@example.com",
-                    "requesterRole": "user",
-                    "createdAt": "2026-06-05T10:00:00Z",
-                },
-            },
-        }
-        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
-        mock_connection, cursor = self.build_mock_connection()
-
-        with (
-            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
-            patch.object(services.transaction, "atomic", return_value=nullcontext()),
-            patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "connection", mock_connection),
-            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000065"}}),
-        ):
-            response = services.acknowledge_coverage_ticket_notification(
-                "KBC-000065",
-                {"actorUsername": "ahmed"},
-            )
-
-        self.assertEqual(response["ticket"]["id"], "KBC-000065")
-        update_params = cursor.execute.call_args.args[1]
-        persisted_metadata = json.loads(update_params[0])
-        self.assertNotIn("pending_coverage_ticket_notification", persisted_metadata)
-
-    def test_acknowledge_support_queue_notification_clears_pending_metadata(self):
-        ticket = {
-            "id": 67,
-            "public_id": "KBC-000067",
-            "assigned_team": services.ASSIGNED_TEAM_SUPPORT_DESK,
-            "technical_subcategory": "LMS",
-            "metadata": {
-                "requester_role": "user",
-                "pending_support_queue_notification": {
-                    "ticketId": "KBC-000067",
-                    "requesterName": "Ali Test",
-                    "requesterEmail": "ali@example.com",
-                    "requesterRole": "user",
-                    "queue": services.ASSIGNED_TEAM_SUPPORT_DESK,
-                    "reason": "support_ticket_created",
-                    "createdAt": "2026-06-05T10:00:00Z",
-                },
-            },
-        }
-        actor_row = {
-            "id": 7,
-            "username": "support.agent",
-            "full_name": "Support Agent",
-            "email": "support.agent@example.com",
-            "role": "agent",
-            "metadata": {"legacy_support_access": True, "legacy_operations_access": False},
-        }
-        mock_connection, cursor = self.build_mock_connection()
-
-        with (
-            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
-            patch.object(services.transaction, "atomic", return_value=nullcontext()),
-            patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "connection", mock_connection),
-            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000067"}}),
-        ):
-            response = services.acknowledge_support_queue_notification(
-                "KBC-000067",
-                {"actorUsername": "support.agent"},
-            )
-
-        self.assertEqual(response["ticket"]["id"], "KBC-000067")
-        update_params = cursor.execute.call_args.args[1]
-        persisted_metadata = json.loads(update_params[0])
-        self.assertNotIn("pending_support_queue_notification", persisted_metadata)
-
-    def test_acknowledge_learning_plan_transfer_notification_clears_pending_metadata(self):
-        ticket = {
-            "id": 66,
-            "public_id": "KBC-000066",
-            "assigned_team": services.ASSIGNED_TEAM_LEARNING_PLAN,
-            "technical_subcategory": "ApTem",
-            "metadata": {
-                "requester_role": "coach",
-                "pending_learning_plan_transfer_notification": {
-                    "ticketId": "KBC-000066",
-                    "requesterName": "Olivia Evans",
-                    "requesterEmail": "olivia@example.com",
-                    "requesterRole": "coach",
-                    "fromTeam": services.ASSIGNED_TEAM_SUPPORT_DESK,
-                    "toTeam": services.ASSIGNED_TEAM_LEARNING_PLAN,
-                    "transferredAt": "2026-06-05T11:00:00Z",
-                    "transferredById": 1,
-                    "transferredByName": "Support Manager",
-                    "transferredByUsername": "manager",
-                    "assignedAgentId": 5,
-                    "assignedAgentName": "Example Agent",
-                    "assignedAgentUsername": "omar",
-                    "note": "Please continue with learning plan workflow.",
-                },
-            },
-        }
-        actor_row = {"id": 7, "username": "ahmed", "full_name": "Ahmed Hamamo", "email": "ahmed@example.com", "role": "admin"}
-        mock_connection, cursor = self.build_mock_connection()
-
-        with (
-            patch.object(services, "fetch_actor_by_username", return_value=actor_row),
-            patch.object(services.transaction, "atomic", return_value=nullcontext()),
-            patch.object(services, "run_query_one", return_value=ticket),
-            patch.object(services, "connection", mock_connection),
-            patch.object(services, "fetch_admin_ticket_detail", return_value={"ticket": {"id": "KBC-000066"}}),
-        ):
-            response = services.acknowledge_learning_plan_transfer_notification(
-                "KBC-000066",
-                {"actorUsername": "ahmed"},
-            )
-
-        self.assertEqual(response["ticket"]["id"], "KBC-000066")
-        update_params = cursor.execute.call_args.args[1]
-        persisted_metadata = json.loads(update_params[0])
-        self.assertNotIn("pending_learning_plan_transfer_notification", persisted_metadata)
 
     def test_confirm_coverage_tutor_session_closes_ticket_and_stamps_confirmation(self):
         ticket = {

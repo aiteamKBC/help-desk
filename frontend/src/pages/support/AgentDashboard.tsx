@@ -358,6 +358,7 @@ interface TicketSummary {
   evidenceCount: number;
   isArchived?: boolean;
   archivedAt?: string | null;
+  scheduledDeletionAt?: string | null;
   archivedById?: number | null;
   archivedByName?: string;
   archivedByUsername?: string;
@@ -582,6 +583,7 @@ type PendingTeamTransfer = {
 interface ListResponse {
   message?: string;
   tickets?: TicketSummary[];
+  dismissedNotificationKeys?: string[];
   pagination?: TicketListPagination;
   accounts?: AdminAgent[];
   agents?: AdminAgent[];
@@ -647,6 +649,7 @@ interface TeamMutationResponse {
 
 interface DetailResponse extends TicketDetailResponse {
   message?: string;
+  dismissedNotificationKeys?: string[];
 }
 
 interface PermanentDeleteResponse {
@@ -1458,6 +1461,11 @@ const AgentDashboard = () => {
   const [isTransferMenuOpen, setIsTransferMenuOpen] = useState(false);
   const [isTransferringConsoleTicket, setIsTransferringConsoleTicket] = useState(false);
   const [isTransferNotificationsOpen, setIsTransferNotificationsOpen] = useState(false);
+  // Shared ticket notifications (new support / coverage tickets, learning plan
+  // transfers) this admin has dismissed. Stored per admin in the database and
+  // returned with the ticket list, so it survives refresh, logout and login.
+  const [dismissedNotificationKeys, setDismissedNotificationKeys] = useState<Set<string>>(() => new Set());
+  const [isDismissingAllNotifications, setIsDismissingAllNotifications] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">(
     () => (typeof window !== "undefined" && "Notification" in window ? window.Notification.permission : "unsupported"),
   );
@@ -2585,21 +2593,21 @@ const AgentDashboard = () => {
       return (Number.isNaN(rightRespondedAt) ? 0 : rightRespondedAt) - (Number.isNaN(leftRespondedAt) ? 0 : leftRespondedAt);
     });
   const supportQueueNotifications = activeAccessibleTickets
-    .filter((ticket) => Boolean(ticket.pendingSupportQueueNotification))
+    .filter((ticket) => Boolean(ticket.pendingSupportQueueNotification) && !dismissedNotificationKeys.has(getSupportQueueNotificationKey(ticket)))
     .sort((leftTicket, rightTicket) => {
       const leftCreatedAt = Date.parse(leftTicket.pendingSupportQueueNotification?.createdAt || leftTicket.createdAt || "");
       const rightCreatedAt = Date.parse(rightTicket.pendingSupportQueueNotification?.createdAt || rightTicket.createdAt || "");
       return (Number.isNaN(rightCreatedAt) ? 0 : rightCreatedAt) - (Number.isNaN(leftCreatedAt) ? 0 : leftCreatedAt);
     });
   const coverageTicketNotifications = activeAccessibleTickets
-    .filter((ticket) => Boolean(ticket.pendingCoverageTicketNotification))
+    .filter((ticket) => Boolean(ticket.pendingCoverageTicketNotification) && !dismissedNotificationKeys.has(getCoverageTicketNotificationKey(ticket)))
     .sort((leftTicket, rightTicket) => {
       const leftCreatedAt = Date.parse(leftTicket.pendingCoverageTicketNotification?.createdAt || leftTicket.createdAt || "");
       const rightCreatedAt = Date.parse(rightTicket.pendingCoverageTicketNotification?.createdAt || rightTicket.createdAt || "");
       return (Number.isNaN(rightCreatedAt) ? 0 : rightCreatedAt) - (Number.isNaN(leftCreatedAt) ? 0 : leftCreatedAt);
     });
   const learningPlanTransferNotifications = activeAccessibleTickets
-    .filter((ticket) => Boolean(ticket.pendingLearningPlanTransferNotification))
+    .filter((ticket) => Boolean(ticket.pendingLearningPlanTransferNotification) && !dismissedNotificationKeys.has(getLearningPlanTransferNotificationKey(ticket)))
     .sort((leftTicket, rightTicket) => {
       const leftTransferredAt = Date.parse(leftTicket.pendingLearningPlanTransferNotification?.transferredAt || leftTicket.updatedAt || "");
       const rightTransferredAt = Date.parse(rightTicket.pendingLearningPlanTransferNotification?.transferredAt || rightTicket.updatedAt || "");
@@ -2615,8 +2623,17 @@ const AgentDashboard = () => {
     + coverageTicketNotifications.length
     + learningPlanTransferNotifications.length
     + coverageTutorResponseNotifications.length;
+  // "Dismiss all" clears this admin's informational alerts only. Alerts that
+  // need a decision (transfer requests, escalations, Teams calls, waiting live
+  // chats) stay in the list.
+  const dismissibleAdminNotificationCount = supportQueueNotifications.length
+    + coverageTicketNotifications.length
+    + learningPlanTransferNotifications.length
+    + transferDecisionNotifications.length
+    + escalationClosureNotifications.length
+    + coverageTutorResponseNotifications.length;
   const archivedNotificationLog = notificationLog
-    .filter((item) => !item.isCurrent)
+    .filter((item) => !item.isCurrent && !dismissedNotificationKeys.has(`log:${item.id}`))
     .slice(0, 12);
   const liveChatLocked = Boolean(consoleDetail) && (
     consoleDetail.ticket.status === "Closed" || consoleDetail.ticket.chatState === "closed"
@@ -3726,6 +3743,37 @@ const AgentDashboard = () => {
     }
   }
 
+  // Dismissals only ever add up (a dismissed event never comes back; a new
+  // event on the same ticket has a new key), so merging is always safe.
+  function rememberDismissedNotificationKeys(keys: unknown) {
+    if (!Array.isArray(keys)) {
+      return;
+    }
+    const validKeys = keys.filter((key): key is string => typeof key === "string" && Boolean(key));
+    if (validKeys.length === 0) {
+      return;
+    }
+    setDismissedNotificationKeys((currentKeys) => {
+      if (validKeys.every((key) => currentKeys.has(key))) {
+        return currentKeys;
+      }
+      const nextKeys = new Set(currentKeys);
+      validKeys.forEach((key) => nextKeys.add(key));
+      return nextKeys;
+    });
+  }
+
+  function forgetDismissedNotificationKeys(keys: string[]) {
+    if (keys.length === 0) {
+      return;
+    }
+    setDismissedNotificationKeys((currentKeys) => {
+      const nextKeys = new Set(currentKeys);
+      keys.forEach((key) => nextKeys.delete(key));
+      return nextKeys;
+    });
+  }
+
   async function fetchTicketsList() {
     const response = await fetch("/api/admin/tickets", { cache: "no-store" });
     const payload = (await response.json().catch(() => null)) as ListResponse | null;
@@ -3737,6 +3785,7 @@ const AgentDashboard = () => {
       throw new Error(payload?.message || "We could not load tickets right now.");
     }
 
+    rememberDismissedNotificationKeys(payload?.dismissedNotificationKeys);
     return payload?.tickets || [];
   }
 
@@ -4665,6 +4714,7 @@ const AgentDashboard = () => {
       return null;
     }
 
+    rememberDismissedNotificationKeys(payload.dismissedNotificationKeys);
     return payload;
   }
 
@@ -4715,6 +4765,7 @@ const AgentDashboard = () => {
       return null;
     }
 
+    rememberDismissedNotificationKeys(payload.dismissedNotificationKeys);
     return payload;
   }
 
@@ -4740,6 +4791,7 @@ const AgentDashboard = () => {
       return null;
     }
 
+    rememberDismissedNotificationKeys(payload.dismissedNotificationKeys);
     return payload;
   }
 
@@ -6309,121 +6361,181 @@ const AgentDashboard = () => {
     }
   }
 
-  async function handleSupportQueueNotificationAcknowledge(ticket: TicketSummary) {
-    if (!ticket.pendingSupportQueueNotification || !session?.username || activeTransferRequestTicketId) {
+  async function handleDismissAllAdminNotifications() {
+    if (!session?.username || isDismissingAllNotifications || activeTransferRequestTicketId) {
       return;
     }
 
-    setActiveTransferRequestTicketId(ticket.id);
+    // Shared alerts: one personal dismissal per alert, owned by the signed-in
+    // admin (the server takes the owner from the session, not from this body).
+    const sharedNotifications = [
+      ...supportQueueNotifications.map((ticket) => ({ ticketId: ticket.id, kind: "support-queue", key: getSupportQueueNotificationKey(ticket) })),
+      ...coverageTicketNotifications.map((ticket) => ({ ticketId: ticket.id, kind: "coverage-ticket", key: getCoverageTicketNotificationKey(ticket) })),
+      ...learningPlanTransferNotifications.map((ticket) => ({ ticketId: ticket.id, kind: "learning-plan-transfer", key: getLearningPlanTransferNotificationKey(ticket) })),
+    ];
+    // Alerts already addressed to this admin alone keep their own endpoints.
+    const personalJobs: Array<[string, string]> = [
+      ...transferDecisionNotifications.map((ticket): [string, string] => [ticket.id, "transfer-decision"]),
+      ...escalationClosureNotifications.map((ticket): [string, string] => [ticket.id, "escalation-closure"]),
+      ...coverageTutorResponseNotifications.map((ticket): [string, string] => [ticket.id, "coverage-tutor-response"]),
+    ];
+    const totalCount = sharedNotifications.length + personalJobs.length;
+    if (totalCount === 0) {
+      return;
+    }
+
+    setIsDismissingAllNotifications(true);
+    // Clear them from this admin's list and bell right away.
+    rememberDismissedNotificationKeys(sharedNotifications.map((item) => item.key));
+    let failedCount = 0;
+
+    try {
+      for (let index = 0; index < sharedNotifications.length; index += 500) {
+        const chunk = sharedNotifications.slice(index, index + 500);
+        const chunkKeys = chunk.map((item) => item.key);
+        try {
+          const response = await fetch("/api/admin/notifications/dismiss", {
+            method: "POST",
+            headers: buildAdminJsonHeaders(),
+            body: JSON.stringify({ notifications: chunk.map(({ ticketId, kind }) => ({ ticketId, kind })), clearAll: true }),
+          });
+          const payload = (await response.json().catch(() => null)) as { dismissedNotificationKeys?: string[]; message?: string } | null;
+          if (!response.ok) {
+            forgetDismissedNotificationKeys(chunkKeys);
+            if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+              return;
+            }
+            failedCount += chunk.length;
+            continue;
+          }
+          rememberDismissedNotificationKeys(payload?.dismissedNotificationKeys);
+        } catch {
+          forgetDismissedNotificationKeys(chunkKeys);
+          failedCount += chunk.length;
+        }
+      }
+
+      for (let index = 0; index < personalJobs.length; index += 6) {
+        const results = await Promise.all(personalJobs.slice(index, index + 6).map(async ([ticketId, endpoint]) => {
+          try {
+            const response = await fetch(
+              `/api/admin/tickets/${encodeURIComponent(ticketId)}/${endpoint}/acknowledge`,
+              {
+                method: "POST",
+                headers: buildAdminJsonHeaders(),
+                body: JSON.stringify({}),
+              },
+            );
+            return response.ok;
+          } catch {
+            return false;
+          }
+        }));
+        failedCount += results.filter((ok) => !ok).length;
+      }
+
+      // Picks up the personal alerts cleared above; not awaited so the panel
+      // does not stay disabled while the full ticket list reloads.
+      void refreshTicketsOnly(true);
+    } finally {
+      setIsDismissingAllNotifications(false);
+    }
+
+    if (failedCount > 0) {
+      toast.error(`${failedCount} notification${failedCount === 1 ? "" : "s"} could not be dismissed. Please try again.`);
+    } else {
+      toast.success("All notifications dismissed.");
+    }
+  }
+
+  // Dismiss one shared notification for the signed-in admin only. It leaves
+  // this admin's list and bell count at once; the server saves it in the
+  // background, and if that fails the notification comes back with an error.
+  async function dismissSharedTicketNotification(ticket: TicketSummary, notificationKey: string, endpoint: string) {
+    if (!notificationKey || !session?.username) {
+      return;
+    }
+
+    rememberDismissedNotificationKeys([notificationKey]);
+    let saved = false;
 
     try {
       const response = await fetch(
-        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/support-queue-notification/acknowledge`,
+        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/${endpoint}/acknowledge`,
         {
           method: "POST",
           headers: buildAdminJsonHeaders(),
           body: JSON.stringify({}),
         },
       );
-
       const payload = (await response.json().catch(() => null)) as DetailResponse | null;
 
       if (!response.ok || !payload?.ticket) {
         if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
           return;
         }
-        toast.error(payload?.message || "We could not clear this support queue alert right now.");
+        toast.error(payload?.message || "We could not dismiss this notification right now.");
         return;
       }
 
+      saved = true;
+      rememberDismissedNotificationKeys(payload.dismissedNotificationKeys);
       syncDetailAcrossViews(payload);
       if (activeDetail?.ticket.id === ticket.id) {
         syncDrafts(payload);
       }
-      await refreshTicketsOnly(true);
     } catch {
       toast.error("We could not connect to the server. Please try again.");
     } finally {
-      setActiveTransferRequestTicketId("");
+      if (!saved) {
+        forgetDismissedNotificationKeys([notificationKey]);
+      }
     }
+  }
+
+  // Hide one Recent Log item for the signed-in admin only (saved on the server).
+  async function handleDismissNotificationLogItem(item: AdminNotificationLogItem) {
+    const logKey = `log:${item.id}`;
+    if (!session?.username) {
+      return;
+    }
+
+    rememberDismissedNotificationKeys([logKey]);
+    let saved = false;
+    try {
+      const response = await fetch("/api/admin/notifications/dismiss", {
+        method: "POST",
+        headers: buildAdminJsonHeaders(),
+        body: JSON.stringify({ logIds: [item.id] }),
+      });
+      const payload = (await response.json().catch(() => null)) as { dismissedNotificationKeys?: string[]; message?: string } | null;
+      if (!response.ok) {
+        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
+          return;
+        }
+        toast.error(payload?.message || "We could not dismiss this notification right now.");
+        return;
+      }
+      saved = true;
+    } catch {
+      toast.error("We could not connect to the server. Please try again.");
+    } finally {
+      if (!saved) {
+        forgetDismissedNotificationKeys([logKey]);
+      }
+    }
+  }
+
+  async function handleSupportQueueNotificationAcknowledge(ticket: TicketSummary) {
+    await dismissSharedTicketNotification(ticket, getSupportQueueNotificationKey(ticket), "support-queue-notification");
   }
 
   async function handleCoverageTicketNotificationAcknowledge(ticket: TicketSummary) {
-    if (!ticket.pendingCoverageTicketNotification || !session?.username || activeTransferRequestTicketId) {
-      return;
-    }
-
-    setActiveTransferRequestTicketId(ticket.id);
-
-    try {
-      const response = await fetch(
-        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/coverage-ticket-notification/acknowledge`,
-        {
-          method: "POST",
-          headers: buildAdminJsonHeaders(),
-          body: JSON.stringify({}),
-        },
-      );
-
-      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
-
-      if (!response.ok || !payload?.ticket) {
-        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
-          return;
-        }
-        toast.error(payload?.message || "We could not clear this coverage ticket alert right now.");
-        return;
-      }
-
-      syncDetailAcrossViews(payload);
-      if (activeDetail?.ticket.id === ticket.id) {
-        syncDrafts(payload);
-      }
-      await refreshTicketsOnly(true);
-    } catch {
-      toast.error("We could not connect to the server. Please try again.");
-    } finally {
-      setActiveTransferRequestTicketId("");
-    }
+    await dismissSharedTicketNotification(ticket, getCoverageTicketNotificationKey(ticket), "coverage-ticket-notification");
   }
 
   async function handleLearningPlanTransferNotificationAcknowledge(ticket: TicketSummary) {
-    if (!ticket.pendingLearningPlanTransferNotification || !session?.username || activeTransferRequestTicketId) {
-      return;
-    }
-
-    setActiveTransferRequestTicketId(ticket.id);
-
-    try {
-      const response = await fetch(
-        `/api/admin/tickets/${encodeURIComponent(ticket.id)}/learning-plan-transfer-notification/acknowledge`,
-        {
-          method: "POST",
-          headers: buildAdminJsonHeaders(),
-          body: JSON.stringify({}),
-        },
-      );
-
-      const payload = (await response.json().catch(() => null)) as DetailResponse | null;
-
-      if (!response.ok || !payload?.ticket) {
-        if ((response.status === 401 || response.status === 403) && await reconcileAdminAuthorizationFailure()) {
-          return;
-        }
-        toast.error(payload?.message || "We could not clear this learning plan transfer alert right now.");
-        return;
-      }
-
-      syncDetailAcrossViews(payload);
-      if (activeDetail?.ticket.id === ticket.id) {
-        syncDrafts(payload);
-      }
-      await refreshTicketsOnly(true);
-    } catch {
-      toast.error("We could not connect to the server. Please try again.");
-    } finally {
-      setActiveTransferRequestTicketId("");
-    }
+    await dismissSharedTicketNotification(ticket, getLearningPlanTransferNotificationKey(ticket), "learning-plan-transfer-notification");
   }
 
   async function handleTeamsCallNotificationOpen(ticket: TicketSummary) {
@@ -7002,9 +7114,9 @@ const AgentDashboard = () => {
                     ) : null}
                   </div>
                   {isArchiveMode ? (
-                    <div className="mt-2 inline-flex max-w-full items-center gap-2 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs text-amber-900">
-                      <Archive className="h-3.5 w-3.5 shrink-0" />
-                      <span>Archived tickets are separate from the live queue.</span>
+                    <div className="mt-2 inline-flex max-w-full items-start gap-2 rounded-xl border border-[#DDD6FE] bg-[#F5F2FF] px-3 py-2 text-xs font-normal leading-5 text-[#33265A]">
+                      <Archive className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                      <span>Archived tickets are retained for 3 months from their archive date and are automatically deleted afterwards.</span>
                     </div>
                   ) : isCoverageDashboardView ? (
                     <p className="mt-1 text-xs text-muted-foreground">
@@ -7689,6 +7801,12 @@ const AgentDashboard = () => {
                           ) : (
                             createdAtLabel
                           )}
+                          {ticket.isArchived ? (
+                            <div className="mt-1.5 space-y-0.5 whitespace-nowrap text-[11px] font-normal leading-4 text-muted-foreground">
+                              <div>Archived {ticket.archivedAt ? formatDateTime(ticket.archivedAt) : "date unknown"}</div>
+                              <div>{ticket.scheduledDeletionAt ? `Deletes ${formatDateTime(ticket.scheduledDeletionAt)}` : "Not scheduled for deletion"}</div>
+                            </div>
+                          ) : null}
                         </td>
                         <td className={dashboardCellClassName}>
                           <div className="min-w-0">
@@ -8320,6 +8438,10 @@ const AgentDashboard = () => {
                         onAcknowledgeDecision={handleTransferDecisionAcknowledge}
                         onOpenTicket={openNotificationLogTicket}
                         onSetAvailable={() => void updateConsoleStatus("Available")}
+                        dismissAllCount={dismissibleAdminNotificationCount}
+                        isDismissingAll={isDismissingAllNotifications}
+                        onDismissAll={handleDismissAllAdminNotifications}
+                        onDismissLogItem={handleDismissNotificationLogItem}
                       />
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -8385,6 +8507,10 @@ const AgentDashboard = () => {
                           onAcknowledgeDecision={handleTransferDecisionAcknowledge}
                           onOpenTicket={openNotificationLogTicket}
                           onSetAvailable={() => void updateConsoleStatus("Available")}
+                          dismissAllCount={dismissibleAdminNotificationCount}
+                          isDismissingAll={isDismissingAllNotifications}
+                          onDismissAll={handleDismissAllAdminNotifications}
+                        onDismissLogItem={handleDismissNotificationLogItem}
                         />
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -9682,6 +9808,14 @@ const AgentDashboard = () => {
                           value={formatArchivedTicketLabel(activeDetail.ticket)}
                         />
                       ) : null}
+                      {activeTicketIsArchived ? (
+                        <InfoCard
+                          label="Scheduled Deletion"
+                          value={activeDetail.ticket.scheduledDeletionAt
+                            ? formatDateTime(activeDetail.ticket.scheduledDeletionAt)
+                            : "Not scheduled (archive date unknown)"}
+                        />
+                      ) : null}
                     </div>
 
                   </TabsContent>
@@ -10523,6 +10657,10 @@ const AdminNotificationsPanel = ({
   onAcknowledgeDecision,
   onOpenTicket,
   onSetAvailable,
+  dismissAllCount,
+  isDismissingAll,
+  onDismissAll,
+  onDismissLogItem,
 }: {
   supportQueueTickets: TicketSummary[];
   coverageTickets: TicketSummary[];
@@ -10549,7 +10687,32 @@ const AdminNotificationsPanel = ({
   onAcknowledgeDecision: (ticket: TicketSummary) => Promise<void>;
   onOpenTicket: (ticketId: string) => Promise<void>;
   onSetAvailable: () => void;
+  dismissAllCount: number;
+  isDismissingAll: boolean;
+  onDismissAll: () => Promise<void>;
+  onDismissLogItem: (item: AdminNotificationLogItem) => Promise<void>;
 }) => {
+  // Header and "Dismiss all" stay visible even when nothing is outstanding.
+  const notificationsHeader = (
+    <div className="border-b px-3 pb-3 pt-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+          Admin Notifications
+        </div>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={dismissAllCount === 0 || isDismissingAll || Boolean(activeTicketId)}
+          onClick={() => void onDismissAll()}
+          className="h-7 rounded-full border-[#DDD6FE] bg-[#F7F5FF] px-3 text-xs font-medium text-[#33265A] hover:border-[#C4B5FD] hover:bg-[#F0E9FF] hover:text-primary"
+        >
+          {isDismissingAll ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+          Dismiss all
+        </Button>
+      </div>
+    </div>
+  );
+
   if (
     supportQueueTickets.length === 0
     && coverageTickets.length === 0
@@ -10564,22 +10727,18 @@ const AdminNotificationsPanel = ({
     && notificationLog.length === 0
   ) {
     return (
-      <div className="rounded-2xl px-3 py-4 text-sm text-muted-foreground">
-        No admin notifications right now.
+      <div>
+        {notificationsHeader}
+        <div className="rounded-2xl px-3 py-4 text-sm text-muted-foreground">
+          No admin notifications right now. New notifications will appear here.
+        </div>
       </div>
     );
   }
 
   return (
     <div>
-      <div className="border-b px-3 pb-3 pt-2">
-        <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-          Admin Notifications
-        </div>
-        <div className="mt-1 text-xs text-muted-foreground">
-          Review active queue alerts and the recent notification log for support tickets, coverage tickets, learning plan transfers, escalation, Teams calls, and waiting live chat activity.
-        </div>
-      </div>
+      {notificationsHeader}
       <div className="max-h-[420px] space-y-2 overflow-y-auto p-2">
         {supportQueueTickets.length > 0 ? (
           <div className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
@@ -11193,6 +11352,7 @@ const AdminNotificationsPanel = ({
             key={`notification-log-${item.id}`}
             item={item}
             onOpenTicket={onOpenTicket}
+            onDismiss={onDismissLogItem}
           />
         ))}
       </div>
@@ -11203,9 +11363,11 @@ const AdminNotificationsPanel = ({
 const AdminNotificationLogCard = ({
   item,
   onOpenTicket,
+  onDismiss,
 }: {
   item: AdminNotificationLogItem;
   onOpenTicket: (ticketId: string) => Promise<void>;
+  onDismiss: (item: AdminNotificationLogItem) => Promise<void>;
 }) => {
   const tone = getActivityEventTone(item.eventType);
   const detail = getAdminNotificationLogDetail(item);
@@ -11269,6 +11431,16 @@ const AdminNotificationLogCard = ({
           }}
         >
           Open Ticket
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={(event) => {
+            event.stopPropagation();
+            void onDismiss(item);
+          }}
+        >
+          Dismiss
         </Button>
       </div>
     </div>
@@ -16225,6 +16397,24 @@ function isLearningPlanTicket(
 
 function isArchivedTicket(ticket?: Pick<TicketSummary, "isArchived"> | null) {
   return ticket?.isArchived === true;
+}
+
+// Must match build_ticket_notification_key_from_payload in the backend.
+function getSupportQueueNotificationKey(ticket: TicketSummary) {
+  const notification = ticket.pendingSupportQueueNotification;
+  return notification ? `support-queue:${ticket.id}:${notification.reason}:${notification.createdAt}` : "";
+}
+
+function getCoverageTicketNotificationKey(ticket: TicketSummary) {
+  const notification = ticket.pendingCoverageTicketNotification;
+  return notification ? `coverage-ticket:${ticket.id}:${notification.createdAt}` : "";
+}
+
+function getLearningPlanTransferNotificationKey(ticket: TicketSummary) {
+  const notification = ticket.pendingLearningPlanTransferNotification;
+  return notification
+    ? `learning-plan-transfer:${ticket.id}:${notification.transferredAt}:${notification.fromTeam}:${notification.toTeam}`
+    : "";
 }
 
 function getSupportQueueNotificationTitle(notification: PendingSupportQueueNotification) {

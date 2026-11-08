@@ -132,13 +132,10 @@ export const SupportLayout = ({
       {right}
     </>
   );
+  // Support-flow pages: no Knowledge Base link (it stays on the admin pages).
   const supportFlowHeaderActions = (
     <>
       {left}
-      <Link to="/knowledge-base" className={supportMasterHeaderPillClassName}>
-        <BookOpen aria-hidden="true" />
-        <span>Knowledge Base</span>
-      </Link>
       <Link to="/admin" className={supportMasterHeaderPillClassName}>
         <ShieldCheck aria-hidden="true" />
         <span>Admin</span>

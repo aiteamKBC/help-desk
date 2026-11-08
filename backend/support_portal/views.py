@@ -24,6 +24,7 @@ from .services import (
     acknowledge_ticket_teams_call_notification,
     acknowledge_ticket_transfer_decision,
     acknowledge_support_queue_notification,
+    dismiss_admin_ticket_notifications,
     acknowledge_coverage_ticket_notification,
     acknowledge_learning_plan_transfer_notification,
     acknowledge_coverage_tutor_response,
@@ -817,6 +818,15 @@ def admin_ticket_metrics(request):
     try:
         actor, _session_payload = require_request_admin_session(request)
         return JsonResponse(get_admin_ticket_metrics(actor, query_params=parse_query_params(request)))
+    except Exception as error:
+        return handle_api_error(error)
+
+
+@require_http_methods(["POST"])
+def admin_notifications_dismiss(request):
+    # Dismiss All: the owner is always the signed-in admin from the session.
+    try:
+        return JsonResponse(dismiss_admin_ticket_notifications(build_session_bound_admin_payload(request)))
     except Exception as error:
         return handle_api_error(error)
 
