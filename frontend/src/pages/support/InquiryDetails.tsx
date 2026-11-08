@@ -28,7 +28,6 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { SupportMasterHeader } from "@/components/support/SupportMasterHeader";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
   SELECTABLE_TECHNICAL_SUBCATEGORIES,
@@ -801,8 +800,7 @@ const InquiryDetails = () => {
           : `${coverageSessionDates.length} session dates selected`;
 
   return (
-    <SupportLayout showHeader={false} fullWidth mainClassName="support-inquiry-main">
-      <SupportMasterHeader />
+    <SupportLayout fullWidth mainClassName="support-inquiry-main">
 
       <div className="support-inquiry-body">
         <div className="support-inquiry-steps">
@@ -1466,7 +1464,7 @@ const InquiryDetails = () => {
                   Return to Ticket Status
                 </Button>
               ) : (
-                <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/support")}>
+                <Button variant="ghost" className="w-full sm:w-auto" onClick={() => navigate("/")}>
                   <ArrowLeft className="w-4 h-4 mr-2" /> Back
                 </Button>
               )}

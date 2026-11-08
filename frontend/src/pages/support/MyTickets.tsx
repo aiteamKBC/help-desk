@@ -1,19 +1,15 @@
-import { useEffect } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, CalendarClock, ListChecks, MessageSquarePlus, Ticket as TicketIcon } from "lucide-react";
+import { ArrowLeft, BadgeCheck, ChevronDown, ChevronRight, ChevronUp, ListFilter, Mail, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { StepIndicator } from "@/components/support/StepIndicator";
-import {
-  type BookingSummary,
-  type RequesterRole,
-  type RequesterSource,
-  type Ticket,
-} from "@/context/SupportContext";
+import { type BookingSummary, type RequesterRole, type RequesterSource, type Ticket } from "@/context/SupportContext";
 import { useSupport } from "@/context/useSupport";
-import { getSupportResumePath, isAwaitingSupportReviewTicket } from "@/lib/supportFlow";
+import { getSupportResumePath } from "@/lib/supportFlow";
 import { toBookingSummary, type ApiBookingSummary } from "@/lib/supportBooking";
+import { cn } from "@/lib/utils";
+import "./MyTickets.css";
 
 interface RestoredTicketPayload {
   id: string;
@@ -33,12 +29,23 @@ interface RestoredTicketPayload {
   status: "Open" | "Pending" | "Closed";
   statusReason?: string;
   assignedAgentId?: number | null;
+  assignedAgentName?: string;
   assignedTeam: string;
   slaStatus: string;
   createdAt: string;
+  updatedAt?: string;
   chatState?: "open" | "closed";
   liveChatRequested?: boolean;
   bookingSummary?: ApiBookingSummary | null;
+}
+
+type TicketFilter = "All" | RestoredTicketPayload["status"];
+
+interface TicketListItem {
+  ticket: Ticket;
+  bookingSummary: BookingSummary | null;
+  assignedAgentName: string;
+  updatedAt: string;
 }
 
 function buildRestoredTicket(restoredTicket: RestoredTicketPayload, learnerNameFallback: string): Ticket {
@@ -66,18 +73,28 @@ function buildRestoredTicket(restoredTicket: RestoredTicketPayload, learnerNameF
     createdAt: restoredTicket.createdAt,
     chatState: restoredTicket.chatState || "open",
     liveChatRequested: restoredTicket.liveChatRequested ?? false,
+    isQuickTicket: false,
     chatHistory: [],
   };
+}
+
+function formatUpdatedDate(value: string) {
+  if (!value || Number.isNaN(Date.parse(value))) return "-";
+  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" }).format(new Date(value));
+}
+
+function ticketCategoryLabel(ticket: Ticket) {
+  return [ticket.category, ticket.technicalSubcategory].filter(Boolean).join(" - ") || "General Support";
 }
 
 const MyTickets = () => {
   const navigate = useNavigate();
   const { ticket, setTicket, setBookingSummary, clearBookingSummary } = useSupport();
+  const [activeFilter, setActiveFilter] = useState<TicketFilter>("All");
+  const tableBodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!ticket.email) {
-      navigate("/", { replace: true });
-    }
+    if (!ticket.email) navigate("/", { replace: true });
   }, [navigate, ticket.email]);
 
   const ticketsQuery = useQuery({
@@ -86,33 +103,39 @@ const MyTickets = () => {
     staleTime: 60_000,
     gcTime: 10 * 60_000,
     refetchOnWindowFocus: false,
-    queryFn: async () => {
+    queryFn: async (): Promise<TicketListItem[]> => {
       const response = await fetch("/api/my-tickets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: ticket.email }),
       });
       const payload = (await response.json().catch(() => null)) as
-        | {
-            message?: string;
-            learner?: { fullName?: string };
-            tickets?: RestoredTicketPayload[];
-          }
+        | { message?: string; learner?: { fullName?: string }; tickets?: RestoredTicketPayload[] }
         | null;
 
-      if (!response.ok) {
-        throw new Error(payload?.message || "We could not load your tickets right now.");
-      }
+      if (!response.ok) throw new Error(payload?.message || "We could not load your tickets right now.");
 
       const learnerName = payload?.learner?.fullName || ticket.learnerName;
       return (payload?.tickets || []).map((restoredTicket) => ({
         ticket: buildRestoredTicket(restoredTicket, learnerName),
         bookingSummary: toBookingSummary(restoredTicket.bookingSummary),
+        assignedAgentName: restoredTicket.assignedAgentName || "Unassigned",
+        updatedAt: restoredTicket.updatedAt || restoredTicket.createdAt,
       }));
     },
   });
 
   const tickets = ticketsQuery.data || [];
+  const ticketCounts = useMemo(() => ({
+    All: tickets.length,
+    Open: tickets.filter(({ ticket: item }) => item.status === "Open").length,
+    Pending: tickets.filter(({ ticket: item }) => item.status === "Pending").length,
+    Closed: tickets.filter(({ ticket: item }) => item.status === "Closed").length,
+  }), [tickets]);
+  const filteredTickets = useMemo(
+    () => activeFilter === "All" ? tickets : tickets.filter(({ ticket: item }) => item.status === activeFilter),
+    [activeFilter, tickets],
+  );
   const isInitialLoading = ticketsQuery.isLoading && !ticketsQuery.data;
   const errorMessage = ticketsQuery.error instanceof Error ? ticketsQuery.error.message : "";
 
@@ -143,101 +166,120 @@ const MyTickets = () => {
       createdAt: "",
       chatState: "open",
       liveChatRequested: false,
+      isQuickTicket: false,
       chatHistory: [],
     });
     clearBookingSummary();
     navigate("/support/inquiry");
   };
 
-  return (
-    <SupportLayout>
-      <StepIndicator current={1} />
-      <div className="mx-auto max-w-4xl">
-        <div className="mb-5 flex items-center justify-between gap-3">
-          <Button variant="ghost" onClick={() => navigate("/")}>
-            <ArrowLeft className="mr-2 h-4 w-4" />
-            Back
-          </Button>
-          <Button className="border-0 gradient-primary" onClick={startNewTicket}>
-            <MessageSquarePlus className="mr-2 h-4 w-4" />
-            Create New Ticket
-          </Button>
-        </div>
+  const scrollTicketList = (direction: "up" | "down") => {
+    tableBodyRef.current?.scrollBy({ top: direction === "up" ? -220 : 220, behavior: "smooth" });
+  };
 
-        <div className="rounded-2xl border bg-card p-6 shadow-card sm:p-8">
-          <div className="mb-6 flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-full bg-primary/10">
-              <ListChecks className="h-5 w-5 text-primary" />
-            </div>
-            <div>
-              <h1 className="text-2xl font-semibold text-foreground">My Tickets</h1>
-              <p className="mt-1 text-sm text-muted-foreground">{ticket.email}</p>
+  return (
+    <SupportLayout fullWidth mainClassName="my-tickets-main">
+      <section className="my-tickets-page" aria-labelledby="my-tickets-title">
+        <div className="my-tickets-heading">
+          <div>
+            <h1 id="my-tickets-title">My Tickets</h1>
+            <p>Every support request linked to your registered email address.</p>
+            <div className="my-tickets-email">
+              <Mail aria-hidden="true" />
+              <span>{ticket.email}</span>
             </div>
           </div>
 
-          {ticketsQuery.isFetching && tickets.length ? (
-            <div className="mb-3 rounded-2xl border border-primary/15 bg-primary/5 px-4 py-3 text-center text-sm text-muted-foreground">
-              Refreshing tickets...
-            </div>
-          ) : null}
+          <div className="my-tickets-actions">
+            <Button
+              variant="outline"
+              onClick={() => navigate("/")}
+              className="h-[38px] rounded-full border-primary/30 bg-white px-4 hover:bg-primary/5 hover:text-primary"
+            >
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back
+            </Button>
+            <Button variant="outline" onClick={() => navigate("/")} className="my-tickets-change-email">
+              <BadgeCheck aria-hidden="true" />
+              Change email
+            </Button>
+            <Button onClick={startNewTicket} className="my-tickets-new-ticket">
+              <Plus aria-hidden="true" />
+              Start new ticket
+            </Button>
+          </div>
+        </div>
 
-          {isInitialLoading ? (
-            <div className="rounded-2xl border border-primary/15 bg-primary/5 px-4 py-8 text-center text-sm text-muted-foreground">
-              Loading your tickets...
-            </div>
-          ) : errorMessage ? (
-            <div className="rounded-2xl border border-destructive/20 bg-destructive/5 px-4 py-8 text-center">
-              <div className="text-sm font-semibold text-foreground">Tickets unavailable</div>
-              <div className="mt-1 text-sm text-muted-foreground">{errorMessage}</div>
-            </div>
-          ) : tickets.length ? (
-            <div className="space-y-3">
-              {tickets.map(({ ticket: oldTicket, bookingSummary }) => (
+        <div className="my-tickets-filters" role="tablist" aria-label="Filter tickets by status">
+          {(["All", "Open", "Pending", "Closed"] as const).map((filter) => (
+            <button
+              key={filter}
+              type="button"
+              role="tab"
+              aria-selected={activeFilter === filter}
+              className={cn("my-tickets-filter", activeFilter === filter && "is-active")}
+              onClick={() => setActiveFilter(filter)}
+            >
+              <span>{filter === "All" ? "All Tickets" : filter}</span>
+              <span className="my-tickets-filter__count">{ticketCounts[filter]}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="my-tickets-divider" />
+
+        <div className="my-tickets-table" aria-busy={isInitialLoading || ticketsQuery.isFetching}>
+          <div className="my-tickets-table__header" role="row">
+            <span>Ticket</span><span>Subject</span><span>Category</span><span>Agent</span><span>Status</span><span>Updated</span><span>View</span>
+          </div>
+
+          <div ref={tableBodyRef} className="my-tickets-table__body">
+            {ticketsQuery.isFetching && tickets.length ? <div className="my-tickets-table__notice">Refreshing tickets...</div> : null}
+            {isInitialLoading ? (
+              <div className="my-tickets-table__state">Loading your tickets...</div>
+            ) : errorMessage ? (
+              <div className="my-tickets-table__state my-tickets-table__state--error">
+                <strong>Tickets unavailable</strong><span>{errorMessage}</span>
+              </div>
+            ) : filteredTickets.length ? (
+              filteredTickets.map(({ ticket: oldTicket, bookingSummary, assignedAgentName, updatedAt }) => (
                 <button
                   key={oldTicket.id}
                   type="button"
-                  className="w-full rounded-2xl border border-primary/15 bg-card px-4 py-4 text-left transition hover:border-primary/40 hover:bg-primary/5"
+                  className="my-tickets-row"
                   onClick={() => openTicket(oldTicket, bookingSummary)}
+                  aria-label={`View ticket ${oldTicket.id}`}
                 >
-                  <div className="flex items-start gap-3">
-                    <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10">
-                      <TicketIcon className="h-4 w-4 text-primary" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-semibold text-foreground">{oldTicket.id}</span>
-                        <span className="rounded-full border px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
-                          {oldTicket.status}
-                        </span>
-                      </div>
-                      <div className="mt-1 truncate text-sm font-medium text-foreground">
-                        {oldTicket.subject || oldTicket.category || "Support request"}
-                      </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {oldTicket.category}
-                        {oldTicket.technicalSubcategory ? ` - ${oldTicket.technicalSubcategory}` : ""}
-                        {bookingSummary?.reservationConfirmed
-                          ? " - Meeting reserved"
-                          : isAwaitingSupportReviewTicket(oldTicket)
-                            ? " - Waiting for team review"
-                            : oldTicket.status === "Pending"
-                              ? " - Waiting for update"
-                              : ""}
-                      </div>
-                    </div>
-                    <CalendarClock className="mt-1 h-4 w-4 shrink-0 text-muted-foreground" />
-                  </div>
+                  <span className="my-tickets-cell my-tickets-cell--ticket" data-label="Ticket">{oldTicket.id}</span>
+                  <span className="my-tickets-cell my-tickets-cell--subject" data-label="Subject">{oldTicket.subject || oldTicket.inquiry || "Support request"}</span>
+                  <span className="my-tickets-cell" data-label="Category">{ticketCategoryLabel(oldTicket)}</span>
+                  <span className="my-tickets-cell" data-label="Agent">{assignedAgentName}</span>
+                  <span className="my-tickets-cell" data-label="Status">
+                    <span className={`my-tickets-status my-tickets-status--${oldTicket.status.toLowerCase()}`}>{oldTicket.status}</span>
+                  </span>
+                  <span className="my-tickets-cell" data-label="Updated">{formatUpdatedDate(updatedAt)}</span>
+                  <span className="my-tickets-cell my-tickets-cell--view" aria-hidden="true"><ChevronRight /></span>
                 </button>
-              ))}
+              ))
+            ) : (
+              <div className="my-tickets-table__state">
+                <strong>{tickets.length ? `No ${activeFilter.toLowerCase()} tickets` : "No previous tickets found"}</strong>
+                <span>{tickets.length ? "Choose another status filter." : "Start a new ticket whenever you need support."}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="my-tickets-table__footer">
+            <div><ListFilter aria-hidden="true" /><span>Scroll the list to see all {filteredTickets.length} tickets</span></div>
+            <div className="my-tickets-scroll-controls">
+              <button type="button" onClick={() => scrollTicketList("up")} aria-label="Scroll tickets up"><ChevronUp /></button>
+              <button type="button" onClick={() => scrollTicketList("down")} aria-label="Scroll tickets down"><ChevronDown /></button>
             </div>
-          ) : (
-            <div className="rounded-2xl border border-dashed px-4 py-10 text-center">
-              <div className="text-sm font-semibold text-foreground">No previous tickets found</div>
-              <div className="mt-1 text-sm text-muted-foreground">You can create a new support inquiry for this email.</div>
-            </div>
-          )}
+          </div>
         </div>
-      </div>
+
+        <p className="my-tickets-summary">Showing {filteredTickets.length} of {tickets.length} tickets. Ticket data is linked to {ticket.email}.</p>
+      </section>
     </SupportLayout>
   );
 };

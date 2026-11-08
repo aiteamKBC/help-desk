@@ -18,17 +18,23 @@ const defaultActions = (
  * purple gradient, lavender wave). `actions` replaces the default Admin button
  * with route-specific navigation; everything else is shared.
  *
- * `variant="banner"` (admin dashboard and Knowledge Base) renders the approved
- * header artwork instead of the composed photo, gradient and wave.
+ * `variant="banner"` (admin dashboard, Knowledge Base and support-flow pages)
+ * renders the approved header artwork instead of the composed photo, gradient
+ * and wave.
  */
 export const SupportMasterHeader = ({
   actions = defaultActions,
   variant = "photo",
+  mobileActionRow = false,
 }: {
   actions?: ReactNode;
   variant?: "photo" | "banner";
+  mobileActionRow?: boolean;
 }) => variant === "banner" ? (
-  <header className="support-master-header support-master-header--banner" aria-label="Kent Business College">
+  <header
+    className={`support-master-header support-master-header--banner${mobileActionRow ? " support-master-header--mobile-action-row" : ""}`}
+    aria-label="Kent Business College"
+  >
     <img
       src="/kbc-dashboard-header.jpg"
       alt="Kent Business College campus building with the college crest"

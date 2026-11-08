@@ -31,8 +31,11 @@ export const SupportLayout = ({
   const location = useLocation();
   const isKnowledgeBaseArea = location.pathname.startsWith("/knowledge-base");
   const isAdminDashboardArea = location.pathname === "/admin" || location.pathname === "/agent";
-  // The admin dashboard and the Knowledge Base share the approved campus header and theme.
-  const usesMasterHeader = isAdminDashboardArea || isKnowledgeBaseArea;
+  const isSupportFlowArea = location.pathname.startsWith("/support/");
+  // Internal support-flow pages share the approved dashboard banner. The public
+  // support landing page and the admin login keep their existing presentation.
+  const usesBannerHeader = isAdminDashboardArea || isKnowledgeBaseArea || isSupportFlowArea;
+  const usesAdminTheme = isAdminDashboardArea || isKnowledgeBaseArea;
   const isAdminArea =
     location.pathname.startsWith("/admin") ||
     location.pathname.startsWith("/agent") ||
@@ -129,6 +132,20 @@ export const SupportLayout = ({
       {right}
     </>
   );
+  const supportFlowHeaderActions = (
+    <>
+      {left}
+      <Link to="/knowledge-base" className={supportMasterHeaderPillClassName}>
+        <BookOpen aria-hidden="true" />
+        <span>Knowledge Base</span>
+      </Link>
+      <Link to="/admin" className={supportMasterHeaderPillClassName}>
+        <ShieldCheck aria-hidden="true" />
+        <span>Admin</span>
+      </Link>
+      {right}
+    </>
+  );
 
   useEffect(() => {
     syncAdminPortalReturnFromSearch(location.search);
@@ -140,16 +157,28 @@ export const SupportLayout = ({
     <div
       className={cn(
         "min-h-screen",
-        usesMasterHeader
+        usesAdminTheme
           ? "support-admin-theme font-[Inter,ui-sans-serif,system-ui,-apple-system,'Segoe_UI',sans-serif]"
-          : "gradient-soft",
+          : isSupportFlowArea
+            ? "support-flow-theme"
+            : "gradient-soft",
         isKnowledgeBaseArea && "support-kb-theme",
         landing && "support-landing",
       )}
     >
       {effectiveShowHeader ? (
-        usesMasterHeader ? (
-          <SupportMasterHeader variant="banner" actions={isKnowledgeBaseArea ? knowledgeBaseHeaderActions : adminDashboardHeaderActions} />
+        usesBannerHeader ? (
+          <SupportMasterHeader
+            variant="banner"
+            mobileActionRow={isSupportFlowArea}
+            actions={
+              isKnowledgeBaseArea
+                ? knowledgeBaseHeaderActions
+                : isAdminDashboardArea
+                  ? adminDashboardHeaderActions
+                  : supportFlowHeaderActions
+            }
+          />
         ) : isAdminArea ? (
           <header className="sticky top-0 z-30 border-b border-black/5 bg-white">
             <div className={cn("sm:hidden", adminHeaderShellClassName)}>

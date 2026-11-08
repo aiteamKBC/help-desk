@@ -79,3 +79,19 @@
   outline: none;
   box-shadow: 0 0 0 3px rgba(124, 58, 237, .14);
 }
+
+/*
+ * Support flow (/support/*): one lavender page background for every step and
+ * support path, applied once on the layout root: #F8F6FF directly under the
+ * header, #F3EFFF mid-page, #EBE5FF at the bottom. Page sections are
+ * transparent and sit on top of it.
+ */
+.support-flow-theme {
+  --support-page-bg: #f8f6ff;
+  background: linear-gradient(
+    180deg,
+    #f8f6ff var(--support-banner-header-h),
+    #f3efff 55%,
+    #ebe5ff 100%
+  );
+}

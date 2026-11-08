@@ -1,5 +1,5 @@
 import { type ComponentType, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
   ArrowRight,
@@ -11,9 +11,16 @@ import {
   PhoneCall,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import { SupportLayout } from "@/components/support/SupportLayout";
-import { SupportMasterHeader } from "@/components/support/SupportMasterHeader";
 import {
   type Ticket,
 } from "@/context/SupportContext";
@@ -41,7 +48,8 @@ interface SupportOptionAction {
 
 const SupportOptions = () => {
   const navigate = useNavigate();
-  const { ticket, bookingSummary, clearBookingSummary, updateTicket } = useSupport();
+  const location = useLocation();
+  const { ticket, bookingSummary, clearBookingSummary, updateTicket, setTicket } = useSupport();
   const [isQuickSubmitting, setIsQuickSubmitting] = useState(false);
   const [teamsCallUrl, setTeamsCallUrl] = useState("");
   const [teamsCallTargetLabel, setTeamsCallTargetLabel] = useState("");
@@ -61,6 +69,16 @@ const SupportOptions = () => {
     ticketRef.current = ticket;
   }, [ticket]);
 
+  // Back from Step 4 keeps this step open for a ticket that is already
+  // submitted (opening the page any other way still sends it to its status
+  // step). Every support method stays selectable: methods that are safe on the
+  // submitted ticket run on it unchanged; the rest ask before starting a new
+  // ticket from the same saved inquiry. See runSupportAction.
+  const [blockedAction, setBlockedAction] = useState<SupportOptionAction | null>(null);
+  const isSubmittedReview = Boolean((location.state as { reviewSubmitted?: boolean } | null)?.reviewSubmitted)
+    && Boolean(ticket.id)
+    && shouldShowStatusStep(ticket, bookingSummary);
+
   useEffect(() => {
     if (!ticket.email) {
       navigate("/support");
@@ -72,10 +90,10 @@ const SupportOptions = () => {
       return;
     }
 
-    if (ticket.id && shouldShowStatusStep(ticket, bookingSummary)) {
+    if (ticket.id && shouldShowStatusStep(ticket, bookingSummary) && !isSubmittedReview) {
       navigate(getSupportResumePath(ticket, bookingSummary));
     }
-  }, [bookingSummary, navigate, ticket]);
+  }, [bookingSummary, isSubmittedReview, navigate, ticket]);
 
   useEffect(() => {
     if (!ticket.id || clearedBookingProgressTicketRef.current === ticket.id) {
@@ -322,6 +340,48 @@ const SupportOptions = () => {
     }
   };
 
+  const isSubmittedTicket = Boolean(ticket.id) && shouldShowStatusStep(ticket, bookingSummary);
+
+  // Methods that can run on an already-submitted ticket without changing its
+  // status: the Teams call only routes the ticket to the support admin. Every
+  // other method would resubmit, rebook or reopen it.
+  const canRunOnSubmittedTicket = (action: SupportOptionAction) =>
+    action.id === "teams-call" && ticket.status !== "Closed";
+
+  const runSupportAction = (action: SupportOptionAction) => {
+    if (isSubmittedTicket && !canRunOnSubmittedTicket(action)) {
+      setBlockedAction(action);
+      return;
+    }
+
+    void action.onClick();
+  };
+
+  // Explicit user choice only: copy the saved inquiry (requester, category,
+  // subject, details, attachments) into a fresh draft, leaving the submitted
+  // ticket untouched, then run the chosen method, which creates the new ticket.
+  const startNewTicketWithAction = (action: SupportOptionAction) => {
+    const freshDraft = {
+      ...ticketRef.current,
+      id: "",
+      status: "Open" as const,
+      statusReason: "",
+      assignedAgentId: null,
+      assignedTeam: "Unassigned",
+      slaStatus: "Pending Review",
+      createdAt: "",
+      chatState: "open" as const,
+      liveChatRequested: false,
+      isQuickTicket: false,
+      chatHistory: [],
+    };
+    setBlockedAction(null);
+    clearBookingSummary();
+    ticketRef.current = freshDraft;
+    setTicket(freshDraft);
+    void action.onClick();
+  };
+
   const supportActions: SupportOptionAction[] = [
     {
       id: "chatbot",
@@ -435,8 +495,7 @@ const SupportOptions = () => {
     },
   ];
   return (
-    <SupportLayout showHeader={false} fullWidth mainClassName="support-options-main">
-      <SupportMasterHeader />
+    <SupportLayout fullWidth mainClassName="support-options-main">
 
       <div className="support-options-body">
         <div className="support-options-steps">
@@ -446,7 +505,6 @@ const SupportOptions = () => {
         <div className="support-options-shell">
           <div className="support-options-heading">
             <div className="support-options-heading__text">
-              <span className="support-options-eyebrow">Support Options</span>
               <h1>{pageTitle}</h1>
               <p>{pageDescription}</p>
             </div>
@@ -487,7 +545,16 @@ const SupportOptions = () => {
               </div>
             </div>
 
-            {showTeamsCall && (
+            {isSubmittedReview ? (
+              <div className="support-options-notice" role="status">
+                <div className="support-options-notice__title">{`Ticket ${ticket.id} is already ${ticket.status}`}</div>
+                <p>
+                  You can still choose any support option below. Options that would change this ticket will ask before starting a new one.
+                </p>
+              </div>
+            ) : null}
+
+            {showTeamsCall && !isSubmittedReview && (
               <div className="support-options-notice">
                 <div className="support-options-notice__title">
                   {hasPreparedTeamsCall
@@ -519,7 +586,7 @@ const SupportOptions = () => {
                   <button
                     key={action.id}
                     type="button"
-                    onClick={() => void action.onClick()}
+                    onClick={() => runSupportAction(action)}
                     disabled={action.disabled}
                     className="support-options-card"
                     data-action={action.id}
@@ -549,6 +616,34 @@ const SupportOptions = () => {
           </section>
         </div>
       </div>
+      <Dialog open={Boolean(blockedAction)} onOpenChange={(open) => !open && setBlockedAction(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              {blockedAction?.id === "quick-ticket" ? "This ticket is already submitted" : `${blockedAction?.title || "This option"} needs a new ticket`}
+            </DialogTitle>
+            <DialogDescription>
+              {blockedAction?.id === "quick-ticket"
+                ? `Ticket ${ticket.id} has already been submitted to the support team and will not be sent again. You can follow it in Step 4, or start a new ticket with the same inquiry.`
+                : `Ticket ${ticket.id} is ${ticket.status}, so ${blockedAction?.title || "this option"} can't be added to it without changing it. You can start a new ticket with the same inquiry instead. Ticket ${ticket.id} stays as it is.`}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            {blockedAction?.id === "quick-ticket" ? (
+              <Button variant="outline" onClick={() => { setBlockedAction(null); navigate("/support/status"); }}>
+                View ticket status
+              </Button>
+            ) : (
+              <Button variant="outline" onClick={() => setBlockedAction(null)}>
+                Cancel
+              </Button>
+            )}
+            <Button onClick={() => blockedAction && startNewTicketWithAction(blockedAction)}>
+              Start a new ticket
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </SupportLayout>
   );
 };

@@ -20,7 +20,7 @@ main.support-options-main {
   margin: 0;
   padding: 0;
   overflow-x: clip;
-  background: #eeeafd;
+  background: transparent;
   color: var(--so-ink);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-feature-settings: "cv11", "ss01";
@@ -30,29 +30,12 @@ main.support-options-main {
 
 .support-options-body {
   position: relative;
-  min-height: calc(100svh - 184px);
+  min-height: calc(100svh - var(--support-banner-header-h));
   padding: 24px 32px 96px;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 10% 14%, rgba(255, 255, 255, .5), transparent 30%),
-    radial-gradient(circle at 92% 40%, rgba(255, 255, 255, .4), transparent 32%),
-    linear-gradient(180deg, #eeeafd 0%, #e9e4fc 100%);
+  background: transparent;
 }
 
-.support-options-body::before,
-.support-options-body::after {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  left: -10%;
-  right: -10%;
-  height: 200px;
-  border-radius: 50%;
-  pointer-events: none;
-}
-
-.support-options-body::before { bottom: -140px; background: rgba(216, 205, 252, .45); }
-.support-options-body::after { bottom: -170px; background: rgba(204, 190, 250, .4); }
 
 .support-options-steps,
 .support-options-shell {
@@ -127,17 +110,6 @@ main.support-options-main {
 
 .support-options-heading__text { min-width: 0; }
 
-.support-options-eyebrow {
-  display: block;
-  margin-bottom: 8px;
-  color: var(--so-primary);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 16px;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-}
-
 .support-options-heading h1 {
   margin: 0;
   color: var(--so-ink);
@@ -158,18 +130,21 @@ main.support-options-main {
 
 .support-options-main .support-options-back {
   flex-shrink: 0;
+  /* Centred on the 44px title line. */
+  margin-top: 2px;
   height: 40px;
-  gap: 8px;
-  padding: 0 16px 0 12px;
-  border: 1px solid var(--so-line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, .6);
-  color: var(--so-ink);
+  gap: 12px;
+  padding: 0 20px 0 16px;
+  border: 1px solid #c9b8f7;
+  border-radius: 999px;
+  background: #fff;
+  color: #171329;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(65, 36, 146, .06);
 }
 
-.support-options-main .support-options-back:hover { background: #fff; color: var(--so-primary); }
+.support-options-main .support-options-back:hover { border-color: #9f86f2; background: #fff; color: var(--so-primary); }
 .support-options-main .support-options-back svg { width: 16px; height: 16px; margin: 0; }
 
 /* ---------- Inquiry summary ---------- */
@@ -451,7 +426,7 @@ main.support-options-main {
   .support-options-steps .bg-border { margin-right: 6px; margin-bottom: 22px; margin-left: 6px; }
 
   .support-options-heading { flex-direction: column-reverse; gap: 12px; margin-bottom: 16px; }
-  .support-options-main .support-options-back { align-self: flex-start; height: 36px; }
+  .support-options-main .support-options-back { align-self: flex-start; margin-top: 0; height: 36px; }
   .support-options-heading h1 { font-size: 28px; line-height: 36px; }
   .support-options-heading p { font-size: 14px; line-height: 20px; }
 

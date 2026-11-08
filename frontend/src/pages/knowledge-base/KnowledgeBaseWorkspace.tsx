@@ -1,6 +1,6 @@
 import { useDeferredValue, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { AlertCircle, CheckCircle2, Eraser, FilePlus2, LoaderCircle, Plus, Save, Search } from "lucide-react";
+import { AlertCircle, ArrowLeft, CheckCircle2, Eraser, FilePlus2, LoaderCircle, Plus, Save, Search } from "lucide-react";
 import { SupportLayout } from "@/components/support/SupportLayout";
 import { AttachmentPanel } from "@/components/knowledge-base/AttachmentPanel";
 import { Badge } from "@/components/ui/badge";
@@ -366,6 +366,16 @@ const KnowledgeBaseWorkspace = () => {
             <p className="mt-1 text-sm text-muted-foreground">Search, open, and edit technical support articles.</p>
           </div>
 
+          <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => navigate("/admin")}
+            className="h-10 rounded-full border-primary/30 bg-white px-4 hover:bg-primary/5 hover:text-primary"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back
+          </Button>
           <div className="inline-flex w-fit shrink-0 gap-1 rounded-full border bg-card p-1 shadow-[0_1px_2px_rgba(23,21,43,0.04)]">
             <button
               type="button"
@@ -386,6 +396,7 @@ const KnowledgeBaseWorkspace = () => {
             >
               Article Creation
             </button>
+          </div>
           </div>
         </div>
 

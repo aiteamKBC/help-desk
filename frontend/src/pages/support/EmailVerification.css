@@ -395,84 +395,111 @@
 @media (min-width: 761px) {
   .support-landing { --u: min(calc(100vw / 1712), calc(100svh / 913)); }
 
-  .support-landing > header > div { padding: calc(15 * var(--u)) 5.5%; }
+  /* Right column (header pill, steps, heading, field, button): fixed sizes that
+     match the Admin Login form (AdminLogin.css), not the scaled design frame. */
+  .support-landing > header > div { min-height: 0; padding: 20px 5.5%; }
 
   .support-landing > header a {
-    background: rgba(246, 242, 255, .92);
-    box-shadow: 0 4px 14px rgba(65, 36, 146, .1);
-    min-height: max(36px, calc(46 * var(--u)));
-    gap: max(8px, calc(10 * var(--u)));
-    padding: 0 max(16px, calc(22 * var(--u)));
+    min-height: 40px;
+    gap: 8px;
+    padding: 0 18px;
+    border: 1px solid #c9b8f7;
     border-radius: 999px;
-    font-size: max(12px, calc(18 * var(--u)));
+    background: rgba(255, 255, 255, .72);
+    color: #171329;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    font-weight: 500;
     line-height: 1;
+    box-shadow: 0 4px 14px rgba(65, 36, 146, .08);
   }
 
-  .support-landing > header a svg {
-    width: max(12px, calc(18 * var(--u)));
-    height: max(12px, calc(18 * var(--u)));
-  }
+  .support-landing > header a:hover { border-color: #9f86f2; background: #fff; color: #5722e8; }
+
+  .support-landing > header a svg { width: 16px; height: 16px; stroke-width: 1.75; }
 
   .support-hero-copy { left: calc(75 * var(--u)); bottom: 12.4%; max-width: 36%; }
   .support-landing .support-hero-copy h2 { font-size: max(28px, calc(56 * var(--u))); }
   .support-hero-copy p { margin-top: calc(18 * var(--u)); font-size: max(14px, calc(23 * var(--u))); }
 
   .support-entry { padding: 72px calc(87 * var(--u)) 48px calc(62 * var(--u)); }
-  .support-entry-content { max-width: max(480px, calc(810 * var(--u))); }
-
-  .support-entry-steps { width: 78%; margin-bottom: max(32px, calc(88 * var(--u))); }
-
-  .support-entry-steps button {
-    width: max(32px, calc(52 * var(--u)));
-    height: max(32px, calc(52 * var(--u)));
-    font-size: max(12px, calc(21 * var(--u)));
-    line-height: 1;
+  .support-entry-content {
+    max-width: clamp(380px, 28vw, 520px);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   }
 
-  .support-entry-steps button + span { font-size: max(12px, calc(22 * var(--u))); line-height: 1.2; }
+  .support-entry-steps { width: 100%; margin-bottom: 40px; }
 
-  .support-entry-steps .bg-border {
-    margin-right: calc(16 * var(--u));
-    margin-left: calc(16 * var(--u));
-    margin-bottom: max(22px, calc(36 * var(--u)));
+  .support-entry-steps button { width: 32px; height: 32px; font-size: 13px; font-weight: 500; line-height: 1; }
+
+  .support-entry-steps button + span { font-size: 13px; font-weight: 500; line-height: 16px; }
+
+  .support-entry-steps .bg-border { margin-right: 10px; margin-left: 10px; margin-bottom: 24px; }
+
+  .support-landing .support-entry-heading h1 {
+    color: #171329;
+    font-size: 36px;
+    font-weight: 600;
+    line-height: 44px;
+    letter-spacing: -.02em;
   }
-
-  .support-landing .support-entry-heading h1 { font-size: max(32px, calc(56 * var(--u))); line-height: 1.15; }
 
   .support-entry-heading > p {
-    margin: calc(28 * var(--u)) 0 calc(46 * var(--u));
-    font-size: max(14px, calc(26 * var(--u)));
-    color: #1c1b45;
-    line-height: 1.46;
+    margin: 12px 0 32px;
+    color: #292638;
+    font-size: 16px;
+    line-height: 24px;
+    letter-spacing: 0;
   }
 
-  .support-entry-form { gap: max(16px, calc(37 * var(--u))); }
+  .support-entry-form { gap: 16px; }
 
   .support-email-field > svg {
-    left: calc(30 * var(--u));
-    width: max(12px, calc(30 * var(--u)));
-    height: max(12px, calc(30 * var(--u)));
+    left: 16px;
+    width: 18px;
+    height: 18px;
+    color: #555269;
     stroke-width: 1.6;
   }
 
   .support-email-field input {
-    height: max(48px, calc(73 * var(--u)));
-    padding: 0 calc(24 * var(--u)) 0 max(40px, calc(86 * var(--u)));
-    border-width: 2px;
-    border-radius: max(12px, calc(19 * var(--u)));
-    font-size: max(14px, calc(23 * var(--u)));
-    color: #08082e;
+    height: 50px;
+    padding: 0 16px 0 46px;
+    border: 1.5px solid #cdbff7;
+    border-radius: 12px;
+    background: rgba(239, 237, 253, .78);
+    color: #171329;
+    font-size: 15px;
+    line-height: 20px;
+    box-shadow: none;
+  }
+
+  .support-email-field input::placeholder { color: #8a879e; }
+  .support-email-field input:hover { border-color: #b39ff3; }
+
+  .support-email-field input:focus-visible {
+    border-color: #5722e8;
+    background: #fff;
+    outline: 3px solid rgba(87, 34, 232, .14);
+    outline-offset: 0;
+    box-shadow: none;
+    --tw-ring-shadow: 0 0 #0000;
+    --tw-ring-offset-shadow: 0 0 #0000;
   }
 
   .support-entry-form .support-next-button {
-    height: max(40px, calc(64 * var(--u)));
-    gap: calc(16 * var(--u));
-    border-radius: max(12px, calc(18 * var(--u)));
-    font-size: max(12px, calc(27 * var(--u)));
+    height: 50px;
+    margin-top: 8px;
+    gap: 10px;
+    padding: 0 20px;
+    border-radius: 12px;
+    font-size: 14px;
     font-weight: 500;
+    line-height: 20px;
+    box-shadow: 0 8px 20px rgba(83, 31, 226, .18);
   }
 
-  .support-entry-form .support-next-button svg { width: max(12px, calc(28 * var(--u))); height: max(12px, calc(28 * var(--u))); }
+  .support-entry-form .support-next-button svg { width: 18px; height: 18px; stroke-width: 1.75; }
 }
 
 @media (max-width: 760px) {
