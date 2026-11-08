@@ -10143,6 +10143,14 @@ class AdminTicketPermanentDeleteTests(SimpleTestCase):
         mock_connection.cursor.return_value = cursor_context
         return mock_connection, cursor
 
+    def test_delete_admin_ticket_permanently_requires_explicit_confirmation(self):
+        with patch.object(services, "fetch_actor_by_username") as fetch_actor:
+            with self.assertRaises(services.ApiError) as raised_error:
+                services.delete_admin_ticket_permanently("KBC-000017", {"actorUsername": "super"})
+
+        self.assertEqual(raised_error.exception.status_code, 400)
+        fetch_actor.assert_not_called()
+
     def test_delete_admin_ticket_permanently_requires_superadmin(self):
         actor_row = {
             "id": 9,
@@ -10155,7 +10163,7 @@ class AdminTicketPermanentDeleteTests(SimpleTestCase):
             with self.assertRaises(services.ApiError) as raised_error:
                 services.delete_admin_ticket_permanently(
                     "KBC-000017",
-                    {"actorUsername": "omar", "confirmTicketId": "KBC-000017"},
+                    {"actorUsername": "omar", "confirmDelete": True},
                 )
 
         self.assertEqual(raised_error.exception.status_code, 403)
@@ -10184,7 +10192,7 @@ class AdminTicketPermanentDeleteTests(SimpleTestCase):
             with self.assertRaises(services.ApiError) as raised_error:
                 services.delete_admin_ticket_permanently(
                     "KBC-000017",
-                    {"actorUsername": "super", "confirmTicketId": "KBC-000017"},
+                    {"actorUsername": "super", "confirmDelete": True},
                 )
 
         self.assertEqual(raised_error.exception.status_code, 409)
@@ -10220,7 +10228,7 @@ class AdminTicketPermanentDeleteTests(SimpleTestCase):
         ):
             response = services.delete_admin_ticket_permanently(
                 "KBC-000017",
-                {"actorUsername": "super", "confirmTicketId": "KBC-000017"},
+                {"actorUsername": "super", "confirmDelete": True},
             )
 
         self.assertEqual(response["ticketId"], "KBC-000017")
@@ -10276,7 +10284,7 @@ class AdminTicketPermanentDeleteTests(SimpleTestCase):
         ):
             response = services.delete_admin_ticket_permanently(
                 "KBC-000017",
-                {"actorUsername": "super", "confirmTicketId": "KBC-000017"},
+                {"actorUsername": "super", "confirmDelete": True},
             )
 
         self.assertEqual(response["ticketId"], "KBC-000017")
