@@ -55,7 +55,7 @@ describe("SupportLayout admin return link", () => {
       "/kbc-dashboard-header.jpg",
     );
     expect(screen.getByRole("link", { name: /Admin/i })).toHaveAttribute("href", "/admin");
-    expect(screen.getByRole("link", { name: /Knowledge Base/i })).toHaveAttribute("href", "/knowledge-base");
+    expect(screen.queryByRole("link", { name: /Knowledge Base/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Back/i })).not.toBeInTheDocument();
   });
 

@@ -1231,6 +1231,7 @@ describe("AgentDashboard runtime", () => {
 
     const notificationButton = screen.getAllByRole("button", { name: /transfer requests/i }).slice(-1)[0];
     expect(notificationButton).toBeTruthy();
+    // The bell shows this admin's outstanding (undismissed) notifications.
     expect(within(notificationButton as HTMLElement).getByText("1")).toBeInTheDocument();
 
     fireEvent.pointerDown(notificationButton as HTMLElement, {
@@ -1242,6 +1243,114 @@ describe("AgentDashboard runtime", () => {
     expect(await screen.findByText("Learning Plan Transfers")).toBeInTheDocument();
     expect(screen.getByText("Ticket KBC-000003")).toBeInTheDocument();
     expect(screen.getByText(/Support Desk to Learning Plan Team/i)).toBeInTheDocument();
+  });
+
+  const learningPlanTransferKey = "learning-plan-transfer:KBC-000003:2026-06-14T12:30:00.000Z:Support Desk:Learning Plan Team";
+
+  function mockTicketListWithDismissals(dismissedNotificationKeys: string[], onRequest?: (url: string, init?: RequestInit) => Response | null) {
+    const defaultFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const custom = onRequest?.(url, init);
+      if (custom) {
+        return custom;
+      }
+      if (url === "/api/admin/tickets") {
+        return new Response(JSON.stringify({ ...dashboardPayload.tickets, dismissedNotificationKeys }), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+  }
+
+  function openNotificationBell() {
+    const notificationButton = screen.getAllByRole("button", { name: /transfer requests/i }).slice(-1)[0] as HTMLElement;
+    fireEvent.pointerDown(notificationButton, { button: 0, ctrlKey: false });
+    return notificationButton;
+  }
+
+  it("hides notifications this admin already dismissed, including after a reload", async () => {
+    mockTicketListWithDismissals([learningPlanTransferKey]);
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=adminDashboard"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("tabpanel");
+
+    const notificationButton = screen.getAllByRole("button", { name: /transfer requests/i }).slice(-1)[0] as HTMLElement;
+    await waitFor(() => expect(within(notificationButton).queryByText("1")).not.toBeInTheDocument());
+    openNotificationBell();
+    expect(await screen.findByText(/No admin notifications right now/i)).toBeInTheDocument();
+    expect(screen.queryByText("Ticket KBC-000003")).not.toBeInTheDocument();
+  });
+
+  it("dismisses all notifications for the signed-in admin only", async () => {
+    let dismissRequestBody: unknown = null;
+    let dismissed = false;
+    mockTicketListWithDismissals([], (url, init) => {
+      if (url === "/api/admin/notifications/dismiss") {
+        dismissRequestBody = JSON.parse(String(init?.body || "{}"));
+        dismissed = true;
+        return new Response(JSON.stringify({ dismissedNotificationKeys: [learningPlanTransferKey], skipped: 0 }), { status: 200 });
+      }
+      if (url === "/api/admin/tickets" && dismissed) {
+        // The ticket and its notification event are unchanged on the server.
+        return new Response(JSON.stringify({ ...dashboardPayload.tickets, dismissedNotificationKeys: [learningPlanTransferKey] }), { status: 200 });
+      }
+      return null;
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/admin?view=adminDashboard"]}>
+        <AgentDashboard />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("tabpanel");
+
+    const notificationButton = openNotificationBell();
+    expect(await screen.findByText("Ticket KBC-000003")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss all" }));
+
+    await waitFor(() => expect(dismissRequestBody).toEqual({
+      notifications: [{ ticketId: "KBC-000003", kind: "learning-plan-transfer" }],
+      clearAll: true,
+    }));
+    await waitFor(() => expect(within(notificationButton).queryByText("1")).not.toBeInTheDocument());
+    // Only the notification goes; the ticket itself stays on the dashboard.
+    expect(screen.getAllByText("KBC-000003").length).toBeGreaterThan(0);
+  });
+
+  it("shows the retention notice and deletion date for archived tickets", async () => {
+    const archivedTicket = {
+      ...dashboardPayload.tickets.tickets[0],
+      id: "KBC-000201",
+      isArchived: true,
+      archivedAt: "2026-08-31T12:00:00.000Z",
+      scheduledDeletionAt: "2026-11-30T12:00:00.000Z",
+    };
+    const defaultFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/api/admin/tickets/metrics")) {
+        return new Response(JSON.stringify({ metrics: null }), { status: 200 });
+      }
+      if (url.startsWith("/api/admin/tickets") && !url.includes("/metrics")) {
+        return new Response(JSON.stringify({ tickets: [...dashboardPayload.tickets.tickets, archivedTicket] }), { status: 200 });
+      }
+      return defaultFetch(input, init);
+    }) as typeof fetch;
+
+    render(<MemoryRouter initialEntries={["/admin"]}><AgentDashboard /></MemoryRouter>);
+    await screen.findByRole("tabpanel");
+    fireEvent.click(await screen.findByRole("button", { name: "Archived" }));
+
+    expect(await screen.findByText("KBC-000201")).toBeInTheDocument();
+    expect(screen.getByText(
+      "Archived tickets are retained for 3 months from their archive date and are automatically deleted afterwards.",
+    )).toBeInTheDocument();
+    expect(screen.getByText(/^Archived .*2026/)).toBeInTheDocument();
+    expect(screen.getByText(/^Deletes .*2026/)).toBeInTheDocument();
   });
 
   it("shows coverage and routed tickets in the Learning Plan Team tab", async () => {

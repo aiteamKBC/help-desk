@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, Link, useLocation } from "react-router-dom";
-import { ArrowLeft, ArrowRight, Building2, Eye, EyeOff, Lock, UserRound } from "lucide-react";
+import { ArrowLeft, ArrowRight, Eye, EyeOff, Lock, UserRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SupportCampusHero } from "@/components/support/SupportCampusHero";
@@ -27,6 +27,22 @@ interface LoginResponse {
     consoleStatus?: string;
   };
 }
+
+const MicrosoftTeamsIcon = () => (
+  <svg
+    className="microsoft-teams-icon"
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+  >
+    <circle cx="17.2" cy="5.1" r="2.15" fill="#7B83EB" />
+    <circle cx="20.7" cy="7.1" r="1.55" fill="#5059C9" />
+    <path d="M16.2 8.1h2.7c1.1 0 2 .9 2 2v4.1a3.35 3.35 0 0 1-6.7 0v-4.1c0-1.1.9-2 2-2Z" fill="#5059C9" />
+    <path d="M10.1 6.4h4.6c1.2 0 2.2 1 2.2 2.2v6.1a4.5 4.5 0 0 1-9 0V8.6c0-1.2 1-2.2 2.2-2.2Z" fill="#7B83EB" />
+    <rect x="2.2" y="7.2" width="10.2" height="10.2" rx="1.65" fill="#4B53BC" />
+    <path d="M4.45 9.55h5.7v1.45H8.02v4.3H6.56V11H4.45V9.55Z" fill="#FFFFFF" />
+  </svg>
+);
 
 const AdminLogin = () => {
   const navigate = useNavigate();
@@ -194,7 +210,7 @@ const AdminLogin = () => {
 
             <Button asChild variant="outline" className="admin-login-teams">
               <a href={microsoftLoginUrl}>
-                <Building2 aria-hidden="true" />
+                <MicrosoftTeamsIcon />
                 Sign in with Microsoft Teams
               </a>
             </Button>

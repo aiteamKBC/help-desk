@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import calendar
 import copy
 import hashlib
 import hmac
@@ -1383,6 +1384,78 @@ def get_pending_learning_plan_transfer_notification(metadata: Any) -> dict[str, 
     return normalize_pending_learning_plan_transfer_notification(
         normalize_json_object(metadata).get(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY)
     )
+
+
+# Archived tickets are kept for this many calendar months after archived_at.
+ARCHIVED_TICKET_RETENTION_MONTHS = 3
+NOTIFICATION_DISMISSALS_TABLE = "support_notification_dismissals"
+TICKET_RETENTION_AUDIT_TABLE = "ticket_retention_audit"
+MAX_BULK_NOTIFICATION_DISMISSALS = 500
+
+# Ticket notifications that every admin with access to the ticket receives.
+# Each admin dismisses them independently (support_notification_dismissals);
+# the event itself stays on the ticket. Keys match the admin dashboard's keys.
+NOTIFICATION_KIND_SUPPORT_QUEUE = "support-queue"
+NOTIFICATION_KIND_COVERAGE_TICKET = "coverage-ticket"
+NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER = "learning-plan-transfer"
+SHARED_TICKET_NOTIFICATION_KINDS = (
+    NOTIFICATION_KIND_SUPPORT_QUEUE,
+    NOTIFICATION_KIND_COVERAGE_TICKET,
+    NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER,
+)
+SHARED_TICKET_NOTIFICATION_SUMMARY_FIELDS = {
+    NOTIFICATION_KIND_SUPPORT_QUEUE: "pendingSupportQueueNotification",
+    NOTIFICATION_KIND_COVERAGE_TICKET: "pendingCoverageTicketNotification",
+    NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER: "pendingLearningPlanTransferNotification",
+}
+
+
+def add_calendar_months(value: datetime, months: int) -> datetime:
+    """Add calendar months in UTC, clamping to the last day of a shorter month
+    (30 Nov + 3 months = 28/29 Feb), the same way PostgreSQL adds an interval."""
+    normalized_value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    normalized_value = normalized_value.astimezone(timezone.utc)
+    month_index = normalized_value.month - 1 + months
+    year = normalized_value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(normalized_value.day, calendar.monthrange(year, month)[1])
+    return normalized_value.replace(year=year, month=month, day=day)
+
+
+def get_archived_ticket_deletion_at(archived_at: Any) -> datetime | None:
+    archived_at_value = coerce_datetime(archived_at)
+    if not archived_at_value:
+        return None
+    return add_calendar_months(archived_at_value, ARCHIVED_TICKET_RETENTION_MONTHS)
+
+
+def build_ticket_notification_key_from_payload(kind: str, public_id: Any, notification: Any) -> str | None:
+    normalized_public_id = sanitize_text(public_id)
+    if not normalized_public_id or not isinstance(notification, dict):
+        return None
+
+    if kind == NOTIFICATION_KIND_SUPPORT_QUEUE:
+        return f"support-queue:{normalized_public_id}:{notification.get('reason')}:{notification.get('createdAt')}"
+    if kind == NOTIFICATION_KIND_COVERAGE_TICKET:
+        return f"coverage-ticket:{normalized_public_id}:{notification.get('createdAt')}"
+    if kind == NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER:
+        return (
+            f"learning-plan-transfer:{normalized_public_id}:{notification.get('transferredAt')}"
+            f":{notification.get('fromTeam')}:{notification.get('toTeam')}"
+        )
+    return None
+
+
+def build_ticket_notification_key(kind: str, public_id: Any, metadata: Any) -> str | None:
+    if kind == NOTIFICATION_KIND_SUPPORT_QUEUE:
+        notification = get_pending_support_queue_notification(metadata)
+    elif kind == NOTIFICATION_KIND_COVERAGE_TICKET:
+        notification = get_pending_coverage_ticket_notification(metadata)
+    elif kind == NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER:
+        notification = get_pending_learning_plan_transfer_notification(metadata)
+    else:
+        return None
+    return build_ticket_notification_key_from_payload(kind, public_id, notification) if notification else None
 
 
 def is_teams_call_requested(metadata: Any) -> bool:
@@ -10902,6 +10975,11 @@ def serialize_ticket_summary(row: dict[str, Any]) -> dict[str, Any]:
         "evidenceCount": int(row.get("evidence_count") or 0),
         "isArchived": normalize_bool(row.get("is_archived")),
         "archivedAt": row.get("archived_at"),
+        "scheduledDeletionAt": (
+            serialize_datetime_value(get_archived_ticket_deletion_at(row.get("archived_at")))
+            if normalize_bool(row.get("is_archived"))
+            else None
+        ),
         "archivedById": int(row["archived_by_id"]) if row.get("archived_by_id") else None,
         "archivedByName": row.get("archived_by_name") or "",
         "archivedByUsername": row.get("archived_by_username") or "",
@@ -13675,11 +13753,16 @@ def require_agent_session_actor(
 
 
 def persist_agent_metadata(agent_id: int, metadata: dict[str, Any]) -> None:
+    # Callers write back a copy read earlier; keep the notification dismissals
+    # stored on the row now (written independently) so they are never lost.
     with connection.cursor() as cursor:
         cursor.execute(
             """
             UPDATE support_accounts
-            SET metadata = %s::jsonb,
+            SET metadata = %s::jsonb || jsonb_strip_nulls(jsonb_build_object(
+                  'dismissed_notification_keys', metadata -> 'dismissed_notification_keys',
+                  'notifications_cleared_at', metadata -> 'notifications_cleared_at'
+                )),
                 updated_at = NOW()
             WHERE id = %s
             """,
@@ -17171,10 +17254,12 @@ def list_admin_tickets(
     tickets = filter_admin_ticket_list(tickets, list_params, actor)
     tickets = sort_admin_ticket_list(tickets, list_params["sort"])
     paged_tickets, pagination = paginate_admin_ticket_list(tickets, list_params)
+    serialized_tickets = [serialize_ticket_summary(ticket) for ticket in paged_tickets]
     return {
-        "tickets": [serialize_ticket_summary(ticket) for ticket in paged_tickets],
+        "tickets": serialized_tickets,
         "pagination": pagination,
         "filters": build_admin_ticket_list_filter_response(list_params),
+        "dismissedNotificationKeys": list_actor_dismissed_notification_keys(actor, serialized_tickets),
     }
 
 
@@ -17369,9 +17454,18 @@ def list_admin_notifications(actor_username: Any, instance_id: Any, *, limit: An
         ORDER BY h.created_at DESC, h.id DESC
         LIMIT %s
         """,
-        [actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, resolved_limit],
+        # Read a few extra rows so hidden items do not shorten the list.
+        [actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, actor_id, resolved_limit + 50],
     )
     notifications = filter_admin_tickets_for_actor(notifications, actor)
+    hidden_keys = get_account_dismissed_notification_keys(
+        int(actor["id"]),
+        {build_notification_log_item_key(row.get("id")) for row in notifications},
+    )
+    notifications = [
+        row for row in notifications
+        if build_notification_log_item_key(row.get("id")) not in hidden_keys
+    ][:resolved_limit]
 
     return {"notifications": [serialize_admin_notification_log_item(row) for row in notifications]}
 
@@ -19318,171 +19412,376 @@ def acknowledge_coverage_tutor_response(public_id: str, payload: dict[str, Any])
     return detail
 
 
-def acknowledge_coverage_ticket_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    actor_username = sanitize_text(payload.get("actorUsername")).lower()
+_available_support_tables: set[str] = set()
 
-    if not public_id:
-        raise ApiError(400, "Ticket id is required.")
+
+def is_support_table_available(table_name: str) -> bool:
+    """True once the table exists. Lets the app keep working before the
+    additive schema (migrations/002_*.sql) has been applied."""
+    if table_name in _available_support_tables:
+        return True
+    row = run_query_one("SELECT to_regclass(%s) IS NOT NULL AS available", [table_name])
+    if row and row.get("available"):
+        _available_support_tables.add(table_name)
+        return True
+    return False
+
+
+ACCOUNT_DISMISSED_NOTIFICATIONS_METADATA_KEY = "dismissed_notification_keys"
+# Per-admin "cleared up to" time for the shared ticket notifications: events at
+# or before it are hidden for that admin only. Set the first time the admin
+# loads the dashboard (so an old backlog never shows) and moved to "now" by
+# Dismiss All. Newer events always show and count on the bell.
+ACCOUNT_NOTIFICATIONS_CLEARED_AT_METADATA_KEY = "notifications_cleared_at"
+
+
+def get_shared_notification_event_at(kind: str, notification: Any) -> datetime | None:
+    if not isinstance(notification, dict):
+        return None
+    field_name = "transferredAt" if kind == NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER else "createdAt"
+    return coerce_datetime(notification.get(field_name))
+
+
+def set_account_notifications_cleared_at(account_id: int, cleared_at: datetime, *, only_if_missing: bool = False) -> datetime | None:
+    """Store the cut-off on the admin's own account row (atomic single UPDATE).
+    With only_if_missing, an existing value is kept and returned instead."""
+    serialized = serialize_datetime_value(cleared_at)
+    if only_if_missing:
+        row = run_query_one(
+            """
+            UPDATE support_accounts
+            SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{notifications_cleared_at}', to_jsonb(%s::text))
+            WHERE id = %s
+              AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'notifications_cleared_at')
+            RETURNING metadata ->> 'notifications_cleared_at' AS cleared_at
+            """,
+            [serialized, account_id],
+        )
+        if row and row.get("cleared_at"):
+            return coerce_datetime(row.get("cleared_at"))
+        existing = run_query_one(
+            "SELECT metadata ->> 'notifications_cleared_at' AS cleared_at FROM support_accounts WHERE id = %s LIMIT 1",
+            [account_id],
+        )
+        return coerce_datetime((existing or {}).get("cleared_at"))
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE support_accounts
+            SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{notifications_cleared_at}', to_jsonb(%s::text))
+            WHERE id = %s
+            """,
+            [serialized, account_id],
+        )
+    return coerce_datetime(serialized)
+
+
+def record_ticket_notification_dismissals(account_id: int, entries: list[tuple[int, str]]) -> None:
+    """Save the signed-in admin's dismissals. Idempotent and safe under
+    concurrency. Uses support_notification_dismissals when that table exists
+    (migrations/002); until then the keys are kept on the admin's own
+    support_accounts.metadata, so nothing is shared with other admins."""
+    if not entries:
+        return
+    if is_support_table_available(NOTIFICATION_DISMISSALS_TABLE):
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO support_notification_dismissals (account_id, ticket_id, notification_key)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (account_id, notification_key) DO NOTHING
+                """,
+                [(account_id, ticket_id, key) for ticket_id, key in entries],
+            )
+        return
+
+    # One UPDATE statement: PostgreSQL locks the account row and re-evaluates
+    # the merge on the latest version, so simultaneous dismissals all persist.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE support_accounts
+            SET metadata = jsonb_set(
+              COALESCE(metadata, '{}'::jsonb),
+              '{dismissed_notification_keys}',
+              (
+                SELECT COALESCE(jsonb_agg(merged.key ORDER BY merged.key), '[]'::jsonb)
+                FROM (
+                  SELECT jsonb_array_elements_text(
+                    CASE
+                      WHEN jsonb_typeof(metadata -> 'dismissed_notification_keys') = 'array'
+                        THEN metadata -> 'dismissed_notification_keys'
+                      ELSE '[]'::jsonb
+                    END
+                  ) AS key
+                  UNION
+                  SELECT unnest(%s::text[]) AS key
+                ) merged
+              )
+            )
+            WHERE id = %s
+            """,
+            [sorted({key for _ticket_id, key in entries}), account_id],
+        )
+
+
+def get_account_dismissed_notification_keys(account_id: int, candidate_keys: set[str] | list[str]) -> set[str]:
+    """Which of candidate_keys this admin has dismissed (account record and,
+    when it exists, the support_notification_dismissals table)."""
+    candidates = {sanitize_text(key) for key in candidate_keys if sanitize_text(key)}
+    if not account_id or not candidates:
+        return set()
+
+    dismissed: set[str] = set()
+    account = run_query_one("SELECT metadata FROM support_accounts WHERE id = %s LIMIT 1", [account_id])
+    stored_keys = normalize_json_object((account or {}).get("metadata")).get(ACCOUNT_DISMISSED_NOTIFICATIONS_METADATA_KEY)
+    if isinstance(stored_keys, list):
+        dismissed.update(sanitize_text(key) for key in stored_keys if sanitize_text(key) in candidates)
+
+    if is_support_table_available(NOTIFICATION_DISMISSALS_TABLE):
+        rows = run_query(
+            """
+            SELECT notification_key
+            FROM support_notification_dismissals
+            WHERE account_id = %s
+              AND notification_key = ANY(%s)
+            """,
+            [account_id, sorted(candidates)],
+        )
+        dismissed.update(sanitize_text(row.get("notification_key")) for row in rows if row.get("notification_key"))
+
+    return dismissed
+
+
+def build_notification_log_item_key(history_id: Any) -> str:
+    parsed_id = parse_int(history_id, 0)
+    return f"log:{parsed_id}" if parsed_id > 0 else ""
+
+
+def dismiss_admin_notification_log_items(actor_row: dict[str, Any], raw_log_ids: Any) -> dict[str, Any]:
+    """Hide items of the signed-in admin's own Recent Log. Personal only: the
+    ticket and its history are not changed."""
+    if not isinstance(raw_log_ids, list):
+        raise ApiError(400, "logIds must be a list.")
+    if len(raw_log_ids) > MAX_BULK_NOTIFICATION_DISMISSALS:
+        raise ApiError(400, f"Dismiss at most {MAX_BULK_NOTIFICATION_DISMISSALS} notifications at a time.")
+
+    log_ids = sorted({parse_int(value, 0) for value in raw_log_ids if parse_int(value, 0) > 0})
+    if not log_ids:
+        return {"dismissedNotificationKeys": [], "skipped": len(raw_log_ids)}
+
+    rows = run_query(
+        """
+        SELECT
+          h.id AS history_id,
+          t.id,
+          t.public_id,
+          t.technical_subcategory,
+          t.assigned_team,
+          t.metadata
+        FROM ticket_history h
+        JOIN tickets t
+          ON t.id = h.ticket_id
+        WHERE h.id = ANY(%s)
+        """,
+        [log_ids],
+    )
+    entries = [
+        (int(row["id"]), build_notification_log_item_key(row.get("history_id")))
+        for row in rows
+        if actor_can_access_admin_ticket(actor_row, row)
+    ]
+    entries = [(ticket_id, key) for ticket_id, key in entries if key]
+    if entries:
+        with transaction.atomic():
+            record_ticket_notification_dismissals(int(actor_row["id"]), entries)
+
+    return {
+        "dismissedNotificationKeys": sorted({key for _ticket_id, key in entries}),
+        "skipped": len(raw_log_ids) - len(entries),
+    }
+
+
+def list_actor_dismissed_notification_keys(actor: dict[str, Any] | None, serialized_tickets: list[dict[str, Any]]) -> list[str]:
+    account_id = parse_assigned_agent_id((actor or {}).get("id"))
+    if not account_id:
+        return []
+
+    event_times: dict[str, datetime | None] = {}
+    for ticket in serialized_tickets:
+        for kind, field_name in SHARED_TICKET_NOTIFICATION_SUMMARY_FIELDS.items():
+            notification = ticket.get(field_name)
+            key = build_ticket_notification_key_from_payload(kind, ticket.get("id"), notification)
+            if key:
+                event_times[key] = get_shared_notification_event_at(kind, notification)
+    if not event_times:
+        return []
+
+    dismissed: set[str] = set()
+    account = run_query_one("SELECT metadata FROM support_accounts WHERE id = %s LIMIT 1", [account_id])
+    account_metadata = normalize_json_object((account or {}).get("metadata"))
+    stored_keys = account_metadata.get(ACCOUNT_DISMISSED_NOTIFICATIONS_METADATA_KEY)
+    if isinstance(stored_keys, list):
+        dismissed.update(sanitize_text(key) for key in stored_keys if sanitize_text(key) in event_times)
+
+    cleared_at = coerce_datetime(account_metadata.get(ACCOUNT_NOTIFICATIONS_CLEARED_AT_METADATA_KEY))
+    if not cleared_at and account:
+        cleared_at = set_account_notifications_cleared_at(
+            account_id,
+            datetime.now(timezone.utc),
+            only_if_missing=True,
+        )
+    if cleared_at:
+        dismissed.update(
+            key for key, event_at in event_times.items()
+            if event_at is not None and event_at <= cleared_at
+        )
+
+    if is_support_table_available(NOTIFICATION_DISMISSALS_TABLE):
+        rows = run_query(
+            """
+            SELECT notification_key
+            FROM support_notification_dismissals
+            WHERE account_id = %s
+              AND notification_key = ANY(%s)
+            """,
+            [account_id, sorted(event_times)],
+        )
+        dismissed.update(sanitize_text(row.get("notification_key")) for row in rows if row.get("notification_key"))
+
+    return sorted(dismissed)
+
+
+def require_notification_actor(payload: dict[str, Any]) -> dict[str, Any]:
+    actor_username = sanitize_text(payload.get("actorUsername")).lower()
     if not actor_username:
         raise ApiError(403, "Admin sign-in is required.")
-
     actor_row = fetch_actor_by_username(actor_username)
     if not actor_row:
         raise ApiError(403, "Admin sign-in is required.")
+    return actor_row
 
-    with transaction.atomic():
-        ticket = run_query_one(
-            """
-            SELECT
-              t.id,
-              t.public_id,
-              t.metadata
-            FROM tickets t
-            WHERE t.public_id = %s
-            LIMIT 1
-            """,
-            [public_id],
-        )
 
-        if not ticket:
-            raise ApiError(404, "Ticket not found.")
+def dismiss_ticket_notification_for_actor(public_id: str, payload: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Dismiss one shared ticket notification for the signed-in admin only.
+    The ticket, its status and every other admin's notifications are untouched."""
+    if not public_id:
+        raise ApiError(400, "Ticket id is required.")
+    actor_row = require_notification_actor(payload)
 
-        ticket_metadata = normalize_json_object(ticket.get("metadata"))
-        if not get_pending_coverage_ticket_notification(ticket_metadata):
-            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
+    ticket = run_query_one(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          t.technical_subcategory,
+          t.assigned_team,
+          t.metadata
+        FROM tickets t
+        WHERE t.public_id = %s
+        LIMIT 1
+        """,
+        [public_id],
+    )
+    if not ticket:
+        raise ApiError(404, "Ticket not found.")
 
-        ticket_metadata.pop(PENDING_COVERAGE_TICKET_NOTIFICATION_METADATA_KEY, None)
+    require_actor_can_access_admin_ticket(actor_row, ticket)
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE tickets
-                SET metadata = %s::jsonb,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                [json.dumps(ticket_metadata), ticket["id"]],
-            )
+    notification_key = build_ticket_notification_key(kind, ticket["public_id"], ticket.get("metadata"))
+    if notification_key:
+        with transaction.atomic():
+            record_ticket_notification_dismissals(int(actor_row["id"]), [(int(ticket["id"]), notification_key)])
 
     detail = fetch_admin_ticket_detail(public_id)
     if not detail:
         raise ApiError(404, "Ticket not found.")
 
-    return detail
+    return {**detail, "dismissedNotificationKeys": [notification_key] if notification_key else []}
+
+
+def dismiss_admin_ticket_notifications(payload: dict[str, Any]) -> dict[str, Any]:
+    """Dismiss All for the signed-in admin: records a personal dismissal for each
+    listed shared notification the admin can access and that is still current.
+    Ownership comes from the session account, never from the request body."""
+    actor_row = require_notification_actor(payload)
+    if "logIds" in payload:
+        return dismiss_admin_notification_log_items(actor_row, payload.get("logIds"))
+
+    raw_items = payload.get("notifications")
+    if not isinstance(raw_items, list):
+        raise ApiError(400, "notifications must be a list.")
+    if len(raw_items) > MAX_BULK_NOTIFICATION_DISMISSALS:
+        raise ApiError(400, f"Dismiss at most {MAX_BULK_NOTIFICATION_DISMISSALS} notifications at a time.")
+
+    requested: list[tuple[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        public_id = sanitize_text(item.get("ticketId"))
+        kind = sanitize_text(item.get("kind"))
+        if public_id and kind in SHARED_TICKET_NOTIFICATION_KINDS:
+            requested.append((public_id, kind))
+
+    if not requested:
+        if normalize_bool(payload.get("clearAll")):
+            with transaction.atomic():
+                set_account_notifications_cleared_at(int(actor_row["id"]), datetime.now(timezone.utc))
+        return {"dismissedNotificationKeys": [], "skipped": len(raw_items)}
+
+    tickets = run_query(
+        """
+        SELECT
+          t.id,
+          t.public_id,
+          t.technical_subcategory,
+          t.assigned_team,
+          t.metadata
+        FROM tickets t
+        WHERE t.public_id = ANY(%s)
+        """,
+        [sorted({public_id for public_id, _kind in requested})],
+    )
+    tickets_by_public_id = {sanitize_text(ticket.get("public_id")): ticket for ticket in tickets}
+
+    entries: list[tuple[int, str]] = []
+    skipped = len(raw_items) - len(requested)
+    for public_id, kind in requested:
+        ticket = tickets_by_public_id.get(public_id)
+        if not ticket or not actor_can_access_admin_ticket(actor_row, ticket):
+            skipped += 1
+            continue
+        notification_key = build_ticket_notification_key(kind, public_id, ticket.get("metadata"))
+        if not notification_key:
+            skipped += 1
+            continue
+        entries.append((int(ticket["id"]), notification_key))
+
+    with transaction.atomic():
+        if entries:
+            record_ticket_notification_dismissals(int(actor_row["id"]), entries)
+        if normalize_bool(payload.get("clearAll")):
+            # Everything up to now is cleared for this admin only, including
+            # alerts not listed in this request; newer alerts still show.
+            set_account_notifications_cleared_at(int(actor_row["id"]), datetime.now(timezone.utc))
+
+    return {
+        "dismissedNotificationKeys": sorted({key for _ticket_id, key in entries}),
+        "skipped": skipped,
+    }
+
+
+def acknowledge_coverage_ticket_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return dismiss_ticket_notification_for_actor(public_id, payload, NOTIFICATION_KIND_COVERAGE_TICKET)
 
 
 def acknowledge_support_queue_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    actor_username = sanitize_text(payload.get("actorUsername")).lower()
-
-    if not public_id:
-        raise ApiError(400, "Ticket id is required.")
-    if not actor_username:
-        raise ApiError(403, "Admin sign-in is required.")
-
-    actor_row = fetch_actor_by_username(actor_username)
-    if not actor_row:
-        raise ApiError(403, "Admin sign-in is required.")
-
-    with transaction.atomic():
-        ticket = run_query_one(
-            """
-            SELECT
-              t.id,
-              t.public_id,
-              t.technical_subcategory,
-              t.assigned_team,
-              t.metadata
-            FROM tickets t
-            WHERE t.public_id = %s
-            LIMIT 1
-            """,
-            [public_id],
-        )
-
-        if not ticket:
-            raise ApiError(404, "Ticket not found.")
-
-        require_actor_can_access_admin_ticket(actor_row, ticket)
-
-        ticket_metadata = normalize_json_object(ticket.get("metadata"))
-        if not get_pending_support_queue_notification(ticket_metadata):
-            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
-
-        ticket_metadata.pop(PENDING_SUPPORT_QUEUE_NOTIFICATION_METADATA_KEY, None)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE tickets
-                SET metadata = %s::jsonb,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                [json.dumps(ticket_metadata), ticket["id"]],
-            )
-
-    detail = fetch_admin_ticket_detail(public_id)
-    if not detail:
-        raise ApiError(404, "Ticket not found.")
-
-    return detail
+    return dismiss_ticket_notification_for_actor(public_id, payload, NOTIFICATION_KIND_SUPPORT_QUEUE)
 
 
 def acknowledge_learning_plan_transfer_notification(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    actor_username = sanitize_text(payload.get("actorUsername")).lower()
-
-    if not public_id:
-        raise ApiError(400, "Ticket id is required.")
-    if not actor_username:
-        raise ApiError(403, "Admin sign-in is required.")
-
-    actor_row = fetch_actor_by_username(actor_username)
-    if not actor_row:
-        raise ApiError(403, "Admin sign-in is required.")
-
-    with transaction.atomic():
-        ticket = run_query_one(
-            """
-            SELECT
-              t.id,
-              t.public_id,
-              t.technical_subcategory,
-              t.assigned_team,
-              t.metadata
-            FROM tickets t
-            WHERE t.public_id = %s
-            LIMIT 1
-            """,
-            [public_id],
-        )
-
-        if not ticket:
-            raise ApiError(404, "Ticket not found.")
-
-        require_actor_can_access_admin_ticket(actor_row, ticket)
-
-        ticket_metadata = normalize_json_object(ticket.get("metadata"))
-        if not get_pending_learning_plan_transfer_notification(ticket_metadata):
-            return fetch_admin_ticket_detail(public_id) or {"ticket": {"id": public_id}}
-
-        ticket_metadata.pop(PENDING_LEARNING_PLAN_TRANSFER_NOTIFICATION_METADATA_KEY, None)
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE tickets
-                SET metadata = %s::jsonb,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                [json.dumps(ticket_metadata), ticket["id"]],
-            )
-
-    detail = fetch_admin_ticket_detail(public_id)
-    if not detail:
-        raise ApiError(404, "Ticket not found.")
-
-    return detail
+    return dismiss_ticket_notification_for_actor(public_id, payload, NOTIFICATION_KIND_LEARNING_PLAN_TRANSFER)
 
 
 def confirm_coverage_tutor_session(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -21488,6 +21787,7 @@ def update_admin_ticket_archive_state(public_id: str, payload: dict[str, Any]) -
             FROM tickets
             WHERE public_id = %s
             LIMIT 1
+            FOR UPDATE
             """,
             [public_id],
         )
@@ -21547,6 +21847,83 @@ def update_admin_ticket_archive_state(public_id: str, payload: dict[str, Any]) -
     return detail
 
 
+def delete_ticket_database_records(ticket: dict[str, Any]) -> bool:
+    """Delete one ticket row (history, attachments rows and session requests
+    cascade) and its conversation when no other ticket still uses it; otherwise
+    re-point the conversation at the latest remaining ticket. Must run inside
+    the caller's transaction. Returns True when the conversation was deleted."""
+    ticket_id = int(ticket["id"])
+    conversation_deleted = False
+    try:
+        conversation_id = int(ticket["conversation_id"]) if ticket.get("conversation_id") else None
+    except (TypeError, ValueError):
+        conversation_id = None
+
+    remaining_conversation_tickets: list[dict[str, Any]] = []
+    if conversation_id is not None:
+        remaining_conversation_tickets = run_query(
+            """
+            SELECT id, public_id, metadata, created_at
+            FROM tickets
+            WHERE conversation_id = %s
+              AND id <> %s
+            ORDER BY created_at ASC, id ASC
+            """,
+            [conversation_id, ticket_id],
+        )
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM tickets
+            WHERE id = %s
+            """,
+            [ticket_id],
+        )
+
+        if conversation_id is not None:
+            if remaining_conversation_tickets:
+                latest_remaining_ticket = remaining_conversation_tickets[-1]
+                latest_remaining_public_id = sanitize_text(latest_remaining_ticket.get("public_id"))
+                previous_remaining_public_id = (
+                    sanitize_text(remaining_conversation_tickets[-2].get("public_id"))
+                    if len(remaining_conversation_tickets) > 1
+                    else latest_remaining_public_id
+                )
+                updated_conversation_metadata = {
+                    **normalize_json_object(ticket.get("conversation_metadata")),
+                    "latest_ticket_public_id": latest_remaining_public_id or None,
+                    "parent_ticket_public_id": previous_remaining_public_id or latest_remaining_public_id or None,
+                }
+                updated_conversation_metadata["chat_public_id"] = (
+                    build_public_chat_id(
+                        latest_remaining_public_id,
+                        conversation_id,
+                        updated_conversation_metadata,
+                    )
+                    or None
+                )
+                cursor.execute(
+                    """
+                    UPDATE conversations
+                    SET metadata = %s::jsonb
+                    WHERE id = %s
+                    """,
+                    [json.dumps(updated_conversation_metadata), conversation_id],
+                )
+            else:
+                cursor.execute(
+                    """
+                    DELETE FROM conversations
+                    WHERE id = %s
+                    """,
+                    [conversation_id],
+                )
+                conversation_deleted = True
+
+    return conversation_deleted
+
+
 def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     normalized_public_id = sanitize_text(public_id).upper()
     if not normalized_public_id:
@@ -21595,72 +21972,7 @@ def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> 
         ticket_id = int(ticket["id"])
         attachment_storage_keys = list_ticket_attachment_storage_keys(ticket_id)
 
-        try:
-            conversation_id = int(ticket["conversation_id"]) if ticket.get("conversation_id") else None
-        except (TypeError, ValueError):
-            conversation_id = None
-
-        remaining_conversation_tickets: list[dict[str, Any]] = []
-        if conversation_id is not None:
-            remaining_conversation_tickets = run_query(
-                """
-                SELECT id, public_id, metadata, created_at
-                FROM tickets
-                WHERE conversation_id = %s
-                  AND id <> %s
-                ORDER BY created_at ASC, id ASC
-                """,
-                [conversation_id, ticket_id],
-            )
-
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM tickets
-                WHERE id = %s
-                """,
-                [ticket_id],
-            )
-
-            if conversation_id is not None:
-                if remaining_conversation_tickets:
-                    latest_remaining_ticket = remaining_conversation_tickets[-1]
-                    latest_remaining_public_id = sanitize_text(latest_remaining_ticket.get("public_id"))
-                    previous_remaining_public_id = (
-                        sanitize_text(remaining_conversation_tickets[-2].get("public_id"))
-                        if len(remaining_conversation_tickets) > 1
-                        else latest_remaining_public_id
-                    )
-                    updated_conversation_metadata = {
-                        **normalize_json_object(ticket.get("conversation_metadata")),
-                        "latest_ticket_public_id": latest_remaining_public_id or None,
-                        "parent_ticket_public_id": previous_remaining_public_id or latest_remaining_public_id or None,
-                    }
-                    updated_conversation_metadata["chat_public_id"] = (
-                        build_public_chat_id(
-                            latest_remaining_public_id,
-                            conversation_id,
-                            updated_conversation_metadata,
-                        )
-                        or None
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE conversations
-                        SET metadata = %s::jsonb
-                        WHERE id = %s
-                        """,
-                        [json.dumps(updated_conversation_metadata), conversation_id],
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        DELETE FROM conversations
-                        WHERE id = %s
-                        """,
-                        [conversation_id],
-                    )
-                    conversation_deleted = True
+        conversation_deleted = delete_ticket_database_records(ticket)
 
     for storage_key in attachment_storage_keys:
         try:
@@ -21678,6 +21990,260 @@ def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> 
         "conversationDeleted": conversation_deleted,
         "message": "Ticket deleted permanently.",
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Archived-ticket retention
+# ---------------------------------------------------------------------------
+def list_conversation_attachment_storage_keys(conversation_id: int) -> list[str]:
+    rows = run_query(
+        """
+        SELECT storage_url
+        FROM message_attachments
+        WHERE conversation_id = %s
+        """,
+        [conversation_id],
+    )
+    return [sanitize_text(row.get("storage_url")) for row in rows if sanitize_text(row.get("storage_url"))]
+
+
+def split_attachment_storage_keys_by_reference(storage_keys: list[str]) -> tuple[list[str], list[str]]:
+    """Return (unreferenced, still_referenced). A file is only safe to delete
+    when no remaining ticket or chat attachment row points at it."""
+    unique_keys = sorted({sanitize_text(key) for key in storage_keys if sanitize_text(key)})
+    if not unique_keys:
+        return [], []
+
+    rows = run_query(
+        """
+        SELECT storage_url FROM ticket_attachments WHERE storage_url = ANY(%s)
+        UNION
+        SELECT storage_url FROM message_attachments WHERE storage_url = ANY(%s)
+        """,
+        [unique_keys, unique_keys],
+    )
+    referenced = {sanitize_text(row.get("storage_url")) for row in rows}
+    return (
+        [key for key in unique_keys if key not in referenced],
+        [key for key in unique_keys if key in referenced],
+    )
+
+
+def delete_unreferenced_attachment_files(storage_keys: list[str], *, ticket_public_id: str) -> dict[str, int]:
+    unreferenced_keys, referenced_keys = split_attachment_storage_keys_by_reference(storage_keys)
+    deleted = 0
+    failed = 0
+    for storage_key in unreferenced_keys:
+        try:
+            delete_support_attachment_file(storage_key)
+            deleted += 1
+        except OSError:
+            failed += 1
+            logger.warning("Retention cleanup could not delete an attachment file for %s", ticket_public_id, exc_info=True)
+    return {"deleted": deleted, "retained": len(referenced_keys), "failed": failed}
+
+
+def record_ticket_retention_audit(
+    *,
+    ticket_public_id: str,
+    archived_at: Any,
+    scheduled_deletion_at: Any,
+    outcome: str,
+    detail: str = "",
+) -> int | None:
+    row = run_query_one(
+        """
+        INSERT INTO ticket_retention_audit (ticket_public_id, archived_at, scheduled_deletion_at, outcome, detail)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        [ticket_public_id, coerce_datetime(archived_at), coerce_datetime(scheduled_deletion_at), outcome, detail[:500]],
+    )
+    return int(row["id"]) if row and row.get("id") else None
+
+
+def update_ticket_retention_audit_files(audit_id: int | None, file_counts: dict[str, int]) -> None:
+    if not audit_id:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE ticket_retention_audit
+            SET attachment_files_deleted = %s,
+                attachment_files_retained = %s,
+                attachment_files_failed = %s
+            WHERE id = %s
+            """,
+            [file_counts.get("deleted", 0), file_counts.get("retained", 0), file_counts.get("failed", 0), audit_id],
+        )
+
+
+def purge_archived_ticket(ticket_id: int, *, now: datetime) -> dict[str, Any]:
+    """Delete one expired archived ticket. Safe to retry and to run in parallel:
+    the row is locked with SKIP LOCKED and eligibility is re-checked under the
+    lock, so a ticket is processed by one worker only, and an already deleted
+    or un-archived ticket is skipped."""
+    public_id = ""
+    archived_at: Any = None
+    deletion_at: datetime | None = None
+    try:
+        with transaction.atomic():
+            ticket = run_query_one(
+                """
+                SELECT
+                  t.id,
+                  t.public_id,
+                  t.is_archived,
+                  t.archived_at,
+                  t.conversation_id,
+                  c.metadata AS conversation_metadata
+                FROM tickets t
+                LEFT JOIN conversations c
+                  ON c.id = t.conversation_id
+                WHERE t.id = %s
+                FOR UPDATE OF t SKIP LOCKED
+                """,
+                [ticket_id],
+            )
+            if not ticket:
+                return {"outcome": "skipped", "ticketId": None, "detail": "missing_or_locked"}
+
+            public_id = sanitize_text(ticket.get("public_id"))
+            archived_at = ticket.get("archived_at")
+            deletion_at = get_archived_ticket_deletion_at(archived_at)
+            if not normalize_bool(ticket.get("is_archived")) or not deletion_at or deletion_at > now:
+                return {"outcome": "skipped", "ticketId": public_id, "detail": "not_eligible"}
+
+            storage_keys = list_ticket_attachment_storage_keys(int(ticket["id"]))
+            conversation_keys: list[str] = []
+            if ticket.get("conversation_id"):
+                conversation_keys = list_conversation_attachment_storage_keys(int(ticket["conversation_id"]))
+
+            conversation_deleted = delete_ticket_database_records(ticket)
+            if conversation_deleted:
+                storage_keys += conversation_keys
+
+            audit_id = record_ticket_retention_audit(
+                ticket_public_id=public_id,
+                archived_at=archived_at,
+                scheduled_deletion_at=deletion_at,
+                outcome="deleted",
+                detail=f"conversation_deleted={str(conversation_deleted).lower()}",
+            )
+
+        # Files are removed only after the database deletion has committed, and
+        # only when nothing else still references them.
+        file_counts = delete_unreferenced_attachment_files(storage_keys, ticket_public_id=public_id)
+        update_ticket_retention_audit_files(audit_id, file_counts)
+        return {
+            "outcome": "deleted",
+            "ticketId": public_id,
+            "archivedAt": serialize_datetime_value(coerce_datetime(archived_at)),
+            "scheduledDeletionAt": serialize_datetime_value(deletion_at),
+            "files": file_counts,
+        }
+    except Exception as error:
+        failure_detail = type(error).__name__
+        # Error type only: exception text can echo ticket or message content.
+        logger.error("Retention cleanup failed for ticket row %s: %s", ticket_id, failure_detail)
+        try:
+            with transaction.atomic():
+                record_ticket_retention_audit(
+                    ticket_public_id=public_id or f"row:{ticket_id}",
+                    archived_at=archived_at,
+                    scheduled_deletion_at=deletion_at,
+                    outcome="failed",
+                    detail=failure_detail,
+                )
+        except Exception as audit_error:
+            logger.error(
+                "Retention cleanup could not record the failure for ticket row %s: %s",
+                ticket_id,
+                type(audit_error).__name__,
+            )
+        return {"outcome": "failed", "ticketId": public_id or None, "detail": failure_detail}
+
+
+def purge_expired_archived_tickets(
+    *,
+    now: datetime | None = None,
+    batch_size: int = 50,
+    max_batches: int = 20,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Find archived tickets whose archived_at + 3 calendar months has passed.
+    Dry run (default) only reports them. With execute=True each one is deleted
+    with purge_archived_ticket. Tickets that were never archived, or archived
+    without an archived_at timestamp (legacy rows), are never deleted: legacy
+    rows are reported for manual reconciliation instead."""
+    current_time = coerce_datetime(now) if now else datetime.now(timezone.utc)
+    batch_size = max(1, min(int(batch_size), 500))
+    max_batches = max(1, min(int(max_batches), 1000))
+
+    if execute and not is_support_table_available(TICKET_RETENTION_AUDIT_TABLE):
+        raise ApiError(503, "The retention audit table is missing. Apply the support schema first.")
+
+    legacy_rows = run_query(
+        """
+        SELECT public_id
+        FROM tickets
+        WHERE is_archived = TRUE
+          AND archived_at IS NULL
+        ORDER BY id ASC
+        LIMIT 500
+        """,
+    )
+    report: dict[str, Any] = {
+        "executed": bool(execute),
+        "now": serialize_datetime_value(current_time),
+        "retentionMonths": ARCHIVED_TICKET_RETENTION_MONTHS,
+        "eligible": [],
+        "deleted": [],
+        "skipped": [],
+        "failed": [],
+        "legacyMissingArchivedAt": [sanitize_text(row.get("public_id")) for row in legacy_rows],
+    }
+
+    seen_ticket_ids: list[int] = []
+    for _batch_index in range(max_batches):
+        candidates = run_query(
+            f"""
+            SELECT id, public_id, archived_at
+            FROM tickets
+            WHERE is_archived = TRUE
+              AND archived_at IS NOT NULL
+              AND ((archived_at AT TIME ZONE 'UTC') + INTERVAL '{ARCHIVED_TICKET_RETENTION_MONTHS} months')
+                  <= (%s::timestamptz AT TIME ZONE 'UTC')
+              AND NOT (id = ANY(%s))
+            ORDER BY archived_at ASC, id ASC
+            LIMIT %s
+            """,
+            [current_time, seen_ticket_ids or [0], batch_size],
+        )
+        if not candidates:
+            break
+
+        for candidate in candidates:
+            candidate_id = int(candidate["id"])
+            seen_ticket_ids.append(candidate_id)
+            deletion_at = get_archived_ticket_deletion_at(candidate.get("archived_at"))
+            if not deletion_at or deletion_at > current_time:
+                continue
+
+            summary = {
+                "ticketId": sanitize_text(candidate.get("public_id")),
+                "archivedAt": serialize_datetime_value(coerce_datetime(candidate.get("archived_at"))),
+                "scheduledDeletionAt": serialize_datetime_value(deletion_at),
+            }
+            report["eligible"].append(summary)
+            if not execute:
+                continue
+
+            result = purge_archived_ticket(candidate_id, now=current_time)
+            report.get(result["outcome"], report["failed"]).append({**summary, **result})
+
+    return report
 
 
 def create_ticket(payload: dict[str, Any], *, uploaded_files: list[Any] | None = None) -> dict[str, Any]:
