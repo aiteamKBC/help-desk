@@ -1478,7 +1478,6 @@ const AgentDashboard = () => {
   const [ticketPendingArchive, setTicketPendingArchive] = useState<TicketSummary | null>(null);
   const [deleteActionTicketId, setDeleteActionTicketId] = useState("");
   const [ticketPendingPermanentDelete, setTicketPendingPermanentDelete] = useState<TicketSummary | null>(null);
-  const [deleteConfirmationTicketId, setDeleteConfirmationTicketId] = useState("");
   const [isUpdatingConsoleStatus, setIsUpdatingConsoleStatus] = useState(false);
   const [managementSearch, setManagementSearch] = useState("");
   const [entraAgentSearchResults, setEntraAgentSearchResults] = useState<EntraAgentSearchResult[]>([]);
@@ -2450,13 +2449,6 @@ const AgentDashboard = () => {
   const canTransferActiveTicketToTeam = Boolean(
     activeDetail
     && canTransferTicketToTeam(activeDetail.ticket),
-  );
-  const normalizedDeleteConfirmationTicketId = deleteConfirmationTicketId.trim().toUpperCase();
-  const normalizedPendingPermanentDeleteTicketId = ticketPendingPermanentDelete?.id.trim().toUpperCase() || "";
-  const canConfirmPermanentDelete = Boolean(
-    normalizedPendingPermanentDeleteTicketId
-    && normalizedDeleteConfirmationTicketId === normalizedPendingPermanentDeleteTicketId
-    && deleteActionTicketId !== ticketPendingPermanentDelete?.id
   );
   const isActiveTicketAlreadyAssigned = Boolean(activeDetail?.ticket.assignedAgentId);
   const canForceCloseConsoleChat = Boolean(consoleDetail)
@@ -5096,7 +5088,6 @@ const AgentDashboard = () => {
     }
 
     setTicketPendingPermanentDelete(ticket);
-    setDeleteConfirmationTicketId("");
   }
 
   function dismissPermanentDeleteDialog() {
@@ -5105,7 +5096,6 @@ const AgentDashboard = () => {
     }
 
     setTicketPendingPermanentDelete(null);
-    setDeleteConfirmationTicketId("");
   }
 
   async function permanentlyDeleteSelectedTicket() {
@@ -5113,18 +5103,13 @@ const AgentDashboard = () => {
     if (!selectedTicket) {
       return;
     }
-    if (normalizedDeleteConfirmationTicketId !== normalizedPendingPermanentDeleteTicketId) {
-      toast.error("Type the ticket ID to confirm permanent deletion.");
-      return;
-    }
-
     setDeleteActionTicketId(selectedTicket.id);
 
     try {
       const response = await fetch(`/api/admin/tickets/${encodeURIComponent(selectedTicket.id)}/delete-permanently`, {
         method: "POST",
         headers: buildAdminJsonHeaders(),
-        body: JSON.stringify({ confirmTicketId: deleteConfirmationTicketId.trim() }),
+        body: JSON.stringify({ confirmDelete: true }),
       });
       const payload = (await response.json().catch(() => null)) as PermanentDeleteResponse | null;
 
@@ -5138,7 +5123,6 @@ const AgentDashboard = () => {
 
       removeTicketAcrossViews(selectedTicket.id);
       setTicketPendingPermanentDelete(null);
-      setDeleteConfirmationTicketId("");
       toast.success("Ticket deleted permanently");
     } catch {
       toast.error("We could not connect to the server. Please try again.");
@@ -10107,7 +10091,7 @@ const AgentDashboard = () => {
           }
         }}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-md" showCloseButton={false}>
           <DialogHeader>
             <DialogTitle>Delete Ticket Permanently</DialogTitle>
             <DialogDescription>
@@ -10115,24 +10099,8 @@ const AgentDashboard = () => {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-3 text-sm text-foreground">
-              <div className="font-medium">
-                {ticketPendingPermanentDelete ? `${ticketPendingPermanentDelete.id} - ${getRequesterDisplayName(ticketPendingPermanentDelete)}` : "Selected ticket"}
-              </div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                Type <span className="font-semibold text-foreground">{ticketPendingPermanentDelete?.id || "the ticket ID"}</span> to confirm permanent deletion.
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="permanent-delete-ticket-id">Ticket ID confirmation</Label>
-              <Input
-                id="permanent-delete-ticket-id"
-                autoComplete="off"
-                value={deleteConfirmationTicketId}
-                onChange={(event) => setDeleteConfirmationTicketId(event.target.value)}
-                placeholder={ticketPendingPermanentDelete?.id || "Type ticket ID"}
-                disabled={Boolean(deleteActionTicketId)}
-              />
+            <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-3 text-sm font-medium text-foreground">
+              {ticketPendingPermanentDelete ? `${ticketPendingPermanentDelete.id} - ${getRequesterDisplayName(ticketPendingPermanentDelete)}` : "Selected ticket"}
             </div>
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
               <Button
@@ -10141,20 +10109,20 @@ const AgentDashboard = () => {
                 onClick={dismissPermanentDeleteDialog}
                 disabled={Boolean(deleteActionTicketId)}
               >
-                Cancel
+                Go Back
               </Button>
               <Button
                 type="button"
                 variant="destructive"
                 onClick={() => void permanentlyDeleteSelectedTicket()}
-                disabled={!canConfirmPermanentDelete}
+                disabled={Boolean(deleteActionTicketId)}
               >
                 {deleteActionTicketId === ticketPendingPermanentDelete?.id ? (
                   <LoaderCircle className="h-4 w-4 mr-2 animate-spin" />
                 ) : (
                   <Trash2 className="h-4 w-4 mr-2" />
                 )}
-                Delete Permanently
+                Confirm Delete
               </Button>
             </div>
           </div>

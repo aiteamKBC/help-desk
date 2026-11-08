@@ -21549,9 +21549,8 @@ def delete_admin_ticket_permanently(public_id: str, payload: dict[str, Any]) -> 
         raise ApiError(400, "Ticket id is required.")
 
     actor_username = sanitize_text(payload.get("actorUsername")).lower()
-    confirm_ticket_id = sanitize_text(payload.get("confirmTicketId")).upper()
-    if not confirm_ticket_id or confirm_ticket_id != normalized_public_id:
-        raise ApiError(400, "Type the ticket ID to confirm permanent deletion.")
+    if payload.get("confirmDelete") is not True:
+        raise ApiError(400, "Confirm permanent deletion before continuing.")
 
     actor_row = fetch_actor_by_username(actor_username) if actor_username else None
     actor_role = sanitize_text(actor_row.get("role") if actor_row else "").lower()
