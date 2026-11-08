@@ -286,7 +286,8 @@ const EmbeddedBooking = () => {
       await setTicketBookingProgress(ticket.id, false);
     }
 
-    navigate(returnPath);
+    // Back always returns to step 3 (Support options).
+    navigate("/support/options");
   };
 
   const handleBooking = async () => {
@@ -383,16 +384,23 @@ const EmbeddedBooking = () => {
     <SupportLayout>
       <StepIndicator current={3} />
       <div className="mx-auto max-w-6xl">
+        <div className="mb-4 flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleBack()}
+            className="rounded-full border-primary/30 bg-white px-4 hover:bg-primary/5 hover:text-primary"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back
+          </Button>
+        </div>
         <div className="rounded-[28px] border border-primary/10 bg-gradient-to-br from-white via-white to-primary/[0.04] p-6 shadow-card md:p-8">
           <div className="flex items-start justify-between gap-4">
             <div className="inline-flex items-center gap-2 rounded-full border border-primary/15 bg-primary/[0.06] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80">
               <span className="h-1.5 w-1.5 rounded-full bg-primary/75" />
               Booking Session
             </div>
-            <Button variant="ghost" onClick={() => void handleBack()} className="shrink-0">
-              <ArrowLeft className="mr-2 h-4 w-4" />
-              {returnPath === "/support/chat" ? "Back to Chat" : "Back"}
-            </Button>
           </div>
 
           <div className="mt-4 grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
@@ -463,10 +471,6 @@ const EmbeddedBooking = () => {
                 </p>
 
                 <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
-                  <Button variant="outline" onClick={() => navigate(returnPath)}>
-                    <ArrowLeft className="mr-2 h-4 w-4" />
-                    {returnPath === "/support/chat" ? "Return to Chat" : "Back"}
-                  </Button>
                   <Button
                     className="border-0 gradient-primary"
                     disabled={!bookingDate || !bookingTime || Boolean(bookingValidationMessage) || isBooking}

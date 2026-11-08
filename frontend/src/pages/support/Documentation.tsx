@@ -46,7 +46,7 @@ const Documentation = () => {
   return (
     <SupportLayout>
       <div className="max-w-5xl mx-auto">
-        <Button variant="ghost" size="sm" onClick={() => navigate(-1)} className="mb-4">
+        <Button variant="ghost" size="sm" onClick={() => navigate("/")} className="mb-4">
           <ArrowLeft className="h-4 w-4 mr-2" /> Back
         </Button>
         <div className="text-center mb-8">

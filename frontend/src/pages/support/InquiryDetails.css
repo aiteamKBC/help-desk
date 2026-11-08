@@ -13,7 +13,7 @@ main.support-inquiry-main {
   margin: 0;
   padding: 0;
   overflow-x: clip;
-  background: #eeeafd;
+  background: transparent;
   color: var(--si-ink);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-feature-settings: "cv11", "ss01";
@@ -27,30 +27,12 @@ main.support-inquiry-main {
 
 .support-inquiry-body {
   position: relative;
-  min-height: calc(100svh - 184px);
+  min-height: calc(100svh - var(--support-banner-header-h));
   padding: 24px 32px 96px;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 10% 14%, rgba(255, 255, 255, .5), transparent 30%),
-    radial-gradient(circle at 92% 40%, rgba(255, 255, 255, .4), transparent 32%),
-    linear-gradient(180deg, #eeeafd 0%, #e9e4fc 100%);
+  background: transparent;
 }
 
-/* Subtle lavender waves at the bottom of the page */
-.support-inquiry-body::before,
-.support-inquiry-body::after {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  left: -10%;
-  right: -10%;
-  height: 200px;
-  border-radius: 50%;
-  pointer-events: none;
-}
-
-.support-inquiry-body::before { bottom: -140px; background: rgba(216, 205, 252, .45); }
-.support-inquiry-body::after { bottom: -170px; background: rgba(204, 190, 250, .4); }
 
 .support-inquiry-steps,
 .support-inquiry-shell {

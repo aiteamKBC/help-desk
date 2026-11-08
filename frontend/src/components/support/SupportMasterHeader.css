@@ -2,7 +2,7 @@
    admin dashboard's fixed-height workspace) can size against it. */
 :root { --support-master-header-h: clamp(184px, 10vw, 240px); }
 
-/* Admin banner header (approved artwork, 2172 x 224): its height follows the
+/* Dashboard banner header (approved artwork, 2172 x 224): its height follows the
    artwork's own ratio, with a usable minimum below the large breakpoint. */
 :root { --support-banner-header-h: max(112px, calc(100vw * 224 / 2172)); }
 @media (min-width: 640px) { :root { --support-banner-header-h: max(140px, calc(100vw * 224 / 2172)); } }
@@ -105,7 +105,9 @@
   color: #17152b;
   font-size: 13px;
   font-weight: 500;
+  font-family: inherit;
   line-height: 18px;
+  cursor: pointer;
   box-shadow: 0 4px 12px rgba(21, 10, 77, .14);
   backdrop-filter: blur(8px);
   transition: border-color .2s ease, color .2s ease, background-color .2s ease;
@@ -168,13 +170,15 @@
   .support-master-header__wave { height: 40px; }
 }
 
-/* ---------- Banner variant (admin dashboard + Knowledge Base) ----------
+/* ---------- Banner variant (admin dashboard + Knowledge Base + support flow) ----------
  * The approved artwork already contains the building, crest, sky, waves, gold
  * line and lavender lower edge; it is drawn at its own 2172 x 224 ratio and
  * anchored left, so nothing is distorted. Only the pills are drawn in code. */
 .support-master-header--banner {
   height: var(--support-banner-header-h);
-  background: var(--support-page-bg, #f2efff);
+  /* Behind the artwork's clipped bottom strip: fade from the artwork's lower
+     edge (#EFE9FD) into the page colour. */
+  background: linear-gradient(180deg, #efe9fd calc(100% * 205 / 224), var(--support-page-bg, #f2efff) 100%);
 }
 
 .support-master-header--banner::before { display: none; }
@@ -188,6 +192,9 @@
   object-position: left center;
   pointer-events: none;
   user-select: none;
+  /* Hide the artwork's bottom 19 of 224 rows: leftover card outlines from the
+     source screenshot. The wave ends above them. */
+  clip-path: inset(0 0 calc(100% * 19 / 224) 0);
 }
 
 /* Pill geometry measured from the approved reference (1:1 capture at 1901px):
@@ -229,7 +236,13 @@
 }
 
 @media (max-width: 639px) {
-  .support-master-header--banner .support-master-header__actions { top: 26%; right: 16px; gap: 6px; }
+  .support-master-header--mobile-action-row {
+    height: 150px;
+    /* Artwork is 112px tall here and its last 19/224 is clipped (~102.5px). */
+    background: linear-gradient(180deg, #efe9fd 102px, var(--support-page-bg, #f2efff) 128px);
+  }
+  .support-master-header--mobile-action-row .support-master-header__banner { top: 0; bottom: auto; height: 112px; }
+  .support-master-header--mobile-action-row .support-master-header__actions { top: auto; right: 16px; bottom: 8px; gap: 6px; }
   .support-master-header--banner .support-master-header__pill { min-height: 28px; gap: 4px; padding: 0 10px; font-size: 11px; }
   .support-master-header--banner .support-master-header__pill svg { width: 13px; height: 13px; }
 }

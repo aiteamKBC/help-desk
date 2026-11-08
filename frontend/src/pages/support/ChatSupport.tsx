@@ -1,6 +1,7 @@
 import { type ChangeEvent, type ComponentType, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
+  ArrowLeft,
   ArrowRight,
   Bot,
   CalendarClock,
@@ -1414,6 +1415,21 @@ const ChatSupport = () => {
   return (
     <SupportLayout>
       <StepIndicator current={3} />
+      <div className="mx-auto mb-4 flex max-w-5xl items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-foreground md:text-3xl">Kent Chatbot</h1>
+          <p className="mt-1 text-sm text-muted-foreground">Continue your support conversation.</p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => navigate("/support/options")}
+          className="shrink-0 rounded-full border-primary/30 bg-white px-4 hover:bg-primary/5 hover:text-primary"
+        >
+          <ArrowLeft className="mr-2 h-4 w-4" />
+          Back
+        </Button>
+      </div>
       <div className="mx-auto max-w-5xl min-h-0">
         <div className="relative flex h-[calc(100dvh-245px)] min-h-[420px] max-h-[760px] flex-col overflow-hidden rounded-2xl border border-primary/10 bg-card shadow-[0_12px_30px_-18px_hsl(var(--primary)/0.35),0_6px_16px_-10px_hsl(var(--primary)/0.18)] sm:h-[calc(100dvh-260px)] sm:min-h-[520px]">
           <div className="relative z-10 shrink-0 flex flex-col gap-3 border-b border-primary/10 bg-gradient-to-r from-primary/[0.05] via-card to-card px-4 py-3.5 shadow-[0_10px_22px_-18px_hsl(var(--primary)/0.4)] sm:flex-row sm:items-center sm:justify-between md:px-6">
