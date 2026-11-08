@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { CalendarCheck, CheckCircle2, ExternalLink, MessageSquare, Send } from "lucide-react";
+import { ArrowLeft, CalendarCheck, CheckCircle2, ExternalLink, MessageSquare, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -320,6 +320,17 @@ const TicketStatus = () => {
     <SupportLayout>
       <StepIndicator current={4} />
       <div className="max-w-3xl mx-auto">
+        <div className="mb-4 flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => navigate("/support/options", { state: { reviewSubmitted: true } })}
+            className="rounded-full border-primary/30 bg-white px-4 hover:bg-primary/5 hover:text-primary"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back
+          </Button>
+        </div>
         <div className="bg-card rounded-2xl border shadow-card p-8 text-center">
           <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-full bg-success/10">
             {hasBookingSummary ? (

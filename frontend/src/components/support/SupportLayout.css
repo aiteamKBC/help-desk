@@ -1,0 +1,97 @@
+/*
+ * Admin dashboard theme (/admin, /agent): every team dashboard view shares the
+ * same Tailwind token utilities (text-foreground, text-muted-foreground,
+ * text-primary, border, divide-y ...), so the Kent design-system colours are
+ * applied once here, by token, rather than per component.
+ *
+ *   #17152B main text      -> 246 33% 13%
+ *   #667085 secondary text -> 221 13% 46%
+ *   #5B21E8 primary purple -> 257 81% 52%
+ *   #E4DDFC subtle border  -> 254 84% 93%
+ *   #F3EEFF pale purple    -> 258 100% 97%
+ *   #F2EFFF page background (also the header's front wave)
+ *
+ * Portalled overlays (dialogs, dropdowns) render outside this wrapper and keep
+ * the global theme.
+ */
+.support-admin-theme {
+  --support-page-bg: #f2efff;
+  --foreground: 246 33% 13%;
+  --card-foreground: 246 33% 13%;
+  --secondary-foreground: 246 33% 13%;
+  --muted-foreground: 221 13% 46%;
+  --primary: 257 81% 52%;
+  --ring: 263 83% 58%;
+  --border: 254 84% 93%;
+  --input: 254 84% 93%;
+  --secondary: 258 100% 97%;
+  --muted: 258 100% 97%;
+
+  background-color: var(--support-page-bg);
+
+  /* <body> resolves text-foreground at the root, and descendants inherit that
+     computed colour, so re-resolve it here with the overridden token. */
+  color: hsl(var(--foreground));
+}
+
+/*
+ * Knowledge Base (/knowledge-base/*): same family as the admin theme, using the
+ * Knowledge Base palette.
+ *
+ *   #17152B main text   -> 246 33% 13%
+ *   #667085 muted text  -> 221 13% 46%
+ *   #5B21E8 primary     -> 257 81% 52%
+ *   #DDD6FE border      -> 251 95% 92%
+ *   #F5F2FF hover/soft  -> 254 100% 97%
+ */
+.support-admin-theme.support-kb-theme {
+  --support-page-bg: #f3f0ff;
+  --foreground: 246 33% 13%;
+  --card-foreground: 246 33% 13%;
+  --secondary-foreground: 246 33% 13%;
+  --muted-foreground: 221 13% 46%;
+  --primary: 257 81% 52%;
+  --ring: 257 81% 52%;
+  --border: 251 95% 92%;
+  --input: 251 95% 92%;
+  --secondary: 254 100% 97%;
+  --muted: 254 100% 97%;
+}
+
+/* Lucide icons in the admin area use the lighter 1.75 stroke. */
+.support-admin-theme svg.lucide { stroke-width: 1.75; }
+
+/*
+ * Dashboard filter row (shared by every team dashboard view): compact 34px
+ * controls. Scoped to the row so dialogs and other pages keep their sizes.
+ */
+.support-admin-theme .admin-dashboard-filters :is(button[role="combobox"], button[aria-haspopup], input) {
+  height: 34px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.support-admin-theme .admin-dashboard-filters input { font-weight: 400; }
+
+.support-admin-theme .admin-dashboard-filters :is(button[role="combobox"], button[aria-haspopup], input):focus-visible {
+  border-color: #7c3aed;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, .14);
+}
+
+/*
+ * Support flow (/support/*): one lavender page background for every step and
+ * support path, applied once on the layout root: #F8F6FF directly under the
+ * header, #F3EFFF mid-page, #EBE5FF at the bottom. Page sections are
+ * transparent and sit on top of it.
+ */
+.support-flow-theme {
+  --support-page-bg: #f8f6ff;
+  background: linear-gradient(
+    180deg,
+    #f8f6ff var(--support-banner-header-h),
+    #f3efff 55%,
+    #ebe5ff 100%
+  );
+}

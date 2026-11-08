@@ -32,8 +32,8 @@ export function AttachmentPanel({
   return (
     <div
       className={cn(
-        "mt-4 rounded-[22px] border border-dashed bg-slate-50/50 p-4 transition-colors",
-        isDragging ? "border-primary bg-primary/5" : "border-slate-300",
+        "mt-4 rounded-xl border border-dashed p-4 transition-colors",
+        isDragging ? "border-primary bg-primary/5" : "border-input bg-secondary/60",
       )}
       onDragEnter={(event) => {
         event.preventDefault();
@@ -61,10 +61,10 @@ export function AttachmentPanel({
         await handleFiles(files);
       }}
     >
-      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <div className="text-base font-semibold text-slate-950">Attachments for this section</div>
-          <p className="mt-1 text-sm text-slate-500">Drag files here, paste screenshots, or add a link.</p>
+          <div className="text-[13px] font-medium text-foreground">Attachments for this section</div>
+          <p className="mt-0.5 text-xs text-muted-foreground">Drag files here, paste screenshots, or add a link.</p>
         </div>
 
         <div className="flex flex-wrap gap-2">
@@ -82,7 +82,7 @@ export function AttachmentPanel({
             type="button"
             variant="secondary"
             size="sm"
-            className="h-8 rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            className="h-8 rounded-lg border border-input bg-card px-3 text-xs font-medium text-foreground hover:bg-secondary hover:text-primary"
             onClick={() => inputRef.current?.click()}
           >
             Add files
@@ -91,7 +91,7 @@ export function AttachmentPanel({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            className="h-8 rounded-lg border border-input bg-card px-3 text-xs font-medium text-foreground hover:bg-secondary hover:text-primary"
             onClick={onAddLink}
           >
             Add link
@@ -99,8 +99,8 @@ export function AttachmentPanel({
         </div>
       </div>
 
-      <div className="mt-4 grid gap-3">
-        {!attachments.length ? <div className="text-sm text-slate-500">No attachments added yet.</div> : null}
+      <div className="mt-3 grid gap-2">
+        {!attachments.length ? <div className="text-xs text-muted-foreground">No attachments added yet.</div> : null}
 
         {attachments.map((attachment) => {
           const source = resolveAttachmentUrl(attachment);
@@ -112,35 +112,35 @@ export function AttachmentPanel({
           return (
             <div
               key={attachment.id}
-              className="grid gap-3 rounded-2xl border border-slate-200/90 bg-white p-3 shadow-soft md:grid-cols-[72px_minmax(0,1fr)_auto]"
+              className="grid gap-3 rounded-lg border bg-card p-3 sm:grid-cols-[64px_minmax(0,1fr)] md:grid-cols-[64px_minmax(0,1fr)_auto]"
             >
-              <div className="flex h-[72px] items-center justify-center overflow-hidden rounded-2xl border border-slate-200 bg-slate-100">
+              <div className="flex h-16 items-center justify-center overflow-hidden rounded-lg border bg-secondary">
                 {isImage && source ? (
                   <img src={source} alt={attachment.name} className="h-full w-full object-cover" />
                 ) : (
-                  <Paperclip className="h-5 w-5 text-slate-400" />
+                  <Paperclip className="h-5 w-5 text-muted-foreground" />
                 )}
               </div>
 
               <div className="min-w-0">
-                <div className="truncate text-sm font-semibold text-slate-950">{attachment.name || "Attachment"}</div>
-                <div className="mt-1 text-xs text-slate-500">
+                <div className="truncate text-sm font-medium text-foreground">{attachment.name || "Attachment"}</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
                   {attachment.type || "link"}
                   {attachment.size ? ` • ${formatBytes(attachment.size)}` : ""}
                 </div>
                 {attachment.url ? (
-                  <div className="mt-2 truncate text-xs text-primary">{attachment.url}</div>
+                  <div className="mt-1 truncate text-xs text-primary">{attachment.url}</div>
                 ) : attachment.evidencePath ? (
-                  <div className="mt-2 truncate text-xs text-slate-500">{attachment.evidencePath}</div>
+                  <div className="mt-1 truncate text-xs text-muted-foreground">{attachment.evidencePath}</div>
                 ) : null}
               </div>
 
-              <div className="flex flex-wrap gap-2 md:justify-end">
+              <div className="flex flex-wrap gap-2 sm:col-span-2 md:col-span-1 md:justify-end">
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  className="h-8 rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                  className="h-8 rounded-lg border border-input bg-card px-3 text-xs font-medium text-foreground hover:bg-secondary hover:text-primary"
                   onClick={() => onOpenAttachment(attachment)}
                 >
                   {isImage ? <ImageIcon className="h-4 w-4" /> : <ExternalLink className="h-4 w-4" />}
@@ -152,7 +152,7 @@ export function AttachmentPanel({
                     type="button"
                     variant="secondary"
                     size="sm"
-                    className="h-8 rounded-xl border border-slate-200 bg-slate-100 px-3 text-xs font-semibold text-slate-700 hover:bg-slate-200"
+                    className="h-8 rounded-lg border border-input bg-card px-3 text-xs font-medium text-foreground hover:bg-secondary hover:text-primary"
                   >
                     <a href={attachment.dataUrl} download={attachment.name || "attachment"}>
                       <Download className="h-4 w-4" />
@@ -164,7 +164,7 @@ export function AttachmentPanel({
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-8 rounded-xl bg-rose-50 px-3 text-xs font-semibold text-rose-600 hover:bg-rose-100 hover:text-rose-700"
+                  className="h-8 rounded-lg border border-rose-200 bg-card px-3 text-xs font-medium text-rose-600 hover:bg-rose-50 hover:text-rose-700"
                   onClick={() => onRemoveAttachment(attachment.id)}
                 >
                   <Trash2 className="h-4 w-4" />

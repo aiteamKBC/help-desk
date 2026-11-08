@@ -12,6 +12,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { SupportLayout } from "@/components/support/SupportLayout";
+import { SupportCampusHero } from "@/components/support/SupportCampusHero";
 import "./EmailVerification.css";
 import { StepIndicator } from "@/components/support/StepIndicator";
 import {
@@ -299,83 +300,10 @@ const EmailVerification = () => {
 
   return (
     <SupportLayout landing mainClassName="support-landing-main">
-      <aside className="support-hero" aria-label="Kent Business College">
-        <div className="support-hero-wave" aria-hidden="true">
-          <svg
-            className="support-wave-ribbons"
-            viewBox="0 0 1712 913"
-            preserveAspectRatio="none"
-            focusable="false"
-          >
-            <defs>
-              <clipPath id="support-campus-clip" clipPathUnits="userSpaceOnUse">
-                <path d="M0 0H665C718 68 751 151 749 233C746 361 705 482 644 596C578 719 475 820 342 873C253 909 167 913 82 913H0Z" />
-              </clipPath>
-              <linearGradient id="support-purple-ribbon" gradientUnits="userSpaceOnUse" x1="490" y1="120" x2="415" y2="913">
-                <stop offset="0" stopColor="#5310ff" />
-                <stop offset="0.52" stopColor="#4810f2" />
-                <stop offset="1" stopColor="#5a00f5" />
-              </linearGradient>
-              <linearGradient id="support-lavender-ribbon" gradientUnits="userSpaceOnUse" x1="470" y1="913" x2="810" y2="65">
-                <stop offset="0" stopColor="#5c18f4" />
-                <stop offset="0.52" stopColor="#9a74f7" />
-                <stop offset="1" stopColor="#c8b5fb" />
-              </linearGradient>
-              <linearGradient id="support-lavender-soft" gradientUnits="userSpaceOnUse" x1="560" y1="850" x2="860" y2="90">
-                <stop offset="0" stopColor="#cbb2fa" stopOpacity="0.9" />
-                <stop offset="1" stopColor="#e9e1fd" stopOpacity="0.72" />
-              </linearGradient>
-              <linearGradient id="support-photo-shade" gradientUnits="userSpaceOnUse" x1="0" y1="330" x2="0" y2="913">
-                <stop offset="0.12" stopColor="#2410a8" stopOpacity="0" />
-                <stop offset="0.58" stopColor="#2710b6" stopOpacity="0.23" />
-                <stop offset="1" stopColor="#25108f" stopOpacity="0.48" />
-              </linearGradient>
-            </defs>
-            <path
-              className="support-wave-corner-band"
-              d="M1270 0C1325 85 1425 140 1550 172C1635 194 1690 245 1712 310V0Z"
-              fill="#e8dfff"
-              fillOpacity="0.55"
-            />
-            <path
-              className="support-wave-corner"
-              d="M1300 0C1350 70 1440 120 1560 150C1640 170 1690 215 1712 270V0Z"
-              fill="#fbfaff"
-              fillOpacity="0.85"
-            />
-            <path
-              className="support-wave-layer support-wave-layer-soft"
-              d="M0 0H850C816 75 804 159 801 248C796 386 767 506 719 621C674 727 634 817 647 866C653 887 664 902 680 913H0Z"
-              fill="url(#support-lavender-soft)"
-            />
-            <path
-              className="support-wave-layer support-wave-layer-lavender"
-              d="M0 0H793C777 74 775 155 771 240C765 370 733 490 679 607C628 718 574 811 559 863C553 883 554 900 562 913H0Z"
-              fill="url(#support-lavender-ribbon)"
-            />
-            <path
-              className="support-wave-layer support-wave-layer-purple"
-              d="M0 0H690C741 70 770 153 766 239C760 369 716 492 651 607C579 733 487 831 390 874C370 884 353 897 343 913H0Z"
-              fill="url(#support-purple-ribbon)"
-            />
-            <g className="support-wave-photo" clipPath="url(#support-campus-clip)">
-              <image
-                href="/support-campus.png"
-                x="-32"
-                y="-12"
-                width="790"
-                height="925"
-                preserveAspectRatio="xMidYMin slice"
-              />
-              <rect width="790" height="913" fill="url(#support-photo-shade)" />
-            </g>
-          </svg>
-        </div>
-        <div className="support-hero-copy">
-          <h2>Support,<br />made simple.</h2>
-          <p>Get the help you need, when you need it.</p>
-        </div>
-      </aside>
+      <SupportCampusHero
+        title={<>Support,<br />made simple.</>}
+        subtitle="Get the help you need, when you need it."
+      />
 
       <section className="support-entry" aria-labelledby="support-request-title">
         <div className="support-entry-content">
@@ -433,19 +361,33 @@ const EmailVerification = () => {
       </Dialog>
 
       <Dialog open={existingRequestOpen} onOpenChange={setExistingRequestOpen}>
+        {/*
+          Layout utilities are passed through className so tailwind-merge drops the
+          conflicting shadcn defaults (p-6, gap-4, max-w-lg, sm:rounded-lg, bg-background,
+          shadow-lg). Tailwind loads after this page's CSS, so those defaults would
+          otherwise override .support-dashboard-modal.
+        */}
         <DialogContent
-          className="support-dashboard-modal"
-          overlayClassName="bg-[#0b1026]/40 backdrop-blur-[1px]"
+          className="support-dashboard-modal w-[calc(100%-32px)] max-w-[440px] gap-6 border-0 bg-[#fbfaff] p-8 pb-7 shadow-[0_16px_40px_rgba(28,16,84,0.12),0_2px_8px_rgba(28,16,84,0.06)] rounded-2xl sm:rounded-2xl max-[480px]:p-6"
+          overlayClassName="bg-[#1b1240]/25 backdrop-blur-[2px]"
         >
-          <DialogHeader className="support-dashboard-header">
-            <Headphones className="support-dashboard-icon" aria-hidden="true" strokeWidth={1.8} />
+          <div className="support-dashboard-header">
+            <span className="support-dashboard-icon" aria-hidden="true">
+              <Headphones strokeWidth={2} />
+            </span>
             <DialogTitle>Support Dashboard</DialogTitle>
             <DialogDescription>
               Choose what you want to do for this email.
             </DialogDescription>
-          </DialogHeader>
+            {email.trim() && (
+              <p className="support-dashboard-email">
+                <Mail aria-hidden="true" />
+                <span>{email.trim()}</span>
+              </p>
+            )}
+          </div>
 
-          <DialogFooter className="support-dashboard-actions">
+          <div className="support-dashboard-actions">
             <Button
               className="support-dashboard-primary"
               onClick={() => startNewTicket(
@@ -467,7 +409,7 @@ const EmailVerification = () => {
             >
               My Tickets
             </Button>
-          </DialogFooter>
+          </div>
         </DialogContent>
       </Dialog>
     </SupportLayout>

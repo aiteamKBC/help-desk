@@ -1,17 +1,17 @@
 import { cn } from "@/lib/utils";
 
 const map: Record<string, string> = {
-  Open: "bg-sky-600 text-white border-sky-600",
-  Pending: "bg-amber-500 text-white border-amber-500",
-  Requested: "bg-amber-500 text-white border-amber-500",
-  Closed: "bg-emerald-600 text-white border-emerald-600",
+  Open: "bg-[#E7F2FF] text-[#1765C1] border-[#C9E2FF]",
+  Pending: "bg-[#FFF1DE] text-[#A95608] border-[#FFE0B2]",
+  Requested: "bg-[#FFF1DE] text-[#A95608] border-[#FFE0B2]",
+  Closed: "bg-[#E1F7E8] text-[#18733A] border-[#C4EACF]",
   Draft: "bg-slate-600 text-white border-slate-600",
 };
 
 export const StatusBadge = ({ status, label }: { status: string; label?: string }) => (
   <span
     className={cn(
-      "inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border",
+      "inline-flex h-6 items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 text-xs font-medium leading-none",
       map[status] ?? "bg-muted text-muted-foreground border-border"
     )}
   >

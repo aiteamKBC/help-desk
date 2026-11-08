@@ -9177,6 +9177,7 @@ def serialize_public_requester_ticket(
         "status": ticket["status"],
         "statusReason": ticket.get("status_reason") or "",
         "assignedAgentId": int(ticket["assigned_agent_id"]) if ticket.get("assigned_agent_id") else None,
+        "assignedAgentName": sanitize_text(ticket.get("assigned_agent_name")),
         "assignedTeam": ticket.get("assigned_team") or "Unassigned",
         "slaStatus": ticket["sla_status"],
         "createdAt": ticket["created_at"],
@@ -9231,6 +9232,7 @@ def list_public_requester_tickets(payload: dict[str, Any]) -> dict[str, Any]:
           t.status,
           t.status_reason,
           t.assigned_agent_id,
+          a.full_name AS assigned_agent_name,
           t.assigned_team,
           t.sla_status,
           t.created_at,
@@ -9241,6 +9243,8 @@ def list_public_requester_tickets(payload: dict[str, Any]) -> dict[str, Any]:
         FROM tickets t
         LEFT JOIN conversations c
           ON c.id = t.conversation_id
+        LEFT JOIN support_accounts a
+          ON a.id = t.assigned_agent_id
         WHERE t.learner_id = %s
           AND COALESCE(t.is_archived, FALSE) = FALSE
         ORDER BY t.updated_at DESC, t.id DESC
